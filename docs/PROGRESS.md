@@ -112,6 +112,17 @@ The boilerplate is complete and passes on both backends:
    Record per backend tolerance. Assert in tests (fixed seeds).
 5. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. Models are data. No per model branches.
+6. **Serving API**: OpenAI-style `/v1/chat/completions` plus an
+   Anthropic-style `/v1/messages` endpoint, served over HTTP from the
+   engine. Streaming and non-streaming responses. The same limits
+   apply to both shapes.
+7. **Runtime options**: every serving and engine knob as a CLI flag
+   and an engine option. Model path, draft path, mmproj path for
+   vision input, KV cache quantization (q4, q8, fp16), maximum
+   context size, batch caps. No hard-coded paths or sizes.
+8. **Multimodal (mmproj)**: load the vision projector next to the
+   model, encode images to embeddings, prepend them to the prompt
+   sequence. Covers the mmproj file in the model directory.
 
 ## Notes and decisions
 
