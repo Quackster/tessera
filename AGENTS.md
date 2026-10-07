@@ -19,6 +19,10 @@ read, fix, and extend it without asking.
 - Complexity budget: small functions, cohesive modules. No hidden globals —
   state flows through explicitly constructed and owned objects (Engine, Model,
   Backend); there is no process-wide singleton, keep it that way.
+- Concurrency: write every component with concurrent use in mind. Prefer
+  immutable inputs and explicit outputs over shared mutable state. Document
+  the thread-safety contract on shared interfaces: safe for concurrent use,
+  externally synchronized, or confined to a single thread.
 - The pillars this project is judged on:
   1. Extensibility: new LLM architectures arrive as data, not as core code
      changes.
