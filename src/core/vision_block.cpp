@@ -14,22 +14,9 @@ namespace {
 
 using detail::AddDevice;
 using detail::AttentionDevice;
+using detail::BiasAddDevice;
+using detail::LayerNormDevice;
 using detail::ProjectDevice;
-
-std::expected<void, StatusCode> BiasAddDevice(Backend& backend,
-                                              const Kernel& kernel,
-                                              const Buffer& x,
-                                              const Buffer& b, Buffer& y,
-                                              std::size_t rows,
-                                              std::size_t cols) {
-  KernelLaunch launch;
-  launch.grid_x =
-      static_cast<std::uint32_t>((rows * cols + 255) / 256);
-  launch.block_x = 256;
-  launch.buffers = {&x, &b, &y};
-  launch.scalars = {rows, cols};
-  return backend.LaunchKernel(kernel, launch);
-}
 
 std::expected<void, StatusCode> GeluDevice(Backend& backend,
                                            const Kernel& kernel,
@@ -143,17 +130,11 @@ std::expected<void, StatusCode> VisionBlockDevice(
       xn2 == nullptr || up == nullptr || down == nullptr) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
-  // LayerNorm with weight+bias.
   const auto norm = [&](const Buffer& src, const Buffer* weight,
                         const Buffer* bias, Buffer& dst) {
-    KernelLaunch launch;
-    launch.grid_x = static_cast<std::uint32_t>((tokens + 255) / 256);
-    launch.block_x = 256;
-    launch.buffers = {&src, weight, bias, &dst};
-    std::uint32_t bits = 0;
-    std::memcpy(&bits, &eps, sizeof(bits));
-    launch.scalars = {tokens, embed, bits};
-    return backend.LaunchKernel(layernorm, launch).has_value();
+    return LayerNormDevice(backend, layernorm, src, *weight, *bias, dst, tokens,
+                           embed, eps)
+        .has_value();
   };
   const auto gemm_to = [&](const Buffer& a, const Buffer* weight, Buffer& c,
                            std::size_t n, std::size_t kk) {

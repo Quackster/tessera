@@ -15,6 +15,7 @@
 #include "core/numerics/conv.hpp"
 #include "core/numerics/vision.hpp"
 #include "core/vision_block.hpp"
+#include "core/vision_stack.hpp"
 #include "core/numerics/selector.hpp"
 #include "spec/dflash2_conv.hpp"
 #include "spec/dflash2_mlp.hpp"
@@ -5130,6 +5131,110 @@ TEST(BackendTest, VisionBlockMatchesRef) {
                                             std::span<float>(ref), kTokens,
                                             kEmbed, kHeads, kHeadDim, kFfn,
                                             kEps)
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the CLIP vision stack (patch embed + blocks + post-norm) matches
+// the host reference.
+TEST(BackendTest, VisionStackMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(114);
+  constexpr std::size_t kTokens = 4, kEmbed = 8, kPatchDim = 6, kHeads = 2,
+                       kHeadDim = 4, kFfn = 16, kBlocks = 2;
+  constexpr float kEps = 1e-5f;
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = DrawValue(rng);
+    return v;
+  };
+  auto up = [&backend](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  std::vector<float> patches = rnd(kTokens * kPatchDim), pw = rnd(kEmbed * kPatchDim);
+  std::vector<float> pb = rnd(kEmbed), pos = rnd(kTokens * kEmbed);
+  std::vector<float> plnw = rnd(kEmbed), plnb = rnd(kEmbed);
+  std::vector<tessera::core::VisionBlockWeights> ref_blocks;
+  std::vector<tessera::core::VisionBlockBuffers> dev_blocks;
+  std::vector<std::vector<float>> keep;
+  std::vector<std::unique_ptr<tessera::Buffer>> keep_b;
+  for (std::size_t b = 0; b < kBlocks; ++b) {
+    std::vector<std::vector<float>> parts = {
+        rnd(kEmbed),        rnd(kEmbed),        rnd(3 * kEmbed * kEmbed),
+        rnd(3 * kEmbed),    rnd(kEmbed * kEmbed), rnd(kEmbed),
+        rnd(kEmbed),        rnd(kEmbed),        rnd(kFfn * kEmbed),
+        rnd(kFfn),          rnd(kEmbed * kFfn),  rnd(kEmbed)};
+    tessera::core::VisionBlockWeights rw;
+    rw.ln1_weight = parts[0]; rw.ln1_bias = parts[1]; rw.qkv_weight = parts[2];
+    rw.qkv_bias = parts[3]; rw.out_weight = parts[4]; rw.out_bias = parts[5];
+    rw.ln2_weight = parts[6]; rw.ln2_bias = parts[7]; rw.up_weight = parts[8];
+    rw.up_bias = parts[9]; rw.down_weight = parts[10]; rw.down_bias = parts[11];
+    ref_blocks.push_back(rw);
+    tessera::core::VisionBlockBuffers bw;
+    keep_b.push_back(up(parts[0]));
+    bw.ln1_weight = keep_b.back().get();
+    keep_b.push_back(up(parts[1]));
+    bw.ln1_bias = keep_b.back().get();
+    keep_b.push_back(up(parts[2]));
+    bw.qkv_weight = keep_b.back().get();
+    keep_b.push_back(up(parts[3]));
+    bw.qkv_bias = keep_b.back().get();
+    keep_b.push_back(up(parts[4]));
+    bw.out_weight = keep_b.back().get();
+    keep_b.push_back(up(parts[5]));
+    bw.out_bias = keep_b.back().get();
+    keep_b.push_back(up(parts[6]));
+    bw.ln2_weight = keep_b.back().get();
+    keep_b.push_back(up(parts[7]));
+    bw.ln2_bias = keep_b.back().get();
+    keep_b.push_back(up(parts[8]));
+    bw.up_weight = keep_b.back().get();
+    keep_b.push_back(up(parts[9]));
+    bw.up_bias = keep_b.back().get();
+    keep_b.push_back(up(parts[10]));
+    bw.down_weight = keep_b.back().get();
+    keep_b.push_back(up(parts[11]));
+    bw.down_bias = keep_b.back().get();
+    dev_blocks.push_back(bw);
+  }
+  auto patches_b = up(patches), pw_b = up(pw), pb_b = up(pb), pos_b = up(pos),
+       plnw_b = up(plnw), plnb_b = up(plnb);
+  auto out_b = backend->AllocateBuffer(kTokens * kEmbed * 4, MemoryKind::Device);
+  ASSERT_TRUE(out_b.has_value());
+  auto ln = backend->LoadKernel("layernorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto attn = backend->LoadKernel("attention", {});
+  auto gelu = backend->LoadKernel("gelu", {});
+  auto ba = backend->LoadKernel("bias_add", {});
+  auto add = backend->LoadKernel("add", {});
+  ASSERT_TRUE(ln && gemm && attn && gelu && ba && add);
+  auto device = tessera::core::VisionStackDevice(
+      *backend, **ln, **gemm, **attn, **gelu, **ba, **add, *patches_b, *pw_b,
+      *pb_b, *pos_b, dev_blocks, *plnw_b, *plnb_b, **out_b, kTokens, kEmbed,
+      kPatchDim, kHeads, kHeadDim, kFfn, kEps);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<float> got(kTokens * kEmbed);
+  backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref(kTokens * kEmbed);
+  ASSERT_TRUE(tessera::core::VisionStackRef(
+                  std::span<const float>(patches), std::span<const float>(pw),
+                  std::span<const float>(pb), std::span<const float>(pos),
+                  ref_blocks, std::span<const float>(plnw),
+                  std::span<const float>(plnb), std::span<float>(ref), kTokens,
+                  kEmbed, kPatchDim, kHeads, kHeadDim, kFfn, kEps)
                   .has_value());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   float max_abs = 0.0f;

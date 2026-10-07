@@ -27,6 +27,7 @@ add_library(tessera STATIC
     src/core/sampling.cpp
     src/core/vision.cpp
     src/core/vision_block.cpp
+    src/core/vision_stack.cpp
     src/core/numerics/quant.cpp
     src/core/numerics/gemm.cpp
     src/core/numerics/attention.cpp

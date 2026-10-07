@@ -230,6 +230,33 @@ inline std::expected<void, StatusCode> AppendKv(
   return {};
 }
 
+// LayerNorm with weight and bias on the device (one thread per row).
+inline std::expected<void, StatusCode> LayerNormDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& x, const Buffer& w,
+    const Buffer& b, Buffer& y, std::size_t rows, std::size_t cols,
+    float eps) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &eps, sizeof(bits));
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&x, &w, &b, &y};
+  launch.scalars = {rows, cols, bits};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Bias add (row broadcast) on the device.
+inline std::expected<void, StatusCode> BiasAddDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& x, const Buffer& b,
+    Buffer& y, std::size_t rows, std::size_t cols) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((rows * cols + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&x, &b, &y};
+  launch.scalars = {rows, cols};
+  return backend.LaunchKernel(kernel, launch);
+}
+
 // Greedy argmax over a logits row (first maximum wins, matching the
 // decode loops). Empty input is undefined; callers pass a nonempty row.
 inline std::uint32_t ArgMax(std::span<const float> logits) {

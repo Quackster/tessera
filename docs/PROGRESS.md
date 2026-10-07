@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 223/223 on both builds.
+`ctest` passes 224/224 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -763,6 +763,12 @@ through RADV GFX1201, rocm through the system ROCm).
   output projection, residual; LayerNorm, GELU MLP, residual. Adds the
   generic "bias_add" (row-broadcast) kernel. Host reference and a
   device-vs-reference test.
+
+- 2026-10-07: CLIP vision stack (224/224 `ctest` on both builds).
+  Current head. `src/core/vision_stack.*` runs the vision encoder body:
+  patch embedding (bias) + position embedding, the transformer blocks,
+  and the final LayerNorm. Adds a shared `LayerNormDevice`/`BiasAddDevice`
+  helper. Host reference and a device-vs-reference test (two blocks).
 
 ## Next (in order)
 
