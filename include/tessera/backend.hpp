@@ -27,7 +27,7 @@ enum class MemoryKind : int {
 // Kernel argument binding limits: the layout both backends expose to a
 // kernel (descriptor bindings and scalar/push-constant arguments).
 constexpr std::size_t kMaxBoundBuffers = 16;
-constexpr std::size_t kMaxScalars = 8;
+constexpr std::size_t kMaxScalars = 16;
 
 // One kernel launch request. grid_* is the workgroup count per axis on
 // both backends. block_* is the workgroup size: honored on rocm
@@ -145,8 +145,9 @@ class Kernel {
 // "attention": buffers are q (m x heads*head_dim fp32), k and v
 // (n x kv_heads*head_dim each), out (m x heads*head_dim); scalars are
 // m, n, heads, kv_heads, head_dim, q_base, window (0 = full causal;
-// a nonzero window keeps only the recent window keys) and kv_f16 (0
-// fp32 keys/values, 1 fp16). Detail:
+// a nonzero window keeps only the recent window keys), kv_f16 (0 fp32
+// keys/values, 1 fp16) and causal (0 attends all n keys, 1 the causal
+// prefix; the CLIP vision encoder is non-causal). Detail:
 // m, n, heads, kv_heads, head_dim, q_base. Query row i sits at
 // position q_base + i and attends keys 0..pos (clamped to n - 1) with
 // scale 1/sqrt(head_dim); head h reads kv head h / (heads/kv_heads).
@@ -316,7 +317,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "attention") {
-    if (launch.buffers.size() != 4 || launch.scalars.size() != 8) {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 9) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t heads = launch.scalars[2];

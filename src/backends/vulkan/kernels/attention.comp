@@ -8,12 +8,12 @@ layout(local_size_x = 256) in;
 // k and v are n x kv_heads*head_dim (fp32, or fp16 when kv_f16 is set),
 // out is m x heads*head_dim. Scalars are 64-bit, so field k lives at
 // pc.v[2k]: m v[0], n v[2], heads v[4], kv_heads v[6], head_dim v[8],
-// q_base v[10], window v[12], kv_f16 v[14]. Query row i sits at
+// q_base v[10], window v[12], kv_f16 v[14], causal v[16]. Query row i sits at
 // q_base + i and attends keys 0..pos (clamped to n - 1); a nonzero window
 // keeps only the recent window keys. Scale is 1/sqrt(head_dim); head h
 // reads kv head h / (heads/kv_heads).
 layout(push_constant) uniform PushConstants {
-  uint v[16];
+  uint v[24];
 } pc;
 
 layout(set = 0, binding = 0) buffer Q {
@@ -49,11 +49,15 @@ void main() {
   uint e = rem % head_dim;
   uint kv = h / (heads / kv_heads);
   uint window = pc.v[12];
+  uint causal = pc.v[16];
   uint pos = pc.v[10] + i;
-  uint last = pos >= n ? n - 1 : pos;
-  uint start = (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
-  if (start > last) {
-    start = last;
+  uint last = causal != 0 ? (pos >= n ? n - 1 : pos) : n - 1;
+  uint start = 0;
+  if (causal != 0) {
+    start = (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+    if (start > last) {
+      start = last;
+    }
   }
   float scale = inversesqrt(float(head_dim));
   uint q_base = (i * heads + h) * head_dim;

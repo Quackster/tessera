@@ -133,7 +133,8 @@ std::expected<void, StatusCode> AttentionRef(
     std::span<const float> q, std::span<const float> k,
     std::span<const float> v, std::span<float> out, std::size_t m,
     std::size_t n, std::size_t heads, std::size_t kv_heads,
-    std::size_t head_dim, std::uint64_t q_base, std::size_t window) {
+    std::size_t head_dim, std::uint64_t q_base, std::size_t window,
+    bool causal) {
   if (m == 0 || n == 0 || heads == 0 || kv_heads == 0 || head_dim == 0 ||
       (heads % kv_heads) != 0) {
     return std::unexpected(StatusCode::InvalidArgument);
@@ -148,11 +149,13 @@ std::expected<void, StatusCode> AttentionRef(
   std::vector<float> scores(n);
   for (std::size_t i = 0; i < m; ++i) {
     const std::size_t pos = static_cast<std::size_t>(q_base + i);
-    const std::size_t last = pos >= n ? n - 1 : pos;
-    std::size_t start =
-        window != 0 && pos + 1 > window ? pos + 1 - window : 0;
-    if (start > last) {
-      start = last;
+    const std::size_t last = causal ? (pos >= n ? n - 1 : pos) : n - 1;
+    std::size_t start = 0;
+    if (causal) {
+      start = window != 0 && pos + 1 > window ? pos + 1 - window : 0;
+      if (start > last) {
+        start = last;
+      }
     }
     for (std::size_t h = 0; h < heads; ++h) {
       const std::size_t kv = h / group;

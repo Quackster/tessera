@@ -11,9 +11,9 @@ namespace tessera::backends::vulkan {
 
 namespace {
 
-// Push constants: 8 x u64 scalars, zero padded (64 bytes, below the 256
-// byte spec minimum for push constant ranges).
-constexpr std::size_t kPushConstantBytes = 64;
+// Push constants: up to 16 x u64 scalars, zero padded (128 bytes, below
+// the 256 byte spec minimum for push constant ranges).
+constexpr std::size_t kPushConstantBytes = 128;
 // SPIR-V module magic.
 constexpr std::uint32_t kSpirvMagic = 0x07230203;
 // Descriptor pool capacity: launches are serialized on a fence, so a few

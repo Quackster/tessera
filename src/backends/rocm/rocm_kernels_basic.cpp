@@ -66,7 +66,8 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
                                 unsigned long long head_dim,
                                 unsigned long long q_base,
                                 unsigned long long window,
-                                unsigned long long kv_f16) {
+                                unsigned long long kv_f16,
+                                unsigned long long causal) {
   const std::uint16_t* kh = reinterpret_cast<const std::uint16_t*>(k);
   const std::uint16_t* vh = reinterpret_cast<const std::uint16_t*>(v);
   const auto kat = [&](unsigned long long idx) {
@@ -86,11 +87,14 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
   const unsigned long long e = rem % head_dim;
   const unsigned long long kv = h / (heads / kv_heads);
   const unsigned long long pos = q_base + i;
-  const unsigned long long last = pos >= n ? n - 1 : pos;
-  unsigned long long start =
-      (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
-  if (start > last) {
-    start = last;
+  const unsigned long long last =
+      causal != 0 ? (pos >= n ? n - 1 : pos) : n - 1;
+  unsigned long long start = 0;
+  if (causal != 0) {
+    start = (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+    if (start > last) {
+      start = last;
+    }
   }
   const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
   const unsigned long long q_base_idx = (i * heads + h) * head_dim;

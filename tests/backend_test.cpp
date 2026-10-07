@@ -1524,7 +1524,7 @@ TEST(BackendTest, AttentionDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 1};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -1614,12 +1614,12 @@ TEST(BackendTest, AttentionRejectsBadContract) {
   const std::vector<const tessera::Buffer*> four_buffers{
       nullptr, nullptr, nullptr, nullptr};
   launch.buffers = three_buffers;
-  launch.scalars = {1, 4, 4, 2, 16, 0, 0, 0};
+  launch.scalars = {1, 4, 4, 2, 16, 0, 0, 0, 1};
   auto short_buffers = backend->LaunchKernel(**attention, launch);
   ASSERT_FALSE(short_buffers.has_value());
   EXPECT_EQ(short_buffers.error(), StatusCode::InvalidArgument);
   launch.buffers = four_buffers;
-  launch.scalars = {1, 4, 3, 2, 16, 0, 0, 0};
+  launch.scalars = {1, 4, 3, 2, 16, 0, 0, 0, 1};
   auto bad_groups = backend->LaunchKernel(**attention, launch);
   ASSERT_FALSE(bad_groups.has_value());
   EXPECT_EQ(bad_groups.error(), StatusCode::InvalidArgument);
@@ -3003,7 +3003,7 @@ TEST(BackendTest, AttentionBatchedMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*o_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 1};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -3205,7 +3205,7 @@ TEST(BackendTest, AttentionWindowDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, kWindow, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, kWindow, 0, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(kM * kHeads * kDim * 4);
@@ -4602,7 +4602,7 @@ TEST(BackendTest, AttentionF16DeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 1};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 1, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(kM * kHeads * kDim * 4);
@@ -5004,6 +5004,56 @@ TEST(BackendTest, ImagePatchifyMatchesRef) {
                                 std::span<const float>(sd),
                                 std::span<float>(ref), kH, kW, kPatch)
                   .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: non-causal attention (causal flag 0) matches the reference.
+TEST(BackendTest, AttentionNonCausalDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(112);
+  constexpr std::size_t kM = 4, kN = 4, kHeads = 4, kKvHeads = 2, kDim = 16;
+  std::vector<float> q(kM * kHeads * kDim), k(kN * kKvHeads * kDim);
+  std::vector<float> v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  auto up = [&backend](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  auto q_buf = up(q), k_buf = up(k), v_buf = up(v);
+  auto out_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(out_buf.has_value());
+  auto kernel = backend->LoadKernel("attention", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), out_buf->get()};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, 0, 0, 0, 0};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(q.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(q.size());
+  ASSERT_TRUE(core::AttentionRef(std::span<const float>(q),
+                                 std::span<const float>(k),
+                                 std::span<const float>(v),
+                                 std::span<float>(ref), kM, kN, kHeads, kKvHeads,
+                                 kDim, 0, 0, false)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   float max_abs = 0.0f;
   for (std::size_t i = 0; i < ref.size(); ++i) {
