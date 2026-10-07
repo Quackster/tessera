@@ -65,6 +65,16 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
         !load(state->attention_kernel, "attention")) {
       return std::unexpected(StatusCode::DeviceError);
     }
+    if (cache.kv_f16) {
+      if (!load(state->cast_kernel, "cast_f32_f16")) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      auto scratch = backend.AllocateBuffer(kv_dim * 2, MemoryKind::Device);
+      if (!scratch) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      state->kv_scratch = std::move(*scratch);
+    }
     const std::size_t h4 = hidden * 4;
     const std::size_t q4 = heads * head_dim * 4;
     const std::size_t kv4 = kv_dim * 4;
@@ -99,6 +109,9 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
     state->mlp = std::move(*mlp);
     state->logits = std::move(*logits);
     state->kv.resize(cfg.layers);
+    for (auto& kv : state->kv) {
+      kv.f16 = cache.kv_f16;
+    }
     cache.device = std::move(state);
   }
   DeviceDecodeState& st = *cache.device;
@@ -169,12 +182,15 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
                     cfg.attention.rope_dim, pos, cfg.attention.rope_theta)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    if (auto appended = AppendKv(backend, kv, *st.k, *st.v, kv_dim * 4);
+    if (auto appended = AppendKv(backend, st.cast_kernel.get(),
+                                 st.kv_scratch.get(), kv, *st.k, *st.v,
+                                 kv_dim);
         !appended) {
       return std::unexpected(appended.error());
     }
     if (!AttentionDevice(backend, *st.attention_kernel, *st.q, *kv.k, *kv.v,
-                         *st.attn, kv.rows, heads, kv_heads, head_dim, pos)) {
+                         *st.attn, kv.rows, heads, kv_heads, head_dim, pos, 0,
+                         1, kv.f16)) {
       return std::unexpected(StatusCode::DeviceError);
     }
     if (!detail::ProjectDevice(backend, *(*gemm_o), *st.attn, *(*wo)->device,

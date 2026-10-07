@@ -28,6 +28,9 @@ struct DecodeCache {
   std::unique_ptr<Kernel> attention_kernel;
   // Constant F32 weights (norms) downloaded once and reused.
   std::unordered_map<std::string, std::vector<float>> host_weights;
+  // Store the full-attention KV cache in fp16 (default fp32). Set before
+  // the first step.
+  bool kv_f16 = false;
   // Hybrid state, created on the first hybrid step (null for vanilla).
   std::unique_ptr<struct HybridDecodeCache> hybrid;
   // Device-resident vanilla state, created on the first vanilla step.
@@ -45,12 +48,15 @@ struct DeviceDecodeState {
     // Allocated row capacity; grows geometrically so a decode step appends
     // one row instead of reallocating the whole cache.
     std::size_t capacity = 0;
+    bool f16 = false;
   };
   std::unique_ptr<Kernel> rmsnorm_kernel;
   std::unique_ptr<Kernel> add_kernel;
   std::unique_ptr<Kernel> silu_mul_kernel;
   std::unique_ptr<Kernel> rope_kernel;
   std::unique_ptr<Kernel> attention_kernel;
+  std::unique_ptr<Kernel> cast_kernel;
+  std::unique_ptr<Buffer> kv_scratch;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
   std::unique_ptr<Buffer> x;
   std::unique_ptr<Buffer> xn;
@@ -84,6 +90,8 @@ struct HybridDecodeCache {
   std::unique_ptr<Kernel> ssm_gate_kernel;
   std::unique_ptr<Kernel> delta_step_heads_kernel;
   std::unique_ptr<Kernel> rmsnorm_gated_kernel;
+  std::unique_ptr<Kernel> cast_kernel;
+  std::unique_ptr<Buffer> kv_scratch;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
   // Shared scratch buffers (sized from the config).
   std::unique_ptr<Buffer> x, xn, proj, logits, pos;
@@ -103,6 +111,7 @@ struct HybridDecodeCache {
     std::size_t rows = 0;
     // Allocated row capacity; grows geometrically (see DeviceDecodeState).
     std::size_t capacity = 0;
+    bool f16 = false;
   };
   struct LinearState {
     std::unique_ptr<Buffer> conv_hist;

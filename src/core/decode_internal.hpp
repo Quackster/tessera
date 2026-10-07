@@ -94,24 +94,41 @@ inline std::expected<std::vector<float>, StatusCode> DownloadF32(
 // a decode step copies one row instead of reallocating the whole cache.
 constexpr std::size_t kInitialKvRows = 4;
 
+// Cast an fp32 buffer (n elements) to a packed fp16 buffer (n*2 bytes).
+inline std::expected<void, StatusCode> CastF16Device(
+    Backend& backend, const Kernel& kernel, const Buffer& in, Buffer& out,
+    std::size_t n) {
+  if (n == 0 || n % 2 != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((n / 2 + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&in, &out};
+  launch.scalars = {n};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Append one key/value row. `kv.f16` selects fp16 storage (converted with
+// `cast` into `scratch`) or fp32; when fp16 both must be non-null.
 template <typename Kv>
-inline std::expected<void, StatusCode> AppendKv(Backend& backend, Kv& kv,
-                                                const Buffer& k_row,
-                                                const Buffer& v_row,
-                                                std::size_t kv_bytes) {
+inline std::expected<void, StatusCode> AppendKv(
+    Backend& backend, const Kernel* cast, Buffer* scratch, Kv& kv,
+    const Buffer& k_row, const Buffer& v_row, std::size_t kv_dim) {
+  const std::size_t row_bytes = kv_dim * (kv.f16 ? 2 : 4);
   if (kv.rows == kv.capacity) {
     const std::size_t new_capacity =
         kv.capacity == 0 ? kInitialKvRows : kv.capacity * 2;
-    auto grown_k = backend.AllocateBuffer(new_capacity * kv_bytes,
+    auto grown_k = backend.AllocateBuffer(new_capacity * row_bytes,
                                           MemoryKind::Device);
-    auto grown_v = backend.AllocateBuffer(new_capacity * kv_bytes,
+    auto grown_v = backend.AllocateBuffer(new_capacity * row_bytes,
                                           MemoryKind::Device);
     if (!grown_k || !grown_v) {
       return std::unexpected(StatusCode::OutOfMemory);
     }
     if (kv.rows > 0) {
-      if (!backend.CopyD2D(*kv.k, 0, **grown_k, 0, kv.rows * kv_bytes) ||
-          !backend.CopyD2D(*kv.v, 0, **grown_v, 0, kv.rows * kv_bytes)) {
+      if (!backend.CopyD2D(*kv.k, 0, **grown_k, 0, kv.rows * row_bytes) ||
+          !backend.CopyD2D(*kv.v, 0, **grown_v, 0, kv.rows * row_bytes)) {
         return std::unexpected(StatusCode::DeviceError);
       }
     }
@@ -119,8 +136,21 @@ inline std::expected<void, StatusCode> AppendKv(Backend& backend, Kv& kv,
     kv.v = std::move(*grown_v);
     kv.capacity = new_capacity;
   }
-  if (!backend.CopyD2D(k_row, 0, *kv.k, kv.rows * kv_bytes, kv_bytes) ||
-      !backend.CopyD2D(v_row, 0, *kv.v, kv.rows * kv_bytes, kv_bytes)) {
+  const auto store = [&](const Buffer& row, Buffer& dst) -> bool {
+    if (kv.f16) {
+      if (cast == nullptr || scratch == nullptr) {
+        return false;
+      }
+      if (!CastF16Device(backend, *cast, row, *scratch, kv_dim)) {
+        return false;
+      }
+      return backend.CopyD2D(*scratch, 0, dst, kv.rows * row_bytes, row_bytes)
+                 .has_value();
+    }
+    return backend.CopyD2D(row, 0, dst, kv.rows * row_bytes, row_bytes)
+        .has_value();
+  };
+  if (!store(k_row, *kv.k) || !store(v_row, *kv.v)) {
     return std::unexpected(StatusCode::DeviceError);
   }
   ++kv.rows;

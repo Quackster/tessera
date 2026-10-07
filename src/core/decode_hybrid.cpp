@@ -222,12 +222,15 @@ std::expected<void, StatusCode> RunFullBlock(
                    cfg.attention.rope_theta)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  if (auto appended = AppendKv(backend, kv, *h.kf, *h.vf, kv_dim * 4);
+  if (auto appended = AppendKv(backend, h.cast_kernel.get(),
+                               h.kv_scratch.get(), kv, *h.kf, *h.vf,
+                               kv_dim);
       !appended) {
     return std::unexpected(appended.error());
   }
   if (!AttentionDevice(backend, *h.attention_kernel, *h.q, *kv.k, *kv.v,
-                       *h.attn, kv.rows, heads, kv_heads, head_dim, pos) ||
+                       *h.attn, kv.rows, heads, kv_heads, head_dim, pos, 0, 1,
+                       kv.f16) ||
       !SigmoidGateDevice(backend, *h.sigmoid_gate_kernel, *h.attn, *h.gate,
                          *h.attn, heads * head_dim) ||
       !ProjectDevice(backend, *(*gemm_o), *h.attn, *(*wo)->device, *h.proj, 1,
@@ -289,6 +292,22 @@ std::expected<void, StatusCode> HybridForward(
     auto scratch = InitScratch(backend, cfg, h, g);
     if (!scratch) {
       return std::unexpected(scratch.error());
+    }
+    if (cache.kv_f16) {
+      auto cast = backend.LoadKernel("cast_f32_f16", {});
+      if (!cast) {
+        return std::unexpected(cast.error());
+      }
+      h.cast_kernel = std::move(*cast);
+      auto kv_scratch =
+          backend.AllocateBuffer(cfg.attention.kv_heads * cfg.attention.head_dim * 2, MemoryKind::Device);
+      if (!kv_scratch) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      h.kv_scratch = std::move(*kv_scratch);
+      for (auto& kv : h.full) {
+        kv.f16 = true;
+      }
     }
     h.ready = true;
   }

@@ -56,6 +56,8 @@ struct GenerateOptions {
   // Draft tokens per speculative step for the DFlash2 draft; 0 uses the
   // draft checkpoint's configured block size.
   std::size_t draft_tokens = 0;
+  // Store the full-attention KV cache in fp16 (default fp32).
+  bool kv_f16 = false;
 };
 
 // Top-level facade: owns the backend and the loaded models.

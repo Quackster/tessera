@@ -83,6 +83,7 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
   core::DecodeCache cache;
+  cache.kv_f16 = options.kv_f16;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
@@ -206,6 +207,7 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
     }
   }
   core::DecodeCache cache;
+  cache.kv_f16 = options.kv_f16;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
