@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -63,6 +64,12 @@ class Engine {
   //   auto ids = engine->Generate(*model, {.max_tokens = 4});
   [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
   Generate(Model& model, const GenerateOptions& options = {});
+
+  // Streaming variant: call `on_token` for each produced token; stop
+  // early when it returns false. Returns the produced count.
+  [[nodiscard]] std::expected<std::size_t, StatusCode> GenerateStreaming(
+      Model& model, const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token);
 
   // The engine's compute backend.
   [[nodiscard]] Backend& Owner();

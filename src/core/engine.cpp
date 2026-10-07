@@ -74,12 +74,11 @@ std::expected<void, StatusCode> Engine::AttachSpeculative(
   return {};
 }
 
-std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(
-    Model& model, const GenerateOptions& options) {
-  std::vector<std::uint32_t> produced;
-  produced.reserve(options.max_tokens);
+std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
+    Model& model, const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token) {
   if (options.max_tokens == 0) {
-    return produced;
+    return 0;
   }
   core::DecodeCache cache;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
@@ -97,8 +96,15 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(
     }
     next = *decoded;
   }
-  produced.push_back(next);
-  for (std::size_t step = 1; step < options.max_tokens; ++step) {
+  std::size_t produced = 0;
+  for (std::size_t step = 0; step < options.max_tokens; ++step) {
+    if (!on_token(next)) {
+      break;
+    }
+    ++produced;
+    if (step + 1 == options.max_tokens) {
+      break;
+    }
     auto decoded = core::DecodeStep(*backend_, model, cache, next);
     if (!decoded) {
       diagnostics_.Warn(
@@ -107,7 +113,21 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(
       return std::unexpected(decoded.error());
     }
     next = *decoded;
-    produced.push_back(next);
+  }
+  return produced;
+}
+
+std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(
+    Model& model, const GenerateOptions& options) {
+  std::vector<std::uint32_t> produced;
+  produced.reserve(options.max_tokens);
+  auto streamed = GenerateStreaming(
+      model, options, [&produced](std::uint32_t token) {
+        produced.push_back(token);
+        return true;
+      });
+  if (!streamed) {
+    return std::unexpected(streamed.error());
   }
   return produced;
 }

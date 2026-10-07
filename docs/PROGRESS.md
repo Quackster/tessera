@@ -82,6 +82,16 @@ through RADV GFX1201, rocm through the system ROCm).
 - Public generation API: `Engine::Generate(model, options)` runs greedy
   single-token decode on the non-speculative (reference) path and
   returns the produced token ids. The CLI drives it.
+- HTTP serving: a blocking HTTP/1.1 server (`tessera::Serve`) with a
+  buffered and a chunked (SSE) response path, API-key auth
+  (Bearer/X-Api-Key/x-api-key, env `TESSERA_API_KEY`) and a CORS
+  allowlist. Endpoints: `/health`, `/metrics`, `/v1/models`, `/props`,
+  `/tokenize`, `/detokenize`, `/slots`, `/v1/completions` (streaming
+  SSE), `/v1/chat/completions` (SSE), `/v1/messages` and
+  `/v1/messages/count_tokens`; unimplemented surfaces return 501.
+  `Engine::GenerateStreaming` emits tokens one at a time. Chat prefill
+  is slow on the 27B (host-glue decode), a performance, not correctness,
+  gap.
 - Chat-template renderer: a compact Jinja2-subset engine
   (`tessera/serve/jinja`) that runs the model's GGUF chat template.
   `Model::ChatTemplate` exposes the template. It matches the reference
@@ -291,6 +301,14 @@ through RADV GFX1201, rocm through the system ROCm).
   template; the 27B template renders byte-for-byte identical to the
   reference HF Jinja2 output (thinking on and off). `tests/jinja_test.cpp`
   covers the engine plus the real template (env-gated).
+
+- 2026-10-07: HTTP serving layer (158/158 `ctest` on both builds).
+  Current head. The HTTP writer supports buffered and chunked/SSE
+  responses; the server adds API-key auth and CORS and a first endpoint
+  set (health, metrics, models, props, tokenize/detokenize, slots,
+  completions/chat/messages with SSE). `Engine::GenerateStreaming`
+  drives token-by-token output. The CLI `serve` gains `--api-key` and
+  `--allow-origin`. Unimplemented endpoints answer 501.
 
 ## Next (in order)
 

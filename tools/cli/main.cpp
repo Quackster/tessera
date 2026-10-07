@@ -1,10 +1,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "tessera/engine.hpp"
+#include "tessera/serve.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
 
@@ -24,27 +27,43 @@ void PrintUsage() {
                "usage: tessera-cli run --model <path> [--draft <dir>]\n"
                "       [--context <n>] [--draft-block <n>]\n"
                "       [--prompt <id>] [--prompt-text <str>] [--tokens <n>]\n"
+               "       tessera-cli serve --model <path> [--host <ip>] "
+               "[--port <n>]\n"
                "  --model <path>    a .gguf file or an MXFP4 model directory\n"
                "  --draft <dir>     DFlash2 draft checkpoint directory\n"
                "  --context <n>     maximum context length (default %zu)\n"
                "  --draft-block <n> draft block tokens (default %zu)\n"
                "  --prompt <id>     first token id for generation (default 0)\n"
                "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
-               "  --tokens <n>      run n greedy decode steps and print them\n",
+               "  --tokens <n>      run n greedy decode steps and print them\n"
+               "  --host <ip>       serve bind address (default 127.0.0.1)\n"
+               "  --port <n>        serve port (default 8080)\n"
+               "  --api-key <k>     accepted API key (repeatable; env "
+               "TESSERA_API_KEY)\n"
+               "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
                kDefaultContext, kDefaultDraftBlock);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 2 || std::string_view(argv[1]) != "run") {
+  if (argc < 2) {
+    PrintUsage();
+    return kExitUsage;
+  }
+  const std::string_view command = argv[1];
+  if (command != "run" && command != "serve") {
     PrintUsage();
     return kExitUsage;
   }
   std::string model_path;
   std::string draft_path;
   std::string prompt_text;
+  std::string host = "127.0.0.1";
+  std::vector<std::string> api_keys;
+  std::vector<std::string> allow_origins;
   std::uint32_t prompt = 0;
+  std::uint16_t port = 8080;
   std::size_t tokens = 0;
   std::size_t context = kDefaultContext;
   std::size_t draft_block = kDefaultDraftBlock;
@@ -56,6 +75,14 @@ int main(int argc, char** argv) {
       draft_path = argv[++i];
     } else if (arg == "--prompt-text" && i + 1 < argc) {
       prompt_text = argv[++i];
+    } else if (arg == "--api-key" && i + 1 < argc) {
+      api_keys.emplace_back(argv[++i]);
+    } else if (arg == "--allow-origin" && i + 1 < argc) {
+      allow_origins.emplace_back(argv[++i]);
+    } else if (arg == "--host" && i + 1 < argc) {
+      host = argv[++i];
+    } else if (arg == "--port" && i + 1 < argc) {
+      port = static_cast<std::uint16_t>(std::stoul(argv[++i]));
     } else if (arg == "--context" && i + 1 < argc) {
       context = std::stoul(argv[++i]);
     } else if (arg == "--draft-block" && i + 1 < argc) {
@@ -75,6 +102,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "cli: --model is required\n");
     PrintUsage();
     return kExitUsage;
+  }
+  if (api_keys.empty()) {
+    if (const char* key = std::getenv("TESSERA_API_KEY");
+        key != nullptr && *key != '\0') {
+      api_keys.emplace_back(key);
+    }
   }
 
   tessera::EngineOptions options;  // default stderr diagnostics sink
@@ -137,6 +170,21 @@ int main(int argc, char** argv) {
     log.Info("cli", "tensor " + std::to_string(i) + ": " +
                         tensors[i].name + " [" +
                         std::to_string(tensors[i].shape.Numel()) + "]");
+  }
+  if (command == "serve") {
+    log.Info("cli", "serving on " + host + ":" + std::to_string(port));
+    tessera::ServeOptions serve_options;
+    serve_options.host = host;
+    serve_options.port = port;
+    serve_options.api_keys = api_keys;
+    serve_options.allow_origins = allow_origins;
+    auto served = tessera::Serve(engine, loaded, serve_options);
+    if (!served) {
+      log.Warn("cli", std::string("serve failed (") +
+                          std::string(tessera::ToString(served.error())) + ")");
+      return kExitError;
+    }
+    return kExitOk;
   }
   if (tokens > 0) {
     tessera::GenerateOptions gen;
