@@ -15,6 +15,7 @@
 #include "core/numerics/conv.hpp"
 #include "core/numerics/selector.hpp"
 #include "spec/dflash2_conv.hpp"
+#include "spec/dflash2_mlp.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -3571,4 +3572,99 @@ TEST(BackendTest, GroupedConvMatchesRef) {
     EXPECT_LE(max_abs, tol.abs)
         << "side " << side << " backend " << backend->Name();
   }
+}
+
+// Device: the DFlash2 MLP half of a draft layer (post-norm, mlp_conv
+// prepare/finish, gated SiLU MLP) matches the host reference.
+TEST(BackendTest, DraftMlpMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(94);
+  constexpr std::size_t kRows = 2;
+  constexpr std::size_t kHidden = 4;
+  constexpr std::size_t kFfn = 8;
+  constexpr std::size_t kTaps = 2;
+  constexpr std::size_t kGroup = 2;
+  constexpr std::size_t kBlock = 2;
+  const float kEps = 1e-6f;
+  const std::size_t num_groups = kHidden / kGroup;
+  const std::size_t proj_n = 2 * kTaps * num_groups;
+  std::vector<float> x(kRows * kHidden), norm(kHidden);
+  std::vector<float> proj_w(proj_n * kHidden), base(2 * kTaps * kHidden);
+  std::vector<float> gate_w(kFfn * kHidden), up_w(kFfn * kHidden);
+  std::vector<float> down_w(kHidden * kFfn);
+  for (auto& v : x) v = DrawValue(rng);
+  for (auto& v : norm) v = DrawValue(rng);
+  for (auto& v : proj_w) v = DrawValue(rng);
+  for (auto& v : base) v = DrawValue(rng);
+  for (auto& v : gate_w) v = DrawValue(rng);
+  for (auto& v : up_w) v = DrawValue(rng);
+  for (auto& v : down_w) v = DrawValue(rng);
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto x_buf = alloc(x.size() * 4);
+  auto norm_buf = alloc(norm.size() * 4);
+  auto pw_buf = alloc(proj_w.size() * 4);
+  auto base_buf = alloc(base.size() * 4);
+  auto gw_buf = alloc(gate_w.size() * 4);
+  auto uw_buf = alloc(up_w.size() * 4);
+  auto dw_buf = alloc(down_w.size() * 4);
+  auto out_buf = alloc(x.size() * 4);
+  auto xn_buf = alloc(kRows * kHidden * 4);
+  auto proj_buf = alloc(kRows * proj_n * 4);
+  auto h1_buf = alloc(kRows * kHidden * 4);
+  auto gate_buf = alloc(kRows * kFfn * 4);
+  auto up_buf = alloc(kRows * kFfn * 4);
+  auto act_buf = alloc(kRows * kFfn * 4);
+  auto down_buf = alloc(kRows * kHidden * 4);
+  auto side_buf = alloc(kTaps * kHidden * 4);
+  ASSERT_TRUE(x_buf && norm_buf && pw_buf && base_buf && gw_buf && uw_buf &&
+              dw_buf && out_buf && xn_buf && proj_buf && h1_buf && gate_buf &&
+              up_buf && act_buf && down_buf && side_buf);
+  const auto upload = [&backend](auto& buf, const std::vector<float>& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(upload(norm_buf, norm).has_value());
+  ASSERT_TRUE(upload(pw_buf, proj_w).has_value());
+  ASSERT_TRUE(upload(base_buf, base).has_value());
+  ASSERT_TRUE(upload(gw_buf, gate_w).has_value());
+  ASSERT_TRUE(upload(uw_buf, up_w).has_value());
+  ASSERT_TRUE(upload(dw_buf, down_w).has_value());
+  auto rms = backend->LoadKernel("rmsnorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto conv = backend->LoadKernel("dflash_conv", {});
+  auto silu = backend->LoadKernel("silu_mul", {});
+  ASSERT_TRUE(rms.has_value() && gemm.has_value() && conv.has_value() &&
+              silu.has_value());
+  auto device = tessera::spec::DraftMlpDevice(
+      *backend, **rms, **gemm, **conv, **silu, **xn_buf, **proj_buf, **h1_buf,
+      **gate_buf, **up_buf, **act_buf, **down_buf, **side_buf, **x_buf,
+      **norm_buf, **pw_buf, **base_buf, **gw_buf, **uw_buf, **dw_buf,
+      **out_buf, kRows, kHidden, kFfn, kTaps, kGroup, kBlock, kEps);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(x.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(x.size());
+  ASSERT_TRUE(tessera::spec::DraftMlpRef(
+                  std::span<const float>(x), std::span<const float>(norm),
+                  std::span<const float>(proj_w), std::span<const float>(base),
+                  std::span<const float>(gate_w), std::span<const float>(up_w),
+                  std::span<const float>(down_w), std::span<float>(ref), kRows,
+                  kHidden, kFfn, kTaps, kGroup, kBlock, kEps)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
 }

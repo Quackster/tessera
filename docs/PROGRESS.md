@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 189/189 on both builds.
+`ctest` passes 190/190 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -538,6 +538,14 @@ through RADV GFX1201, rocm through the system ROCm).
   (`side * taps * num_groups`); the device helper copies the requested
   base side into scratch and runs both on device. Host reference and a
   device-vs-reference test cover both sides.
+
+- 2026-10-07: DFlash2 MLP layer half (190/190 `ctest` on both builds).
+  Current head. `src/spec/dflash2_mlp.*` runs the MLP half of a draft
+  layer: post_attention RMSNorm, the mlp_conv prepare (projection +
+  side-0 grouped conv), the gated SiLU MLP, and the mlp_conv finish
+  (side-1 conv reusing the prepare projection). Adds the finish conv
+  stage (convolve with an externally computed delta) to
+  dflash2_conv. Host reference and a device-vs-reference test.
 
 ## Next (in order)
 

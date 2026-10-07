@@ -39,4 +39,20 @@ namespace tessera::spec {
     std::size_t rows, std::size_t channels, std::size_t taps,
     std::size_t group_size, std::size_t block_size, std::size_t side);
 
+// The "finish" stage: convolve `hidden` with a `delta` computed earlier
+// (the side `side` of the projection of a different tensor). `delta` is
+// rows x 2*taps*num_groups. `base_kernel` holds both sides (2 x taps x
+// channels) and the requested side is copied into `scratch_base`.
+[[nodiscard]] std::expected<void, StatusCode> GroupedConvFinishRef(
+    std::span<const float> hidden, std::span<const float> delta,
+    std::span<const float> base_side, std::span<float> out, std::size_t rows,
+    std::size_t channels, std::size_t taps, std::size_t group_size,
+    std::size_t block_size, std::size_t side);
+
+[[nodiscard]] std::expected<void, StatusCode> GroupedConvFinishDevice(
+    Backend& backend, const Kernel& conv, const Buffer& hidden,
+    const Buffer& delta, const Buffer& base_kernel, Buffer& scratch_base,
+    Buffer& out, std::size_t rows, std::size_t channels, std::size_t taps,
+    std::size_t group_size, std::size_t block_size, std::size_t side);
+
 }  // namespace tessera::spec
