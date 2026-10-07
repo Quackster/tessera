@@ -344,6 +344,22 @@ class VulkanBackend final : public Backend {
     return copy;
   }
 
+  std::expected<void, StatusCode> CopyD2D(
+      const Buffer& src, std::size_t src_offset, Buffer& dst,
+      std::size_t dst_offset, std::size_t bytes) override {
+    if (src_offset > src.Size() || bytes > src.Size() - src_offset ||
+        dst_offset > dst.Size() || bytes > dst.Size() - dst_offset) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    auto src_record = LookupRecord(src.Handle());
+    auto dst_record = LookupRecord(dst.Handle());
+    if (!src_record || !dst_record) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    return SubmitCopy(src_record->buffer, dst_record->buffer, src_offset,
+                      dst_offset, bytes);
+  }
+
   std::expected<std::unique_ptr<Kernel>, StatusCode> LoadKernel(
       std::string_view name, std::span<const std::byte> code) override {
     auto kernel = compute_.LoadKernel(name, code);

@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 161/161 on both builds.
+`ctest` passes 162/162 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -333,6 +333,12 @@ through RADV GFX1201, rocm through the system ROCm).
   ProjectDevice/RmsNormDevice/AddDevice/SiluMulDevice so a block
   forward can keep activations on the device; a chained
   gemm_q4k -> rmsnorm -> add device test matches the host refs.
+
+- 2026-10-07: device-to-device copy (162/162 `ctest` on both
+  builds). Current head. `Backend::CopyD2D` moves byte ranges
+  between device buffers (vkCmdCopyBuffer / hipMemcpy D2D) for a
+  device-resident decode and cache; a bounds-checked copy test
+  covers it on both backends.
 
 ## Next (in order)
 

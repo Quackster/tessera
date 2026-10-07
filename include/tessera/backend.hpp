@@ -435,6 +435,12 @@ class Backend {
   virtual std::expected<void, StatusCode> CopyD2HAt(
       const Buffer& src, std::size_t offset, std::byte* dst,
       std::size_t bytes) = 0;
+  // Copy `bytes` between two device buffers at the given offsets
+  // (bounds-checked). The regions must not overlap. Keeps activations
+  // and caches on the device without a host round-trip.
+  virtual std::expected<void, StatusCode> CopyD2D(
+      const Buffer& src, std::size_t src_offset, Buffer& dst,
+      std::size_t dst_offset, std::size_t bytes) = 0;
 
   // Load a compiled kernel. Vulkan: `code` is a SPIR-V module and `name`
   // its entry point; an empty code resolves a built-in (today "fill" and

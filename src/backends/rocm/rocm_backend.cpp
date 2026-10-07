@@ -188,6 +188,26 @@ class RocmBackend final : public Backend {
     return {};
   }
 
+  std::expected<void, StatusCode> CopyD2D(
+      const Buffer& src, std::size_t src_offset, Buffer& dst,
+      std::size_t dst_offset, std::size_t bytes) override {
+    if (src_offset > src.Size() || bytes > src.Size() - src_offset ||
+        dst_offset > dst.Size() || bytes > dst.Size() - dst_offset) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    const auto* src_base =
+        static_cast<const std::byte*>(src.Handle()) + src_offset;
+    auto* dst_base = static_cast<std::byte*>(dst.Handle()) + dst_offset;
+    auto error =
+        hipMemcpy(dst_base, src_base, bytes, hipMemcpyDeviceToDevice);
+    if (error != hipSuccess) {
+      LogError(std::string("hipMemcpy D2D of ") + std::to_string(bytes) +
+               " bytes failed (" + HipErrorName(error) + ")");
+      return std::unexpected(FromHip(error));
+    }
+    return {};
+  }
+
   std::expected<std::unique_ptr<Kernel>, StatusCode> LoadKernel(
       std::string_view name, std::span<const std::byte> code) override {
     if (!code.empty()) {

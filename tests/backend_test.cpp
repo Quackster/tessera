@@ -2647,3 +2647,31 @@ TEST(BackendTest, DeviceChainMatchesRef) {
     EXPECT_NEAR(got[i], z_ref[i], tol.abs);
   }
 }
+
+// Device: device-to-device copies move byte ranges between buffers.
+TEST(BackendTest, BufferD2DCopy) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::vector<std::byte> src(64);
+  for (std::size_t i = 0; i < src.size(); ++i) {
+    src[i] = static_cast<std::byte>(i);
+  }
+  auto src_buf = backend->AllocateBuffer(64, MemoryKind::Device);
+  auto dst_buf = backend->AllocateBuffer(64, MemoryKind::Device);
+  ASSERT_TRUE(src_buf && dst_buf);
+  ASSERT_TRUE(backend->CopyH2D(**src_buf, std::span<const std::byte>(src))
+                  .has_value());
+  ASSERT_TRUE(backend
+                  ->CopyD2D(**src_buf, 16, **dst_buf, 32, 16)
+                  .has_value());
+  std::vector<std::byte> readback(64, std::byte{0});
+  ASSERT_TRUE(backend->CopyD2H(**dst_buf, readback.data(), readback.size())
+                  .has_value());
+  for (std::size_t i = 0; i < 16; ++i) {
+    EXPECT_EQ(readback[32 + i], static_cast<std::byte>(16 + i));
+  }
+  // Out-of-range offsets are rejected.
+  auto bad = backend->CopyD2D(**src_buf, 60, **dst_buf, 0, 16);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+}
