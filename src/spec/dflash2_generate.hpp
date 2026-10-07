@@ -7,6 +7,7 @@
 
 #include "tessera/backend.hpp"
 #include "tessera/engine.hpp"
+#include "tessera/log.hpp"
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
 
@@ -20,6 +21,7 @@ namespace tessera::spec {
 // load.
 [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
 GenerateDFlash2(Backend& backend, Model& target, const GenerateOptions& options,
-                const std::string& draft_path);
+                const std::string& draft_path,
+                const log::Diagnostics* log = nullptr);
 
 }  // namespace tessera::spec

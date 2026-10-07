@@ -16,7 +16,7 @@ namespace tessera::spec {
 
 std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     Backend& backend, Model& target, const GenerateOptions& options,
-    const std::string& draft_path) {
+    const std::string& draft_path, const log::Diagnostics* log) {
   if (options.max_tokens == 0) {
     return std::vector<std::uint32_t>{};
   }
@@ -97,6 +97,9 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   }
   std::vector<std::uint32_t> produced;
   produced.reserve(options.max_tokens);
+  std::size_t proposed = 0;
+  std::size_t accepted = 0;
+  std::size_t steps = 0;
   std::uint32_t next = core::detail::ArgMax(*first);
   while (produced.size() < options.max_tokens) {
     produced.push_back(next);
@@ -203,6 +206,9 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (!verify) {
       return std::unexpected(verify.error());
     }
+    ++steps;
+    proposed += draft_tokens.size();
+    accepted += verify->accepted;
     for (std::size_t i = 0; i < verify->accepted; ++i) {
       if (produced.size() >= options.max_tokens) {
         break;
@@ -211,6 +217,12 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     }
     // The bonus token is emitted by the loop top on the next iteration.
     next = verify->next_token;
+  }
+  if (log != nullptr) {
+    log->Info("spec dflash2",
+              "accepted " + std::to_string(accepted) + " of " +
+                  std::to_string(proposed) + " draft token(s) over " +
+                  std::to_string(steps) + " step(s)");
   }
   return produced;
 }

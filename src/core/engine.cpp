@@ -180,7 +180,8 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::GenerateDraft(
     Model& model, const GenerateOptions& options,
     const std::string& draft_path) {
-  return spec::GenerateDFlash2(*backend_, model, options, draft_path);
+  return spec::GenerateDFlash2(*backend_, model, options, draft_path,
+                               &diagnostics_);
 }
 
 std::expected<std::vector<std::uint32_t>, StatusCode>
