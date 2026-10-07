@@ -25,15 +25,33 @@ struct EngineOptions {
   int device_index = 0;
 };
 
+// Sampling parameters, with the Qwen 3.8 27B defaults. Applied in this
+// order: repetition and presence penalties over the token history, then
+// temperature, then min_p, top_k and top_p. temperature 0 means greedy.
+struct SamplingOptions {
+  float temperature = 0.6f;
+  float top_p = 0.95f;
+  int top_k = 20;
+  float min_p = 0.0f;
+  float presence_penalty = 0.0f;
+  float repetition_penalty = 1.0f;
+};
+
 // Options for Engine::Generate.
 struct GenerateOptions {
-  // Greedy decode steps to run; 0 produces no tokens.
+  // Decode steps to run; 0 produces no tokens.
   std::size_t max_tokens = 0;
   // The first token fed to the decoder when prompt_tokens is empty.
   std::uint32_t first_token = 0;
   // Prompt tokens fed before generation; when non-empty they take the
   // place of first_token and the last one seeds generation.
   std::vector<std::uint32_t> prompt_tokens;
+  // When false (the default) the reference greedy path runs. When true,
+  // tokens are drawn from `sampling` with the fixed `seed`.
+  bool sample = false;
+  SamplingOptions sampling;
+  // RNG seed for sampling; a fixed value keeps sampling reproducible.
+  std::uint64_t seed = 0;
 };
 
 // Top-level facade: owns the backend and the loaded models.

@@ -41,6 +41,14 @@ void PrintUsage() {
                "  --mtp <id>        print the MTP draft after this token id\n"
                "  --tokens <n>      run n greedy decode steps and print them\n"
                "  --speculate       verify MTP drafts instead of plain greedy\n"
+               "  --sample          sample instead of greedy decode\n"
+               "  --temperature <f> sampling temperature (default 0.6)\n"
+               "  --top-p <f>       nucleus probability (default 0.95)\n"
+               "  --top-k <n>       keep the top n tokens (default 20)\n"
+               "  --min-p <f>       minimum probability (default 0.0)\n"
+               "  --presence-penalty <f>   presence penalty (default 0.0)\n"
+               "  --repetition-penalty <f> repetition penalty (default 1.0)\n"
+               "  --seed <n>        sampling RNG seed (default 0)\n"
                "  --host <ip>       serve bind address (default 127.0.0.1)\n"
                "  --port <n>        serve port (default 8080)\n"
                "  --api-key <k>     accepted API key (repeatable; env "
@@ -83,6 +91,9 @@ int main(int argc, char** argv) {
   std::uint32_t mtp_token = 0;
   bool mtp = false;
   bool speculate = false;
+  tessera::SamplingOptions sampling;
+  bool sample = false;
+  std::uint64_t seed = 0;
   std::uint16_t port = 8080;
   std::size_t tokens = 0;
   std::size_t context = kDefaultContext;
@@ -117,6 +128,22 @@ int main(int argc, char** argv) {
       mtp = true;
     } else if (arg == "--speculate") {
       speculate = true;
+    } else if (arg == "--sample") {
+      sample = true;
+    } else if (arg == "--temperature" && i + 1 < argc) {
+      sampling.temperature = std::stof(argv[++i]);
+    } else if (arg == "--top-p" && i + 1 < argc) {
+      sampling.top_p = std::stof(argv[++i]);
+    } else if (arg == "--top-k" && i + 1 < argc) {
+      sampling.top_k = std::stoi(argv[++i]);
+    } else if (arg == "--min-p" && i + 1 < argc) {
+      sampling.min_p = std::stof(argv[++i]);
+    } else if (arg == "--presence-penalty" && i + 1 < argc) {
+      sampling.presence_penalty = std::stof(argv[++i]);
+    } else if (arg == "--repetition-penalty" && i + 1 < argc) {
+      sampling.repetition_penalty = std::stof(argv[++i]);
+    } else if (arg == "--seed" && i + 1 < argc) {
+      seed = std::stoull(argv[++i]);
     } else if (arg == "--tokens" && i + 1 < argc) {
       tokens = std::stoul(argv[++i]);
     } else {
@@ -228,6 +255,9 @@ int main(int argc, char** argv) {
     tessera::GenerateOptions gen;
     gen.max_tokens = tokens;
     gen.first_token = prompt;
+    gen.sample = sample;
+    gen.sampling = sampling;
+    gen.seed = seed;
     if (!prompt_text.empty()) {
       const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
       if (tokenizer == nullptr) {

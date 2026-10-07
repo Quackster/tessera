@@ -1,10 +1,12 @@
 #include "tessera/engine.hpp"
 
+#include <random>
 #include <string>
 #include <vector>
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "core/sampling.hpp"
 
 namespace tessera {
 
@@ -186,6 +188,16 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   if (options.max_tokens == 0) {
     return 0;
   }
+  if (options.sample) {
+    const SamplingOptions& p = options.sampling;
+    if (!(p.temperature >= 0.0f) || !(p.top_p > 0.0f && p.top_p <= 1.0f) ||
+        p.top_k < 0 || !(p.min_p >= 0.0f && p.min_p < 1.0f) ||
+        p.repetition_penalty <= 0.0f) {
+      diagnostics_.Warn("engine", "invalid sampling parameters; using defaults "
+                                  "is not attempted, request rejected");
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+  }
   core::DecodeCache cache;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
@@ -202,15 +214,22 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       return std::unexpected(forward.error());
     }
   }
-  auto decoded = core::DecodeStep(*backend_, model, cache, prompt.back());
-  if (!decoded) {
+  auto first_logits = core::DecodeLogits(*backend_, model, cache, prompt.back());
+  if (!first_logits) {
     diagnostics_.Warn("engine", std::string("prompt step ") +
                                     std::to_string(prompt.size() - 1) +
                                     " failed: " +
-                                    std::string(ToString(decoded.error())));
-    return std::unexpected(decoded.error());
+                                    std::string(ToString(first_logits.error())));
+    return std::unexpected(first_logits.error());
   }
-  std::uint32_t next = *decoded;
+  std::mt19937_64 rng(options.seed);
+  std::vector<std::uint32_t> history = prompt;
+  const auto pick = [&](std::span<const float> logits) {
+    return options.sample
+               ? core::SampleToken(logits, options.sampling, history, rng)
+               : core::detail::ArgMax(logits);
+  };
+  std::uint32_t next = pick(*first_logits);
   std::size_t produced = 0;
   for (std::size_t step = 0; step < options.max_tokens; ++step) {
     if (!on_token(next)) {
@@ -220,14 +239,15 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
     if (step + 1 == options.max_tokens) {
       break;
     }
-    auto decoded = core::DecodeStep(*backend_, model, cache, next);
-    if (!decoded) {
+    history.push_back(next);
+    auto logits = core::DecodeLogits(*backend_, model, cache, next);
+    if (!logits) {
       diagnostics_.Warn(
           "engine", std::string("generation step ") + std::to_string(step) +
-                        " failed: " + std::string(ToString(decoded.error())));
-      return std::unexpected(decoded.error());
+                        " failed: " + std::string(ToString(logits.error())));
+      return std::unexpected(logits.error());
     }
-    next = *decoded;
+    next = pick(*logits);
   }
   return produced;
 }

@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 195/195 on both builds.
+`ctest` passes 197/197 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -588,6 +588,17 @@ through RADV GFX1201, rocm through the system ROCm).
   dflash2_fuse.*` composes it with the `fc` projection, the DFlash2
   target-hidden fusion, with a host reference and device test.
 
+- 2026-10-07: sampling parameters (197/197 `ctest` on both builds).
+  Current head. `GenerateOptions` gains `sample`, a `SamplingOptions`
+  block with the Qwen 3.8 27B defaults (temperature 0.6, top_p 0.95,
+  top_k 20, min_p 0.0, presence_penalty 0.0, repetition_penalty 1.0)
+  and a seed. `src/core/sampling.*` draws a token: repetition and
+  presence penalties over the history, temperature (0 is greedy),
+  min_p, top_k and top_p, then a seeded draw. The generation loop
+  scores with DecodeLogits and picks greedy or sampled. Tests cover
+  the filters and seeded determinism; the greedy baseline is
+  unchanged. The CLI gains `--sample` and the parameter flags.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
@@ -628,11 +639,6 @@ through RADV GFX1201, rocm through the system ROCm).
    pipeline parallelism). Both need several `Backend` instances, weight
    sharding in the loaders, and cross-device collectives or peer copies.
    Not started.
-
-8. **Sampling parameters**: generation is greedy today. Add sampling with
-   the Qwen 3.8 27B defaults: temperature 0.6, top_p 0.95, top_k 20,
-   min_p 0.0, presence_penalty 0.0 and repetition_penalty 1.0. Expose them
-   as generation options and CLI flags.
 
 ## Notes and decisions
 

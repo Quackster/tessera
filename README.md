@@ -28,6 +28,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | DFlash2 | Skeleton | Validates checkpoint layout. Draft logic is in work. |
 | CLI | Partial | Loads model, prints summary, generates tokens (`--tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). Text prompts need a tokenizer. |
 | Generation | Done | `Engine::Generate` greedy decode on the non-speculative path. Runtime options: `--context`, `--draft-block`. |
+| Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Host reference check. Per backend tolerance. |
 | Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |

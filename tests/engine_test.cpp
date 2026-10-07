@@ -1,10 +1,13 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+
+#include <random>
 #include <random>
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/sampling.hpp"
 #include "test_helpers.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
@@ -617,6 +620,68 @@ TEST(EngineTest, RejectsOutOfRangeDeviceIndex) {
   EngineOptions options;
   options.device_index = 100000;
   auto bad = Engine::Create(options);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+}
+
+// Sampling: temperature 0 and top_k 1 both reduce to the argmax, the
+// draw is reproducible for a fixed seed, and the repetition penalty
+// lowers a repeated token.
+TEST(EngineTest, SampleTokenFilters) {
+  const std::vector<float> logits = {1.0f, 3.0f, 2.0f};
+  tessera::SamplingOptions greedy;
+  greedy.temperature = 0.0f;
+  std::mt19937_64 rng(1);
+  EXPECT_EQ(tessera::core::SampleToken(
+                std::span<const float>(logits), greedy, {}, rng),
+            1u);
+  tessera::SamplingOptions top1;
+  top1.temperature = 1.0f;
+  top1.top_k = 1;
+  std::mt19937_64 rng2(1);
+  EXPECT_EQ(tessera::core::SampleToken(
+                std::span<const float>(logits), top1, {}, rng2),
+            1u);
+
+  const std::vector<float> many = {0.5f, 0.2f, 1.0f, 0.1f};
+  tessera::SamplingOptions full;
+  full.temperature = 1.0f;
+  std::mt19937_64 a(7), b(7);
+  EXPECT_EQ(
+      tessera::core::SampleToken(std::span<const float>(many), full, {}, a),
+      tessera::core::SampleToken(std::span<const float>(many), full, {}, b));
+
+  const std::vector<float> pair = {5.0f, 4.9f};
+  tessera::SamplingOptions penalty;
+  penalty.temperature = 0.0f;
+  penalty.repetition_penalty = 2.0f;
+  const std::vector<std::uint32_t> history = {0};
+  std::mt19937_64 rng3(1);
+  EXPECT_EQ(tessera::core::SampleToken(std::span<const float>(pair), penalty,
+                                       history, rng3),
+            1u);
+}
+
+// Sampling through the engine is reproducible for a fixed seed, and
+// invalid parameters are rejected.
+TEST(EngineTest, SampleGenerationIsDeterministic) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("sample.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions options;
+  options.max_tokens = 4;
+  options.sample = true;
+  options.seed = 42;
+  auto first = engine->Generate(**model, options);
+  ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
+  EXPECT_EQ(first->size(), 4u);
+  auto again = engine->Generate(**model, options);
+  ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
+  EXPECT_EQ(*first, *again);
+  options.sampling.top_p = 0.0f;
+  auto bad = engine->Generate(**model, options);
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
 }
