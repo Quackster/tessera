@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -143,5 +144,35 @@ struct HybridDecodeCache {
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraftStep(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos);
+
+// The full vocab logits for one hybrid decoder step (same forward as
+// HybridDecodeStep, but the whole row comes back). Dispatched from
+// DecodeLogits.
+[[nodiscard]] std::expected<std::vector<float>, StatusCode>
+HybridDecodeLogits(Backend& backend, const Model& model, DecodeCache& cache,
+                   std::uint32_t token,
+                   std::vector<float>* hidden_out = nullptr);
+
+// The full vocab logits for one device-resident vanilla step.
+[[nodiscard]] std::expected<std::vector<float>, StatusCode>
+DecodeStepDeviceLogits(Backend& backend, const Model& model,
+                       DecodeCache& cache, std::uint32_t token,
+                       std::vector<float>* hidden_out = nullptr);
+
+// One decoder step returning the vocab logits instead of the argmax
+// token. Dispatches to the hybrid or device path, preserving the cache
+// state exactly as DecodeStep does. This is the primitive the
+// speculative verifier scores candidates with.
+[[nodiscard]] std::expected<std::vector<float>, StatusCode> DecodeLogits(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
+
+// Score a token sequence with a fresh cache: run each token in order and
+// return the logits at every position (row i is the distribution after
+// tokens[0..i]). The cache is local, so the caller's decode state is not
+// touched. This is the verifier vocabulary for speculative decoding.
+[[nodiscard]] std::expected<std::vector<std::vector<float>>, StatusCode>
+ScoreTokens(Backend& backend, const Model& model,
+            std::span<const std::uint32_t> tokens);
 
 }  // namespace tessera::core

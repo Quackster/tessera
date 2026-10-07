@@ -266,7 +266,7 @@ std::expected<void, StatusCode> RunFullBlock(
   return RunFfn(backend, model, cfg, h, layer);
 }
 
-std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
+std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out) {
   auto config = model.Config();
@@ -492,21 +492,18 @@ std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
     return std::unexpected(StatusCode::DeviceError);
   }
   backend.Synchronize();
-  std::vector<float> logits(cfg.vocab_size);
-  auto down = backend.CopyD2H(*h.logits,
-                              reinterpret_cast<std::byte*>(logits.data()),
-                              logits.size() * 4);
-  if (!down) {
-    return std::unexpected(down.error());
-  }
-  std::uint32_t best = 0;
-  for (std::uint32_t i = 1; i < logits.size(); ++i) {
-    if (logits[i] > logits[best]) {
-      best = i;
-    }
-  }
   ++h.position;
-  return best;
+  return detail::DownloadF32(backend, *h.logits);
+}
+
+std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out) {
+  auto logits = HybridDecodeLogits(backend, model, cache, token, hidden_out);
+  if (!logits) {
+    return std::unexpected(logits.error());
+  }
+  return detail::ArgMax(*logits);
 }
 
 }  // namespace tessera::core

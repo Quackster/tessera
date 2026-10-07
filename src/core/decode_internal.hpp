@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -85,6 +86,18 @@ inline std::expected<std::vector<float>, StatusCode> DownloadF32(
   std::vector<float> out(buf.Size() / 4);
   std::memcpy(out.data(), raw.data(), raw.size());
   return out;
+}
+
+// Greedy argmax over a logits row (first maximum wins, matching the
+// decode loops). Empty input is undefined; callers pass a nonempty row.
+inline std::uint32_t ArgMax(std::span<const float> logits) {
+  std::uint32_t best = 0;
+  for (std::size_t i = 1; i < logits.size(); ++i) {
+    if (logits[i] > logits[best]) {
+      best = static_cast<std::uint32_t>(i);
+    }
+  }
+  return best;
 }
 
 // Download an F32 buffer once and cache it by name (constant weights:

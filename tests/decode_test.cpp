@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -318,6 +319,53 @@ TEST(HybridDecodeTest, LinearBaselineIsPinned) {
       GreedyTokens(WriteLinearHybridFixture("linear.gguf").string(), 8);
   const std::vector<std::uint32_t> want = {5, 5, 31, 0, 30, 4, 19, 19};
   EXPECT_EQ(got, want);
+}
+
+namespace {
+
+std::uint32_t RowArgMax(const std::vector<float>& row) {
+  std::uint32_t best = 0;
+  for (std::size_t i = 1; i < row.size(); ++i) {
+    if (row[i] > row[best]) {
+      best = static_cast<std::uint32_t>(i);
+    }
+  }
+  return best;
+}
+
+}  // namespace
+
+// ScoreTokens is the verifier vocabulary: each row is the full logits
+// distribution after the prefix ending at that token. Its argmaxes must
+// follow the pinned greedy sequence, each row must be vocab sized, and a
+// single DecodeLogits step must agree with the first row exactly.
+TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value()) << tessera::ToString(cfg.error());
+  const std::vector<std::uint32_t> prefix = {0, 1, 0, 26};
+  auto rows = tessera::core::ScoreTokens(engine->Owner(), **model, prefix);
+  ASSERT_TRUE(rows.has_value()) << tessera::ToString(rows.error());
+  ASSERT_EQ(rows->size(), prefix.size());
+  const std::vector<std::uint32_t> want = {1, 0, 26, 18};
+  for (std::size_t i = 0; i < rows->size(); ++i) {
+    EXPECT_EQ((*rows)[i].size(), cfg->vocab_size);
+    EXPECT_EQ(RowArgMax((*rows)[i]), want[i]);
+  }
+  tessera::core::DecodeCache cache;
+  auto one = tessera::core::DecodeLogits(engine->Owner(), **model, cache, 0);
+  ASSERT_TRUE(one.has_value()) << tessera::ToString(one.error());
+  EXPECT_EQ(*one, (*rows)[0]);
+  EXPECT_EQ(RowArgMax(*one), 1u);
+
+  auto empty = tessera::core::ScoreTokens(
+      engine->Owner(), **model, std::span<const std::uint32_t>{});
+  ASSERT_TRUE(empty.has_value());
+  EXPECT_TRUE(empty->empty());
 }
 
 // The MTP head drafts a token from the backbone hidden state (27B target;

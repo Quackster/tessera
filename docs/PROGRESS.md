@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 173/173 on both builds.
+`ctest` passes 174/174 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -431,14 +431,24 @@ through RADV GFX1201, rocm through the system ROCm).
   reference Triton kernel's delta_stride_row. Host reference, contract
   and a strided device-vs-reference test updated.
 
+- 2026-10-07: verifier vocabulary (174/174 `ctest` on both builds).
+  Current head. `DecodeLogits` returns the full vocab row for one
+  step and `ScoreTokens` scores a token sequence from a fresh cache
+(row i is the distribution after tokens[0..i]); the hybrid and
+  device paths share one forward through a logits helper, and the
+  step functions now argmax that row (single implementation). This is
+  the primitive both speculative paths verify with. A test pins the
+  ScoreTokens rows against the greedy baseline.
+
 ## Next (in order)
 
-1. **MTP verification**: the MTP head drafts. Still missing: wire the
-   draft into a verifier so MTP speculative decoding actually runs
-   (batched scoring of the draft plus the main token).
+1. **MTP verification**: the MTP head drafts. The verifier vocabulary
+   (`DecodeLogits`/`ScoreTokens`) now exists. Still missing: the
+   draft/accept/reject loop and batched scoring of the draft tokens.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
-   Requires the full verifier vocabulary.
+   The verifier vocabulary and the draft kernels are in place; the draft
+   forward and the accept/reject loop remain.
 3. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
