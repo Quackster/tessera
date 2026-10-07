@@ -238,7 +238,7 @@ std::expected<void, StatusCode> RunFullBlock(
   return RunFfn(backend, model, cfg, h, layer);
 }
 
-std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
+std::expected<void, StatusCode> HybridForward(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out) {
   auto config = model.Config();
@@ -448,6 +448,26 @@ std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
     }
     *hidden_out = std::move(*snapshot);
   }
+  ++h.position;
+  return {};
+}
+
+// The output head is separate so a prompt prefill can run the block
+// forward for all but the last token without the vocab-sized projection.
+std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out) {
+  auto forward = HybridForward(backend, model, cache, token, hidden_out);
+  if (!forward) {
+    return std::unexpected(forward.error());
+  }
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const TransformerConfig& cfg = *config;
+  HybridDecodeCache& h = *cache.hybrid;
+  const std::size_t hidden = cfg.hidden_dim;
   auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
   auto output = NeedWeightAny(model, "output.weight");
   if (!out_norm || !output) {
@@ -464,7 +484,6 @@ std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
     return std::unexpected(StatusCode::DeviceError);
   }
   backend.Synchronize();
-  ++h.position;
   return detail::DownloadF32(backend, *h.logits);
 }
 

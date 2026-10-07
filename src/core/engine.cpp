@@ -80,16 +80,23 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
   }
   std::vector<float> hidden;
   std::vector<float> current;
-  for (const std::uint32_t token : prompt) {
-    auto logits = core::DecodeLogits(*backend_, model, cache, token, &hidden);
-    if (!logits) {
+  for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
+    auto forward = core::DecodeForward(*backend_, model, cache, prompt[i]);
+    if (!forward) {
       diagnostics_.Warn(
           "engine", std::string("speculative prefill failed: ") +
-                        std::string(ToString(logits.error())));
-      return std::unexpected(logits.error());
+                        std::string(ToString(forward.error())));
+      return std::unexpected(forward.error());
     }
-    current = std::move(*logits);
   }
+  auto logits =
+      core::DecodeLogits(*backend_, model, cache, prompt.back(), &hidden);
+  if (!logits) {
+    diagnostics_.Warn("engine", std::string("speculative prefill failed: ") +
+                                    std::string(ToString(logits.error())));
+    return std::unexpected(logits.error());
+  }
+  current = std::move(*logits);
   std::vector<std::uint32_t> produced;
   produced.reserve(options.max_tokens);
   std::uint64_t pos = prompt.size();
@@ -184,17 +191,26 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
   }
-  std::uint32_t next = prompt.back();
-  for (std::size_t i = 0; i < prompt.size(); ++i) {
-    auto decoded = core::DecodeStep(*backend_, model, cache, prompt[i]);
-    if (!decoded) {
+  // Prefill: only the last prompt token needs logits, so every earlier
+  // token runs the block forward without the vocab-sized output head.
+  for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
+    auto forward = core::DecodeForward(*backend_, model, cache, prompt[i]);
+    if (!forward) {
       diagnostics_.Warn(
           "engine", std::string("prompt step ") + std::to_string(i) +
-                        " failed: " + std::string(ToString(decoded.error())));
-      return std::unexpected(decoded.error());
+                        " failed: " + std::string(ToString(forward.error())));
+      return std::unexpected(forward.error());
     }
-    next = *decoded;
   }
+  auto decoded = core::DecodeStep(*backend_, model, cache, prompt.back());
+  if (!decoded) {
+    diagnostics_.Warn("engine", std::string("prompt step ") +
+                                    std::to_string(prompt.size() - 1) +
+                                    " failed: " +
+                                    std::string(ToString(decoded.error())));
+    return std::unexpected(decoded.error());
+  }
+  std::uint32_t next = *decoded;
   std::size_t produced = 0;
   for (std::size_t step = 0; step < options.max_tokens; ++step) {
     if (!on_token(next)) {

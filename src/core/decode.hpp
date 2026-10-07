@@ -164,6 +164,25 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
                        DecodeCache& cache, std::uint32_t token,
                        std::vector<float>* hidden_out = nullptr);
 
+// The block forward of one hybrid step without the output head (the
+// vocab-sized projection). Used by prefill for every prompt token except
+// the last, which is all that needs logits.
+[[nodiscard]] std::expected<void, StatusCode> HybridForward(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
+
+// The block forward of one device-resident vanilla step without the head.
+[[nodiscard]] std::expected<void, StatusCode> DecodeStepDeviceForward(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
+
+// One decoder step without the output head: embed and run the blocks,
+// leaving the cache at the new position. Dispatches to the hybrid or
+// device path. Use for prompt tokens that do not need logits.
+[[nodiscard]] std::expected<void, StatusCode> DecodeForward(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
+
 // One decoder step returning the vocab logits instead of the argmax
 // token. Dispatches to the hybrid or device path, preserving the cache
 // state exactly as DecodeStep does. This is the primitive the

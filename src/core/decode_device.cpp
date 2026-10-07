@@ -28,7 +28,7 @@ std::uint32_t FloatBits(float value) {
 
 }  // namespace
 
-std::expected<std::vector<float>, StatusCode> DecodeStepDeviceLogits(
+std::expected<void, StatusCode> DecodeStepDeviceForward(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out) {
   auto config = model.Config();
@@ -208,6 +208,24 @@ std::expected<std::vector<float>, StatusCode> DecodeStepDeviceLogits(
     }
     *hidden_out = std::move(*snapshot);
   }
+  return {};
+}
+
+std::expected<std::vector<float>, StatusCode> DecodeStepDeviceLogits(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out) {
+  auto forward =
+      DecodeStepDeviceForward(backend, model, cache, token, hidden_out);
+  if (!forward) {
+    return std::unexpected(forward.error());
+  }
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const TransformerConfig& cfg = *config;
+  DeviceDecodeState& st = *cache.device;
+  const std::size_t hidden = cfg.hidden_dim;
   auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
   auto output = NeedWeightAny(model, "output.weight");
   if (!out_norm || !output) {

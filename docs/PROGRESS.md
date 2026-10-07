@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 179/179 on both builds.
+`ctest` passes 181/181 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -477,6 +477,15 @@ through RADV GFX1201, rocm through the system ROCm).
   InvalidArgument. The backend logs the selected index and name, and
   the engine start line carries the device index. Verified on the
   host (vulkan sees 3 devices, rocm 2).
+
+- 2026-10-07: prompt prefill skips the output head (181/181 `ctest` on
+  both builds). Current head. `DecodeForward`/`HybridForward`/
+  `DecodeStepDeviceForward` run a block forward without the
+  vocab-sized output projection. `Engine::Generate` and
+  `GenerateSpeculative` use it for every prompt token except the last,
+  which removes a full vocab GEMM and a logits download per prompt
+  token. A hybrid test asserts the forward leaves the cache identical
+  to a full step, and an engine test prefills a multi-token prompt.
 
 ## Next (in order)
 

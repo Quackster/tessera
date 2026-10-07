@@ -472,6 +472,28 @@ TEST(HybridDecodeTest, SpeculativeMatchesGreedyOnModel) {
   EXPECT_EQ(*spec, *greedy);
 }
 
+// The forward-only step leaves the cache in the same state as a full step,
+// so the next token's logits match.
+TEST(HybridDecodeTest, ForwardMatchesStepState) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  tessera::core::DecodeCache full;
+  auto first = tessera::core::DecodeStep(engine->Owner(), **model, full, 0);
+  ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
+  tessera::core::DecodeCache fwd;
+  auto forward = tessera::core::DecodeForward(engine->Owner(), **model, fwd, 0);
+  ASSERT_TRUE(forward.has_value()) << tessera::ToString(forward.error());
+  auto from_full =
+      tessera::core::DecodeLogits(engine->Owner(), **model, full, *first);
+  auto from_fwd =
+      tessera::core::DecodeLogits(engine->Owner(), **model, fwd, *first);
+  ASSERT_TRUE(from_full.has_value() && from_fwd.has_value());
+  EXPECT_EQ(*from_full, *from_fwd);
+}
+
 // The MTP head drafts a token from the backbone hidden state (27B target;
 // path via TESSERA_TEST_GGUF). Deterministic across fresh caches.
 TEST(HybridDecodeTest, MtpDraftWhenModelProvided) {

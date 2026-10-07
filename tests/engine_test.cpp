@@ -269,6 +269,26 @@ TEST(EngineTest, GenerateTinyModelGreedy) {
   EXPECT_TRUE(none->empty());
 }
 
+// A multi-token prompt prefills through the forward-only path (all but the
+// last prompt token skip the output head) and still generates.
+TEST(EngineTest, GenerateWithPromptTokensPrefills) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("prefill.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions options;
+  options.first_token = 0;
+  options.max_tokens = 4;
+  options.prompt_tokens = {0, 1, 2};
+  auto ids = engine->Generate(**model, options);
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  EXPECT_EQ(ids->size(), 4u);
+  auto again = engine->Generate(**model, options);
+  ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
+  EXPECT_EQ(*ids, *again);
+}
+
 TEST(EngineTest, RealModelLoadPathWhenProvided) {
   const char* raw = std::getenv("TESSERA_TEST_GGUF");
   if (raw == nullptr) {
