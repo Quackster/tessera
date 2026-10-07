@@ -101,52 +101,48 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
                                     " token(s), " +
                                     std::to_string(image_tokens) + " image");
   }
+  const std::size_t hidden = config->hidden_dim;
+  auto embed = core::detail::NeedWeightAny(model, "token_embd.weight");
+  if (!embed) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
   auto embedding_buffer =
-      backend_->AllocateBuffer(config->hidden_dim * 4, MemoryKind::Device);
+      backend_->AllocateBuffer(prompt.size() * hidden * 4, MemoryKind::Device);
   if (!embedding_buffer) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
+  // Assemble one embedding per row: the image rows replace the placeholder
+  // token's gathered row. Then prefill the whole prompt in one forward.
+  std::vector<float> host(prompt.size() * hidden);
+  std::vector<float> row(hidden);
   std::size_t used_images = 0;
-  std::vector<float> current;
   for (std::size_t i = 0; i < prompt.size(); ++i) {
-    const Buffer* embedding = nullptr;
+    float* dst = host.data() + i * hidden;
     if (prompt[i] == image_token_id && used_images < image_tokens) {
-      const std::span<const float> row =
-          image_embeddings.subspan(used_images * config->hidden_dim,
-                                   config->hidden_dim);
-      if (!backend_->CopyH2D(**embedding_buffer,
-                             std::span<const std::byte>(
-                                 reinterpret_cast<const std::byte*>(row.data()),
-                                 row.size() * 4))) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-      embedding = embedding_buffer->get();
+      std::copy(image_embeddings.begin() + used_images * hidden,
+                image_embeddings.begin() + (used_images + 1) * hidden, dst);
       ++used_images;
-    }
-    if (i + 1 == prompt.size()) {
-      auto logits =
-          core::DecodeLogits(*backend_, model, cache, prompt[i], nullptr,
-                             nullptr, nullptr, embedding);
-      if (!logits) {
-        return std::unexpected(logits.error());
-      }
-      current = std::move(*logits);
     } else {
-      auto forward = core::DecodeForward(*backend_, model, cache, prompt[i],
-                                         nullptr, embedding);
-      if (!forward) {
-        return std::unexpected(forward.error());
+      auto gathered = core::detail::GatherEmbedding(*backend_, **embed,
+                                                    prompt[i], hidden, row);
+      if (!gathered) {
+        return std::unexpected(gathered.error());
       }
-    }
-    if (options.progress_every > 0 &&
-        (i + 1) % options.progress_every == 0) {
-      diagnostics_.Info("engine",
-                        std::string("multimodal prefill: ") +
-                            std::to_string(i + 1) + "/" +
-                            std::to_string(prompt.size()) + " (" +
-                            std::to_string(elapsed_ms()) + " ms)");
+      std::copy(row.begin(), row.end(), dst);
     }
   }
+  if (!backend_->CopyH2D(**embedding_buffer,
+                         std::span<const std::byte>(
+                             reinterpret_cast<const std::byte*>(host.data()),
+                             host.size() * 4))) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  auto first = core::PrefillTokens(*backend_, model, cache, prompt, nullptr,
+                                   embedding_buffer->get());
+  if (!first) {
+    return std::unexpected(first.error());
+  }
+  std::vector<float> current = std::move(*first);
   std::vector<std::uint32_t> produced;
   produced.reserve(options.max_tokens);
   std::mt19937_64 rng(options.seed);

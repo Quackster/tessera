@@ -263,7 +263,8 @@ DecodeLogitsBatch(Backend& backend, const Model& model, DecodeCache& cache,
 [[nodiscard]] std::expected<std::vector<float>, StatusCode> PrefillTokens(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens,
-    std::vector<float>* hidden_out = nullptr);
+    std::vector<float>* hidden_out = nullptr,
+    const Buffer* embeddings = nullptr);
 
 // The outcome of verifying a greedy draft against the target model.
 // `accepted` leading draft tokens match the target's greedy distribution

@@ -864,7 +864,9 @@ through RADV GFX1201, rocm through the system ROCm).
   the whole prompt in one batched trunk forward (`PrefillTokens`), with
   the output head on the last row only, instead of one forward per token.
   A 27-token prompt drops from about 38 s to 8.9 s; the last logits and
-  the retained hidden match the sequential prefill.
+  the retained hidden match the sequential prefill. `GenerateMultimodal`
+  passes one embedding per row (text rows gathered, image rows substituted)
+  to the same batched prefill, so the image prompt is one forward too.
 
 ## Next (in order)
 
@@ -877,7 +879,12 @@ through RADV GFX1201, rocm through the system ROCm).
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Models are data. No per
    model branches.
-2. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
+2. **Attention kernel cost**: the attention, attention_q8 and attention_q4
+   kernels recompute the query/key dot product for every output dimension
+   (O(n * head_dim^2) per query). Long context and the image prefill are
+   dominated by this. Next: one workgroup per (query, head) with the scores
+   in shared memory (softmax, then the weighted sum), on both backends.
+3. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
    `/slots`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -886,17 +893,17 @@ through RADV GFX1201, rocm through the system ROCm).
    queue, keep-alive, `/v1/responses`, render/derender/batch,
    `/tokenizer_info`, `/load` and LoRA, and the 501
    embedding/rerank/audio/pooling/classify/score surfaces.
-3. **Runtime options**: context size, draft-block and the GPU index
+4. **Runtime options**: context size, draft-block and the GPU index
    (`--gpu`) are CLI flags now, and the KV cache can be fp16 (`--kv-f16`)
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-4. **Multimodal (mmproj)**: config, weights, encoder+merger, image
+5. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, and image-embedding injection into generation are done
    (`Engine::GenerateMultimodal`). Still to do: the CLI wiring, deepstack
    feature injection, and the image placeholder tokenizer mapping.
 
-5. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
+6. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism
    (shard attention heads and MLP rows across GPUs with an all-reduce per
    layer; vLLM tensor parallelism, Megatron-LM TP) or layer/pipeline

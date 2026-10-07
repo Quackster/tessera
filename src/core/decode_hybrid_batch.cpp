@@ -387,7 +387,8 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
 std::expected<void, StatusCode> HybridForwardBatch(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
-    std::vector<float>* hidden_out, bool all_logits) {
+    std::vector<float>* hidden_out, bool all_logits,
+    const Buffer* embeddings) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -420,23 +421,31 @@ std::expected<void, StatusCode> HybridForwardBatch(
   if (!embed) {
     return std::unexpected(embed.error());
   }
-  // Embed the tokens into a host staging buffer (quant weights gather on
-  // the host) and upload once.
-  std::vector<float> staged(rows * hidden);
-  std::vector<float> row(hidden);
-  for (std::size_t t = 0; t < rows; ++t) {
-    if (tokens[t] >= cfg.vocab_size) {
+  if (embeddings != nullptr) {
+    // A caller-supplied embedding per row (text rows and image rows).
+    if (embeddings->Size() < rows * hidden * 4 ||
+        !backend.CopyD2D(*embeddings, 0, *h.batch->x, 0, rows * hidden * 4)) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
-    auto gathered =
-        GatherEmbedding(backend, **embed, tokens[t], hidden, row);
-    if (!gathered) {
-      return std::unexpected(gathered.error());
+  } else {
+    // Embed the tokens into a host staging buffer (quant weights gather on
+    // the host) and upload once.
+    std::vector<float> staged(rows * hidden);
+    std::vector<float> row(hidden);
+    for (std::size_t t = 0; t < rows; ++t) {
+      if (tokens[t] >= cfg.vocab_size) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+      auto gathered =
+          GatherEmbedding(backend, **embed, tokens[t], hidden, row);
+      if (!gathered) {
+        return std::unexpected(gathered.error());
+      }
+      std::copy(row.begin(), row.end(), staged.begin() + t * hidden);
     }
-    std::copy(row.begin(), row.end(), staged.begin() + t * hidden);
-  }
-  if (!UploadF32(backend, *h.batch->x, staged)) {
-    return std::unexpected(StatusCode::DeviceError);
+    if (!UploadF32(backend, *h.batch->x, staged)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
   }
   // Position triples for mRoPE (text rows: t == h == w).
   std::vector<std::uint64_t> triples(rows * 3);

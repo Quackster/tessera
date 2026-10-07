@@ -86,7 +86,8 @@ std::expected<std::vector<std::vector<float>>, StatusCode> ScoreTokens(
 
 std::expected<std::vector<float>, StatusCode> PrefillTokens(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::span<const std::uint32_t> tokens, std::vector<float>* hidden_out) {
+    std::span<const std::uint32_t> tokens, std::vector<float>* hidden_out,
+    const Buffer* embeddings) {
   if (tokens.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -94,7 +95,8 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
   if (config && config->hybrid) {
     std::vector<float> logits;
     auto status = HybridForwardBatch(backend, model, cache, tokens, &logits,
-                                     hidden_out, /*all_logits=*/false);
+                                     hidden_out, /*all_logits=*/false,
+                                     embeddings);
     if (!status) {
       return std::unexpected(status.error());
     }

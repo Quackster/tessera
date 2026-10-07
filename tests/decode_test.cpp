@@ -491,6 +491,67 @@ TEST(HybridDecodeTest, BatchedPrefillMatchesSequential) {
   }
 }
 
+// Batched prefill honours a caller-supplied embedding per row (the
+// multimodal image path): it must equal a sequential prefill that feeds
+// the same embeddings one row at a time.
+TEST(HybridDecodeTest, BatchedPrefillEmbeddingsMatchSequential) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("emb-gated.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value());
+  const std::size_t hidden = cfg->hidden_dim;
+  const std::vector<std::uint32_t> tokens = {0, 1, 0, 26, 5};
+  const std::size_t rows = tokens.size();
+  std::vector<float> emb(rows * hidden);
+  for (std::size_t i = 0; i < emb.size(); ++i) {
+    emb[i] = 0.0007f * static_cast<float>(i) - 0.5f;
+  }
+  auto emb_buf =
+      engine->Owner().AllocateBuffer(rows * hidden * 4, tessera::MemoryKind::Device);
+  ASSERT_TRUE(emb_buf.has_value());
+  ASSERT_TRUE(engine->Owner()
+                  .CopyH2D(**emb_buf,
+                           std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(emb.data()),
+                               emb.size() * 4))
+                  .has_value());
+  tessera::core::DecodeCache batched;
+  auto fast = tessera::core::PrefillTokens(engine->Owner(), **model, batched,
+                                           tokens, nullptr, emb_buf->get());
+  ASSERT_TRUE(fast.has_value()) << tessera::ToString(fast.error());
+  tessera::core::DecodeCache seq;
+  auto row_buf =
+      engine->Owner().AllocateBuffer(hidden * 4, tessera::MemoryKind::Device);
+  ASSERT_TRUE(row_buf.has_value());
+  for (std::size_t i = 0; i + 1 < rows; ++i) {
+    ASSERT_TRUE(engine->Owner()
+                    .CopyD2D(**emb_buf, i * hidden * 4, **row_buf, 0,
+                             hidden * 4)
+                    .has_value());
+    ASSERT_TRUE(tessera::core::DecodeForward(engine->Owner(), **model, seq,
+                                             tokens[i], nullptr,
+                                             row_buf->get())
+                    .has_value());
+  }
+  ASSERT_TRUE(engine->Owner()
+                  .CopyD2D(**emb_buf, (rows - 1) * hidden * 4, **row_buf, 0,
+                           hidden * 4)
+                  .has_value());
+  auto slow = tessera::core::DecodeLogits(engine->Owner(), **model, seq,
+                                          tokens.back(), nullptr, nullptr,
+                                          nullptr, row_buf->get());
+  ASSERT_TRUE(slow.has_value()) << tessera::ToString(slow.error());
+  ASSERT_EQ(fast->size(), slow->size());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < slow->size(); ++i) {
+    max_abs = std::max(max_abs, std::abs((*fast)[i] - (*slow)[i]));
+  }
+  EXPECT_LE(max_abs, 1e-3f) << "logits max_abs " << max_abs;
+}
+
 // Batched verification must be output preserving: for any draft the
 // accepted tokens plus the bonus token equal the plain greedy sequence,
 // and the rolled-back cache continues greedily from the accepted prefix.
