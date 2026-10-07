@@ -32,6 +32,13 @@ namespace tessera::core {
     std::span<const float> b, std::span<float> y, std::size_t rows,
     std::size_t cols, float eps);
 
+// Host reference for the "bias_add" built-in: y[r,c] = x[r,c] + b[c].
+// rows and cols must be nonzero; `b` holds cols elements; else
+// InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> BiasAddRef(
+    std::span<const float> x, std::span<const float> b, std::span<float> y,
+    std::size_t rows, std::size_t cols);
+
 // Host reference for the "gelu" built-in: elementwise tanh-approximation
 // GELU over n fp32. n must be nonzero; else InvalidArgument.
 [[nodiscard]] std::expected<void, StatusCode> GeluRef(

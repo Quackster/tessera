@@ -724,6 +724,18 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
   out[t] = acc / denom;
 }
 
+// Built-in "bias_add": row-broadcast bias add.
+__global__ void BiasAddKernel(const float* x, const float* b, float* y,
+                              unsigned long long rows,
+                              unsigned long long cols) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= rows * cols) {
+    return;
+  }
+  y[idx] = x[idx] + b[idx % cols];
+}
+
 // Built-in "image_patchify": normalize and split an image into patches.
 __global__ void ImagePatchifyKernel(const float* image, const float* mean,
                                     const float* sd, float* out_values,

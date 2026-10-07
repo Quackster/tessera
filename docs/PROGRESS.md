@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 222/222 on both builds.
+`ctest` passes 223/223 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -756,6 +756,13 @@ through RADV GFX1201, rocm through the system ROCm).
   bidirectional. Push constants widen to 128 bytes and kMaxScalars to
   16 for the ninth scalar. Host reference and non-causal device-vs-
   reference test.
+
+- 2026-10-07: CLIP vision transformer block (223/223 `ctest` on both
+  builds). Current head. `src/core/vision_block.*` runs one CLIP block:
+  LayerNorm, fused QKV (split per row), non-causal multi-head attention,
+  output projection, residual; LayerNorm, GELU MLP, residual. Adds the
+  generic "bias_add" (row-broadcast) kernel. Host reference and a
+  device-vs-reference test.
 
 ## Next (in order)
 

@@ -64,6 +64,23 @@ std::expected<void, StatusCode> LayerNormRef(std::span<const float> x,
   return {};
 }
 
+std::expected<void, StatusCode> BiasAddRef(std::span<const float> x,
+                                           std::span<const float> b,
+                                           std::span<float> y,
+                                           std::size_t rows,
+                                           std::size_t cols) {
+  if (rows == 0 || cols == 0 || x.size() != rows * cols || b.size() != cols ||
+      y.size() != rows * cols) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t c = 0; c < cols; ++c) {
+      y[r * cols + c] = x[r * cols + c] + b[c];
+    }
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> GeluRef(std::span<const float> x,
                                         std::span<float> y, std::size_t n) {
   if (n == 0 || x.size() != n || y.size() != n) {

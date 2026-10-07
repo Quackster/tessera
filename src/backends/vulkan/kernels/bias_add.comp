@@ -1,0 +1,25 @@
+#version 450
+
+// One thread per element; dispatch ceil(rows*cols / 256).
+layout(local_size_x = 256) in;
+
+// "bias_add" contract: buffer 0 X (fp32, rows x cols), buffer 1 B (fp32,
+// cols, broadcast per row), buffer 2 the output (rows x cols). Scalars:
+// rows v[0], cols v[2].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) buffer B { float b[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint rows = pc.v[0];
+  uint cols = pc.v[2];
+  if (idx >= rows * cols) {
+    return;
+  }
+  y[idx] = x[idx] + b[idx % cols];
+}

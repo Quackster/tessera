@@ -220,6 +220,9 @@ class Kernel {
 // "layernorm": buffers X (fp32, rows x cols), weight (fp32, cols), bias
 // (fp32, cols) and the output (fp32, rows x cols); scalars rows, cols and
 // eps (fp32 bits). One thread per row.
+// "bias_add": buffers X (fp32, rows x cols), B (fp32, cols, broadcast
+// per row) and the output (fp32, rows x cols); scalars rows and cols. The
+// dispatch is ceil(rows*cols / 256).
 // "gelu": buffer 0 X (fp32, n), buffer 1 the output (fp32, n); scalar n.
 // Tanh approximation. The dispatch is ceil(n / 256).
 // "quantize_q8": buffer 0 is In (fp32, rows x cols), buffer 1 the packed
@@ -491,6 +494,12 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "bias_add") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 2 ||
+        launch.scalars[0] == 0 || launch.scalars[1] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

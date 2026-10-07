@@ -14,6 +14,7 @@
 #include "core/numerics/attention.hpp"
 #include "core/numerics/conv.hpp"
 #include "core/numerics/vision.hpp"
+#include "core/vision_block.hpp"
 #include "core/numerics/selector.hpp"
 #include "spec/dflash2_conv.hpp"
 #include "spec/dflash2_mlp.hpp"
@@ -5054,6 +5055,82 @@ TEST(BackendTest, AttentionNonCausalDeviceMatchesRef) {
                                  kDim, 0, 0, false)
                   .has_value());
   const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: a CLIP vision transformer block matches the host reference.
+TEST(BackendTest, VisionBlockMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(113);
+  constexpr std::size_t kTokens = 4, kEmbed = 8, kHeads = 2, kHeadDim = 4,
+                       kFfn = 16;
+  constexpr float kEps = 1e-5f;
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = DrawValue(rng);
+    return v;
+  };
+  std::vector<float> x = rnd(kTokens * kEmbed);
+  tessera::core::VisionBlockWeights w;
+  std::vector<float> ln1w = rnd(kEmbed), ln1b = rnd(kEmbed);
+  std::vector<float> qkvw = rnd(3 * kEmbed * kEmbed), qkvb = rnd(3 * kEmbed);
+  std::vector<float> ow = rnd(kEmbed * kEmbed), ob = rnd(kEmbed);
+  std::vector<float> ln2w = rnd(kEmbed), ln2b = rnd(kEmbed);
+  std::vector<float> upw = rnd(kFfn * kEmbed), upb = rnd(kFfn);
+  std::vector<float> dw = rnd(kEmbed * kFfn), db = rnd(kEmbed);
+  w.ln1_weight = ln1w; w.ln1_bias = ln1b; w.qkv_weight = qkvw;
+  w.qkv_bias = qkvb; w.out_weight = ow; w.out_bias = ob;
+  w.ln2_weight = ln2w; w.ln2_bias = ln2b; w.up_weight = upw;
+  w.up_bias = upb; w.down_weight = dw; w.down_bias = db;
+  auto up = [&backend](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  tessera::core::VisionBlockBuffers wb;
+  auto ln1w_b = up(ln1w), ln1b_b = up(ln1b), qkvw_b = up(qkvw),
+       qkvb_b = up(qkvb), ow_b = up(ow), ob_b = up(ob), ln2w_b = up(ln2w),
+       ln2b_b = up(ln2b), upw_b = up(upw), upb_b = up(upb), dw_b = up(dw),
+       db_b = up(db);
+  wb.ln1_weight = ln1w_b.get(); wb.ln1_bias = ln1b_b.get();
+  wb.qkv_weight = qkvw_b.get(); wb.qkv_bias = qkvb_b.get();
+  wb.out_weight = ow_b.get(); wb.out_bias = ob_b.get();
+  wb.ln2_weight = ln2w_b.get(); wb.ln2_bias = ln2b_b.get();
+  wb.up_weight = upw_b.get(); wb.up_bias = upb_b.get();
+  wb.down_weight = dw_b.get(); wb.down_bias = db_b.get();
+  auto x_b = up(x);
+  auto out_b = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(out_b.has_value());
+  auto ln = backend->LoadKernel("layernorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto attn = backend->LoadKernel("attention", {});
+  auto gelu = backend->LoadKernel("gelu", {});
+  auto ba = backend->LoadKernel("bias_add", {});
+  auto add = backend->LoadKernel("add", {});
+  ASSERT_TRUE(ln && gemm && attn && gelu && ba && add);
+  auto device = tessera::core::VisionBlockDevice(
+      *backend, **ln, **gemm, **attn, **gelu, **ba, **add, *x_b, wb, **out_b,
+      kTokens, kEmbed, kHeads, kHeadDim, kFfn, kEps);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<float> got(x.size());
+  backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref(x.size());
+  ASSERT_TRUE(tessera::core::VisionBlockRef(std::span<const float>(x), w,
+                                            std::span<float>(ref), kTokens,
+                                            kEmbed, kHeads, kHeadDim, kFfn,
+                                            kEps)
+                  .has_value());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   float max_abs = 0.0f;
   for (std::size_t i = 0; i < ref.size(); ++i) {

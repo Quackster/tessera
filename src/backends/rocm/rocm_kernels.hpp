@@ -184,6 +184,9 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
                                   unsigned long long head_dim,
                                   unsigned long long q_base,
                                   unsigned long long window);
+__global__ void BiasAddKernel(const float* x, const float* b, float* y,
+                              unsigned long long rows,
+                              unsigned long long cols);
 __global__ void ImagePatchifyKernel(const float* image, const float* mean,
                                     const float* sd, float* out_values,
                                     unsigned long long h,
