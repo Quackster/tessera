@@ -103,15 +103,17 @@ TEST(DTypeTest, TensorBytesSizesTensors) {
   EXPECT_EQ(*tessera::TensorBytes(DType::Q5K, 512), 352u);
   EXPECT_EQ(*tessera::TensorBytes(DType::Q6K, 256), 210u);
   EXPECT_EQ(*tessera::TensorBytes(DType::Q8K, 256), 258u);
-  // No known layout for microscaled and K-quant leftovers.
+  EXPECT_EQ(*tessera::TensorBytes(DType::F4E2M1, 256), 128u);
+  // No known layout for K-quant leftovers.
   EXPECT_EQ(tessera::TensorBytes(DType::Q2K, 256).error(),
             StatusCode::UnsupportedFeature);
   EXPECT_EQ(tessera::TensorBytes(DType::Q3K, 256).error(),
             StatusCode::UnsupportedFeature);
-  EXPECT_EQ(tessera::TensorBytes(DType::F4E2M1, 256).error(),
-            StatusCode::UnsupportedFeature);
-  // 100 elements are not a whole number of Q4_K blocks.
+  // 100 elements are not a whole number of Q4_K blocks; 3 elements
+  // are not a whole number of F4E2M1 pairs.
   EXPECT_EQ(tessera::TensorBytes(DType::Q4K, 100).error(),
+            StatusCode::InvalidArgument);
+  EXPECT_EQ(tessera::TensorBytes(DType::F4E2M1, 3).error(),
             StatusCode::InvalidArgument);
 }
 

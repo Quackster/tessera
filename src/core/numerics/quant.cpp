@@ -89,6 +89,147 @@ float Fp16ToFloat(std::uint16_t half) {
   return sign != 0 ? -value : value;
 }
 
+float Fp8E4M3ToFloat(std::uint8_t bits) {
+  const std::uint32_t sign = bits >> 7;
+  const std::uint32_t exp = (bits >> 3) & 0xF;
+  const std::uint32_t mant = bits & 0x7;
+  float value;
+  if (exp == 0) {
+    value = static_cast<float>(mant) * 0x1p-10f;
+  } else if (exp == 15) {
+    // Only the all-ones mantissa is NaN; the rest encode 2^8 scale.
+    if (mant == 7) {
+      return std::nanf("");
+    }
+    value = (1.0f + static_cast<float>(mant) / 8.0f) * 256.0f;
+  } else {
+    value = (1.0f + static_cast<float>(mant) / 8.0f) *
+            std::ldexp(1.0f, static_cast<int>(exp) - 8);
+  }
+  return sign != 0 ? -value : value;
+}
+
+float E8M0ToFloat(std::uint8_t scale) {
+  return std::ldexp(1.0f, static_cast<int>(scale) - 127);
+}
+
+float F4E2M1ToFloat(std::uint8_t nibble) {
+  const std::uint32_t sign = (nibble >> 3) & 1;
+  const std::uint32_t exp = (nibble >> 1) & 0x3;
+  const std::uint32_t mant = nibble & 1;
+  float value;
+  if (exp == 0) {
+    value = static_cast<float>(mant) * 0.5f;
+  } else if (exp == 3 && mant == 1) {
+    value = std::nanf("");
+  } else {
+    value = (1.0f + static_cast<float>(mant) / 2.0f) *
+            std::ldexp(1.0f, static_cast<int>(exp) - 1);
+  }
+  return sign != 0 ? -value : value;
+}
+
+std::uint8_t Fp32ToFp8E4M3Bits(float value) {
+  std::uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value));
+  std::memcpy(&bits, &value, sizeof(bits));
+  const std::uint32_t sign = bits >> 31;
+  if ((bits & 0x7FFFFFFF) > 0x7F800000 || !(value == value)) {
+    return static_cast<std::uint8_t>((sign << 7) | 0x7F);
+  }
+  float abs = value < 0 ? -value : value;
+  if (abs == 0.0f) {
+    return static_cast<std::uint8_t>(sign << 7);
+  }
+  if (abs > 448.0f) {
+    return static_cast<std::uint8_t>((sign << 7) | 0x7F);
+  }
+  if (abs > 240.0f) {
+    // Top bin: 2^8 scale, mantissas 0..6 (448 max).
+    long long mant = std::llrint(abs / 256.0f * 8.0f - 8.0f);
+    if (mant < 0) {
+      mant = 0;
+    }
+    if (mant > 6) {
+      return static_cast<std::uint8_t>((sign << 7) | 0x7F);
+    }
+    return static_cast<std::uint8_t>((sign << 7) | (15 << 3) |
+                                     static_cast<std::uint32_t>(mant));
+  }
+  int exp = 0;
+  const float frac = std::frexp(abs, &exp);  // abs = frac * 2^exp
+  int field = exp + 7;  // 2^(field-8) brackets abs with frac in [1, 2)
+  if (field < 1) {
+    const long long mant = std::llrint(abs * 1024.0f);
+    if (mant >= 8) {
+      return static_cast<std::uint8_t>((sign << 7) | (1 << 3));
+    }
+    return static_cast<std::uint8_t>((sign << 7) |
+                                     static_cast<std::uint32_t>(mant));
+  }
+  long long mant = std::llrint((frac * 2.0f - 1.0f) * 8.0f);
+  if (mant == 8) {
+    if (field == 14) {
+      mant = 7;  // 120 beats 256 below the 188 midpoint
+    } else {
+      ++field;
+      mant = 0;
+    }
+  }
+  if (field > 14) {
+    // Between the E=14 max (120) and the E=15 base (256).
+    if (abs < 188.0f) {
+      field = 14;
+      mant = 7;
+    } else {
+      field = 15;
+      mant = 0;
+    }
+  }
+  return static_cast<std::uint8_t>(
+      (sign << 7) | (static_cast<std::uint32_t>(field) << 3) |
+      static_cast<std::uint32_t>(mant));
+}
+
+std::uint8_t Fp32ToF4E2M1Nibble(float value) {
+  if (!(value == value)) {
+    return 0x7;
+  }
+  float abs = value < 0 ? -value : value;
+  if (abs > 4.0f) {
+    abs = 4.0f;
+  }
+  constexpr float kGrid[7] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
+  std::uint32_t best = 0;
+  float best_dist = abs;
+  for (std::uint32_t i = 1; i < 7; ++i) {
+    const float dist = abs > kGrid[i] ? abs - kGrid[i] : kGrid[i] - abs;
+    if (dist < best_dist) {
+      best_dist = dist;
+      best = i;
+    }
+  }
+  const std::uint32_t sign = value < 0 ? 8 : 0;
+  std::uint32_t exp = 0;
+  std::uint32_t mant = 0;
+  switch (best) {
+    case 0: break;
+    case 1: mant = 1; break;
+    case 2: exp = 1; break;
+    case 3:
+      exp = 1;
+      mant = 1;
+      break;
+    case 4: exp = 2; break;
+    case 5:
+      exp = 2;
+      mant = 1;
+      break;
+    default: exp = 3; break;  // 4.0
+  }
+  return static_cast<std::uint8_t>(sign | (exp << 1) | mant);
+}
+
 std::uint16_t Fp32ToHalfBits(float value) {
   std::uint32_t bits;
   static_assert(sizeof(bits) == sizeof(value));

@@ -89,11 +89,12 @@ enum class DType : int {
 constexpr std::size_t kQ4KBlockElements = 256;
 
 // Byte size of a dense tensor with `numel` elements. Block types use
-// their block layout (ggml 2026 numbering); plain types use
-// ElementBytes. UnsupportedFeature for layouts without a known size
-// (Q2_K, Q3_K, microscaled types); InvalidArgument when numel is not
-// a multiple of the block elements or the product overflows. This is
-// the single canonical sizer (weight upload, file validation).
+// their block layout (ggml 2026 numbering, F4E2M1 packs two elements
+// per byte); plain types use ElementBytes. UnsupportedFeature for
+// layouts without a known size (Q2_K, Q3_K); InvalidArgument when
+// numel is not a multiple of the block elements or the product
+// overflows. This is the single canonical sizer (weight upload,
+// file validation).
 //
 // Usage:
 //   auto bytes = TensorBytes(DType::Q4K, 256);  // 144 when present
@@ -122,6 +123,11 @@ constexpr std::size_t kQ4KBlockElements = 256;
       }
       return numel / elements * bytes;
     }
+    case DType::F4E2M1:
+      if ((numel % 2) != 0 || numel / 2 > kMax) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+      return numel / 2;
     default: break;
   }
   try {

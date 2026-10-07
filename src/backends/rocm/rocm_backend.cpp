@@ -211,6 +211,100 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
   out[t] = acc / denom;
 }
 
+// OCP FP8 E4M3 byte to fp32 (device port of the core Fp8E4M3ToFloat).
+__host__ __device__ float Fp8E4M3ToFloatDev(std::uint8_t bits) {
+  const std::uint32_t sign = bits >> 7;
+  const std::uint32_t exp = (bits >> 3) & 0xF;
+  const std::uint32_t mant = bits & 0x7;
+  float value;
+  if (exp == 0) {
+    value = static_cast<float>(mant) * 0x1p-10f;
+  } else if (exp == 15) {
+    if (mant == 7) {
+      return std::numeric_limits<float>::quiet_NaN();
+    }
+    value = (1.0f + static_cast<float>(mant) / 8.0f) * 256.0f;
+  } else {
+    value = (1.0f + static_cast<float>(mant) / 8.0f) *
+            std::ldexp(1.0f, static_cast<int>(exp) - 8);
+  }
+  return sign != 0 ? -value : value;
+}
+
+// OCP MX E8M0 scale byte to fp32 (device port of E8M0ToFloat).
+__host__ __device__ float E8M0ToFloatDev(std::uint8_t scale) {
+  return static_cast<float>(
+      std::ldexp(1.0, static_cast<int>(scale) - 127));
+}
+
+// OCP MX E2M1 nibble to fp32 (device port of F4E2M1ToFloat).
+__host__ __device__ float F4E2M1ToFloatDev(std::uint8_t nibble) {
+  const std::uint32_t sign = (nibble >> 3) & 1;
+  const std::uint32_t exp = (nibble >> 1) & 0x3;
+  const std::uint32_t mant = nibble & 1;
+  float value;
+  if (exp == 0) {
+    value = static_cast<float>(mant) * 0.5f;
+  } else if (exp == 3 && mant == 1) {
+    return std::numeric_limits<float>::quiet_NaN();
+  } else {
+    value = (1.0f + static_cast<float>(mant) / 2.0f) *
+            std::ldexp(1.0f, static_cast<int>(exp) - 1);
+  }
+  return sign != 0 ? -value : value;
+}
+
+// Built-in "gemm_fp8": C = A x (diag(s) x W)^T with fp32 sequential
+// accumulation; W holds FP8 E4M3 bytes, s one fp32 scale per row.
+__global__ void GemmFp8Kernel(const float* a, const unsigned char* w,
+                              const float* s, float* c,
+                              unsigned long long m, unsigned long long n,
+                              unsigned long long k) {
+  unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const float scale = s[row_w];
+  float acc = 0.0f;
+  for (unsigned long long t = 0; t < k; ++t) {
+    acc = fmaf(a[row_a * k + t],
+               scale * Fp8E4M3ToFloatDev(w[row_w * k + t]), acc);
+  }
+  c[idx] = acc;
+}
+
+// Built-in "gemm_mxfp4": C = A x W'^T with fp32 sequential
+// accumulation; W' dequantizes MXFP4 nibbles (low nibble first) with
+// one E8M0 scale byte per 32 elements. k is a multiple of 32.
+__global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
+                                const unsigned char* s, float* c,
+                                unsigned long long m, unsigned long long n,
+                                unsigned long long k) {
+  unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const unsigned long long blocks = k / 32;
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const float scale = E8M0ToFloatDev(s[row_w * blocks + b]);
+    for (unsigned long long l = 0; l < 32; ++l) {
+      const unsigned long long t = b * 32 + l;
+      const std::uint8_t packed = w[(row_w * k + t) / 2];
+      const std::uint8_t nibble =
+          (t % 2 == 0) ? (packed & 0xF) : (packed >> 4);
+      acc = fmaf(a[row_a * k + t], scale * F4E2M1ToFloatDev(nibble), acc);
+    }
+  }
+  c[idx] = acc;
+}
+
 // The kernels compiled into the rocm backend.
 struct BuiltInKernel {
   std::string_view name;
@@ -221,6 +315,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_q4k", reinterpret_cast<void*>(&GemmQ4KKernel)},
     {"attention", reinterpret_cast<void*>(&AttentionKernel)},
     {"rope", reinterpret_cast<void*>(&RopeKernel)},
+    {"gemm_fp8", reinterpret_cast<void*>(&GemmFp8Kernel)},
+    {"gemm_mxfp4", reinterpret_cast<void*>(&GemmMxFp4Kernel)},
 };
 
 int LookupBuiltIn(std::string_view name) {

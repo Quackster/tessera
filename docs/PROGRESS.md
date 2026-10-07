@@ -31,9 +31,15 @@ The boilerplate is complete and passes on both backends:
   range and base from GGUF metadata. The generic "rope" and
   "attention" built-ins take all dims as launch scalars and are
   verified against host references on both devices.
-- Single GoogleTest target. `ctest` passes 91/91 on both builds.
+- Single GoogleTest target. `ctest` passes 102/102 on both builds.
   Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
   through RADV GFX1201, rocm through the system ROCm).
+- MXFP4 tensor map: the safetensors header parser reads the fixed
+  schema with a bounded hand-rolled reader. MXFP4 blobs pair with
+  their E8M0 scales by name; MTP FP8 weights map natively. Model
+  load builds the manifest and uploads every tensor.
+- FP8 and MXFP4 GEMM kernels on both backends, checked against fp32
+  host references with per backend tolerance.
 - Single-token decode loop in the core (backend agnostic): embed,
   block forward (device GEMM/RoPE/attention, host norms), greedy
   sample. Runs on vanilla-layout GGUF models. The 27B target is a
@@ -85,6 +91,16 @@ The boilerplate is complete and passes on both backends:
   data start. `Model::Load` reads the file once, uploads every
   tensor, and keeps the buffers in `Model::Weights` with a
   `FindWeight` lookup. The CLI prints the device byte count.
+- 2026-10-07: MXFP4 path (102/102 `ctest` on both builds). A bounded
+  schema-strict JSON reader parses the safetensors map (no third
+  party dependency, by decision). U8 blobs become F4E2M1 against
+  their paired `.weight_scale`, U8 scales become F8E8M0, and the
+  manifest carries element shapes. New generic "gemm_fp8" (per-row
+  scaled E4M3) and "gemm_mxfp4" (32-element E8M0 blocks) built-ins
+  on vulkan (GLSL) and rocm (HIP) with exact codec unit tests. The
+  OCP E4M3 top bin needed care (only mantissa-all-ones is NaN,
+  max 448). `tests/backend_test.cpp` grows further (exemption
+  stands); `src/core/loaders/safetensors.cpp` nears the 600 cap.
 - 2026-10-07: decode loop (91/91 `ctest` on both builds).
   `TransformerConfig` comes from GGUF metadata and `DecodeStep`
   runs one greedy step (device projections/RoPE/attention, host
@@ -97,30 +113,27 @@ The boilerplate is complete and passes on both backends:
 
 ## Next (in order)
 
-1. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
-   the fixed schema, decision pending). fp8 and mxfp4 GEMM kernels.
-   MTP-FP8 draft weights.
-2. **Hybrid SSM decode** for the 27B target (arch `qwen35`): fused
+1. **Hybrid SSM decode** for the 27B target (arch `qwen35`): fused
    QKV splitting, selective-scan and conv1d kernels, Q3_K and
    2026-type layouts (ids 20, 21, 23), Q5_K/Q6_K GEMM paths. The
    file probes as 866 tensors (248320 vocab, 65 blocks, hidden
    5120); the loader reports the first unmapped layout today.
-3. **DFlash2**: local dynamic convolution (grouped causal convolutions),
+2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
-4. **Baseline pinning**: run the non speculative path on both backends.
+3. **Baseline pinning**: run the non speculative path on both backends.
    Record per backend tolerance. Assert in tests (fixed seeds).
-5. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+4. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. Models are data. No per model branches.
-6. **Serving API**: OpenAI-style `/v1/chat/completions` plus an
+5. **Serving API**: OpenAI-style `/v1/chat/completions` plus an
    Anthropic-style `/v1/messages` endpoint, served over HTTP from the
    engine. Streaming and non-streaming responses. The same limits
    apply to both shapes.
-7. **Runtime options**: every serving and engine knob as a CLI flag
+6. **Runtime options**: every serving and engine knob as a CLI flag
    and an engine option. Model path, draft path, mmproj path for
    vision input, KV cache quantization (q4, q8, fp16), maximum
    context size, batch caps. No hard-coded paths or sizes.
-8. **Multimodal (mmproj)**: load the vision projector next to the
+7. **Multimodal (mmproj)**: load the vision projector next to the
    model, encode images to embeddings, prepend them to the prompt
    sequence. Covers the mmproj file in the model directory.
 

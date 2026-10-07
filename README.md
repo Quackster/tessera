@@ -12,7 +12,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | --- | --- | --- |
 | Public API | Done | `Engine` owns backend and models. `Backend` covers buffers and launch. `SpeculativeStrategy` covers draft methods. |
 | GGUF loader | Done | Parses v2 and v3 headers. Checks bounds. Rejects bad input. |
-| MXFP4 loader | Partial | Checks directory layout. Full map parsing is in work. |
+| MXFP4 loader | Done | Parses tensor map. Uploads weights. FP8 and MXFP4 GEMM verified. |
 | Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. |
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. |
 | DFlash2 | Skeleton | Validates checkpoint layout. Draft logic is in work. |

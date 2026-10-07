@@ -92,6 +92,275 @@ TEST(BackendTest, BufferRoundTrip) {
   EXPECT_TRUE(read_mapped);
 }
 
+// Per backend tolerance for the fp GEMM kernels.
+struct FpTolerance {
+  float abs = 0.0f;
+  float rel = 0.0f;
+};
+FpTolerance FpToleranceFor(std::string_view backend) {
+  if (backend == "vulkan") {
+    return {2.0e-4f, 2.0e-4f};
+  }
+  if (backend == "rocm") {
+    return {2.0e-4f, 2.0e-4f};
+  }
+  return {1.0e-3f, 1.0e-3f};
+}
+
+// Host: the fp8 and mxfp4 codecs hit exact known patterns.
+TEST(BackendTest, FpCodecsHitKnownPatterns) {
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x00), 0.0f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x38), 0.5f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x40), 1.0f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0xBC), -0.75f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0xC4), -1.5f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x76), 112.0f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x7E), 448.0f);
+  EXPECT_TRUE(std::isnan(core::Fp8E4M3ToFloat(0x7F)));
+  EXPECT_TRUE(std::isnan(core::Fp8E4M3ToFloat(0xFF)));
+  EXPECT_EQ(core::Fp32ToFp8E4M3Bits(1.0f), 0x40);
+  EXPECT_EQ(core::Fp32ToFp8E4M3Bits(-0.0f), 0x80);
+  EXPECT_EQ(core::Fp32ToFp8E4M3Bits(448.0f), 0x7E);
+  EXPECT_EQ(core::Fp32ToFp8E4M3Bits(1e30f), 0x7F);
+  const float grid[7] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
+  for (std::uint32_t i = 0; i < 7; ++i) {
+    EXPECT_FLOAT_EQ(core::F4E2M1ToFloat(static_cast<std::uint8_t>(i)),
+                                       grid[i])
+        << "nibble " << i;
+    EXPECT_FLOAT_EQ(core::F4E2M1ToFloat(static_cast<std::uint8_t>(8 | i)),
+                                       -grid[i])
+        << "nibble " << (8 | i);
+    EXPECT_EQ(core::Fp32ToF4E2M1Nibble(grid[i]),
+              static_cast<std::uint8_t>(i));
+  }
+  EXPECT_TRUE(std::isnan(core::F4E2M1ToFloat(7)));
+  EXPECT_FLOAT_EQ(core::E8M0ToFloat(126), 0.5f);
+  EXPECT_FLOAT_EQ(core::E8M0ToFloat(127), 1.0f);
+  EXPECT_FLOAT_EQ(core::E8M0ToFloat(128), 2.0f);
+}
+
+// Device: FP8 GEMM matches the host reference (2 x 32 outputs).
+TEST(BackendTest, GemmFp8DeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(2024);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 32;
+  constexpr std::size_t kK = 64;
+  std::vector<float> a(kM * kK);
+  std::vector<std::byte> w(kN * kK);
+  std::vector<float> s(kN);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  for (std::size_t i = 0; i < w.size(); ++i) {
+    w[i] = static_cast<std::byte>(
+        core::Fp32ToFp8E4M3Bits(DrawValue(rng) * 2.0f));
+  }
+  for (std::size_t j = 0; j < kN; ++j) {
+    s[j] = 0.25f * static_cast<float>(1 + (j % 4));
+  }
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto s_buf = backend->AllocateBuffer(s.size() * 4, MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() &&
+              s_buf.has_value() && c_buf.has_value());
+  const auto upload = [&backend](auto& buf, const auto& data,
+                                 std::size_t elem) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * elem));
+  };
+  ASSERT_TRUE(upload(a_buf, a, 4).has_value());
+  ASSERT_TRUE(upload(w_buf, w, 1).has_value());
+  ASSERT_TRUE(upload(s_buf, s, 4).has_value());
+
+  auto kernel = backend->LoadKernel("gemm_fp8", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*s_buf).get(),
+                    (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmFp8Ref(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<const float>(s), std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(device_out[i] - ref[i]);
+    const float r =
+        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, r);
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Device: MXFP4 GEMM matches the host reference (2 x 32 outputs).
+TEST(BackendTest, GemmMxFp4DeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(2025);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 32;
+  constexpr std::size_t kK = 64;
+  constexpr float kGrid[7] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
+  std::vector<float> a(kM * kK);
+  std::vector<std::byte> w(kN * kK / 2, std::byte{0});
+  std::vector<std::byte> s(kN * kK / 32);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  for (std::size_t j = 0; j < kN; ++j) {
+    for (std::size_t b = 0; b < kK / 32; ++b) {
+      s[j * (kK / 32) + b] = static_cast<std::byte>(125 + (j + b) % 5);
+      for (std::size_t l = 0; l < 32; ++l) {
+        const std::size_t t = b * 32 + l;
+        const std::uint8_t nib = core::Fp32ToF4E2M1Nibble(
+            kGrid[(j + t) % 7] * (t % 3 == 0 ? -1.0f : 1.0f));
+        const std::size_t at = (j * kK + t) / 2;
+        std::uint8_t packed = static_cast<std::uint8_t>(w[at]);
+        if (t % 2 == 0) {
+          packed = static_cast<std::uint8_t>((packed & 0xF0) | nib);
+        } else {
+          packed = static_cast<std::uint8_t>((packed & 0x0F) |
+                                             (nib << 4));
+        }
+        w[at] = static_cast<std::byte>(packed);
+      }
+    }
+  }
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto s_buf = backend->AllocateBuffer(s.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() &&
+              s_buf.has_value() && c_buf.has_value());
+  const auto upload = [&backend](auto& buf, const auto& data,
+                                 std::size_t elem) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * elem));
+  };
+  ASSERT_TRUE(upload(a_buf, a, 4).has_value());
+  ASSERT_TRUE(upload(w_buf, w, 1).has_value());
+  ASSERT_TRUE(upload(s_buf, s, 1).has_value());
+
+  auto kernel = backend->LoadKernel("gemm_mxfp4", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*s_buf).get(),
+                    (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmMxFp4Ref(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<const std::byte>(s), std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(device_out[i] - ref[i]);
+    const float r =
+        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, r);
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Host: the fp GEMM references reject malformed shapes.
+TEST(BackendTest, FpGemmRefsRejectBadArgs) {
+  std::vector<float> a(2 * 64, 0.5f);
+  std::vector<std::byte> w(4 * 64, std::byte{0x40});
+  std::vector<float> s(4, 1.0f);
+  std::vector<float> c(2 * 4);
+  auto bad = core::GemmFp8Ref(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<const float>(s), std::span<float>(c), 2, 4, 0);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_s(3, 1.0f);
+  bad = core::GemmFp8Ref(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<const float>(short_s), std::span<float>(c), 2, 4, 64);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<std::byte> wm(4 * 32, std::byte{0});
+  std::vector<std::byte> sm(4 * 2, std::byte{127});
+  auto bad_mx = core::GemmMxFp4Ref(
+      std::span<const float>(a), std::span<const std::byte>(wm),
+      std::span<const std::byte>(sm), std::span<float>(c), 2, 4, 100);
+  ASSERT_FALSE(bad_mx.has_value());
+  EXPECT_EQ(bad_mx.error(), StatusCode::InvalidArgument);
+  auto ok_mx = core::GemmMxFp4Ref(
+      std::span<const float>(a), std::span<const std::byte>(wm),
+      std::span<const std::byte>(sm), std::span<float>(c), 2, 4, 64);
+  ASSERT_TRUE(ok_mx.has_value()) << tessera::ToString(ok_mx.error());
+}
+
+// Device: the fp GEMM contracts reject bad shapes.
+TEST(BackendTest, FpGemmRejectsBadContract) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto fp8 = backend->LoadKernel("gemm_fp8", {});
+  ASSERT_TRUE(fp8.has_value()) << tessera::ToString(fp8.error());
+  auto mxfp4 = backend->LoadKernel("gemm_mxfp4", {});
+  ASSERT_TRUE(mxfp4.has_value()) << tessera::ToString(mxfp4.error());
+  const std::vector<const tessera::Buffer*> three_buffers{
+      nullptr, nullptr, nullptr};
+  const std::vector<const tessera::Buffer*> four_buffers{
+      nullptr, nullptr, nullptr, nullptr};
+  tessera::KernelLaunch launch;
+  launch.buffers = three_buffers;
+  launch.scalars = {1, 4, 64};
+  auto short_buffers = backend->LaunchKernel(**fp8, launch);
+  ASSERT_FALSE(short_buffers.has_value());
+  EXPECT_EQ(short_buffers.error(), StatusCode::InvalidArgument);
+  launch.buffers = four_buffers;
+  launch.scalars = {1, 4, 100};
+  auto bad_k = backend->LaunchKernel(**mxfp4, launch);
+  ASSERT_FALSE(bad_k.has_value());
+  EXPECT_EQ(bad_k.error(), StatusCode::InvalidArgument);
+}
+
 TEST(BackendTest, CopyD2HAtReadsSlice) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);

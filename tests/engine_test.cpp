@@ -13,11 +13,13 @@
 using tessera::Engine;
 using tessera::EngineOptions;
 using tessera::ModelFormat;
+using tessera::TensorEntry;
 using tessera::ModelOptions;
 using tessera::StatusCode;
 using tessera::testing::DrawValue;
 using tessera::testing::FreshTempDir;
 using tessera::testing::GgufBuilder;
+using tessera::testing::MakeSafetensorsContainer;
 using tessera::testing::MakeValidGguf;
 using tessera::testing::QuantizeRows;
 using tessera::testing::WriteBytes;
@@ -273,6 +275,43 @@ TEST(EngineTest, RealModelLoadPathWhenProvided) {
   EXPECT_EQ(model.error(), StatusCode::UnsupportedFeature);
 }
 
+TEST(EngineTest, LoadMxFp4BlobAndScalePair) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  // A 4x32 MXFP4 weight (64 blob bytes) with its 4x1 E8M0 scales.
+  std::string json =
+      R"({"w.weight":{"dtype":"U8","shape":[4,16],"data_offsets":[0,64]},)"
+      R"("w.weight_scale":{"dtype":"U8","shape":[4,1],)"
+      R"("data_offsets":[64,68]}})";
+  auto container = MakeSafetensorsContainer(json);
+  container.insert(container.end(), 68, std::byte{0});
+  auto dir = FreshTempDir("tessera_tests_mxfp4_pair");
+  WritePlaceholderConfig(dir);
+  WriteBytes(dir / "model.safetensors", container);
+  auto model = engine->LoadModel(ModelOptions{dir.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto& loaded = *model;
+  ASSERT_EQ(loaded->Tensors().size(), 2u);
+  const TensorEntry* blob = nullptr;
+  const TensorEntry* scale = nullptr;
+  for (const auto& entry : loaded->Tensors()) {
+    if (entry.name == "w.weight") {
+      blob = &entry;
+    } else if (entry.name == "w.weight_scale") {
+      scale = &entry;
+    }
+  }
+  ASSERT_NE(blob, nullptr);
+  ASSERT_NE(scale, nullptr);
+  EXPECT_EQ(blob->dtype, tessera::DType::F4E2M1);
+  ASSERT_EQ(blob->shape.rank, 2u);
+  EXPECT_EQ(blob->shape.dims[0], 4u);
+  EXPECT_EQ(blob->shape.dims[1], 32u);
+  EXPECT_EQ(scale->dtype, tessera::DType::F8E8M0);
+  EXPECT_EQ(loaded->FindWeight("w.weight")->Size(), 64u);
+  EXPECT_EQ(loaded->FindWeight("w.weight_scale")->Size(), 4u);
+}
+
 TEST(EngineTest, LoadModelMissingFile) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
@@ -394,7 +433,20 @@ TEST(EngineTest, LoadModelAcceptsMxFp4Directory) {
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   auto& loaded = *model;
   EXPECT_EQ(loaded->Format(), ModelFormat::MxFp4);
-  EXPECT_EQ(loaded->Tensors().size(), 0u);  // manifest in milestone 6
+  ASSERT_EQ(loaded->Tensors().size(), 1u);
+  EXPECT_EQ(loaded->Tensors()[0].name, "w");
+  EXPECT_EQ(loaded->Tensors()[0].dtype, tessera::DType::F32);
+  ASSERT_EQ(loaded->Weights().size(), 1u);
+  EXPECT_EQ(loaded->Weights()[0].device->Size(), 16u);
+  const auto* buffer = loaded->FindWeight("w");
+  ASSERT_NE(buffer, nullptr);
+  std::vector<std::byte> readback(16);
+  auto download = engine->Owner().CopyD2H(*buffer, readback.data(), 16);
+  ASSERT_TRUE(download.has_value())
+      << tessera::ToString(download.error());
+  const auto* values = reinterpret_cast<const float*>(readback.data());
+  EXPECT_FLOAT_EQ(values[0], 1.0f);
+  EXPECT_FLOAT_EQ(values[3], 4.0f);
 }
 
 TEST(EngineTest, AttachSpeculativeNull) {

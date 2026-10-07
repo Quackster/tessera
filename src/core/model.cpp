@@ -248,15 +248,37 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         std::move(*config), std::move(*weights)));
   }
   if (std::filesystem::is_directory(path, ec) && !ec) {
-    // MXFP4 layout check; the tensor map is parsed in milestone 6, so the
-    // manifest is empty until then.
     auto layout = core::InspectMxFp4Directory(path);
     if (!layout) {
       return std::unexpected(layout.error());
     }
+    auto bytes = core::ReadFile(layout->weights_path);
+    if (!bytes) {
+      return std::unexpected(bytes.error());
+    }
+    auto parsed =
+        core::ParseSafetensorsMap(std::span<const std::byte>(*bytes));
+    if (!parsed) {
+      return std::unexpected(parsed.error());
+    }
+    std::vector<TensorEntry> tensors;
+    std::vector<std::uint64_t> offsets;
+    tensors.reserve(parsed->size());
+    offsets.reserve(parsed->size());
+    for (const auto& tensor : *parsed) {
+      tensors.push_back(tensor.entry);
+      offsets.push_back(tensor.begin);
+    }
+    // Map offsets count from the file start, so the base is zero.
+    auto weights = UploadWeights(backend, tensors, offsets, 0,
+                                 std::span<const std::byte>(*bytes));
+    if (!weights) {
+      return std::unexpected(weights.error());
+    }
     return std::unique_ptr<Model>(
-        new Model(backend, options, ModelFormat::MxFp4, {}, std::string{},
-                  std::string{}, std::nullopt, std::nullopt, {}));
+        new Model(backend, options, ModelFormat::MxFp4, std::move(tensors),
+                  std::string{}, std::string{}, std::nullopt, std::nullopt,
+                  std::move(*weights)));
   }
   return std::unexpected(StatusCode::InvalidArgument);
 }

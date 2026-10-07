@@ -1,0 +1,68 @@
+#version 450
+
+// One workgroup per 256 output elements; the dispatch is
+// ceil(m * n / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "gemm_fp8" contract (tessera API): buffer 0 is A (fp32, m x k),
+// buffer 1 the FP8 E4M3 weights W (n x k bytes), buffer 2 one fp32
+// scale per row of W, buffer 3 the output C (fp32, m x n). Scalars
+// are 64-bit, so field k lives at pc.v[2k]: m v[0], n v[2], k v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) buffer S {
+  float s[];
+};
+
+layout(set = 0, binding = 3) buffer C {
+  float c[];
+};
+
+// Byte `offset` of the weight buffer (little-endian extraction).
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+// OCP FP8 E4M3 byte to fp32 (port of the core Fp8E4M3ToFloat).
+float fp8_at(uint b) {
+  uint s = b >> 7;
+  uint e = (b >> 3) & 15;
+  uint m = b & 7;
+  float value;
+  if (e == 0) {
+    value = float(m) * exp2(-10.0);
+  } else if (e == 15) {
+    value = m == 7 ? 0.0 / 0.0 : (1.0 + float(m) / 8.0) * 256.0;
+  } else {
+    value = (1.0 + float(m) / 8.0) * exp2(float(e) - 8.0);
+  }
+  return s > 0 ? -value : value;
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  if (idx >= m * n) {
+    return;
+  }
+  uint row_a = idx / n;
+  uint row_w = idx % n;
+  float scale = s[row_w];
+  float acc = 0.0;
+  for (uint t = 0; t < k; ++t) {
+    acc += a[row_a * k + t] * (scale * fp8_at(wbyte(row_w * k + t)));
+  }
+  c[idx] = acc;
+}

@@ -311,10 +311,19 @@ inline void WritePlaceholderConfig(const std::filesystem::path& dir) {
 }
 
 inline void WritePlaceholderWeights(const std::filesystem::path& dir,
-                                   const std::string& file_name =
-                                       "model.safetensors") {
-  WriteBytes(dir / file_name, MakeSafetensorsContainer(
-                                 R"({"model":{"w":{"dtype":"F32"}}})"));
+                                    const std::string& file_name =
+                                        "model.safetensors") {
+  auto container = MakeSafetensorsContainer(
+      R"({"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}})");
+  // Payload: four little-endian floats (1, 2, 3, 4).
+  const std::uint32_t words[4] = {0x3F800000, 0x40000000, 0x40400000,
+                                  0x40800000};
+  for (auto bits : words) {
+    for (int i = 0; i < 4; ++i) {
+      container.push_back(static_cast<std::byte>((bits >> (8 * i)) & 0xFF));
+    }
+  }
+  WriteBytes(dir / file_name, container);
 }
 
 }  // namespace tessera::testing
