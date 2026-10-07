@@ -377,6 +377,16 @@ through RADV GFX1201, rocm through the system ROCm).
   linear path uses it so the conv output feeds the next kernel
   without a strided gather.
 
+- 2026-10-07: device-resident hybrid decode (167/167 `ctest` on
+  both builds). Current head. `decode_hybrid.cpp` now keeps the
+  activations, full-attention KV caches and the linear recurrent
+  state on the device, chaining the qgate-split/QK-norm/mRoPE/
+  attention/sigmoid-gate and conv/L2/norm-gated/delta kernels with
+  one sync per step. Only the causal conv and the final logits
+  touch the host. The hybrid greedy baselines are unchanged. The
+  27B gated-delta decode drops from about 8.5 s to about 1 s per
+  token. The host-only `hybrid_ops.hpp` helper is removed.
+
 ## Next (in order)
 
 1. **MTP for the 27B target** (arch `qwen35`): the block.64 nextn

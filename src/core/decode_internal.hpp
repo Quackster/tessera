@@ -150,33 +150,6 @@ inline std::expected<void, StatusCode> GatherEmbedding(
                           std::span<float>(x));
 }
 
-// y = A(1 x k) times dequant(W) on the device; `weights` is n x k in
-// the format the loaded `gemm` kernel expects.
-inline std::expected<std::vector<float>, StatusCode> Project(    Backend& backend, const Kernel& gemm, const std::vector<float>& x,
-    const Buffer& weights, std::size_t n) {
-  const std::size_t k = x.size();
-  auto x_buf = backend.AllocateBuffer(k * 4, MemoryKind::Device);
-  auto out_buf = backend.AllocateBuffer(n * 4, MemoryKind::Device);
-  if (!x_buf || !out_buf) {
-    return std::unexpected(StatusCode::OutOfMemory);
-  }
-  auto up = UploadF32(backend, **x_buf, x);
-  if (!up) {
-    return std::unexpected(up.error());
-  }
-  KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((n + 255) / 256);
-  launch.block_x = 256;
-  launch.buffers = {(*x_buf).get(), &weights, (*out_buf).get()};
-  launch.scalars = {1, n, k};
-  auto ran = backend.LaunchKernel(gemm, launch);
-  if (!ran) {
-    return std::unexpected(ran.error());
-  }
-  backend.Synchronize();
-  return DownloadF32(backend, **out_buf);
-}
-
 // Device-to-device launch helpers (no host copies): keep activations on
 // the device and chain kernels. The device-resident block forward uses
 // these instead of Project (which round-trips through the host).
@@ -341,39 +314,112 @@ inline std::expected<void, StatusCode> DeltaStepDevice(
   return backend.LaunchKernel(kernel, launch);
 }
 
-// Causal GQA attention over one query row; the key/value matrices
-// upload fresh every step.
-inline std::expected<std::vector<float>, StatusCode> Attend(
-    Backend& backend, const Kernel& attention, const std::vector<float>& q,
-    const std::vector<float>& k, const std::vector<float>& v,
-    std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
-    std::uint64_t q_base) {
-  const std::size_t kv_dim = kv_heads * head_dim;
-  const std::size_t n = k.size() / kv_dim;
-  auto q_buf = backend.AllocateBuffer(q.size() * 4, MemoryKind::Device);
-  auto k_buf = backend.AllocateBuffer(k.size() * 4, MemoryKind::Device);
-  auto v_buf = backend.AllocateBuffer(v.size() * 4, MemoryKind::Device);
-  auto out_buf =
-      backend.AllocateBuffer(heads * head_dim * 4, MemoryKind::Device);
-  if (!q_buf || !k_buf || !v_buf || !out_buf) {
-    return std::unexpected(StatusCode::OutOfMemory);
-  }
-  if (!UploadF32(backend, **q_buf, q) || !UploadF32(backend, **k_buf, k) ||
-      !UploadF32(backend, **v_buf, v)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
+// One gated-delta step for all value heads with the device state updated// in place (`k`/`q` are heads x dk, `v`/`o` heads x dv, `alpha`/`beta`
+// one value per head).
+inline std::expected<void, StatusCode> DeltaStepHeadsDevice(
+    Backend& backend, const Kernel& kernel, Buffer& state, const Buffer& k,
+    const Buffer& v, const Buffer& q, Buffer& o, const Buffer& alpha,
+    const Buffer& beta, std::size_t heads, std::size_t dk, std::size_t dv) {
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
+  launch.grid_x = static_cast<std::uint32_t>((heads * dv + 255) / 256);
   launch.block_x = 256;
-  launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
-                    (*out_buf).get()};
+  launch.buffers = {&state, &k, &v, &q, &o, &alpha, &beta};
+  launch.scalars = {heads, dk, dv};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Causal GQA attention over `n` key/value rows on the device.
+inline std::expected<void, StatusCode> AttentionDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& q, const Buffer& k,
+    const Buffer& v, Buffer& out, std::size_t n, std::size_t heads,
+    std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base) {
+  KernelLaunch launch;
+  launch.grid_x =
+      static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&q, &k, &v, &out};
   launch.scalars = {1, n, heads, kv_heads, head_dim, q_base};
-  auto ran = backend.LaunchKernel(attention, launch);
-  if (!ran) {
-    return std::unexpected(ran.error());
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// In-place NeoX RoPE over rows x heads x head_dim on the device.
+inline std::expected<void, StatusCode> RopeDevice(
+    Backend& backend, const Kernel& kernel, Buffer& io, std::size_t heads,
+    std::size_t head_dim, std::size_t rope_dim, std::uint64_t pos_base,
+    double theta) {
+  const float theta_f = static_cast<float>(theta);
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &theta_f, sizeof(bits));
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(
+      (heads * (rope_dim / 2) + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&io};
+  launch.scalars = {1, heads, head_dim, rope_dim, pos_base, bits};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Gated-delta decay/write gates per value head on the device.
+inline std::expected<void, StatusCode> SsmGateDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& a_log,
+    const Buffer& dt, const Buffer& alpha_raw, const Buffer& beta_raw,
+    Buffer& alpha, Buffer& beta, std::size_t heads) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((heads + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&a_log, &dt, &alpha_raw, &beta_raw, &alpha, &beta};
+  launch.scalars = {heads};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Expand q/k head vectors to the value heads on the device.
+inline std::expected<void, StatusCode> RepeatHeadsDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& in, Buffer& out,
+    std::size_t num_v_heads, std::size_t head_k_dim, std::size_t factor) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(
+      (num_v_heads * head_k_dim + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&in, &out};
+  launch.scalars = {num_v_heads, head_k_dim, factor};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// GEMM kernel id for a projection dtype (the formats the GGUF targets// use). Empty when the dtype has no GEMM kernel.
+inline std::string_view GemmKernelName(DType dtype) {
+  switch (dtype) {
+    case DType::Q4K: return "gemm_q4k";
+    case DType::Q5K: return "gemm_q5k";
+    case DType::Q6K: return "gemm_q6k";
+    case DType::Q3K: return "gemm_q3k";
+    case DType::Q80: return "gemm_q80";
+    case DType::IQ4_NL: return "gemm_iq4nl";
+    case DType::IQ4_XS: return "gemm_iq4xs";
+    case DType::IQ3_S: return "gemm_iq3s";
+    default: return {};
   }
-  backend.Synchronize();
-  return DownloadF32(backend, **out_buf);
+}
+
+// Load (once, into `cache`) and return the GEMM kernel for a projection
+// dtype.
+inline std::expected<Kernel*, StatusCode> GemmFor(
+    Backend& backend, std::unordered_map<int, std::unique_ptr<Kernel>>& cache,
+    DType dtype) {
+  auto it = cache.find(static_cast<int>(dtype));
+  if (it != cache.end()) {
+    return it->second.get();
+  }
+  const std::string_view name = GemmKernelName(dtype);
+  if (name.empty()) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  auto kernel = backend.LoadKernel(name, {});
+  if (!kernel) {
+    return std::unexpected(kernel.error());
+  }
+  Kernel* raw = kernel->get();
+  cache.emplace(static_cast<int>(dtype), std::move(*kernel));
+  return raw;
 }
 
 }  // namespace tessera::core::detail

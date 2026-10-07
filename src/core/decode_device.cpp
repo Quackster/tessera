@@ -11,78 +11,17 @@ namespace tessera::core {
 namespace {
 
 using detail::GatherEmbedding;
+using detail::AttentionDevice;
+using detail::GemmFor;
+using detail::RopeDevice;
 using detail::NeedWeight;
 using detail::NeedWeightAny;
 using detail::UploadF32;
-
-std::string_view GemmKernelName(DType dtype) {
-  switch (dtype) {
-    case DType::Q4K: return "gemm_q4k";
-    case DType::Q5K: return "gemm_q5k";
-    case DType::Q6K: return "gemm_q6k";
-    case DType::Q3K: return "gemm_q3k";
-    case DType::Q80: return "gemm_q80";
-    case DType::IQ4_NL: return "gemm_iq4nl";
-    case DType::IQ4_XS: return "gemm_iq4xs";
-    case DType::IQ3_S: return "gemm_iq3s";
-    default: return {};
-  }
-}
-
-std::expected<Kernel*, StatusCode> GemmFor(Backend& backend,
-                                           DeviceDecodeState& state,
-                                           DType dtype) {
-  auto it = state.gemms.find(static_cast<int>(dtype));
-  if (it != state.gemms.end()) {
-    return it->second.get();
-  }
-  const std::string_view name = GemmKernelName(dtype);
-  if (name.empty()) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
-  auto kernel = backend.LoadKernel(name, {});
-  if (!kernel) {
-    return std::unexpected(kernel.error());
-  }
-  Kernel* raw = kernel->get();
-  state.gemms.emplace(static_cast<int>(dtype), std::move(*kernel));
-  return raw;
-}
 
 std::uint32_t FloatBits(float value) {
   std::uint32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
-}
-
-std::expected<void, StatusCode> RopeDevice(Backend& backend,
-                                           const Kernel& kernel, Buffer& io,
-                                           std::size_t heads,
-                                           std::size_t head_dim,
-                                           std::size_t rope_dim,
-                                           std::uint64_t pos_base,
-                                           double theta) {
-  KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>(
-      (heads * (rope_dim / 2) + 255) / 256);
-  launch.block_x = 256;
-  launch.buffers = {&io};
-  launch.scalars = {1, heads, head_dim, rope_dim, pos_base,
-                    FloatBits(static_cast<float>(theta))};
-  return backend.LaunchKernel(kernel, launch);
-}
-
-std::expected<void, StatusCode> AttentionDevice(
-    Backend& backend, const Kernel& kernel, const Buffer& q, const Buffer& k,
-    const Buffer& v, Buffer& out, std::size_t n, std::size_t heads,
-    std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base) {
-  KernelLaunch launch;
-  launch.grid_x =
-      static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
-  launch.block_x = 256;
-  launch.buffers = {&q, &k, &v, &out};
-  launch.scalars = {1, n, heads, kv_heads, head_dim, q_base};
-  return backend.LaunchKernel(kernel, launch);
 }
 
 // Grow a KV cache by one row and append `k_row`/`v_row` (kv_dim floats
@@ -226,13 +165,13 @@ std::expected<std::uint32_t, StatusCode> DecodeStepDevice(
         !down_w) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    auto gemm_q = GemmFor(backend, st, (*wq)->manifest.dtype);
-    auto gemm_k = GemmFor(backend, st, (*wk)->manifest.dtype);
-    auto gemm_v = GemmFor(backend, st, (*wv)->manifest.dtype);
-    auto gemm_o = GemmFor(backend, st, (*wo)->manifest.dtype);
-    auto gemm_gate = GemmFor(backend, st, (*gate_w)->manifest.dtype);
-    auto gemm_up = GemmFor(backend, st, (*up_w)->manifest.dtype);
-    auto gemm_down = GemmFor(backend, st, (*down_w)->manifest.dtype);
+    auto gemm_q = GemmFor(backend, st.gemms, (*wq)->manifest.dtype);
+    auto gemm_k = GemmFor(backend, st.gemms, (*wk)->manifest.dtype);
+    auto gemm_v = GemmFor(backend, st.gemms, (*wv)->manifest.dtype);
+    auto gemm_o = GemmFor(backend, st.gemms, (*wo)->manifest.dtype);
+    auto gemm_gate = GemmFor(backend, st.gemms, (*gate_w)->manifest.dtype);
+    auto gemm_up = GemmFor(backend, st.gemms, (*up_w)->manifest.dtype);
+    auto gemm_down = GemmFor(backend, st.gemms, (*down_w)->manifest.dtype);
     if (!gemm_q || !gemm_k || !gemm_v || !gemm_o || !gemm_gate || !gemm_up ||
         !gemm_down) {
       return std::unexpected(StatusCode::UnsupportedFeature);
@@ -295,7 +234,7 @@ std::expected<std::uint32_t, StatusCode> DecodeStepDevice(
   if (!out_norm || !output) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto gemm_out = GemmFor(backend, st, (*output)->manifest.dtype);
+  auto gemm_out = GemmFor(backend, st.gemms, (*output)->manifest.dtype);
   if (!gemm_out) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
