@@ -7,12 +7,12 @@
 namespace tessera::backends::rocm {
 // Built-in "gemm_q4k": buffer 0 is the activation A (fp32, m x k),
 // buffer 1 the quantized weights W (Q4_K, n x k), buffer 2 the output
-// C (fp32, m x n); scalar 0 is k, scalar 1 n, scalar 2 m. One
-// workgroup per 256 output elements (block_x = 256).
+// C (fp32, m x n); scalars are m, n, k. One workgroup per 256 output
+// elements (block_x = 256).
 __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
-                              float* c, unsigned long long k,
+                              float* c, unsigned long long m,
                               unsigned long long n,
-                              unsigned long long m) {
+                              unsigned long long k) {
   unsigned long long idx =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= m * n) {

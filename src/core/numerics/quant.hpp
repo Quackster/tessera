@@ -205,4 +205,21 @@ void DequantizeIQ3S(std::span<const std::byte> block, std::span<float> out);
 // 32 signed bytes). The GGUF Q8_0 layout.
 void DequantizeQ80(std::span<const std::byte> block, std::span<float> out);
 
+// Block layout (elements and bytes per block) of a supported quant
+// dtype. UnsupportedFeature for plain or unsized dtypes. One canonical
+// table shared by the GEMM and embedding paths.
+struct QuantBlockLayout {
+  std::size_t elements = 0;
+  std::size_t bytes = 0;
+};
+[[nodiscard]] std::expected<QuantBlockLayout, StatusCode> BlockLayout(
+    DType dtype);
+
+// Dequantize a whole number of `dtype` blocks from `bytes` into out
+// (bytes must hold blocks*BlockLayout.bytes; out a matching element
+// count). InvalidArgument on a size mismatch; UnsupportedFeature for a
+// plain or unsized dtype.
+[[nodiscard]] std::expected<void, StatusCode> DequantizeBlocks(
+    DType dtype, std::span<const std::byte> bytes, std::span<float> out);
+
 }  // namespace tessera::core

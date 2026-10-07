@@ -37,8 +37,17 @@ struct HybridDecodeCache {
     std::vector<float> k;
     std::vector<float> v;
   };
+  struct LinearLayer {
+    // Previous conv-kernel-1 raw qkv vectors, oldest first.
+    std::vector<float> conv_hist;
+    // Gated-delta recurrent state per value head.
+    std::vector<float> state;
+  };
   std::vector<FullLayer> full;
+  std::vector<LinearLayer> linear;
   std::unique_ptr<Kernel> mrope_kernel;
+  std::unique_ptr<Kernel> conv_kernel;
+  std::unique_ptr<Kernel> delta_kernel;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
   bool ready = false;
 };

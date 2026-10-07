@@ -861,6 +861,42 @@ TEST(BackendTest, QuantDequantsExact) {
   EXPECT_FLOAT_EQ(out8[1], 127.0f);
 }
 
+// Host: the canonical block-layout table and whole-buffer dequantizer
+// agree with the per-block dequants (relied on by embedding gather).
+TEST(BackendTest, QuantizeBlocksDispatch) {
+  auto q4k = core::BlockLayout(tessera::DType::Q4K);
+  ASSERT_TRUE(q4k.has_value());
+  EXPECT_EQ(q4k->elements, 256u);
+  EXPECT_EQ(q4k->bytes, 144u);
+  auto q80 = core::BlockLayout(tessera::DType::Q80);
+  ASSERT_TRUE(q80.has_value());
+  EXPECT_EQ(q80->elements, 32u);
+  EXPECT_EQ(q80->bytes, 34u);
+  auto f32 = core::BlockLayout(tessera::DType::F32);
+  ASSERT_FALSE(f32.has_value());
+  EXPECT_EQ(f32.error(), StatusCode::UnsupportedFeature);
+
+  // Two Q8_0 blocks: d=1 with q[0]=-128; d=1 with q[1]=127.
+  std::vector<std::byte> bytes(68, std::byte{0});
+  bytes[1] = std::byte{0x3C};
+  bytes[2] = std::byte{0x80};
+  bytes[34 + 1] = std::byte{0x3C};
+  bytes[34 + 3] = std::byte{0x7F};
+  std::vector<float> out(64);
+  auto done = core::DequantizeBlocks(tessera::DType::Q80,
+                                     std::span<const std::byte>(bytes),
+                                     std::span<float>(out));
+  ASSERT_TRUE(done.has_value()) << tessera::ToString(done.error());
+  EXPECT_FLOAT_EQ(out[0], -128.0f);
+  EXPECT_FLOAT_EQ(out[32 + 1], 127.0f);
+  std::vector<float> short_out(32);
+  auto bad = core::DequantizeBlocks(tessera::DType::Q80,
+                                    std::span<const std::byte>(bytes),
+                                    std::span<float>(short_out));
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+}
+
 // Host: the K-quant and IQ GEMM references reject malformed shapes.
 TEST(BackendTest, QuantGemmRefsRejectBadArgs) {
   std::vector<float> a(2 * 256, 0.5f);
@@ -1062,17 +1098,17 @@ TEST(BackendTest, GemmQ4KRejectsBadContract) {
   tessera::KernelLaunch launch;
   // k is not a multiple of 256.
   launch.buffers = three_buffers;
-  launch.scalars = {100, 1, 1};
+  launch.scalars = {1, 1, 100};
   auto bad_k = backend->LaunchKernel(**kernel, launch);
   ASSERT_FALSE(bad_k.has_value());
   EXPECT_EQ(bad_k.error(), StatusCode::InvalidArgument);
   // k is zero.
-  launch.scalars = {0, 1, 1};
+  launch.scalars = {1, 1, 0};
   auto zero_k = backend->LaunchKernel(**kernel, launch);
   ASSERT_FALSE(zero_k.has_value());
   EXPECT_EQ(zero_k.error(), StatusCode::InvalidArgument);
   // n is zero.
-  launch.scalars = {256, 0, 1};
+  launch.scalars = {1, 0, 256};
   auto zero_n = backend->LaunchKernel(**kernel, launch);
   ASSERT_FALSE(zero_n.has_value());
   EXPECT_EQ(zero_n.error(), StatusCode::InvalidArgument);
@@ -1316,7 +1352,7 @@ TEST(BackendTest, GemmQ4KDeviceMatchesRef) {
   launch.grid_x = (kM * kN + 255) / 256;
   launch.block_x = 256;
   launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
-  launch.scalars = {kK, kN, kM};
+  launch.scalars = {kM, kN, kK};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();

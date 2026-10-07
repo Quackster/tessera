@@ -527,4 +527,51 @@ void DequantizeQ80(std::span<const std::byte> block, std::span<float> out) {
   }
 }
 
+std::expected<QuantBlockLayout, StatusCode> BlockLayout(DType dtype) {
+  switch (dtype) {
+    case DType::Q40: return QuantBlockLayout{32, 17};
+    case DType::Q80: return QuantBlockLayout{32, 34};
+    case DType::Q3K: return QuantBlockLayout{256, 110};
+    case DType::Q4K: return QuantBlockLayout{256, 144};
+    case DType::Q5K: return QuantBlockLayout{256, 176};
+    case DType::Q6K: return QuantBlockLayout{256, 210};
+    case DType::Q8K: return QuantBlockLayout{256, 258};
+    case DType::IQ4_NL: return QuantBlockLayout{32, 18};
+    case DType::IQ4_XS: return QuantBlockLayout{256, 136};
+    case DType::IQ3_S: return QuantBlockLayout{256, 110};
+    default: return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+}
+
+std::expected<void, StatusCode> DequantizeBlocks(
+    DType dtype, std::span<const std::byte> bytes, std::span<float> out) {
+  const auto layout = BlockLayout(dtype);
+  if (!layout) {
+    return std::unexpected(layout.error());
+  }
+  if (bytes.size() % layout->bytes != 0 ||
+      out.size() != bytes.size() / layout->bytes * layout->elements) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  using Dequant = void (*)(std::span<const std::byte>, std::span<float>);
+  Dequant dequant = nullptr;
+  switch (dtype) {
+    case DType::Q4K: dequant = DequantizeQ4K; break;
+    case DType::Q5K: dequant = DequantizeQ5K; break;
+    case DType::Q6K: dequant = DequantizeQ6K; break;
+    case DType::Q3K: dequant = DequantizeQ3K; break;
+    case DType::Q80: dequant = DequantizeQ80; break;
+    case DType::IQ4_NL: dequant = DequantizeIQ4NL; break;
+    case DType::IQ4_XS: dequant = DequantizeIQ4XS; break;
+    case DType::IQ3_S: dequant = DequantizeIQ3S; break;
+    default: return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  const std::size_t blocks = bytes.size() / layout->bytes;
+  for (std::size_t b = 0; b < blocks; ++b) {
+    dequant(bytes.subspan(b * layout->bytes, layout->bytes),
+            out.subspan(b * layout->elements, layout->elements));
+  }
+  return {};
+}
+
 }  // namespace tessera::core

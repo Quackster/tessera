@@ -13,6 +13,8 @@
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
 
+#include "core/numerics/quant.hpp"
+
 // Host-side decode helpers shared by the vanilla and hybrid paths
 // (single implementation, not one copy per path; AGENTS.md rule 2).
 // They move host vectors through the generic device kernels, so the
@@ -29,6 +31,18 @@ NeedWeight(const Model& model, std::string_view name, DType dtype) {
       if (weight.manifest.dtype != dtype) {
         return std::unexpected(StatusCode::UnsupportedFeature);
       }
+      return &weight;
+    }
+  }
+  return std::unexpected(StatusCode::MalformedFile);
+}
+
+// Like NeedWeight but accepts any dtype (the caller selects the kernel
+// from the weight's format). Missing is MalformedFile.
+[[nodiscard]] inline std::expected<const DeviceTensor*, StatusCode>
+NeedWeightAny(const Model& model, std::string_view name) {
+  for (const auto& weight : model.Weights()) {
+    if (weight.manifest.name == name) {
       return &weight;
     }
   }
@@ -83,6 +97,40 @@ inline std::expected<void, StatusCode> UploadF32(Backend& backend,
                reinterpret_cast<const std::byte*>(x.data()), x.size() * 4));
 }
 
+// Read token row `token` of an embedding tensor (F32 or a supported
+// quant format) into x (hidden floats); the row is dequantized on the
+// host when the tensor is quantized.
+inline std::expected<void, StatusCode> GatherEmbedding(
+    Backend& backend, const DeviceTensor& embed, std::size_t token,
+    std::size_t hidden, std::vector<float>& x) {
+  if (embed.manifest.dtype == DType::F32) {
+    auto row = backend.CopyD2HAt(*embed.device, token * hidden * 4,
+                                 reinterpret_cast<std::byte*>(x.data()),
+                                 hidden * 4);
+    if (!row) {
+      return std::unexpected(row.error());
+    }
+    return {};
+  }
+  const auto layout = BlockLayout(embed.manifest.dtype);
+  if (!layout) {
+    return std::unexpected(layout.error());
+  }
+  if (layout->elements == 0 || hidden % layout->elements != 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const std::size_t row_bytes = hidden / layout->elements * layout->bytes;
+  std::vector<std::byte> raw(row_bytes);
+  auto row = backend.CopyD2HAt(*embed.device, token * row_bytes, raw.data(),
+                               row_bytes);
+  if (!row) {
+    return std::unexpected(row.error());
+  }
+  return DequantizeBlocks(embed.manifest.dtype,
+                          std::span<const std::byte>(raw),
+                          std::span<float>(x));
+}
+
 // y = A(1 x k) times dequant(W) on the device; `weights` is n x k in
 // the format the loaded `gemm` kernel expects.
 inline std::expected<std::vector<float>, StatusCode> Project(
@@ -102,7 +150,7 @@ inline std::expected<std::vector<float>, StatusCode> Project(
   launch.grid_x = static_cast<std::uint32_t>((n + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {(*x_buf).get(), &weights, (*out_buf).get()};
-  launch.scalars = {k, n, 1};
+  launch.scalars = {1, n, k};
   auto ran = backend.LaunchKernel(gemm, launch);
   if (!ran) {
     return std::unexpected(ran.error());

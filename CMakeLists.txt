@@ -163,6 +163,7 @@ add_executable(tessera-tests
     tests/gguf_test.cpp
     tests/safetensors_test.cpp
     tests/engine_test.cpp
+    tests/decode_test.cpp
     tests/backend_test.cpp
     tests/spec_test.cpp
 )

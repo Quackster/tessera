@@ -133,9 +133,9 @@ class Kernel {
 // the element count.
 // "gemm_q4k": buffer 0 is the activation A (fp32, m x k), buffer 1 the
 // quantized weights W (Q4_K, n x k rows of k/256 blocks), buffer 2 the
-// output C (fp32, m x n); scalar 0 is k (a positive multiple of
-// kQ4KBlockElements), scalar 1 is n, scalar 2 is m. The dispatch is
-// ceil(m * n / 256) workgroups of 256.
+// output C (fp32, m x n); scalars are m, n, k (k a positive multiple of
+// kQ4KBlockElements). The dispatch is ceil(m * n / 256) workgroups of
+// 256. Every quantized GEMM built-in shares this m, n, k order.
 // "rope": buffer 0 holds rows x heads x head_dim fp32 rotated in place
 // (NeoX pairing over rope_dim per head); scalars are rows, heads,
 // head_dim, rope_dim, pos_base, and the fp32 theta bits. head_dim and
@@ -214,9 +214,9 @@ class Kernel {
     if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
       return StatusCode::InvalidArgument;
     }
-    const std::uint64_t k = launch.scalars[0];
-    if (k == 0 || k % kQ4KBlockElements != 0 || launch.scalars[1] == 0 ||
-        launch.scalars[2] == 0) {
+    const std::uint64_t k = launch.scalars[2];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || k == 0 ||
+        k % kQ4KBlockElements != 0) {
       return StatusCode::InvalidArgument;
     }
   }

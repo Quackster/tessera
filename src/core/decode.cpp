@@ -11,7 +11,9 @@ namespace {
 
 using detail::Attend;
 using detail::DownloadF32;
+using detail::GatherEmbedding;
 using detail::NeedWeight;
+using detail::NeedWeightAny;
 using detail::Project;
 using detail::RmsNormInto;
 using detail::SiluMulInto;
@@ -77,16 +79,14 @@ std::expected<std::uint32_t, StatusCode> DecodeStep(
     cache.rope_kernel = std::move(*rope);
     cache.attention_kernel = std::move(*attention);
   }
-  auto embed = NeedWeight(model, "token_embd.weight", DType::F32);
+  auto embed = NeedWeightAny(model, "token_embd.weight");
   if (!embed) {
     return std::unexpected(embed.error());
   }
   std::vector<float> x(hidden);
-  auto row = backend.CopyD2HAt(
-      *(*embed)->device, static_cast<std::size_t>(token) * hidden * 4,
-      reinterpret_cast<std::byte*>(x.data()), hidden * 4);
-  if (!row) {
-    return std::unexpected(row.error());
+  if (auto gathered = GatherEmbedding(backend, **embed, token, hidden, x);
+      !gathered) {
+    return std::unexpected(gathered.error());
   }
   std::vector<float> work(hidden);
   std::vector<float> mlp_work(cfg.ffn_dim);

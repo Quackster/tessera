@@ -6,8 +6,8 @@ layout(local_size_x = 256) in;
 
 // "gemm_q4k" contract (tessera API): buffer 0 is the activation A
 // (fp32, m x k), buffer 1 the quantized weights W (Q4_K, n x k),
-// buffer 2 the output C (fp32, m x n). Scalars are 64-bit, so field k
-// lives at pc.v[0], n at pc.v[2], m at pc.v[4].
+// buffer 2 the output C (fp32, m x n). Scalars are 64-bit, so field m
+// lives at pc.v[0], n at pc.v[2], k at pc.v[4].
 layout(push_constant) uniform PushConstants {
   uint v[8];
 } pc;
@@ -69,9 +69,9 @@ void scale_min4(uint j, uint base, out uint scale, out uint min) {
 
 void main() {
   uint idx = gl_GlobalInvocationID.x;
-  uint k = pc.v[0];
+  uint m = pc.v[0];
   uint n = pc.v[2];
-  uint m = pc.v[4];
+  uint k = pc.v[4];
   if (idx >= m * n) {
     return;
   }

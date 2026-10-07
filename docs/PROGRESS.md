@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 136/136 on both builds.
+`ctest` passes 137/137 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -70,13 +70,14 @@ through RADV GFX1201, rocm through the system ROCm).
   `Model::Weights` exposes them next to the manifest. Unsized
   layouts stay in the manifest but fail the load as unsupported.
 - Single-token decode loop in the core (backend agnostic): embed,
-  block forward (device GEMM/RoPE/attention, host norms), greedy
-  sample. It runs on vanilla-layout GGUF models and on hybrid models
-  whose layers are all full attention (gated attention: fused Q-plus-
-  gate split, QK-Norm, mRoPE, sigmoid output gate). Hybrid models with
-  linear-attention layers still report unsupported: only the recurrent
-  (gated delta) path is unwired. Norms and SiLU run on the host until
-  their device kernels land.
+  block forward (device GEMM/RoPE/attention/conv/scan, host norms),
+  greedy sample. It runs on vanilla-layout GGUF models and on hybrid
+  models: the gated full-attention path (fused Q-plus-gate split,
+  QK-Norm, mRoPE, sigmoid output gate) and the recurrent linear-
+  attention path (causal conv1d, gated-delta scan, L2/gated norms) are
+  both wired. Embeddings gather through the quantized formats. The 27B
+  target generates on both backends. Norms and elementwise ops run on
+  the host until their device kernels land.
 - DFlash2 strategy skeleton. It validates the draft checkpoint layout.
 - CLI: `tessera-cli run --model <path> [--draft <dir>] [--prompt <id>]
   [--tokens <n>]`. It loads the model, uploads weights, prints a tensor
@@ -223,23 +224,32 @@ through RADV GFX1201, rocm through the system ROCm).
   gate, conv, scan, mrope and split kernels the hybrid path needs are
   now in place.
 - 2026-10-07: hybrid full-attention decode + CLI (136/136 `ctest` on
-  both builds). Current head. Shared host ops moved to
+  both builds). Shared host ops moved to
   `src/core/decode_internal.hpp`; the new `src/core/decode_hybrid.cpp`
   runs the gated full-attention path (fused Q-plus-gate split, QK-Norm,
   mRoPE, attention, sigmoid output gate, multi-format GEMM selection)
   and `DecodeStep` dispatches to it on a hybrid config. A tiny gated
   hybrid fixture decodes deterministically on both backends. The CLI
-  gains `--prompt` and `--tokens` and runs greedy decode. Models with
-  linear-attention layers still report UnsupportedFeature (recurrent
-  path unwired).
+  gains `--prompt` and `--tokens` and runs greedy decode.
+- 2026-10-07: recurrent linear-attention decode (137/137 `ctest` on
+  both builds). Current head. `src/core/decode_hybrid.cpp` now runs
+  the gated-delta block: fused qkv/gate projections, causal conv1d
+  over a per-layer conv history, L2-normalized q/k with head repeat,
+  a per-value-head delta scan with a carried recurrent state, and the
+  gated RMS norm. An all-linear fixture decodes deterministically on
+  both backends. Quantized embeddings gather through a new canonical
+  `DequantizeBlocks` helper. Fixed along the way: Q4_K used a
+  `{k, n, m}` scalar order while every other GEMM used `{m, n, k}`;
+  all quant GEMMs now share one order. The 27B target generates on
+  both backends (CLI `--tokens`); only MTP remains.
 
 ## Next (in order)
 
-1. **Hybrid linear-attention decode** for the 27B target (arch
-   `qwen35`): the full-attention gated path decodes. Still missing: the
-   recurrent (gated delta) path (conv1d state, scan state, L2 norm,
-   gated norm, head repeat), and MTP handling. A model with any
-   linear-attention layer reports UnsupportedFeature today.
+1. **MTP for the 27B target** (arch `qwen35`): the block.64 nextn
+   tensors (eh_proj, enorm/hnorm, shared_head_norm) are loaded but not
+   decoded. Wire the multi-token-prediction head so the draft block can
+   run. The main hybrid decode (full attention + recurrent) generates on
+   both backends today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.

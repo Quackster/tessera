@@ -25,7 +25,6 @@ using tessera::testing::MakeSafetensorsContainer;
 using tessera::testing::MakeValidGguf;
 using tessera::testing::QuantizeRows;
 using tessera::testing::WriteBytes;
-using tessera::testing::WriteGatedHybridFixture;
 using tessera::testing::WriteHybridFixture;
 using tessera::testing::WritePlaceholderConfig;
 using tessera::testing::WritePlaceholderWeights;
@@ -261,8 +260,7 @@ TEST(EngineTest, RealModelLoadPathWhenProvided) {
   MakeEngineOrSkip(engine);
   auto model = engine->LoadModel(ModelOptions{raw, 1024});
   // The first-class target is a hybrid attention/SSM model: the load
-  // succeeds and decode reports UnsupportedFeature until the
-  // recurrent kernels land (see docs/PROGRESS.md).
+  // succeeds and a greedy step produces a token in range.
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   auto config = (*model)->Config();
   ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
@@ -278,8 +276,8 @@ TEST(EngineTest, RealModelLoadPathWhenProvided) {
   EXPECT_EQ(config->rope_sections[2], 10u);
   tessera::core::DecodeCache cache;
   auto step = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
-  ASSERT_FALSE(step.has_value());
-  EXPECT_EQ(step.error(), StatusCode::UnsupportedFeature);
+  ASSERT_TRUE(step.has_value()) << tessera::ToString(step.error());
+  EXPECT_LT(*step, config->vocab_size);
 }
 
 TEST(EngineTest, LoadMxFp4BlobAndScalePair) {
@@ -471,42 +469,7 @@ TEST(EngineTest, LoadGgufModelHybridMissingSections) {
   EXPECT_EQ(model.error(), StatusCode::MalformedFile);
 }
 
-TEST(EngineTest, HybridDecodeReturnsUnsupported) {
-  std::unique_ptr<Engine> engine;
-  MakeEngineOrSkip(engine);
-  auto path = WriteHybridFixture("hybrid_decode.gguf", true);
-  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
-  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
-  tessera::core::DecodeCache cache;
-  auto step = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
-  ASSERT_FALSE(step.has_value());
-  EXPECT_EQ(step.error(), StatusCode::UnsupportedFeature);
-}
-TEST(EngineTest, GatedHybridDecodesDeterministically) {
-  std::unique_ptr<Engine> engine;
-  MakeEngineOrSkip(engine);
-  auto path = WriteGatedHybridFixture("gated.gguf");
-  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
-  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
-  auto config = (*model)->Config();
-  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
-  EXPECT_TRUE(config->hybrid);
-  tessera::core::DecodeCache cache;
-  auto first = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
-  ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
-  EXPECT_LT(*first, 32u);
-  auto second =
-      tessera::core::DecodeStep(engine->Owner(), **model, cache, *first);
-  ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
-  EXPECT_LT(*second, 32u);
-  tessera::core::DecodeCache replay;
-  auto again = tessera::core::DecodeStep(engine->Owner(), **model, replay, 0);
-  ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
-  EXPECT_EQ(*again, *first);
-}
-
 TEST(EngineTest, LoadModelAttentionMxFp4Unsupported) {
-
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
   auto dir = FreshTempDir("tessera_tests_attention_mxfp4");
