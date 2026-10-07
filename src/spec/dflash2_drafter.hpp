@@ -38,8 +38,8 @@ class DFlash2Drafter {
   [[nodiscard]] std::expected<void, StatusCode> Run(
       Backend& backend, const Buffer& mask_embeds, const Buffer& aux,
       const Buffer& output_w, const Kernel& head_gemm, Buffer& logits,
-      std::size_t rows, std::size_t ctx, std::size_t vocab,
-      Buffer* hidden_out = nullptr) const;
+      std::size_t rows, std::size_t ctx, std::uint64_t pos_base,
+      std::size_t vocab, Buffer* hidden_out = nullptr) const;
 
  private:
   DFlash2Config config_;

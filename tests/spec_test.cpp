@@ -268,7 +268,7 @@ TEST(SpecDrafterTest, RunsRealDraftWhenProvided) {
   auto head = backend.LoadKernel("gemm_f32", {});
   ASSERT_TRUE(head.has_value());
   auto status = drafter->Run(backend, *mask, *aux, *outw, **head, **logits,
-                             rows, ctx, vocab);
+                             rows, ctx, 0, vocab);
   ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
   backend.Synchronize();
   std::vector<float> got(rows * vocab);

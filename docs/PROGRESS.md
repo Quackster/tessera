@@ -909,12 +909,24 @@ through RADV GFX1201, rocm through the system ROCm).
   GGUF config parse stay in core (format-generic, not architecture
   specific).
 
+- 2026-10-07: DFlash2 draft context width (235/235 `ctest` on both
+  builds). The draft now conditions on a configurable window of target
+  positions: `DraftBlockDevice` gets the real `pos_base`, and the
+  generate keeps a rolling history of the captured target hidden and
+  builds `aux` for the window (default width 1, set with
+  `TESSERA_DFLASH2_CTX`). Wider context does not raise acceptance (it
+  stays about 0 to 15 percent), so the draft block quality, not the
+  context, is the limit.
+
 ## Next (in order)
 
-0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
-   grouped dynamic convolution, sliding attention, candidate selector and
-   the verification loop, output equal to greedy. Remaining: acceptance
-   tuning (context beyond the last token) and batching.
+0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
+   and output equals greedy. Batching and the draft context width are
+   done (see the Done entry). The draft accepts about 0 to 15 percent, so
+   speculation is slower than greedy despite correct output. The context
+   width does not lift acceptance, so the draft block is the suspect:
+   check its layer order (the residual add and the grouped conv wrapping
+   attention and the MLP) against the reference.
 1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.

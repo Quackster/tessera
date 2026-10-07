@@ -1,5 +1,7 @@
 #include "spec/dflash2_generate.hpp"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -56,6 +58,15 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     block = options.draft_tokens;
   }
   const std::size_t n = draft_config->target_layer_ids.size();
+  // Number of target positions the draft block conditions on. 1 uses only
+  // the anchor; a wider window lets the draft attend to more context.
+  std::size_t ctx_window = 1;
+  if (const char* env = std::getenv("TESSERA_DFLASH2_CTX"); env != nullptr) {
+    const int v = std::atoi(env);
+    if (v > 0) {
+      ctx_window = static_cast<std::size_t>(v);
+    }
+  }
   std::vector<std::size_t> capture_layers(draft_config->target_layer_ids.begin(),
                                           draft_config->target_layer_ids.end());
   std::vector<std::unique_ptr<Buffer>> capture_storage;
@@ -68,7 +79,8 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     capture_storage.push_back(std::move(*buffer));
     captures.push_back(capture_storage.back().get());
   }
-  auto aux = backend.AllocateBuffer(n * hidden * 4, MemoryKind::Device);
+  auto aux =
+      backend.AllocateBuffer(n * ctx_window * hidden * 4, MemoryKind::Device);
   auto logits = backend.AllocateBuffer(block * vocab * 4, MemoryKind::Device);
   auto draft_hidden = backend.AllocateBuffer(block * hidden * 4,
                                              MemoryKind::Device);
@@ -90,11 +102,29 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     }
   }
   std::vector<float> hidden_state;
+  std::vector<std::vector<std::vector<float>>> hist(n);
+  const auto push_capture = [&]() -> std::expected<void, StatusCode> {
+    for (std::size_t i = 0; i < n; ++i) {
+      auto down = core::detail::DownloadF32(backend, *captures[i]);
+      if (!down) {
+        return std::unexpected(down.error());
+      }
+      hist[i].push_back(std::move(*down));
+      if (hist[i].size() > ctx_window) {
+        hist[i].erase(hist[i].begin());
+      }
+    }
+    return {};
+  };
   auto first = core::DecodeLogits(backend, target, cache, prompt.back(),
                                   &hidden_state, &capture_layers, &captures);
   if (!first) {
     return std::unexpected(first.error());
   }
+  if (auto pushed = push_capture(); !pushed) {
+    return std::unexpected(pushed.error());
+  }
+  std::uint64_t anchor = prompt.size() - 1;
   std::vector<std::uint32_t> produced;
   produced.reserve(options.max_tokens);
   std::size_t proposed = 0;
@@ -111,18 +141,30 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (!current) {
       return std::unexpected(current.error());
     }
+    ++anchor;
+    if (auto pushed = push_capture(); !pushed) {
+      return std::unexpected(pushed.error());
+    }
+    const std::size_t ctx = hist[0].size();
+    std::vector<float> aux_host(n * ctx * hidden);
     for (std::size_t i = 0; i < n; ++i) {
-      if (!backend.CopyD2D(*captures[i], 0, **aux, i * hidden * 4, hidden * 4)) {
-        return std::unexpected(StatusCode::DeviceError);
+      for (std::size_t t = 0; t < ctx; ++t) {
+        std::copy(hist[i][t].begin(), hist[i][t].end(),
+                  aux_host.begin() + (i * ctx + t) * hidden);
       }
+    }
+    if (!core::detail::UploadF32(backend, **aux, aux_host)) {
+      return std::unexpected(StatusCode::DeviceError);
     }
     auto mask = MaskEmbeddings(backend, *embed, draft_config->mask_token_id,
                                block, hidden);
     if (!mask) {
       return std::unexpected(mask.error());
     }
+    const std::uint64_t pos_base = anchor + 1 - ctx;
     auto run = drafter->Run(backend, **mask, **aux, *output->device, **head_gemm,
-                            **logits, block, 1, vocab, draft_hidden->get());
+                            **logits, block, ctx, pos_base, vocab,
+                            draft_hidden->get());
     if (!run) {
       return std::unexpected(run.error());
     }
