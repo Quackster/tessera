@@ -893,10 +893,14 @@ through RADV GFX1201, rocm through the system ROCm).
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Models are data. No per
    model branches.
-2. **GEMM row reuse**: the batched prefill is now dominated by the GEMM
-   kernels, which dequantize each weight block once per output row (m
-   times for an m-token batch). Restructure so a block is dequantized
-   once and applied to all rows, then re-measure the prefill. The
+2. **GEMM throughput**: the model runs far below memory bandwidth
+   (about 20 GB/s of 16 GB weights per 0.76 s/step), so the GEMM kernels
+   are bound by the per-element byte-wise weight reads, not by the
+   multiply-accumulate. Two changes: (a) read and dequantize a weight
+   block once and apply it to a tile of rows (the batched prefill
+   dequantizes each weight m times for an m-token batch); (b) vectorize
+   the byte reads (read 4 bytes at a time and extract). Applies to
+   gemm_q4k/q5k/q6k/q3k/q8_0/iq4xs/iq4nl/fp8 on both backends. The
    attention_q8/attention_q4 kernels still recompute the dot product per
    output dimension.
 3. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
