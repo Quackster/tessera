@@ -340,6 +340,14 @@ through RADV GFX1201, rocm through the system ROCm).
   device-resident decode and cache; a bounds-checked copy test
   covers it on both backends.
 
+- 2026-10-07: device-resident vanilla decode (162/162 `ctest` on
+  both builds). Current head. `src/core/decode_device.cpp` keeps
+  the vanilla activations on the device: embedding via CopyD2D, a
+  device KV cache, and chained gemm/rmsnorm/add/silu_mul/rope/
+  attention kernels with a single sync per step and only the
+  logits downloaded. `DecodeStep` dispatches vanilla configs to it;
+  the hybrid path is still host-orchestrated (next).
+
 ## Next (in order)
 
 1. **MTP for the 27B target** (arch `qwen35`): the block.64 nextn

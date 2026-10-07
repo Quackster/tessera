@@ -1,0 +1,327 @@
+#include "core/decode.hpp"
+
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "core/decode_internal.hpp"
+
+namespace tessera::core {
+
+namespace {
+
+using detail::GatherEmbedding;
+using detail::NeedWeight;
+using detail::NeedWeightAny;
+using detail::UploadF32;
+
+std::string_view GemmKernelName(DType dtype) {
+  switch (dtype) {
+    case DType::Q4K: return "gemm_q4k";
+    case DType::Q5K: return "gemm_q5k";
+    case DType::Q6K: return "gemm_q6k";
+    case DType::Q3K: return "gemm_q3k";
+    case DType::Q80: return "gemm_q80";
+    case DType::IQ4_NL: return "gemm_iq4nl";
+    case DType::IQ4_XS: return "gemm_iq4xs";
+    case DType::IQ3_S: return "gemm_iq3s";
+    default: return {};
+  }
+}
+
+std::expected<Kernel*, StatusCode> GemmFor(Backend& backend,
+                                           DeviceDecodeState& state,
+                                           DType dtype) {
+  auto it = state.gemms.find(static_cast<int>(dtype));
+  if (it != state.gemms.end()) {
+    return it->second.get();
+  }
+  const std::string_view name = GemmKernelName(dtype);
+  if (name.empty()) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  auto kernel = backend.LoadKernel(name, {});
+  if (!kernel) {
+    return std::unexpected(kernel.error());
+  }
+  Kernel* raw = kernel->get();
+  state.gemms.emplace(static_cast<int>(dtype), std::move(*kernel));
+  return raw;
+}
+
+std::uint32_t FloatBits(float value) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+std::expected<void, StatusCode> RopeDevice(Backend& backend,
+                                           const Kernel& kernel, Buffer& io,
+                                           std::size_t heads,
+                                           std::size_t head_dim,
+                                           std::size_t rope_dim,
+                                           std::uint64_t pos_base,
+                                           double theta) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(
+      (heads * (rope_dim / 2) + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&io};
+  launch.scalars = {1, heads, head_dim, rope_dim, pos_base,
+                    FloatBits(static_cast<float>(theta))};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+std::expected<void, StatusCode> AttentionDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& q, const Buffer& k,
+    const Buffer& v, Buffer& out, std::size_t n, std::size_t heads,
+    std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base) {
+  KernelLaunch launch;
+  launch.grid_x =
+      static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&q, &k, &v, &out};
+  launch.scalars = {1, n, heads, kv_heads, head_dim, q_base};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Grow a KV cache by one row and append `k_row`/`v_row` (kv_dim floats
+// each).
+std::expected<void, StatusCode> AppendKv(Backend& backend,
+                                         DeviceDecodeState::Kv& kv,
+                                         const Buffer& k_row,
+                                         const Buffer& v_row,
+                                         std::size_t kv_bytes) {
+  auto grown_k = backend.AllocateBuffer((kv.rows + 1) * kv_bytes,
+                                        MemoryKind::Device);
+  auto grown_v = backend.AllocateBuffer((kv.rows + 1) * kv_bytes,
+                                        MemoryKind::Device);
+  if (!grown_k || !grown_v) {
+    return std::unexpected(StatusCode::OutOfMemory);
+  }
+  if (kv.rows > 0) {
+    if (!backend.CopyD2D(*kv.k, 0, **grown_k, 0, kv.rows * kv_bytes) ||
+        !backend.CopyD2D(*kv.v, 0, **grown_v, 0, kv.rows * kv_bytes)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  if (!backend.CopyD2D(k_row, 0, **grown_k, kv.rows * kv_bytes, kv_bytes) ||
+      !backend.CopyD2D(v_row, 0, **grown_v, kv.rows * kv_bytes, kv_bytes)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  kv.k = std::move(*grown_k);
+  kv.v = std::move(*grown_v);
+  ++kv.rows;
+  return {};
+}
+
+}  // namespace
+
+std::expected<std::uint32_t, StatusCode> DecodeStepDevice(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token) {
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const TransformerConfig& cfg = *config;
+  if (cfg.hybrid) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  const std::size_t hidden = cfg.hidden_dim;
+  const std::size_t heads = cfg.attention.heads;
+  const std::size_t kv_heads = cfg.attention.kv_heads;
+  const std::size_t head_dim = cfg.attention.head_dim;
+  const std::size_t kv_dim = kv_heads * head_dim;
+  if (token >= cfg.vocab_size) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (cache.device == nullptr) {
+    auto state = std::make_unique<DeviceDecodeState>();
+    auto load = [&backend](std::unique_ptr<Kernel>& slot,
+                           std::string_view name) -> bool {
+      auto kernel = backend.LoadKernel(name, {});
+      if (!kernel) {
+        return false;
+      }
+      slot = std::move(*kernel);
+      return true;
+    };
+    if (!load(state->rmsnorm_kernel, "rmsnorm") ||
+        !load(state->add_kernel, "add") ||
+        !load(state->silu_mul_kernel, "silu_mul") ||
+        !load(state->rope_kernel, "rope") ||
+        !load(state->attention_kernel, "attention")) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    const std::size_t h4 = hidden * 4;
+    const std::size_t q4 = heads * head_dim * 4;
+    const std::size_t kv4 = kv_dim * 4;
+    const std::size_t f4 = cfg.ffn_dim * 4;
+    auto alloc = [&backend](std::size_t bytes) {
+      return backend.AllocateBuffer(bytes, MemoryKind::Device);
+    };
+    auto x = alloc(h4);
+    auto xn = alloc(h4);
+    auto proj = alloc(h4);
+    auto q = alloc(q4);
+    auto k = alloc(kv4);
+    auto v = alloc(kv4);
+    auto attn = alloc(q4);
+    auto gate = alloc(f4);
+    auto up = alloc(f4);
+    auto mlp = alloc(f4);
+    auto logits = alloc(cfg.vocab_size * 4);
+    if (!x || !xn || !proj || !q || !k || !v || !attn || !gate || !up || !mlp ||
+        !logits) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    state->x = std::move(*x);
+    state->xn = std::move(*xn);
+    state->proj = std::move(*proj);
+    state->q = std::move(*q);
+    state->k = std::move(*k);
+    state->v = std::move(*v);
+    state->attn = std::move(*attn);
+    state->gate = std::move(*gate);
+    state->up = std::move(*up);
+    state->mlp = std::move(*mlp);
+    state->logits = std::move(*logits);
+    state->kv.resize(cfg.layers);
+    cache.device = std::move(state);
+  }
+  DeviceDecodeState& st = *cache.device;
+  auto embed = NeedWeightAny(model, "token_embd.weight");
+  if (!embed) {
+    return std::unexpected(embed.error());
+  }
+  if ((*embed)->manifest.dtype == DType::F32) {
+    const std::size_t offset = static_cast<std::size_t>(token) * hidden * 4;
+    auto copy = backend.CopyD2D(*(*embed)->device, offset, *st.x, 0, hidden * 4);
+    if (!copy) {
+      return std::unexpected(copy.error());
+    }
+  } else {
+    std::vector<float> row(hidden);
+    auto gathered = GatherEmbedding(backend, **embed, token, hidden, row);
+    if (!gathered) {
+      return std::unexpected(gathered.error());
+    }
+    if (!UploadF32(backend, *st.x, row)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  for (std::size_t l = 0; l < cfg.layers; ++l) {
+    const std::string base = "blk." + std::to_string(l) + ".";
+    auto norm = NeedWeight(model, base + "attn_norm.weight", DType::F32);
+    auto wq = NeedWeightAny(model, base + "attn_q.weight");
+    auto wk = NeedWeightAny(model, base + "attn_k.weight");
+    auto wv = NeedWeightAny(model, base + "attn_v.weight");
+    auto wo = NeedWeightAny(model, base + "attn_output.weight");
+    auto mlp_norm = NeedWeight(model, base + "ffn_norm.weight", DType::F32);
+    auto gate_w = NeedWeightAny(model, base + "ffn_gate.weight");
+    auto up_w = NeedWeightAny(model, base + "ffn_up.weight");
+    auto down_w = NeedWeightAny(model, base + "ffn_down.weight");
+    if (!norm || !wq || !wk || !wv || !wo || !mlp_norm || !gate_w || !up_w ||
+        !down_w) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    auto gemm_q = GemmFor(backend, st, (*wq)->manifest.dtype);
+    auto gemm_k = GemmFor(backend, st, (*wk)->manifest.dtype);
+    auto gemm_v = GemmFor(backend, st, (*wv)->manifest.dtype);
+    auto gemm_o = GemmFor(backend, st, (*wo)->manifest.dtype);
+    auto gemm_gate = GemmFor(backend, st, (*gate_w)->manifest.dtype);
+    auto gemm_up = GemmFor(backend, st, (*up_w)->manifest.dtype);
+    auto gemm_down = GemmFor(backend, st, (*down_w)->manifest.dtype);
+    if (!gemm_q || !gemm_k || !gemm_v || !gemm_o || !gemm_gate || !gemm_up ||
+        !gemm_down) {
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
+    DeviceDecodeState::Kv& kv = st.kv[l];
+    const std::size_t pos = kv.rows;
+    if (!detail::RmsNormDevice(backend, *st.rmsnorm_kernel, *st.x,
+                               *(*norm)->device, *st.xn, 1, hidden,
+                               cfg.norm_eps)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!detail::ProjectDevice(backend, *(*gemm_q), *st.xn, *(*wq)->device,
+                               *st.q, 1, heads * head_dim, hidden) ||
+        !detail::ProjectDevice(backend, *(*gemm_k), *st.xn, *(*wk)->device,
+                               *st.k, 1, kv_dim, hidden) ||
+        !detail::ProjectDevice(backend, *(*gemm_v), *st.xn, *(*wv)->device,
+                               *st.v, 1, kv_dim, hidden)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!RopeDevice(backend, *st.rope_kernel, *st.q, heads, head_dim,
+                    cfg.attention.rope_dim, pos, cfg.attention.rope_theta) ||
+        !RopeDevice(backend, *st.rope_kernel, *st.k, kv_heads, head_dim,
+                    cfg.attention.rope_dim, pos, cfg.attention.rope_theta)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (auto appended = AppendKv(backend, kv, *st.k, *st.v, kv_dim * 4);
+        !appended) {
+      return std::unexpected(appended.error());
+    }
+    if (!AttentionDevice(backend, *st.attention_kernel, *st.q, *kv.k, *kv.v,
+                         *st.attn, kv.rows, heads, kv_heads, head_dim, pos)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!detail::ProjectDevice(backend, *(*gemm_o), *st.attn, *(*wo)->device,
+                               *st.proj, 1, hidden, heads * head_dim)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!detail::AddDevice(backend, *st.add_kernel, *st.x, *st.proj, *st.x,
+                           hidden) ||
+        !detail::RmsNormDevice(backend, *st.rmsnorm_kernel, *st.x,
+                               *(*mlp_norm)->device, *st.xn, 1, hidden,
+                               cfg.norm_eps) ||
+        !detail::ProjectDevice(backend, *(*gemm_gate), *st.xn,
+                               *(*gate_w)->device, *st.gate, 1, cfg.ffn_dim,
+                               hidden) ||
+        !detail::ProjectDevice(backend, *(*gemm_up), *st.xn, *(*up_w)->device,
+                               *st.up, 1, cfg.ffn_dim, hidden) ||
+        !detail::SiluMulDevice(backend, *st.silu_mul_kernel, *st.gate, *st.up,
+                               *st.mlp, cfg.ffn_dim) ||
+        !detail::ProjectDevice(backend, *(*gemm_down), *st.mlp,
+                               *(*down_w)->device, *st.proj, 1, hidden,
+                               cfg.ffn_dim) ||
+        !detail::AddDevice(backend, *st.add_kernel, *st.x, *st.proj, *st.x,
+                           hidden)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
+  auto output = NeedWeightAny(model, "output.weight");
+  if (!out_norm || !output) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  auto gemm_out = GemmFor(backend, st, (*output)->manifest.dtype);
+  if (!gemm_out) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  if (!detail::RmsNormDevice(backend, *st.rmsnorm_kernel, *st.x,
+                             *(*out_norm)->device, *st.xn, 1, hidden,
+                             cfg.norm_eps) ||
+      !detail::ProjectDevice(backend, *(*gemm_out), *st.xn,
+                             *(*output)->device, *st.logits, 1, cfg.vocab_size,
+                             hidden)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  backend.Synchronize();
+  std::vector<float> logits(cfg.vocab_size);
+  auto down = backend.CopyD2H(*st.logits,
+                              reinterpret_cast<std::byte*>(logits.data()),
+                              logits.size() * 4);
+  if (!down) {
+    return std::unexpected(down.error());
+  }
+  std::uint32_t best = 0;
+  for (std::uint32_t i = 1; i < logits.size(); ++i) {
+    if (logits[i] > logits[best]) {
+      best = i;
+    }
+  }
+  return best;
+}
+
+}  // namespace tessera::core

@@ -13,6 +13,7 @@ set_property(CACHE TESSERA_BACKEND PROPERTY STRINGS vulkan rocm)
 
 add_library(tessera STATIC
     src/core/decode.cpp
+    src/core/decode_device.cpp
     src/core/decode_hybrid.cpp
     src/core/engine.cpp
     src/core/model.cpp
