@@ -61,6 +61,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"attention_q4", kAttentionQ4SpirV, sizeof(kAttentionQ4SpirV)},
     {"layernorm", kLayernormSpirV, sizeof(kLayernormSpirV)},
     {"gelu", kGeluSpirV, sizeof(kGeluSpirV)},
+    {"image_patchify", kImagePatchifySpirV, sizeof(kImagePatchifySpirV)},
     {"delta_step", kDeltaStepSpirV, sizeof(kDeltaStepSpirV)},
     {"mrope", kMropeSpirV, sizeof(kMropeSpirV)},
     {"qgate_split", kQgateSplitSpirV, sizeof(kQgateSplitSpirV)},

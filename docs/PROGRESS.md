@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 220/220 on both builds.
+`ctest` passes 221/221 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -743,6 +743,12 @@ through RADV GFX1201, rocm through the system ROCm).
   on vulkan and rocm with host references and device-vs-reference
   tests. The CLIP vision encoder needs both (it uses LayerNorm and
   GELU, not RMSNorm/SiLU).
+
+- 2026-10-07: image patchify (221/221 `ctest` on both builds). Current
+  head. Generic "image_patchify" normalizes an [h, w, 3] image by the
+  per-channel mean/std and splits it into patch x patch patches in the
+  CLIP conv weight layout (host reference, vulkan + rocm, device test).
+  This is the CLIP vision encoder input step.
 
 ## Next (in order)
 

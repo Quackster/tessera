@@ -13,6 +13,7 @@
 #include "core/decode_internal.hpp"
 #include "core/numerics/attention.hpp"
 #include "core/numerics/conv.hpp"
+#include "core/numerics/vision.hpp"
 #include "core/numerics/selector.hpp"
 #include "spec/dflash2_conv.hpp"
 #include "spec/dflash2_mlp.hpp"
@@ -4953,6 +4954,55 @@ TEST(BackendTest, GeluDeviceMatchesRef) {
                    got.size() * 4);
   ASSERT_TRUE(core::GeluRef(std::span<const float>(x), std::span<float>(ref),
                             kN)
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: image normalize + patchify matches the host reference.
+TEST(BackendTest, ImagePatchifyMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(111);
+  constexpr std::size_t kH = 4, kW = 4, kPatch = 2;
+  const std::size_t nx = kW / kPatch, ny = kH / kPatch;
+  const std::size_t per_patch = 3 * kPatch * kPatch;
+  std::vector<float> image(kH * kW * 3), mean = {0.5f, 0.5f, 0.5f};
+  std::vector<float> sd = {0.5f, 0.5f, 0.5f};
+  for (auto& v : image) v = std::abs(DrawValue(rng));  // [0, 1)
+  auto up = [&backend](const std::vector<float>& d) {
+    auto buf = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**buf, std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(d.data()),
+                               d.size() * 4));
+    return std::move(*buf);
+  };
+  auto img_b = up(image), mean_b = up(mean), sd_b = up(sd);
+  auto out_b = backend->AllocateBuffer(nx * ny * per_patch * 4,
+                                       MemoryKind::Device);
+  ASSERT_TRUE(out_b.has_value());
+  auto kernel = backend->LoadKernel("image_patchify", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((nx * ny * per_patch + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {img_b.get(), mean_b.get(), sd_b.get(), out_b->get()};
+  launch.scalars = {kH, kW, kPatch};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<float> got(nx * ny * per_patch);
+  backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref(nx * ny * per_patch);
+  ASSERT_TRUE(core::PatchifyRef(std::span<const float>(image),
+                                std::span<const float>(mean),
+                                std::span<const float>(sd),
+                                std::span<float>(ref), kH, kW, kPatch)
                   .has_value());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   float max_abs = 0.0f;

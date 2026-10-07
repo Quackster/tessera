@@ -720,6 +720,33 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
   out[t] = acc / denom;
 }
 
+// Built-in "image_patchify": normalize and split an image into patches.
+__global__ void ImagePatchifyKernel(const float* image, const float* mean,
+                                    const float* sd, float* out_values,
+                                    unsigned long long h,
+                                    unsigned long long w,
+                                    unsigned long long patch) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const unsigned long long nx = w / patch;
+  const unsigned long long ny = h / patch;
+  const unsigned long long per_patch = 3 * patch * patch;
+  if (idx >= nx * ny * per_patch) {
+    return;
+  }
+  const unsigned long long p = idx / per_patch;
+  const unsigned long long rem = idx % per_patch;
+  const unsigned long long c = rem / (patch * patch);
+  const unsigned long long pos = rem % (patch * patch);
+  const unsigned long long ph = pos / patch;
+  const unsigned long long pw = pos % patch;
+  const unsigned long long py = p / nx;
+  const unsigned long long px = p % nx;
+  const unsigned long long y = py * patch + ph;
+  const unsigned long long x = px * patch + pw;
+  out_values[idx] = (image[(y * w + x) * 3 + c] - mean[c]) / sd[c];
+}
+
 // Built-in "layernorm": one thread per row.
 __global__ void LayerNormKernel(const float* x, const float* w, const float* b,
                                 float* y, unsigned long long rows,

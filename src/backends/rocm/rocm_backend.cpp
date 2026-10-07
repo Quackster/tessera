@@ -71,6 +71,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"attention_q4", reinterpret_cast<void*>(&AttentionQ4Kernel)},
     {"layernorm", reinterpret_cast<void*>(&LayerNormKernel)},
     {"gelu", reinterpret_cast<void*>(&GeluKernel)},
+    {"image_patchify", reinterpret_cast<void*>(&ImagePatchifyKernel)},
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},

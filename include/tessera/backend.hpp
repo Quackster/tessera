@@ -213,6 +213,9 @@ class Kernel {
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
 // for both is ceil(n / 256) workgroups of 256.
+// "image_patchify": buffer 0 In (image [h, w, 3] fp32), buffer 1 Mean
+// (3), buffer 2 Std (3), buffer 3 Out (patches x 3*patch*patch); scalars
+// h, w and patch. The dispatch is ceil(out_elems / 256).
 // "layernorm": buffers X (fp32, rows x cols), weight (fp32, cols), bias
 // (fp32, cols) and the output (fp32, rows x cols); scalars rows, cols and
 // eps (fp32 bits). One thread per row.
@@ -468,6 +471,17 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "image_patchify") {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t h = launch.scalars[0];
+    const std::uint64_t w = launch.scalars[1];
+    const std::uint64_t patch = launch.scalars[2];
+    if (h == 0 || w == 0 || patch == 0 || h % patch != 0 || w % patch != 0) {
       return StatusCode::InvalidArgument;
     }
   }

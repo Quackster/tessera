@@ -1,0 +1,44 @@
+#version 450
+
+// One thread per output element; dispatch ceil(out_elems / 256).
+layout(local_size_x = 256) in;
+
+// "image_patchify" contract: buffer 0 In (image [h, w, 3] fp32 in [0,1]),
+// buffer 1 Mean (3), buffer 2 Std (3), buffer 3 Out (patches x
+// 3*patch*patch). Scalars: h v[0], w v[2], patch v[4]. Patch p indexes
+// (py, px) row-major; within a patch the element is c*patch*patch +
+// ph*patch + pw.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer In { float image[]; };
+layout(set = 0, binding = 1) buffer Mean { float mean[]; };
+layout(set = 0, binding = 2) buffer Std { float sd[]; };
+layout(set = 0, binding = 3) buffer Out { float out_values[]; };
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint h = pc.v[0];
+  uint w = pc.v[2];
+  uint ps = pc.v[4];
+  uint nx = w / ps;
+  uint ny = h / ps;
+  uint per_patch = 3u * ps * ps;
+  uint total = nx * ny * per_patch;
+  if (idx >= total) {
+    return;
+  }
+  uint pidx = idx / per_patch;
+  uint rem = idx % per_patch;
+  uint c = rem / (ps * ps);
+  uint pos = rem % (ps * ps);
+  uint ph = pos / ps;
+  uint pw = pos % ps;
+  uint py = pidx / nx;
+  uint px = pidx % nx;
+  uint y = py * ps + ph;
+  uint x = px * ps + pw;
+  float value = image[(y * w + x) * 3u + c];
+  out_values[idx] = (value - mean[c]) / sd[c];
+}
