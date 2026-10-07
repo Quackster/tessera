@@ -4,7 +4,6 @@
 #include <string>
 #include <string_view>
 
-#include "core/decode.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
@@ -16,15 +15,22 @@ constexpr int kExitError = 1;
 constexpr int kExitUsage = 2;
 // How many tensor names to print when summarizing a model.
 constexpr std::size_t kPrintedTensorNames = 5;
+// Defaults for the runtime options; override with the flags below.
+constexpr std::size_t kDefaultContext = 4096;
+constexpr std::size_t kDefaultDraftBlock = 4;
 
 void PrintUsage() {
   std::fprintf(stderr,
                "usage: tessera-cli run --model <path> [--draft <dir>]\n"
+               "       [--context <n>] [--draft-block <n>]\n"
                "       [--prompt <id>] [--tokens <n>]\n"
-               "  --model <path>  a .gguf file or an MXFP4 model directory\n"
-               "  --draft <dir>  DFlash2 draft checkpoint directory\n"
-               "  --prompt <id>  first token id for generation (default 0)\n"
-               "  --tokens <n>   run n greedy decode steps and print them\n");
+               "  --model <path>    a .gguf file or an MXFP4 model directory\n"
+               "  --draft <dir>     DFlash2 draft checkpoint directory\n"
+               "  --context <n>     maximum context length (default %zu)\n"
+               "  --draft-block <n> draft block tokens (default %zu)\n"
+               "  --prompt <id>     first token id for generation (default 0)\n"
+               "  --tokens <n>      run n greedy decode steps and print them\n",
+               kDefaultContext, kDefaultDraftBlock);
 }
 
 }  // namespace
@@ -38,12 +44,18 @@ int main(int argc, char** argv) {
   std::string draft_path;
   std::uint32_t prompt = 0;
   std::size_t tokens = 0;
+  std::size_t context = kDefaultContext;
+  std::size_t draft_block = kDefaultDraftBlock;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "--model" && i + 1 < argc) {
       model_path = argv[++i];
     } else if (arg == "--draft" && i + 1 < argc) {
       draft_path = argv[++i];
+    } else if (arg == "--context" && i + 1 < argc) {
+      context = std::stoul(argv[++i]);
+    } else if (arg == "--draft-block" && i + 1 < argc) {
+      draft_block = std::stoul(argv[++i]);
     } else if (arg == "--prompt" && i + 1 < argc) {
       prompt = static_cast<std::uint32_t>(std::stoul(argv[++i]));
     } else if (arg == "--tokens" && i + 1 < argc) {
@@ -74,7 +86,7 @@ int main(int argc, char** argv) {
   if (!draft_path.empty()) {
     auto strategy = tessera::CreateDFlash2Strategy();
     auto attach =
-        strategy->Attach(tessera::StrategyOptions{draft_path, 4});
+        strategy->Attach(tessera::StrategyOptions{draft_path, draft_block});
     if (!attach) {
       log.Warn("cli",
                std::string("draft attach failed for '") + draft_path + ": " +
@@ -91,8 +103,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  auto model =
-      engine.LoadModel(tessera::ModelOptions{model_path, 4096});
+  auto model = engine.LoadModel(tessera::ModelOptions{model_path, context});
   if (!model) {
     std::fprintf(stderr, "cli: model load failed (%s)\n",
                  tessera::ToString(model.error()).data());
@@ -124,21 +135,17 @@ int main(int argc, char** argv) {
                         std::to_string(tensors[i].shape.Numel()) + "]");
   }
   if (tokens > 0) {
-    tessera::core::DecodeCache cache;
-    std::uint32_t next = prompt;
+    auto generated =
+        engine.Generate(loaded, tessera::GenerateOptions{tokens, prompt});
+    if (!generated) {
+      log.Warn("cli", std::string("generation failed (") +
+                          std::string(tessera::ToString(generated.error())) +
+                          ")");
+      return kExitError;
+    }
     std::string produced;
-    for (std::size_t step = 0; step < tokens; ++step) {
-      auto decoded =
-          tessera::core::DecodeStep(engine.Owner(), loaded, cache, next);
-      if (!decoded) {
-        log.Warn("cli", std::string("decode step ") +
-                            std::to_string(step) + " failed (" +
-                            std::string(tessera::ToString(decoded.error())) +
-                            ")");
-        return kExitError;
-      }
-      next = *decoded;
-      produced += std::to_string(next) + " ";
+    for (std::uint32_t id : *generated) {
+      produced += std::to_string(id) + " ";
     }
     log.Info("cli", "generated tokens: " + produced);
   }

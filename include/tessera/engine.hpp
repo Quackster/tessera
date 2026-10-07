@@ -1,6 +1,10 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <expected>
 #include <memory>
+#include <vector>
 
 #include "tessera/backend.hpp"
 #include "tessera/log.hpp"
@@ -15,6 +19,14 @@ struct EngineOptions {
   // The channel the engine (and its backend) logs through. A default
   // stderr sink is used unless the caller replaces it.
   log::Diagnostics diagnostics;
+};
+
+// Options for Engine::Generate.
+struct GenerateOptions {
+  // Greedy decode steps to run; 0 produces no tokens.
+  std::size_t max_tokens = 0;
+  // The first token fed to the decoder (a prompt token id).
+  std::uint32_t first_token = 0;
 };
 
 // Top-level facade: owns the backend and the loaded models.
@@ -37,6 +49,17 @@ class Engine {
   // ownership; the strategy must not be attached elsewhere.
   std::expected<void, StatusCode> AttachSpeculative(
       std::unique_ptr<SpeculativeStrategy>&& strategy);
+
+  // Greedy single-token generation on the non-speculative (reference
+  // baseline) path: run `options.max_tokens` decode steps from
+  // `options.first_token` and return the produced token ids. An empty
+  // request returns an empty vector. MalformedFile/UnsupportedFeature
+  // when the model config cannot drive the decoder.
+  //
+  // Usage:
+  //   auto ids = engine->Generate(*model, {.max_tokens = 4});
+  [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
+  Generate(Model& model, const GenerateOptions& options = {});
 
   // The engine's compute backend.
   [[nodiscard]] Backend& Owner();

@@ -1,6 +1,9 @@
 #include "tessera/engine.hpp"
 
 #include <string>
+#include <vector>
+
+#include "core/decode.hpp"
 
 namespace tessera {
 
@@ -69,6 +72,26 @@ std::expected<void, StatusCode> Engine::AttachSpeculative(
       "engine", std::string("speculative strategy '") +
                    std::string(speculative_->Name()) + "' attached");
   return {};
+}
+
+std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(
+    Model& model, const GenerateOptions& options) {
+  std::vector<std::uint32_t> produced;
+  produced.reserve(options.max_tokens);
+  core::DecodeCache cache;
+  std::uint32_t next = options.first_token;
+  for (std::size_t step = 0; step < options.max_tokens; ++step) {
+    auto decoded = core::DecodeStep(*backend_, model, cache, next);
+    if (!decoded) {
+      diagnostics_.Warn(
+          "engine", std::string("generation step ") + std::to_string(step) +
+                        " failed: " + std::string(ToString(decoded.error())));
+      return std::unexpected(decoded.error());
+    }
+    next = *decoded;
+    produced.push_back(next);
+  }
+  return produced;
 }
 
 Backend& Engine::Owner() {

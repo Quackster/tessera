@@ -144,7 +144,6 @@ endif()
 
 add_executable(tessera-cli tools/cli/main.cpp)
 target_link_libraries(tessera-cli PRIVATE tessera)
-target_include_directories(tessera-cli PRIVATE src)
 
 enable_testing()
 

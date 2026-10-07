@@ -12,6 +12,7 @@
 
 using tessera::Engine;
 using tessera::EngineOptions;
+using tessera::GenerateOptions;
 using tessera::ModelFormat;
 using tessera::TensorEntry;
 using tessera::ModelOptions;
@@ -249,6 +250,23 @@ TEST(EngineTest, TinyModelDecodesDeterministically) {
       tessera::core::DecodeStep(engine->Owner(), **model, replay, 0);
   ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
   EXPECT_EQ(*again, *first);
+}
+
+TEST(EngineTest, GenerateTinyModelGreedy) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("generate.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto ids = engine->Generate(**model, GenerateOptions{4, 0});
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  ASSERT_EQ(ids->size(), 4u);
+  auto again = engine->Generate(**model, GenerateOptions{4, 0});
+  ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
+  EXPECT_EQ(*ids, *again);
+  auto none = engine->Generate(**model, GenerateOptions{0, 0});
+  ASSERT_TRUE(none.has_value()) << tessera::ToString(none.error());
+  EXPECT_TRUE(none->empty());
 }
 
 TEST(EngineTest, RealModelLoadPathWhenProvided) {

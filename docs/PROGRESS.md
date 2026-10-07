@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 139/139 on both builds.
+`ctest` passes 140/140 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -79,9 +79,13 @@ through RADV GFX1201, rocm through the system ROCm).
   target generates on both backends. Norms and elementwise ops run on
   the host until their device kernels land.
 - DFlash2 strategy skeleton. It validates the draft checkpoint layout.
-- CLI: `tessera-cli run --model <path> [--draft <dir>] [--prompt <id>]
-  [--tokens <n>]`. It loads the model, uploads weights, prints a tensor
-  summary, and with `--tokens` runs greedy decode and prints the ids.
+- Public generation API: `Engine::Generate(model, options)` runs greedy
+  single-token decode on the non-speculative (reference) path and
+  returns the produced token ids. The CLI drives it.
+- CLI: `tessera-cli run --model <path> [--draft <dir>] [--context <n>]
+  [--draft-block <n>] [--prompt <id>] [--tokens <n>]`. It loads the
+  model, uploads weights, prints a tensor summary, and with `--tokens`
+  runs greedy decode through `Engine::Generate` and prints the ids.
 - Single GoogleTest target. Device dependent tests skip cleanly when
   no device is present. Numerical checks use per backend tolerance.
 
@@ -249,6 +253,12 @@ through RADV GFX1201, rocm through the system ROCm).
   accumulation, same op order), so a drift flags a kernel or scheduler
   change. The 27B baseline stays covered by the env-gated real-model
   test.
+- 2026-10-07: public generation API + runtime options (140/140 `ctest`
+  on both builds). Current head. `Engine::Generate` runs greedy decode
+  on the non-speculative path and returns the token ids. The CLI gains
+  `--context` and `--draft-block` (no more hard-coded sizes) and drives
+  generation through the public API, so it no longer includes core
+  internals.
 
 ## Next (in order)
 
@@ -269,10 +279,10 @@ through RADV GFX1201, rocm through the system ROCm).
    Anthropic-style `/v1/messages` endpoint, served over HTTP from the
    engine. Streaming and non-streaming responses. The same limits
    apply to both shapes.
-5. **Runtime options**: every serving and engine knob as a CLI flag
-   and an engine option. Model path, draft path, mmproj path for
-   vision input, KV cache quantization (q4, q8, fp16), maximum
-   context size, batch caps. No hard-coded paths or sizes.
+5. **Runtime options**: context size and draft-block are CLI flags
+   now. Still to wire: KV cache quantization (q4, q8, fp16), mmproj
+   path for vision input, and batch caps (features that do not exist
+   yet). No hard-coded paths or sizes.
 6. **Multimodal (mmproj)**: load the vision projector next to the
    model, encode images to embeddings, prepend them to the prompt
    sequence. Covers the mmproj file in the model directory.
