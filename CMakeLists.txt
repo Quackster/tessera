@@ -53,11 +53,11 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/vulkan_kernels)
     # Parallel lists: kernel file stems and their generated array
     # name prefixes.
-    set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8
+    set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8 gemm_f32
         gemm_mxfp4 gemm_q5k gemm_q6k gemm_q3k gemm_iq4nl gemm_iq4xs
         gemm_iq3s gemm_q80 rmsnorm sigmoid_gate l2norm rmsnorm_gated
         conv1d conv1d_step dflash_conv selector_edge_score delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads)
-    set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8
+    set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8 GemmF32
         GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S
         GemmQ80 Rmsnorm SigmoidGate L2Norm RmsnormGated Conv1d Conv1dStep DflashConv SelectorEdgeScore DeltaStep
         Mrope QgateSplit Add SiluMul RepeatHeads SsmGate DeltaStepHeads)

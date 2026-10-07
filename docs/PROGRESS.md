@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 182/182 on both builds.
+`ctest` passes 183/183 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -493,6 +493,14 @@ through RADV GFX1201, rocm through the system ROCm).
   `gpu <i>: <name>` and exits. Vulkan and rocm each build a temporary
   device context (no engine). The vulkan instance setup is shared by
   Init and the listing. An engine test checks the non-empty result.
+
+- 2026-10-07: plain fp32 GEMM (183/183 `ctest` on both builds).
+  Current head. Generic "gemm_f32" computes C = A x W^T for
+  unquantized fp32 weights (the layout bf16 weights convert to), on
+  vulkan (GLSL) and rocm (HIP) with a host reference and a
+  device-vs-reference test. `GemmKernelName` maps DType::F32 to it, so
+  a projection whose weights are fp32 now selects a kernel instead of
+  UnsupportedFeature.
 
 ## Next (in order)
 

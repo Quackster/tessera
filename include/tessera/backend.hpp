@@ -151,6 +151,9 @@ class Kernel {
 // position q_base + i and attends keys 0..pos (clamped to n - 1) with
 // scale 1/sqrt(head_dim); head h reads kv head h / (heads/kv_heads).
 // The dispatch is ceil(m * heads * head_dim / 256) workgroups of 256.
+// "gemm_f32": buffer 0 is A (fp32, m x k), buffer 1 the fp32
+// weights W (n x k), buffer 2 the output C (fp32, m x n); scalars are
+// m, n, k. The dispatch is ceil(m * n / 256) workgroups of 256.
 // "gemm_fp8": buffer 0 is A (fp32, m x k), buffer 1 the FP8 E4M3
 // weights W (n x k bytes), buffer 2 one fp32 scale per row of W,
 // buffer 3 the output C (fp32, m x n); scalars are m, n, k. The
@@ -285,6 +288,15 @@ class Kernel {
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
         kv_heads == 0 || launch.scalars[4] == 0 ||
         (heads % kv_heads) != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "gemm_f32") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
+        launch.scalars[2] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

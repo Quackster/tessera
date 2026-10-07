@@ -161,6 +161,27 @@ std::expected<void, StatusCode> GemmQ80Ref(
   return GemmBlocksRef(a, w, c, m, n, k, kElements, kBytes, DequantizeQ80);
 }
 
+std::expected<void, StatusCode> GemmF32Ref(
+    std::span<const float> a, std::span<const float> w, std::span<float> c,
+    std::size_t m, std::size_t n, std::size_t k) {
+  if (m == 0 || n == 0 || k == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (a.size() != m * k || w.size() != n * k || c.size() != m * n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < m; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      float acc = 0.0f;
+      for (std::size_t t = 0; t < k; ++t) {
+        acc = std::fma(a[i * k + t], w[j * k + t], acc);
+      }
+      c[i * n + j] = acc;
+    }
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> GemmFp8Ref(
     std::span<const float> a, std::span<const std::byte> w,
     std::span<const float> s, std::span<float> c, std::size_t m,

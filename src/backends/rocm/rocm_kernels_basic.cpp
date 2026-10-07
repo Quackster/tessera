@@ -157,6 +157,24 @@ __host__ __device__ float F4E2M1ToFloatDev(std::uint8_t nibble) {
   return sign != 0 ? -value : value;
 }
 
+// Built-in "gemm_f32": C = A x W^T with fp32 sequential accumulation.
+__global__ void GemmF32Kernel(const float* a, const float* w, float* c,
+                              unsigned long long m, unsigned long long n,
+                              unsigned long long k) {
+  unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  float acc = 0.0f;
+  for (unsigned long long t = 0; t < k; ++t) {
+    acc = fmaf(a[row_a * k + t], w[row_w * k + t], acc);
+  }
+  c[idx] = acc;
+}
+
 // Built-in "gemm_fp8": C = A x (diag(s) x W)^T with fp32 sequential
 // accumulation; W holds FP8 E4M3 bytes, s one fp32 scale per row.
 __global__ void GemmFp8Kernel(const float* a, const unsigned char* w,
