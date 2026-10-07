@@ -195,3 +195,4 @@ TEST(SpecConfigTest, LoadsRealConfigWhenProvided) {
   EXPECT_EQ(config->target_layer_ids.size(), 5u);
   EXPECT_EQ(config->layer_types.size(), 5u);
 }
+

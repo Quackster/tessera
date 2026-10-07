@@ -37,6 +37,7 @@ add_library(tessera STATIC
     src/serve/jinja/jinja_eval.cpp
     src/spec/dflash2.cpp
     src/spec/dflash2_config.cpp
+    src/spec/dflash2_conv.cpp
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
 target_compile_options(tessera PRIVATE -Wall -Wextra)

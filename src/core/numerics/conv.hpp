@@ -41,7 +41,9 @@ namespace tessera::core {
 // kernel consume one side of the kernel_projection output
 // [rows, 2, taps, num_groups] directly. With num_groups =
 // channels / group_size, position = row % block_size and group =
-// channel / group_size:
+// channel / group_size. `delta_offset` shifts the delta base (the two
+// sides of the kernel_projection output sit at offsets 0 and
+// taps x num_groups of each row):
 //   y[r,c] = (base[0,c] + delta[r,0,g]) * x[r,c]
 //          + sum_{tap=1..taps-1, position>=tap}
 //                (base[tap,c] + delta[r,tap,g]) * x[r-tap,c]
@@ -51,6 +53,7 @@ namespace tessera::core {
     std::span<const float> x, std::span<const float> delta,
     std::span<const float> base, std::span<float> y, std::size_t rows,
     std::size_t channels, std::size_t taps, std::size_t group_size,
-    std::size_t block_size, std::size_t delta_row_stride);
+    std::size_t block_size, std::size_t delta_row_stride,
+    std::size_t delta_offset = 0);
 
 }  // namespace tessera::core

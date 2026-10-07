@@ -6,7 +6,8 @@ layout(local_size_x = 256) in;
 // "dflash_conv" contract: buffers X (rows x channels), Delta
 // (rows x taps x num_groups), Base (taps x channels), Y (rows x
 // channels). Scalars: rows v[0], channels v[2], taps v[4],
-// group_size v[6], block_size v[8], delta_row_stride v[10].
+// group_size v[6], block_size v[8], delta_row_stride v[10],
+// delta_offset v[12].
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -27,12 +28,13 @@ void main() {
   uint group_size = pc.v[6];
   uint block_size = pc.v[8];
   uint delta_row_stride = pc.v[10];
+  uint delta_offset = pc.v[12];
   uint num_groups = channels / group_size;
   uint row = i / channels;
   uint c = i % channels;
   uint grp = c / group_size;
   uint position = row % block_size;
-  uint delta_base = row * delta_row_stride + grp;
+  uint delta_base = delta_offset + row * delta_row_stride + grp;
   float acc = (base[c] + delta[delta_base]) * x[i];
   for (uint tap = 1; tap < taps; ++tap) {
     if (position < tap) {

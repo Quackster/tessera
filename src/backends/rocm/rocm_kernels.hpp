@@ -166,7 +166,8 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
                                  unsigned long long taps,
                                  unsigned long long group_size,
                                  unsigned long long block_size,
-                                 unsigned long long delta_row_stride);
+                                 unsigned long long delta_row_stride,
+                                 unsigned long long delta_offset);
 __global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
                                  unsigned long long channels,
                                  unsigned long long width);

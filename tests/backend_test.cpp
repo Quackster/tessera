@@ -14,6 +14,7 @@
 #include "core/numerics/attention.hpp"
 #include "core/numerics/conv.hpp"
 #include "core/numerics/selector.hpp"
+#include "spec/dflash2_conv.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -3052,7 +3053,7 @@ TEST(BackendTest, DflashConvDeviceMatchesRef) {
   launch.buffers = {(*x_buf).get(), (*d_buf).get(), (*b_buf).get(),
                     (*y_buf).get()};
   launch.scalars = {kRows, kChannels, kTaps, kGroup, kBlock,
-                    kTaps * num_groups};
+                    kTaps * num_groups, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(x.size() * 4);
@@ -3254,7 +3255,7 @@ TEST(BackendTest, DflashConvStridedDeltaMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*x_buf).get(), (*d_buf).get(), (*b_buf).get(),
                     (*y_buf).get()};
-  launch.scalars = {kRows, kChannels, kTaps, kGroup, kBlock, stride};
+  launch.scalars = {kRows, kChannels, kTaps, kGroup, kBlock, stride, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(x.size() * 4);
@@ -3501,4 +3502,73 @@ TEST(BackendTest, GemmFp8BlockDeviceMatchesRef) {
   }
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the DFlash2 grouped-conv layer stage (projection then one conv
+// side) matches the host reference for both sides.
+TEST(BackendTest, GroupedConvMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(93);
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kChannels = 8;
+  constexpr std::size_t kTaps = 2;
+  constexpr std::size_t kGroup = 4;
+  constexpr std::size_t kBlock = 4;
+  const std::size_t num_groups = kChannels / kGroup;
+  const std::size_t proj_n = 2 * kTaps * num_groups;
+  std::vector<float> hidden(kRows * kChannels), w(proj_n * kChannels);
+  std::vector<float> base_kernel(2 * kTaps * kChannels);
+  for (auto& v : hidden) v = DrawValue(rng);
+  for (auto& v : w) v = DrawValue(rng);
+  for (auto& v : base_kernel) v = DrawValue(rng);
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto h_buf = alloc(hidden.size() * 4);
+  auto w_buf = alloc(w.size() * 4);
+  auto base_buf = alloc(base_kernel.size() * 4);
+  auto out_buf = alloc(hidden.size() * 4);
+  auto proj_buf = alloc(kRows * proj_n * 4);
+  auto side_buf = alloc(kTaps * kChannels * 4);
+  ASSERT_TRUE(h_buf && w_buf && base_buf && out_buf && proj_buf && side_buf);
+  const auto upload = [&backend](auto& buf, const std::vector<float>& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(h_buf, hidden).has_value());
+  ASSERT_TRUE(upload(w_buf, w).has_value());
+  ASSERT_TRUE(upload(base_buf, base_kernel).has_value());
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto conv = backend->LoadKernel("dflash_conv", {});
+  ASSERT_TRUE(gemm.has_value() && conv.has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  for (std::size_t side = 0; side < 2; ++side) {
+    auto device = tessera::spec::GroupedConvDevice(
+        *backend, **gemm, **conv, **proj_buf, **side_buf, **h_buf, **w_buf,
+        **base_buf, **out_buf, kRows, kChannels, kTaps, kGroup, kBlock, side);
+    ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+    backend->Synchronize();
+    std::vector<std::byte> readback(hidden.size() * 4);
+    ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                    .has_value());
+    std::vector<float> ref(hidden.size());
+    std::span<const float> base_side(base_kernel.data() + side * kTaps *
+                                                          kChannels,
+                                     kTaps * kChannels);
+    ASSERT_TRUE(tessera::spec::GroupedConvRef(std::span<const float>(hidden),
+                                     std::span<const float>(w), base_side,
+                                     std::span<float>(ref), kRows, kChannels,
+                                     kTaps, kGroup, kBlock, side)
+                    .has_value());
+    const auto* got = reinterpret_cast<const float*>(readback.data());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << "side " << side << " backend " << backend->Name();
+  }
 }

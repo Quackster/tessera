@@ -592,7 +592,8 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
                                  unsigned long long taps,
                                  unsigned long long group_size,
                                  unsigned long long block_size,
-                                 unsigned long long delta_row_stride) {
+                                 unsigned long long delta_row_stride,
+                                 unsigned long long delta_offset) {
   const unsigned long long i =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= rows * channels) {
@@ -603,7 +604,7 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
   const unsigned long long c = i % channels;
   const unsigned long long grp = c / group_size;
   const unsigned long long position = row % block_size;
-  const unsigned long long delta_base = row * delta_row_stride + grp;
+  const unsigned long long delta_base = delta_offset + row * delta_row_stride + grp;
   float acc = (base[c] + delta[delta_base]) * x[i];
   for (unsigned long long tap = 1; tap < taps; ++tap) {
     if (position < tap) {

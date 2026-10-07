@@ -457,7 +457,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "dflash_conv") {
-    if (launch.buffers.size() != 4 || launch.scalars.size() != 6) {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 7) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t channels = launch.scalars[1];
