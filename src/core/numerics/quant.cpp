@@ -89,6 +89,13 @@ float Fp16ToFloat(std::uint16_t half) {
   return sign != 0 ? -value : value;
 }
 
+float Bf16ToFloat(std::uint16_t bits) {
+  const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+  float value = 0.0f;
+  std::memcpy(&value, &wide, sizeof(value));
+  return value;
+}
+
 float Fp8E4M3ToFloat(std::uint8_t bits) {
   const std::uint32_t sign = bits >> 7;
   const std::uint32_t exp = (bits >> 3) & 0xF;
@@ -541,6 +548,45 @@ std::expected<QuantBlockLayout, StatusCode> BlockLayout(DType dtype) {
     case DType::IQ3_S: return QuantBlockLayout{256, 110};
     default: return std::unexpected(StatusCode::UnsupportedFeature);
   }
+}
+
+std::expected<void, StatusCode> DequantizeBf16(
+    std::span<const std::byte> bytes, std::span<float> out) {
+  if (bytes.size() != out.size() * 2) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    const std::uint16_t bits = static_cast<std::uint16_t>(
+        static_cast<std::uint8_t>(bytes[i * 2]) |
+        (static_cast<std::uint16_t>(static_cast<std::uint8_t>(bytes[i * 2 + 1]))
+         << 8));
+    out[i] = Bf16ToFloat(bits);
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> DequantizeFp8Block(
+    std::span<const std::byte> bytes, std::span<const float> scales,
+    std::span<float> out, std::size_t rows, std::size_t cols) {
+  constexpr std::size_t kBlock = 128;
+  if (rows == 0 || cols == 0 || rows % kBlock != 0 || cols % kBlock != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t cols_blocks = cols / kBlock;
+  if (bytes.size() != rows * cols ||
+      scales.size() != (rows / kBlock) * cols_blocks ||
+      out.size() != rows * cols) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    const float* scale_row = &scales[(r / kBlock) * cols_blocks];
+    for (std::size_t c = 0; c < cols; ++c) {
+      out[r * cols + c] =
+          Fp8E4M3ToFloat(static_cast<std::uint8_t>(bytes[r * cols + c])) *
+          scale_row[c / kBlock];
+    }
+  }
+  return {};
 }
 
 std::expected<void, StatusCode> DequantizeBlocks(

@@ -22,6 +22,10 @@ constexpr std::size_t kQ4KScaleBytes = 12;
 //   float value = Fp16ToFloat(half);
 [[nodiscard]] float Fp16ToFloat(std::uint16_t half);
 
+// Decode a bfloat16 (little-endian) to fp32. bf16 shares the fp32
+// exponent field, so the conversion is exact.
+[[nodiscard]] float Bf16ToFloat(std::uint16_t bits);
+
 // Decode an OCP FP8 E4M3 byte to fp32 (bias 8; only the all-ones
 // mantissa is NaN, no infinities, max 448). Exact for every finite
 // value.
@@ -219,6 +223,17 @@ struct QuantBlockLayout {
 // (bytes must hold blocks*BlockLayout.bytes; out a matching element
 // count). InvalidArgument on a size mismatch; UnsupportedFeature for a
 // plain or unsized dtype.
+// Decode a whole bf16 tensor (2 bytes per element) to fp32.
+[[nodiscard]] std::expected<void, StatusCode> DequantizeBf16(
+    std::span<const std::byte> bytes, std::span<float> out);
+
+// Decode a block-scaled FP8 E4M3 tensor (one fp32 scale per 128 x 128
+// block, the DFlash2 draft quantization) to fp32. rows and cols must be
+// multiples of 128; `scales` is (rows/128) x (cols/128) row-major.
+[[nodiscard]] std::expected<void, StatusCode> DequantizeFp8Block(
+    std::span<const std::byte> bytes, std::span<const float> scales,
+    std::span<float> out, std::size_t rows, std::size_t cols);
+
 [[nodiscard]] std::expected<void, StatusCode> DequantizeBlocks(
     DType dtype, std::span<const std::byte> bytes, std::span<float> out);
 

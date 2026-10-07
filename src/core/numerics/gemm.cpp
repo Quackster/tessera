@@ -11,15 +11,6 @@ namespace tessera::core {
 
 namespace {
 
-// bf16 -> fp32: bf16 shares the fp32 exponent field, so shifting the 16
-// bits into the high half of an fp32 word is exact.
-float Bf16ToFloat(std::uint16_t bits) {
-  const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
-  float value = 0.0f;
-  std::memcpy(&value, &wide, sizeof(value));
-  return value;
-}
-
 // One canonical dequantize-then-dot loop for every block-quantized
 // GEMM reference (a single implementation, not one copy per format).
 using DequantBlockFn = void (*)(std::span<const std::byte>,

@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 200/200 on both builds.
+`ctest` passes 201/201 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -628,6 +628,14 @@ through RADV GFX1201, rocm through the system ROCm).
   normed hidden to logits with the shared output weight. Host reference
   and a device-vs-reference test. Fixes a dropped `ctx` argument in the
   device stack call.
+
+- 2026-10-07: bf16 and block-fp8 dequant to fp32 (201/201 `ctest` on
+  both builds). Current head. `Bf16ToFloat` moves next to the other
+  codecs in `quant.*` (gemm_bf16 shares it) and new
+  `DequantizeBf16`/`DequantizeFp8Block` decode whole tensors to fp32
+  (the latter with the DFlash2 128x128 block scales). Host tests
+  cover both. These are the building blocks for loading the real
+  bf16/fp8 DFlash2 draft weights into the fp32 draft forward.
 
 ## Next (in order)
 

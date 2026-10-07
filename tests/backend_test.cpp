@@ -4477,3 +4477,50 @@ TEST(BackendTest, DraftBlockMatchesRef) {
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
+
+// Host: bf16 and block-scaled fp8 tensors decode to fp32.
+TEST(BackendTest, DequantizeBf16AndFp8Block) {
+  std::vector<float> values = {1.0f, -2.5f, 0.25f, 3.75f};
+  std::vector<std::byte> bf16(values.size() * 2);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &values[i], sizeof(bits));
+    const std::uint16_t bf = static_cast<std::uint16_t>(bits >> 16);
+    bf16[i * 2] = static_cast<std::byte>(bf & 0xFF);
+    bf16[i * 2 + 1] = static_cast<std::byte>((bf >> 8) & 0xFF);
+  }
+  std::vector<float> out(values.size());
+  ASSERT_TRUE(core::DequantizeBf16(std::span<const std::byte>(bf16),
+                                   std::span<float>(out))
+                  .has_value());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    EXPECT_FLOAT_EQ(out[i], core::Bf16ToFloat(
+                                static_cast<std::uint16_t>(
+                                    static_cast<std::uint8_t>(bf16[i * 2]) |
+                                    (static_cast<std::uint16_t>(
+                                         static_cast<std::uint8_t>(
+                                             bf16[i * 2 + 1]))
+                                     << 8))));
+  }
+
+  constexpr std::size_t kRows = 128;
+  constexpr std::size_t kCols = 256;
+  std::vector<std::byte> fp8(kRows * kCols);
+  for (std::size_t i = 0; i < fp8.size(); ++i) {
+    fp8[i] = static_cast<std::byte>(static_cast<std::uint8_t>((i * 7) & 0x7E));
+  }
+  std::vector<float> scales((kRows / 128) * (kCols / 128), 0.5f);
+  std::vector<float> fp8_out(kRows * kCols);
+  ASSERT_TRUE(core::DequantizeFp8Block(std::span<const std::byte>(fp8),
+                                       std::span<const float>(scales),
+                                       std::span<float>(fp8_out), kRows, kCols)
+                  .has_value());
+  for (std::size_t r = 0; r < kRows; ++r) {
+    for (std::size_t c = 0; c < kCols; ++c) {
+      const float expected =
+          core::Fp8E4M3ToFloat(static_cast<std::uint8_t>(fp8[r * kCols + c])) *
+          scales[(r / 128) * (kCols / 128) + (c / 128)];
+      EXPECT_FLOAT_EQ(fp8_out[r * kCols + c], expected);
+    }
+  }
+}
