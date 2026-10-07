@@ -19,6 +19,7 @@
 #include "spec/dflash2_attention.hpp"
 #include "spec/dflash2_layer.hpp"
 #include "spec/dflash2_stack.hpp"
+#include "spec/dflash2_selector.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -4048,6 +4049,90 @@ TEST(BackendTest, DraftStackMatchesRef) {
                   kRows, kHidden, kHeads, kKvHeads, kHeadDim, kFfn, kTaps,
                   kGroup, kBlock, kWindow, 0, kTheta, kEps)
                   .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the DFlash2 candidate-selector block (hidden projection +
+// transition edge scores) matches the host reference.
+TEST(BackendTest, DraftSelectorMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(98);
+  constexpr std::size_t kRows = 2, kHidden = 4, kRank = 3, kVocab = 5,
+                       kTopK = 2;
+  std::vector<float> hidden(kRows * kHidden), pw(kRank * kHidden);
+  std::vector<float> pred(kVocab * kRank), succ(kVocab * kRank);
+  std::vector<float> unary(kRows * kTopK);
+  for (auto& v : hidden) v = DrawValue(rng);
+  for (auto& v : pw) v = DrawValue(rng);
+  for (auto& v : pred) v = DrawValue(rng);
+  for (auto& v : succ) v = DrawValue(rng);
+  for (auto& v : unary) v = DrawValue(rng);
+  std::vector<std::int32_t> cand(kRows * kTopK), anchor(kRows);
+  std::uniform_int_distribution<std::int32_t> pick(
+      0, static_cast<std::int32_t>(kVocab - 1));
+  for (auto& v : cand) v = pick(rng);
+  for (auto& v : anchor) v = pick(rng);
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto upf = [&backend](auto& buf, const std::vector<float>& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  auto h_b = alloc(hidden.size() * 4), pw_b = alloc(pw.size() * 4);
+  auto pr_b = alloc(pred.size() * 4), su_b = alloc(succ.size() * 4);
+  auto un_b = alloc(unary.size() * 4);
+  auto ca_b = alloc(cand.size() * 4), an_b = alloc(anchor.size() * 4);
+  auto proj_b = alloc(kRows * kRank * 4);
+  auto out_b = alloc(kRows * kTopK * kTopK * 4);
+  ASSERT_TRUE(h_b && pw_b && pr_b && su_b && un_b && ca_b && an_b && proj_b &&
+              out_b);
+  ASSERT_TRUE(upf(h_b, hidden).has_value());
+  ASSERT_TRUE(upf(pw_b, pw).has_value());
+  ASSERT_TRUE(upf(pr_b, pred).has_value());
+  ASSERT_TRUE(upf(su_b, succ).has_value());
+  ASSERT_TRUE(upf(un_b, unary).has_value());
+  ASSERT_TRUE(backend->CopyH2D(
+                  **ca_b, std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(cand.data()),
+                               cand.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(
+                  **an_b,
+                  std::span<const std::byte>(
+                      reinterpret_cast<const std::byte*>(anchor.data()),
+                      anchor.size() * 4))
+                  .has_value());
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto edge = backend->LoadKernel("selector_edge_score", {});
+  ASSERT_TRUE(gemm.has_value() && edge.has_value());
+  auto device = tessera::spec::DraftSelectorDevice(
+      *backend, **gemm, **edge, **proj_b, **h_b, **pw_b, **pr_b, **su_b, **ca_b,
+      **an_b, **un_b, **out_b, kRows, kHidden, kRank, kVocab, kTopK);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kRows * kTopK * kTopK * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_b, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kRows * kTopK * kTopK);
+  ASSERT_TRUE(tessera::spec::DraftSelectorRef(
+                  std::span<const float>(hidden), std::span<const float>(pw),
+                  std::span<const float>(pred), std::span<const float>(succ),
+                  std::span<const std::int32_t>(cand),
+                  std::span<const std::int32_t>(anchor),
+                  std::span<const float>(unary), std::span<float>(ref), kRows,
+                  kHidden, kRank, kVocab, kTopK)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   float max_abs = 0.0f;
   for (std::size_t i = 0; i < ref.size(); ++i) {
