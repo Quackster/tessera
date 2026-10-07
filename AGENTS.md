@@ -203,6 +203,9 @@ Repository-specific constraints on top of the hard rules:
 - Keep the `README.md` features table current as development progresses:
   after each finished milestone, update the Area, State, and Detail rows
   so the table matches `docs/PROGRESS.md`.
+- Hook up the CLI whenever a new feature lands: if an engine capability is
+  added (a kernel, a decode path, a loader), expose it through `tools/cli`
+  in the same change so the feature is usable from the command line.
 - Search with `rg` before assuming a behavior is missing.
 - Research model architecture online: use papers, model cards, and
   public specs for algorithm details. Do not read the local llama.cpp
