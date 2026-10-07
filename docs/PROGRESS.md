@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 227/227 on both builds.
+`ctest` passes 228/228 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -790,6 +790,12 @@ through RADV GFX1201, rocm through the system ROCm).
   gathered token embedding, so a precomputed image embedding can be fed
   as a prompt token. Test: feeding a gathered embedding buffer equals
   decoding the same token.
+
+- 2026-10-07: image load and resize (228/228 `ctest` on both builds).
+  Current head. Dependency-free binary PPM (P6) loader
+  (`tessera::LoadPpm`) to fp32 RGB [0, 1] and bilinear resize
+  (`ResizeBilinear`). Host tests cover a tiny PPM and resize. This is
+  the image input step before the vision encoder.
 
 ## Next (in order)
 

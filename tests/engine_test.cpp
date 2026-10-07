@@ -11,6 +11,7 @@
 #include "test_helpers.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
+#include "tessera/image.hpp"
 #include "tessera/vision.hpp"
 #include "tessera/types.hpp"
 
@@ -762,4 +763,39 @@ TEST(EngineTest, VisionEncodeWhenProvided) {
   for (const float value : *embeddings) {
     EXPECT_TRUE(std::isfinite(value));
   }
+}
+
+// Host: a binary PPM loads to fp32 RGB, and bilinear resize works.
+TEST(EngineTest, ImageLoadAndResize) {
+  auto dir = FreshTempDir("tessera_tests_image");
+  const std::string header = "P6\n2 2\n255\n";
+  std::vector<std::byte> bytes;
+  for (char c : header) bytes.push_back(static_cast<std::byte>(c));
+  const std::uint8_t px[12] = {255, 0, 0, 0, 255, 0,
+                               0, 0, 255, 255, 255, 255};
+  for (std::uint8_t v : px) bytes.push_back(static_cast<std::byte>(v));
+  auto path = dir / "tiny.ppm";
+  WriteBytes(path, bytes);
+  auto image = tessera::LoadPpm(path);
+  ASSERT_TRUE(image.has_value()) << tessera::ToString(image.error());
+  EXPECT_EQ(image->width, 2u);
+  EXPECT_EQ(image->height, 2u);
+  EXPECT_FLOAT_EQ(image->pixels[0], 1.0f);
+  EXPECT_FLOAT_EQ(image->pixels[1], 0.0f);
+  EXPECT_FLOAT_EQ(image->pixels[3], 0.0f);
+  EXPECT_FLOAT_EQ(image->pixels[4], 1.0f);
+  auto resized = tessera::ResizeBilinear(*image, 4, 4);
+  EXPECT_EQ(resized.width, 4u);
+  EXPECT_EQ(resized.height, 4u);
+  EXPECT_EQ(resized.pixels.size(), 4u * 4u * 3u);
+  // The centre of the output equals the average of the four inputs.
+  const std::size_t centre = (1 * 4 + 1) * 3;
+  EXPECT_FLOAT_EQ(resized.pixels[centre + 2], 0.25f);
+
+  std::vector<std::byte> notppm = {std::byte{'P'}, std::byte{'3'}};
+  auto bad_path = dir / "bad.ppm";
+  WriteBytes(bad_path, notppm);
+  auto bad = tessera::LoadPpm(bad_path);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::MalformedFile);
 }
