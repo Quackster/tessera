@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/decode_internal.hpp"
+#include "spec/dflash2_mask.hpp"
 #include "test_helpers.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/types.hpp"
@@ -556,4 +558,41 @@ TEST(HybridDecodeTest, ForwardCapturesLayerHidden) {
                           reinterpret_cast<std::byte*>(captured.data()),
                           captured.size() * 4);
   EXPECT_EQ(captured, hidden_out);
+}
+
+// The mask-token embeddings tile the gathered target embedding row.
+TEST(HybridDecodeTest, MaskEmbeddingsTileGather) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value()) << tessera::ToString(cfg.error());
+  const std::size_t hidden = cfg->hidden_dim;
+  const tessera::DeviceTensor* embed = nullptr;
+  for (const auto& weight : (*model)->Weights()) {
+    if (weight.manifest.name == "token_embd.weight") {
+      embed = &weight;
+    }
+  }
+  ASSERT_NE(embed, nullptr);
+  constexpr std::size_t kRows = 3;
+  auto buffer = tessera::spec::MaskEmbeddings(engine->Owner(), *embed, 0, kRows,
+                                              hidden);
+  ASSERT_TRUE(buffer.has_value()) << tessera::ToString(buffer.error());
+  engine->Owner().Synchronize();
+  std::vector<float> tiled(kRows * hidden);
+  engine->Owner().CopyD2H(**buffer,
+                          reinterpret_cast<std::byte*>(tiled.data()),
+                          tiled.size() * 4);
+  std::vector<float> row(hidden);
+  ASSERT_TRUE(tessera::core::detail::GatherEmbedding(
+                  engine->Owner(), *embed, 0, hidden, row)
+                  .has_value());
+  for (std::size_t r = 0; r < kRows; ++r) {
+    for (std::size_t c = 0; c < hidden; ++c) {
+      EXPECT_EQ(tiled[r * hidden + c], row[c]);
+    }
+  }
 }

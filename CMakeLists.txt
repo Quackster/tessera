@@ -51,6 +51,7 @@ add_library(tessera STATIC
     src/spec/dflash2_weights.cpp
     src/spec/dflash2_candidates.cpp
     src/spec/dflash2_drafter.cpp
+    src/spec/dflash2_mask.cpp
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
 target_compile_options(tessera PRIVATE -Wall -Wextra)
