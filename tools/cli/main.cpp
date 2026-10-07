@@ -1,7 +1,10 @@
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
 
+#include "core/decode.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
@@ -17,8 +20,11 @@ constexpr std::size_t kPrintedTensorNames = 5;
 void PrintUsage() {
   std::fprintf(stderr,
                "usage: tessera-cli run --model <path> [--draft <dir>]\n"
+               "       [--prompt <id>] [--tokens <n>]\n"
                "  --model <path>  a .gguf file or an MXFP4 model directory\n"
-               "  --draft <dir>  DFlash2 draft checkpoint directory\n");
+               "  --draft <dir>  DFlash2 draft checkpoint directory\n"
+               "  --prompt <id>  first token id for generation (default 0)\n"
+               "  --tokens <n>   run n greedy decode steps and print them\n");
 }
 
 }  // namespace
@@ -30,12 +36,18 @@ int main(int argc, char** argv) {
   }
   std::string model_path;
   std::string draft_path;
+  std::uint32_t prompt = 0;
+  std::size_t tokens = 0;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "--model" && i + 1 < argc) {
       model_path = argv[++i];
     } else if (arg == "--draft" && i + 1 < argc) {
       draft_path = argv[++i];
+    } else if (arg == "--prompt" && i + 1 < argc) {
+      prompt = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+    } else if (arg == "--tokens" && i + 1 < argc) {
+      tokens = std::stoul(argv[++i]);
     } else {
       std::fprintf(stderr, "cli: unknown or unterminated argument '%s'\n",
                    arg.data());
@@ -111,7 +123,24 @@ int main(int argc, char** argv) {
                         tensors[i].name + " [" +
                         std::to_string(tensors[i].shape.Numel()) + "]");
   }
-  // The decode loop lands in milestone 5 (docs/PROGRESS.md); the CLI
-  // today validates the load path end to end.
+  if (tokens > 0) {
+    tessera::core::DecodeCache cache;
+    std::uint32_t next = prompt;
+    std::string produced;
+    for (std::size_t step = 0; step < tokens; ++step) {
+      auto decoded =
+          tessera::core::DecodeStep(engine.Owner(), loaded, cache, next);
+      if (!decoded) {
+        log.Warn("cli", std::string("decode step ") +
+                            std::to_string(step) + " failed (" +
+                            std::string(tessera::ToString(decoded.error())) +
+                            ")");
+        return kExitError;
+      }
+      next = *decoded;
+      produced += std::to_string(next) + " ";
+    }
+    log.Info("cli", "generated tokens: " + produced);
+  }
   return kExitOk;
 }

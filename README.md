@@ -20,8 +20,8 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ and FP8/MXFP4 dequant. Host reference check. Per backend tolerance. |
 | Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
-| Decode loop | Done | Single token loop on vanilla GGUF. Hybrid configs load but decode reports unsupported. |
-| Hybrid SSM | Partial | Definition, load, sections and all kernels (norm, gate, l2norm, gated norm, conv, scan, mrope, qgate split) done. Decode wiring in work. |
+| Decode loop | Done | Single token loop on vanilla and full-attention hybrid GGUF. Linear-attention layers report unsupported. |
+| Hybrid SSM | Partial | Definition, load, all kernels, and the gated full-attention decode path done. Recurrent (linear) decode in work. |
 | MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
 | DFlash2 decode | Todo | Grouped causal convolutions. Low rank selector. Verify loop. |
 | Baseline pinning | Todo | Runs reference path on both backends. Records tolerance. |
@@ -74,7 +74,7 @@ CLI example:
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --draft ~/models/Qwen3.8-27B-DFlash2-FP8
 ```
 
-The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count and total elements. Token generation from the CLI is still in work.
+The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count and total elements. With `--tokens N` it runs N greedy decode steps from `--prompt` and prints the token ids.
 
 ## Build and test
 

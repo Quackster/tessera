@@ -20,25 +20,17 @@ using tessera::TransformerConfig;
 using tessera::testing::DrawValue;
 using tessera::testing::FreshTempDir;
 using tessera::testing::GgufBuilder;
+using tessera::testing::MakeEngineOrSkip;
 using tessera::testing::MakeSafetensorsContainer;
 using tessera::testing::MakeValidGguf;
 using tessera::testing::QuantizeRows;
 using tessera::testing::WriteBytes;
+using tessera::testing::WriteGatedHybridFixture;
 using tessera::testing::WriteHybridFixture;
 using tessera::testing::WritePlaceholderConfig;
 using tessera::testing::WritePlaceholderWeights;
 
 namespace {
-
-// A device is required for the engine; skip cleanly without one.
-void MakeEngineOrSkip(std::unique_ptr<Engine>& engine) {
-  auto created = Engine::Create(EngineOptions{});
-  if (!created) {
-    GTEST_SKIP()
-        << "no device available: " << tessera::ToString(created.error());
-  }
-  engine = std::move(*created);
-}
 
 std::filesystem::path WriteGgufFixture(const std::string& name) {
   auto dir = FreshTempDir("tessera_tests_engine");
@@ -489,6 +481,28 @@ TEST(EngineTest, HybridDecodeReturnsUnsupported) {
   auto step = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
   ASSERT_FALSE(step.has_value());
   EXPECT_EQ(step.error(), StatusCode::UnsupportedFeature);
+}
+TEST(EngineTest, GatedHybridDecodesDeterministically) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteGatedHybridFixture("gated.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto config = (*model)->Config();
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_TRUE(config->hybrid);
+  tessera::core::DecodeCache cache;
+  auto first = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
+  ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
+  EXPECT_LT(*first, 32u);
+  auto second =
+      tessera::core::DecodeStep(engine->Owner(), **model, cache, *first);
+  ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
+  EXPECT_LT(*second, 32u);
+  tessera::core::DecodeCache replay;
+  auto again = tessera::core::DecodeStep(engine->Owner(), **model, replay, 0);
+  ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
+  EXPECT_EQ(*again, *first);
 }
 
 TEST(EngineTest, LoadModelAttentionMxFp4Unsupported) {

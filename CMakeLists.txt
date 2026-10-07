@@ -13,6 +13,7 @@ set_property(CACHE TESSERA_BACKEND PROPERTY STRINGS vulkan rocm)
 
 add_library(tessera STATIC
     src/core/decode.cpp
+    src/core/decode_hybrid.cpp
     src/core/engine.cpp
     src/core/model.cpp
     src/core/files.cpp
@@ -143,6 +144,7 @@ endif()
 
 add_executable(tessera-cli tools/cli/main.cpp)
 target_link_libraries(tessera-cli PRIVATE tessera)
+target_include_directories(tessera-cli PRIVATE src)
 
 enable_testing()
 
