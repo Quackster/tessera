@@ -25,7 +25,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | MXFP4 loader | Done | Parses tensor map. Uploads weights. FP8 and MXFP4 GEMM verified. |
 | Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. |
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. |
-| DFlash2 | Skeleton | Validates checkpoint layout. Draft logic is in work. |
+| DFlash2 | Partial | Draft forward built: grouped dynamic convolution, sliding attention, candidate selector and target-hidden fusion. The real draft loads and runs one block. |
 | CLI | Partial | Loads model, prints summary, generates tokens (`--tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). Text prompts need a tokenizer. |
 | Generation | Done | `Engine::Generate` greedy decode on the non-speculative path. Runtime options: `--context`, `--draft-block`. |
 | Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
@@ -34,9 +34,9 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. 27B generates. |
 | Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. |
-| Speculative decode | Partial | MTP draft and greedy verifier run end to end (`--speculate`); output equals greedy. Batched scoring and the DFlash2 draft are in work. |
+| Speculative decode | Partial | MTP draft and greedy verifier run end to end (`--speculate`); output equals greedy. DFlash2 draft forward built; engine wiring and batched scoring in work. |
 | MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
-| DFlash2 decode | Todo | Grouped causal convolutions. Low rank selector. Verify loop. |
+| DFlash2 decode | Partial | Draft block runs on the device with the real checkpoint. Engine integration (target hidden, mask block, accept/reject) in work. |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
 | MoE, MLP, norms | Partial | RMSNorm and sigmoid-gate kernels done. MLP and embedding kernels in work. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
 
