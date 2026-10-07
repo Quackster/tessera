@@ -29,6 +29,8 @@ void PrintUsage() {
                "       [--prompt <id>] [--prompt-text <str>] [--tokens <n>]\n"
                "       tessera-cli serve --model <path> [--host <ip>] "
                "[--port <n>]\n"
+               "       tessera-cli --list-gpus\n"
+               "  --list-gpus       list the GPUs the backend sees and exit\n"
                "  --model <path>    a .gguf file or an MXFP4 model directory\n"
                "  --draft <dir>     DFlash2 draft checkpoint directory\n"
                "  --context <n>     maximum context length (default %zu)\n"
@@ -55,6 +57,18 @@ int main(int argc, char** argv) {
     return kExitUsage;
   }
   const std::string_view command = argv[1];
+  if (command == "--list-gpus") {
+    auto names = tessera::ListGpuNames();
+    if (!names) {
+      std::fprintf(stderr, "cli: cannot list GPUs (%s)\n",
+                   tessera::ToString(names.error()).data());
+      return kExitError;
+    }
+    for (std::size_t i = 0; i < names->size(); ++i) {
+      std::printf("gpu %zu: %s\n", i, (*names)[i].c_str());
+    }
+    return kExitOk;
+  }
   if (command != "run" && command != "serve") {
     PrintUsage();
     return kExitUsage;

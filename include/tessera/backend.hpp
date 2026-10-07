@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "tessera/log.hpp"
 #include "tessera/types.hpp"
@@ -580,5 +581,12 @@ class Backend {
 // Construct the configured backend. Returns nullptr only when the build
 // has no backend (a misconfiguration the engine reports as an error).
 [[nodiscard]] std::unique_ptr<Backend> CreateBackend();
+
+// Enumerate the GPUs the configured backend can see, in index order (the
+// index is what EngineOptions::device_index selects). Creates its own
+// temporary device context; no engine is needed. DeviceError when the
+// backend is unavailable or sees no GPU.
+[[nodiscard]] std::expected<std::vector<std::string>, StatusCode>
+ListGpuNames();
 
 }  // namespace tessera

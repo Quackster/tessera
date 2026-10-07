@@ -599,6 +599,16 @@ TEST(EngineTest, AttachSpeculativeValid) {
   EXPECT_EQ(engine->Speculative()->Name(), "dflash2");
 }
 
+// --list-gpus path: when a device is present the backend enumerates at
+// least that device, and the index matches the one Engine::Create picks.
+TEST(EngineTest, ListGpuNamesWhenDevice) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto names = tessera::ListGpuNames();
+  ASSERT_TRUE(names.has_value()) << tessera::ToString(names.error());
+  EXPECT_FALSE(names->empty());
+}
+
 // Engine::Create selects the GPU by index (default 0). An out-of-range
 // index is InvalidArgument, not a crash or a silent fallback.
 TEST(EngineTest, RejectsOutOfRangeDeviceIndex) {

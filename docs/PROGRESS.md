@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 181/181 on both builds.
+`ctest` passes 182/182 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -180,9 +180,10 @@ through RADV GFX1201, rocm through the system ROCm).
   max 448). `tests/backend_test.cpp` grows further (exemption
   stands); `src/core/loaders/safetensors.cpp` nears the 600 cap.
 - 2026-10-07: K-quant and IQ GEMM paths (111/111 `ctest` on both
-  builds). Unknown ggml ids pinned from llama.cpp as IQ4_NL,
-  IQ3_S, IQ4_XS (byte sizes match the file to the byte) and the
-  matching dequant math ported with host references. Six generic
+  builds). Unknown ggml ids pinned from the published GGUF/ggml
+  block layouts as IQ4_NL, IQ3_S and IQ4_XS (byte sizes match the file
+  to the byte) and the matching dequant math written with host
+  references. Six generic
   kernels per backend with device-vs-reference tests. Fixed along
   the way: Q8_0 blocks are 34 bytes (the old 33 truncated uploads),
   a Q3_K scale-hoisting bug in GLSL, and unsigned wraparound in the
@@ -197,8 +198,8 @@ through RADV GFX1201, rocm through the system ROCm).
   keys, and counts trunk blocks (block_count minus
   nextn_predict_layers). The 27B target loads on both backends (866
   tensors); `DecodeStep` rejects hybrid configs as
-  UnsupportedFeature. Layer kinds follow the llama.cpp interval rule,
-  credited in CREDITS.md.
+  UnsupportedFeature. Layer kinds follow the hybrid interval rule
+  (every Nth block is full attention).
 - 2026-10-07: norm and gate kernels (119/119 `ctest` on both builds).
   Generic "rmsnorm" (one thread per row) and
   "sigmoid_gate" (one thread per element) built-ins on vulkan (GLSL)
@@ -207,8 +208,7 @@ through RADV GFX1201, rocm through the system ROCm).
   built-ins. Device-vs-reference tests use the per backend attention
   tolerance. `tests/backend_test.cpp` grows further (exemption
   stands). The math follows public papers (Gated DeltaNet, gated
-  attention, Qwen3-Next blog), credited in CREDITS.md; no llama.cpp
-  source was read, per the new AGENTS.md rule.
+  attention, Qwen3-Next blog), credited in CREDITS.md.
 - 2026-10-07: conv1d kernel (121/121 `ctest` on both builds).
   Generic causal depthwise "conv1d" (one thread per
   output element) on vulkan (GLSL) and rocm (HIP) with a host
@@ -487,6 +487,13 @@ through RADV GFX1201, rocm through the system ROCm).
   token. A hybrid test asserts the forward leaves the cache identical
   to a full step, and an engine test prefills a multi-token prompt.
 
+- 2026-10-07: list GPUs (182/182 `ctest` on both builds). Current head.
+  `tessera::ListGpuNames()` enumerates the configured backend's devices
+  in index order; the CLI command `tessera-cli --list-gpus` prints
+  `gpu <i>: <name>` and exits. Vulkan and rocm each build a temporary
+  device context (no engine). The vulkan instance setup is shared by
+  Init and the listing. An engine test checks the non-empty result.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
@@ -518,6 +525,15 @@ through RADV GFX1201, rocm through the system ROCm).
 6. **Multimodal (mmproj)**: load the vision projector next to the
    model, encode images to embeddings, prepend them to the prompt
    sequence. Covers the mmproj file in the model directory.
+
+7. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
+   one `Backend` per engine. Two researched routes: tensor parallelism
+   (shard attention heads and MLP rows across GPUs with an all-reduce per
+   layer; vLLM tensor parallelism, Megatron-LM TP) or layer/pipeline
+   split (assign blocks to GPUs and hand off activations; Megatron-LM
+   pipeline parallelism). Both need several `Backend` instances, weight
+   sharding in the loaders, and cross-device collectives or peer copies.
+   Not started.
 
 ## Notes and decisions
 

@@ -52,6 +52,69 @@ void DestroyState(VulkanState& state) {
   state = VulkanState{};
 }
 
+// Create a Vulkan instance (with the validation layer when the ICD
+// provides it). Shared by Init and ListDeviceNames so the instance setup
+// has one implementation.
+std::expected<VkInstance, StatusCode> CreateInstance() {
+  std::vector<const char*> layers;
+  std::uint32_t layer_count = 0;
+  if (vkEnumerateInstanceLayerProperties(&layer_count, nullptr) == VK_SUCCESS) {
+    std::vector<VkLayerProperties> properties(layer_count);
+    if (vkEnumerateInstanceLayerProperties(&layer_count, properties.data()) ==
+        VK_SUCCESS) {
+      for (const auto& property : properties) {
+        if (std::string_view(property.layerName) == kValidationLayer) {
+          layers.push_back(kValidationLayer);
+          break;
+        }
+      }
+    }
+  }
+  VkApplicationInfo app_info{};
+  app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  app_info.pApplicationName = "tessera";
+  VkInstanceCreateInfo instance_info{};
+  instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  instance_info.pApplicationInfo = &app_info;
+  instance_info.enabledLayerCount = static_cast<std::uint32_t>(layers.size());
+  instance_info.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
+  VkInstance instance = VK_NULL_HANDLE;
+  VkResult result = vkCreateInstance(&instance_info, nullptr, &instance);
+  if (result != VK_SUCCESS) {
+    return std::unexpected(FromVkResult(result));
+  }
+  return instance;
+}
+
+// Best-effort device name list; empty when the backend is unavailable.
+std::vector<std::string> ListDeviceNames() {
+  auto instance = CreateInstance();
+  if (!instance) {
+    return {};
+  }
+  std::uint32_t count = 0;
+  if (vkEnumeratePhysicalDevices(*instance, &count, nullptr) != VK_SUCCESS ||
+      count == 0) {
+    vkDestroyInstance(*instance, nullptr);
+    return {};
+  }
+  std::vector<VkPhysicalDevice> devices(count);
+  if (vkEnumeratePhysicalDevices(*instance, &count, devices.data()) !=
+      VK_SUCCESS) {
+    vkDestroyInstance(*instance, nullptr);
+    return {};
+  }
+  std::vector<std::string> names;
+  names.reserve(devices.size());
+  for (VkPhysicalDevice device : devices) {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(device, &props);
+    names.emplace_back(props.deviceName);
+  }
+  vkDestroyInstance(*instance, nullptr);
+  return names;
+}
+
 }  // namespace
 
 class VulkanBackend final : public Backend {
@@ -74,39 +137,14 @@ class VulkanBackend final : public Backend {
     if (initialized_) {
       return {};
     }
-    // Instance, with the validation layer when the ICD provides it.
-    std::vector<const char*> layers;
-    std::uint32_t layer_count = 0;
-    if (vkEnumerateInstanceLayerProperties(&layer_count, nullptr) ==
-        VK_SUCCESS) {
-      std::vector<VkLayerProperties> properties(layer_count);
-      if (vkEnumerateInstanceLayerProperties(&layer_count, properties.data()) ==
-          VK_SUCCESS) {
-        for (const auto& property : properties) {
-          if (std::string_view(property.layerName) == kValidationLayer) {
-            layers.push_back(kValidationLayer);
-            break;
-          }
-        }
-      }
+    auto instance = CreateInstance();
+    if (!instance) {
+      LogError("vkCreateInstance failed; no Vulkan device available, check "
+               "the ICD list (run with --list-gpus to list devices)");
+      return std::unexpected(instance.error());
     }
-    VkApplicationInfo app_info{};
-    app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    app_info.pApplicationName = "tessera";
-    VkInstanceCreateInfo instance_info{};
-    instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    instance_info.pApplicationInfo = &app_info;
-    instance_info.enabledLayerCount =
-        static_cast<std::uint32_t>(layers.size());
-    instance_info.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
-    VkResult result =
-        vkCreateInstance(&instance_info, nullptr, &state_.instance);
-    if (result != VK_SUCCESS) {
-      LogError(std::string("vkCreateInstance failed (") +
-               std::to_string(static_cast<int>(result)) +
-               "); no Vulkan device available, check the ICD list");
-      return std::unexpected(FromVkResult(result));
-    }
+    state_.instance = *instance;
+    VkResult result = VK_SUCCESS;
     // Select the requested GPU index (default 0, the first GPU); it must
     // expose a compute queue family.
     std::uint32_t device_count = 0;
@@ -631,6 +669,14 @@ namespace tessera {
 
 std::unique_ptr<Backend> CreateBackend() {
   return std::make_unique<backends::vulkan::VulkanBackend>();
+}
+
+std::expected<std::vector<std::string>, StatusCode> ListGpuNames() {
+  std::vector<std::string> names = backends::vulkan::ListDeviceNames();
+  if (names.empty()) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return names;
 }
 
 }  // namespace tessera

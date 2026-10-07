@@ -316,12 +316,39 @@ class RocmBackend final : public Backend {
   bool initialized_ = false;
 };
 
+// Best-effort device name list; empty when the runtime is unavailable.
+std::vector<std::string> ListDeviceNames() {
+  int count = 0;
+  if (hipGetDeviceCount(&count) != hipSuccess || count <= 0) {
+    return {};
+  }
+  std::vector<std::string> names;
+  names.reserve(static_cast<std::size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    hipDeviceProp_t props{};
+    if (hipGetDeviceProperties(&props, i) == hipSuccess) {
+      names.emplace_back(props.name);
+    } else {
+      names.emplace_back("unknown");
+    }
+  }
+  return names;
+}
+
 }  // namespace tessera::backends::rocm
 
 namespace tessera {
 
 std::unique_ptr<Backend> CreateBackend() {
   return std::make_unique<backends::rocm::RocmBackend>();
+}
+
+std::expected<std::vector<std::string>, StatusCode> ListGpuNames() {
+  std::vector<std::string> names = backends::rocm::ListDeviceNames();
+  if (names.empty()) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return names;
 }
 
 }  // namespace tessera
