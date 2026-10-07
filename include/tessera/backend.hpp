@@ -179,6 +179,11 @@ class Kernel {
 // and the fp32 epsilon bits. Y = X / sqrt(mean(X^2) + eps) * W *
 // silu(gate) per row. The dispatch is ceil(rows / 256) workgroups of
 // 256.
+// "add": buffers 0 and 1 are A and B (fp32, n each) and buffer 2 the
+// output O (fp32, n); scalar 0 is n. O = A + B elementwise.
+// "silu_mul": buffers are G and U (fp32, n each) and the output O
+// (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
+// for both is ceil(n / 256) workgroups of 256.
 // "conv1d": buffer 0 is X (fp32, channels x length), buffer 1 the
 // weights W (fp32, channels x width), buffer 2 the output Y (fp32,
 // channels x length); scalars are channels, length, width. Y is the
@@ -324,6 +329,14 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "add" || kernel.Id() == "silu_mul") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 1) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

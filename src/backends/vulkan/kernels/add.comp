@@ -1,0 +1,21 @@
+#version 450
+
+// One thread per element; the dispatch is ceil(n / 256) workgroups.
+layout(local_size_x = 256) in;
+
+// "add" contract: buffers A, B, O (fp32, n each); O = A + B.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) buffer B { float b[]; };
+layout(set = 0, binding = 2) buffer O { float o[]; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.v[0]) {
+    return;
+  }
+  o[i] = a[i] + b[i];
+}

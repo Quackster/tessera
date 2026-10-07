@@ -2478,3 +2478,97 @@ TEST(BackendTest, LinearNormRejectsBadArgs) {
   ASSERT_FALSE(bad_gated_contract.has_value());
   EXPECT_EQ(bad_gated_contract.error(), StatusCode::InvalidArgument);
 }
+
+// Device: elementwise add matches the host reference.
+TEST(BackendTest, AddDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(72);
+  constexpr std::size_t kN = 256;
+  std::vector<float> a(kN);
+  std::vector<float> b(kN);
+  for (auto& v : a) v = DrawValue(rng);
+  for (auto& v : b) v = DrawValue(rng);
+  auto a_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto b_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto o_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && b_buf && o_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(a_buf, a).has_value());
+  ASSERT_TRUE(upload(b_buf, b).has_value());
+  auto kernel = backend->LoadKernel("add", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*b_buf).get(), (*o_buf).get()};
+  launch.scalars = {kN};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**o_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kN);
+  auto ref_status = core::AddRef(std::span<const float>(a),
+                                 std::span<const float>(b),
+                                 std::span<float>(ref), kN);
+  ASSERT_TRUE(ref_status.has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  for (std::size_t i = 0; i < kN; ++i) {
+    EXPECT_FLOAT_EQ(got[i], ref[i]);
+  }
+  // Contract: two buffers is invalid.
+  launch.buffers = {(*a_buf).get(), (*b_buf).get()};
+  auto bad = backend->LaunchKernel(**kernel, launch);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+}
+
+// Device: silu(gate) * up matches the host reference.
+TEST(BackendTest, SiluMulDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(73);
+  constexpr std::size_t kN = 256;
+  std::vector<float> g(kN);
+  std::vector<float> u(kN);
+  for (auto& v : g) v = DrawValue(rng);
+  for (auto& v : u) v = DrawValue(rng);
+  auto g_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto u_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto o_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(g_buf && u_buf && o_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(g_buf, g).has_value());
+  ASSERT_TRUE(upload(u_buf, u).has_value());
+  auto kernel = backend->LoadKernel("silu_mul", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*g_buf).get(), (*u_buf).get(), (*o_buf).get()};
+  launch.scalars = {kN};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**o_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kN);
+  auto ref_status = core::SiluMulRef(std::span<const float>(g),
+                                     std::span<const float>(u),
+                                     std::span<float>(ref), kN);
+  ASSERT_TRUE(ref_status.has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < kN; ++i) {
+    EXPECT_NEAR(got[i], ref[i], tol.abs);
+  }
+}

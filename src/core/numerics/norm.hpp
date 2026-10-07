@@ -60,4 +60,18 @@ namespace tessera::core {
     std::span<const float> gate, std::span<float> y, std::size_t rows,
     std::size_t cols, float eps);
 
+// Host reference for the "add" built-in: elementwise a + b over n fp32.
+// Residual connections use this on the device. n must be nonzero and
+// every span must hold n elements; else InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> AddRef(
+    std::span<const float> a, std::span<const float> b, std::span<float> out,
+    std::size_t n);
+
+// Host reference for the "silu_mul" built-in: out = silu(gate) * up over
+// n fp32. The gated MLP uses this on the device. n must be nonzero and
+// every span must hold n elements; else InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> SiluMulRef(
+    std::span<const float> gate, std::span<const float> up,
+    std::span<float> out, std::size_t n);
+
 }  // namespace tessera::core

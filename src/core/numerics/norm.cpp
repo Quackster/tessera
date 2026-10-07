@@ -102,4 +102,36 @@ std::expected<void, StatusCode> RmsNormGatedRef(
   return {};
 }
 
+std::expected<void, StatusCode> AddRef(std::span<const float> a,
+                                       std::span<const float> b,
+                                       std::span<float> out, std::size_t n) {
+  if (n == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (a.size() != n || b.size() != n || out.size() != n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = a[i] + b[i];
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> SiluMulRef(std::span<const float> gate,
+                                           std::span<const float> up,
+                                           std::span<float> out,
+                                           std::size_t n) {
+  if (n == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (gate.size() != n || up.size() != n || out.size() != n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    const float silu = gate[i] / (1.0f + std::exp(-gate[i]));
+    out[i] = silu * up[i];
+  }
+  return {};
+}
+
 }  // namespace tessera::core

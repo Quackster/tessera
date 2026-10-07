@@ -399,4 +399,29 @@ __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
   q[t] = fused[src + e];
   gate[t] = fused[src + head_dim + e];
 }
+// Built-in "add": elementwise o = a + b over n fp32. One thread per
+// element.
+__global__ void AddKernel(const float* a, const float* b, float* o,
+                          unsigned long long n) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  o[i] = a[i] + b[i];
+}
+
+// Built-in "silu_mul": elementwise o = silu(g) * u over n fp32. One
+// thread per element.
+__global__ void SiluMulKernel(const float* g, const float* u, float* o,
+                              unsigned long long n) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  const float gate = g[i];
+  o[i] = (gate / (1.0f + expf(-gate))) * u[i];
+}
+
 }  // namespace tessera::backends::rocm

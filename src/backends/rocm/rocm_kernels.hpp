@@ -128,5 +128,9 @@ __global__ void MropeKernel(float* data, const unsigned long long* pos,
 __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
                                  unsigned long long heads,
                                  unsigned long long head_dim);
+__global__ void AddKernel(const float* a, const float* b, float* o,
+                          unsigned long long n);
+__global__ void SiluMulKernel(const float* g, const float* u, float* o,
+                              unsigned long long n);
 
 }  // namespace tessera::backends::rocm
