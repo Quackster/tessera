@@ -32,4 +32,32 @@ namespace tessera::core {
     std::span<const float> a, std::span<const float> g, std::span<float> out,
     std::size_t n);
 
+// Host reference for the "l2norm" built-in: row-wise L2 normalization
+// over rows x cols fp32 (y = x / sqrt(sum(x^2) + eps), ascending
+// accumulation, the order the kernels use). The gated delta rule
+// normalizes its queries and keys this way before the scan. Rows and
+// cols must be nonzero, eps must not be negative, and the spans must
+// hold rows*cols elements; else InvalidArgument.
+//
+// Usage:
+//   auto status = L2NormRef(x, y, rows, cols, 1e-6f);
+[[nodiscard]] std::expected<void, StatusCode> L2NormRef(
+    std::span<const float> x, std::span<float> y, std::size_t rows,
+    std::size_t cols, float eps);
+
+// Host reference for the "rmsnorm_gated" built-in: row-wise RMS
+// normalization scaled by a SiLU gate over rows x cols fp32
+// (y = x / sqrt(mean(x^2) + eps) * w * silu(gate)). The linear-
+// attention block normalizes the scan output and gates it with the z
+// projection. Rows and cols must be nonzero, eps must not be negative,
+// and the spans must hold rows*cols (x, gate) and cols (w); else
+// InvalidArgument.
+//
+// Usage:
+//   auto status = RmsNormGatedRef(x, w, gate, y, rows, cols, 1e-6f);
+[[nodiscard]] std::expected<void, StatusCode> RmsNormGatedRef(
+    std::span<const float> x, std::span<const float> w,
+    std::span<const float> gate, std::span<float> y, std::size_t rows,
+    std::size_t cols, float eps);
+
 }  // namespace tessera::core

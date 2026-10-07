@@ -49,6 +49,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_q80", reinterpret_cast<void*>(&GemmQ80Kernel)},
     {"rmsnorm", reinterpret_cast<void*>(&RmsnormKernel)},
     {"sigmoid_gate", reinterpret_cast<void*>(&SigmoidGateKernel)},
+    {"l2norm", reinterpret_cast<void*>(&L2NormKernel)},
+    {"rmsnorm_gated", reinterpret_cast<void*>(&RmsnormGatedKernel)},
     {"conv1d", reinterpret_cast<void*>(&Conv1dKernel)},
     {"delta_step", reinterpret_cast<void*>(&DeltaStepKernel)},
     {"mrope", reinterpret_cast<void*>(&MropeKernel)},

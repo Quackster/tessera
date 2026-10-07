@@ -237,6 +237,60 @@ __global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
   }
   o[i] = a[i] / (1.0f + expf(-g[i]));
 }
+
+// Built-in "l2norm": row-wise L2 normalization over rows x cols fp32.
+// One thread per row with sequential accumulation.
+__global__ void L2NormKernel(const float* x, float* y,
+                             unsigned long long rows, unsigned long long cols,
+                             unsigned long long eps_bits) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  float eps = 0.0f;
+  static_assert(sizeof(eps) == 4);
+  std::uint32_t bits = static_cast<std::uint32_t>(eps_bits);
+  std::memcpy(&eps, &bits, 4);
+  float sum = 0.0f;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    sum = fmaf(x[r * cols + c], x[r * cols + c], sum);
+  }
+  const float gain = 1.0f / sqrtf(sum + eps);
+  for (unsigned long long c = 0; c < cols; ++c) {
+    y[r * cols + c] = x[r * cols + c] * gain;
+  }
+}
+
+// Built-in "rmsnorm_gated": row-wise RMS norm scaled by a SiLU gate
+// over rows x cols fp32. One thread per row with sequential
+// accumulation.
+__global__ void RmsnormGatedKernel(const float* x, const float* w,
+                                   const float* gate, float* y,
+                                   unsigned long long rows,
+                                   unsigned long long cols,
+                                   unsigned long long eps_bits) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  float eps = 0.0f;
+  static_assert(sizeof(eps) == 4);
+  std::uint32_t bits = static_cast<std::uint32_t>(eps_bits);
+  std::memcpy(&eps, &bits, 4);
+  float mean = 0.0f;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    mean = fmaf(x[r * cols + c], x[r * cols + c], mean);
+  }
+  mean /= static_cast<float>(cols);
+  const float gain = 1.0f / sqrtf(mean + eps);
+  for (unsigned long long c = 0; c < cols; ++c) {
+    const float g = gate[r * cols + c];
+    const float silu = g / (1.0f + expf(-g));
+    y[r * cols + c] = x[r * cols + c] * gain * w[c] * silu;
+  }
+}
 // Built-in "conv1d": causal depthwise convolution over channels x
 // length fp32. One thread per output element, sequential accumulation.
 __global__ void Conv1dKernel(const float* x, const float* w, float* y,

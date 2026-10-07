@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 132/132 on both builds.
+`ctest` passes 135/135 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -61,6 +61,10 @@ through RADV GFX1201, rocm through the system ROCm).
   query then gate per head; the split yields the queries and the gates
   for the sigmoid output gate. Verified against the host reference on
   both devices.
+- Generic L2 normalization and gated RMS normalization for the linear
+  attention path: L2 normalizes delta queries and keys before the
+  scan; the gated form normalizes the scan output and scales it by a
+  SiLU gate. Both verified against host references on both devices.
 - Weight upload: `Model::Load` allocates one device buffer per
   manifest tensor and copies the file bytes through the backend.
   `Model::Weights` exposes them next to the manifest. Unsized
@@ -204,11 +208,19 @@ through RADV GFX1201, rocm through the system ROCm).
   reference next to the attention refs; contract in
   `include/tessera/backend.hpp`.
 - 2026-10-07: Q8_0 GEMM kernel (132/132 `ctest` on both builds).
-  Current head. Generic "gemm_q80" (34-byte blocks: fp16 scale plus 32
+  Generic "gemm_q80" (34-byte blocks: fp16 scale plus 32
   signed bytes) on vulkan (GLSL) and rocm (HIP), with a host dequant
   and GEMM reference in the quant/gemm pair. The hybrid linear layers
-  use Q8_0 for their gate projections, so this closes the last missing
+  use Q8_0   for their gate projections, so this closes the last missing
   GEMM format before decode wiring.
+- 2026-10-07: linear-attention normalizations (135/135 `ctest` on both
+  builds). Current head. Generic "l2norm" and "rmsnorm_gated" (one
+  thread per row) on vulkan (GLSL) and rocm (HIP) with host references
+  in `src/core/numerics/norm.*`. The gated delta rule normalizes q and
+  k with L2 and gates the scan output through the gated RMS norm.
+  Contracts in `include/tessera/backend.hpp`. All projection, norm,
+  gate, conv, scan, mrope and split kernels the hybrid path needs are
+  now in place.
 
 ## Next (in order)
 

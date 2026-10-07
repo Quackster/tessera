@@ -21,7 +21,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla GGUF. Hybrid configs load but decode reports unsupported. |
-| Hybrid SSM | Partial | Definition, load, sections and kernels (norm, gate, conv, scan, mrope, qgate split) done. Decode wiring in work. |
+| Hybrid SSM | Partial | Definition, load, sections and all kernels (norm, gate, l2norm, gated norm, conv, scan, mrope, qgate split) done. Decode wiring in work. |
 | MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
 | DFlash2 decode | Todo | Grouped causal convolutions. Low rank selector. Verify loop. |
 | Baseline pinning | Todo | Runs reference path on both backends. Records tolerance. |

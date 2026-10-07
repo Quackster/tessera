@@ -44,6 +44,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_q80", kGemmQ80SpirV, sizeof(kGemmQ80SpirV)},
     {"rmsnorm", kRmsnormSpirV, sizeof(kRmsnormSpirV)},
     {"sigmoid_gate", kSigmoidGateSpirV, sizeof(kSigmoidGateSpirV)},
+    {"l2norm", kL2NormSpirV, sizeof(kL2NormSpirV)},
+    {"rmsnorm_gated", kRmsnormGatedSpirV, sizeof(kRmsnormGatedSpirV)},
     {"conv1d", kConv1dSpirV, sizeof(kConv1dSpirV)},
     {"delta_step", kDeltaStepSpirV, sizeof(kDeltaStepSpirV)},
     {"mrope", kMropeSpirV, sizeof(kMropeSpirV)},

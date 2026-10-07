@@ -48,4 +48,58 @@ std::expected<void, StatusCode> SigmoidGateRef(std::span<const float> a,
   return {};
 }
 
+std::expected<void, StatusCode> L2NormRef(std::span<const float> x,
+                                          std::span<float> y,
+                                          std::size_t rows, std::size_t cols,
+                                          float eps) {
+  if (rows == 0 || cols == 0 || eps < 0.0f) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (x.size() != rows * cols || y.size() != rows * cols) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    const float* x_row = x.data() + r * cols;
+    float sum = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      sum = std::fma(x_row[c], x_row[c], sum);
+    }
+    const float gain = 1.0f / std::sqrt(sum + eps);
+    float* y_row = y.data() + r * cols;
+    for (std::size_t c = 0; c < cols; ++c) {
+      y_row[c] = x_row[c] * gain;
+    }
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> RmsNormGatedRef(
+    std::span<const float> x, std::span<const float> w,
+    std::span<const float> gate, std::span<float> y, std::size_t rows,
+    std::size_t cols, float eps) {
+  if (rows == 0 || cols == 0 || eps < 0.0f) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (x.size() != rows * cols || gate.size() != rows * cols ||
+      w.size() != cols || y.size() != rows * cols) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    const float* x_row = x.data() + r * cols;
+    const float* gate_row = gate.data() + r * cols;
+    float mean = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      mean = std::fma(x_row[c], x_row[c], mean);
+    }
+    mean /= static_cast<float>(cols);
+    const float gain = 1.0f / std::sqrt(mean + eps);
+    float* y_row = y.data() + r * cols;
+    for (std::size_t c = 0; c < cols; ++c) {
+      const float silu = gate_row[c] / (1.0f + std::exp(-gate_row[c]));
+      y_row[c] = x_row[c] * gain * w[c] * silu;
+    }
+  }
+  return {};
+}
+
 }  // namespace tessera::core

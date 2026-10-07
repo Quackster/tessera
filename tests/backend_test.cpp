@@ -2273,3 +2273,172 @@ TEST(BackendTest, QGateSplitRejectsBadArgs) {
   ASSERT_FALSE(bad_contract.has_value());
   EXPECT_EQ(bad_contract.error(), StatusCode::InvalidArgument);
 }
+
+// Device: row-wise L2 normalization matches the host reference (4 rows
+// of 16, epsilon 1e-6).
+TEST(BackendTest, L2NormDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(48);
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kCols = 16;
+  constexpr float kEps = 1e-6f;
+  std::vector<float> x(kRows * kCols);
+  for (auto& v : x) {
+    v = DrawValue(rng);
+  }
+  auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto y_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf.has_value() && y_buf.has_value());
+  auto upload = backend->CopyH2D(**x_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(x.data()), x.size() * 4));
+  ASSERT_TRUE(upload.has_value()) << tessera::ToString(upload.error());
+  std::uint32_t eps_bits = 0;
+  static_assert(sizeof(eps_bits) == sizeof(kEps));
+  std::memcpy(&eps_bits, &kEps, sizeof(eps_bits));
+  auto kernel = backend->LoadKernel("l2norm", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*x_buf).get(), (*y_buf).get()};
+  launch.scalars = {kRows, kCols, eps_bits};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(x.size() * 4);
+  auto download =
+      backend->CopyD2H(**y_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(x.size());
+  auto ref_status = core::L2NormRef(std::span<const float>(x),
+                                    std::span<float>(ref), kRows, kCols, kEps);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: gated RMS normalization matches the host reference (4 rows
+// of 16, unit weights plus a scale, random gate).
+TEST(BackendTest, RmsNormGatedDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(49);
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kCols = 16;
+  constexpr float kEps = 1e-6f;
+  std::vector<float> x(kRows * kCols);
+  std::vector<float> gate(kRows * kCols);
+  std::vector<float> w(kCols, 1.0f);
+  for (auto& v : x) {
+    v = DrawValue(rng);
+  }
+  for (auto& v : gate) {
+    v = DrawValue(rng);
+  }
+  w[0] = 0.5f;
+  auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size() * 4, MemoryKind::Device);
+  auto gate_buf = backend->AllocateBuffer(gate.size() * 4, MemoryKind::Device);
+  auto y_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf.has_value() && w_buf.has_value() && gate_buf.has_value() &&
+              y_buf.has_value());
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(upload(w_buf, w).has_value());
+  ASSERT_TRUE(upload(gate_buf, gate).has_value());
+  std::uint32_t eps_bits = 0;
+  static_assert(sizeof(eps_bits) == sizeof(kEps));
+  std::memcpy(&eps_bits, &kEps, sizeof(eps_bits));
+  auto kernel = backend->LoadKernel("rmsnorm_gated", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*x_buf).get(), (*w_buf).get(), (*gate_buf).get(),
+                    (*y_buf).get()};
+  launch.scalars = {kRows, kCols, eps_bits};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(x.size() * 4);
+  auto download =
+      backend->CopyD2H(**y_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(x.size());
+  auto ref_status = core::RmsNormGatedRef(
+      std::span<const float>(x), std::span<const float>(w),
+      std::span<const float>(gate), std::span<float>(ref), kRows, kCols, kEps);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Host and contract: the l2norm and rmsnorm_gated references and the
+// launch contracts reject malformed shapes at the boundary.
+TEST(BackendTest, LinearNormRejectsBadArgs) {
+  std::vector<float> x(4 * 8, 0.5f);
+  std::vector<float> w(8, 1.0f);
+  std::vector<float> gate(4 * 8, 0.5f);
+  std::vector<float> y(4 * 8);
+  auto bad = core::L2NormRef(std::span<const float>(x), std::span<float>(y), 0,
+                             8, 1e-6f);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  bad = core::L2NormRef(std::span<const float>(x), std::span<float>(y), 4, 8,
+                        -1.0f);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  auto bad_gated = core::RmsNormGatedRef(
+      std::span<const float>(x), std::span<const float>(w),
+      std::span<const float>(gate), std::span<float>(y), 4, 8, -1.0f);
+  ASSERT_FALSE(bad_gated.has_value());
+  EXPECT_EQ(bad_gated.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_gate(4, 0.5f);
+  bad_gated = core::RmsNormGatedRef(
+      std::span<const float>(x), std::span<const float>(w),
+      std::span<const float>(short_gate), std::span<float>(y), 4, 8, 1e-6f);
+  ASSERT_FALSE(bad_gated.has_value());
+  EXPECT_EQ(bad_gated.error(), StatusCode::InvalidArgument);
+
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto l2 = backend->LoadKernel("l2norm", {});
+  ASSERT_TRUE(l2.has_value()) << tessera::ToString(l2.error());
+  auto gated = backend->LoadKernel("rmsnorm_gated", {});
+  ASSERT_TRUE(gated.has_value()) << tessera::ToString(gated.error());
+  tessera::KernelLaunch launch;
+  const std::vector<const tessera::Buffer*> two_buffers{nullptr, nullptr};
+  const std::vector<const tessera::Buffer*> four_buffers{
+      nullptr, nullptr, nullptr, nullptr};
+  // l2norm wants 2 buffers and 3 scalars; zero rows rejected.
+  launch.buffers = two_buffers;
+  launch.scalars = {0, 8, 0};
+  auto bad_l2 = backend->LaunchKernel(**l2, launch);
+  ASSERT_FALSE(bad_l2.has_value());
+  EXPECT_EQ(bad_l2.error(), StatusCode::InvalidArgument);
+  // rmsnorm_gated wants 4 buffers and 3 scalars; zero rows rejected.
+  launch.buffers = four_buffers;
+  auto bad_gated_contract = backend->LaunchKernel(**gated, launch);
+  ASSERT_FALSE(bad_gated_contract.has_value());
+  EXPECT_EQ(bad_gated_contract.error(), StatusCode::InvalidArgument);
+}
