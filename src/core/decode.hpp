@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "tessera/backend.hpp"
+#include "tessera/architecture.hpp"
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
 
@@ -163,14 +164,6 @@ struct HybridDecodeCache {
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out = nullptr);
 
-// One hybrid decoder step (interleaved full-attention and linear
-// attention). Dispatched from DecodeStep when the config is hybrid. The
-// full-attention gated path is implemented; a linear layer reports
-// UnsupportedFeature until the recurrent path lands.
-[[nodiscard]] std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
-    Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
-
 // One device-resident vanilla decoder step: activations stay on the
 // device and chain through the elementwise/projection kernels; only the
 // logits download for the argmax. Dispatched from DecodeStep for a
@@ -188,32 +181,11 @@ struct HybridDecodeCache {
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
     std::vector<float>* mtp_hidden_out = nullptr);
 
-// The full vocab logits for one hybrid decoder step (same forward as
-// HybridDecodeStep, but the whole row comes back). Dispatched from
-// DecodeLogits.
-[[nodiscard]] std::expected<std::vector<float>, StatusCode>
-HybridDecodeLogits(Backend& backend, const Model& model, DecodeCache& cache,
-                   std::uint32_t token,
-                   std::vector<float>* hidden_out = nullptr,
-                   const std::vector<std::size_t>* capture_layers = nullptr,
-                   std::vector<Buffer*>* capture = nullptr,
-                   const Buffer* embedding = nullptr);
-
 // The full vocab logits for one device-resident vanilla step.
 [[nodiscard]] std::expected<std::vector<float>, StatusCode>
 DecodeStepDeviceLogits(Backend& backend, const Model& model,
                        DecodeCache& cache, std::uint32_t token,
                        std::vector<float>* hidden_out = nullptr);
-
-// The block forward of one hybrid step without the output head (the
-// vocab-sized projection). Used by prefill for every prompt token except
-// the last, which is all that needs logits.
-[[nodiscard]] std::expected<void, StatusCode> HybridForward(
-    Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out = nullptr,
-    const std::vector<std::size_t>* capture_layers = nullptr,
-    std::vector<Buffer*>* capture = nullptr,
-    const Buffer* embedding = nullptr);
 
 // The block forward of one device-resident vanilla step without the head.
 [[nodiscard]] std::expected<void, StatusCode> DecodeStepDeviceForward(
@@ -265,17 +237,6 @@ DecodeLogitsBatch(Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens,
     std::vector<float>* hidden_out = nullptr,
     const Buffer* embeddings = nullptr);
-
-// The outcome of verifying a greedy draft against the target model.
-// `accepted` leading draft tokens match the target's greedy distribution
-// and are already in the cache; `next_token` is the target's greedy token
-// after them (the bonus token); `logits` is the distribution after the
-// accepted prefix, ready to verify the next draft.
-struct DraftVerification {
-  std::size_t accepted = 0;
-  std::uint32_t next_token = 0;
-  std::vector<float> logits;
-};
 
 // Greedy speculative verification. Given the target's distribution at the
 // current prefix (`prefix_logits`) and a draft, feed each draft token only

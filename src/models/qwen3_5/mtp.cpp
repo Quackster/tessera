@@ -5,15 +5,12 @@
 #include <vector>
 
 #include "core/decode.hpp"
-#include "core/decode_hybrid_internal.hpp"
 #include "core/decode_internal.hpp"
+#include "models/qwen3_5/internal.hpp"
 
-namespace tessera {
-
-namespace {
+namespace tessera::models::qwen3_5 {
 
 using core::HybridDecodeCache;
-using core::RunFullBlock;
 using core::detail::DownloadF32;
 using core::detail::GatherEmbedding;
 using core::detail::GemmFor;
@@ -23,21 +20,14 @@ using core::detail::ProjectDevice;
 using core::detail::RmsNormDevice;
 using core::detail::UploadF32;
 
-// The Qwen3.5 module: the nextn multi-token-prediction draft head. The
-// trunk (hybrid gated attention plus gated-delta linear attention) is
-// still in src/core/decode_hybrid.cpp and moves here next.
-class Qwen35Architecture final : public Architecture {
- public:
-  [[nodiscard]] std::string_view Name() const override { return "qwen35"; }
-
-  // The Qwen3.5 MTP head (public layout, vLLM qwen3_5_mtp): concat the
-  // normed token embedding and the normed backbone hidden, project with
-  // nextn.eh_proj to one hidden vector, run one full-attention block, then
-  // the shared head norm and the shared output weight.
-  [[nodiscard]] std::expected<std::uint32_t, StatusCode> Draft(
-      Backend& backend, const Model& model, core::DecodeCache& cache,
-      std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-      std::vector<float>* mtp_hidden_out) const override {
+// The Qwen3.5 MTP head (public layout, vLLM qwen3_5_mtp): concat the
+// normed token embedding and the normed backbone hidden, project with
+// nextn.eh_proj to one hidden vector, run one full-attention block, then
+// the shared head norm and the shared output weight.
+std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
+    std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
+    std::vector<float>* mtp_hidden_out) const {
     auto config = model.Config();
     if (!config) {
       return std::unexpected(config.error());
@@ -147,14 +137,11 @@ class Qwen35Architecture final : public Architecture {
         best = i;
       }
     }
-    return best;
-  }
-};
-
-}  // namespace
+  return best;
+}
 
 std::unique_ptr<Architecture> MakeQwen35Architecture() {
   return std::make_unique<Qwen35Architecture>();
 }
 
-}  // namespace tessera
+}  // namespace tessera::models::qwen3_5

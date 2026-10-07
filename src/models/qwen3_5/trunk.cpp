@@ -5,14 +5,20 @@
 #include <string>
 #include <vector>
 
-#include "core/decode_hybrid_internal.hpp"
 #include "core/decode_internal.hpp"
 #include "core/numerics/conv.hpp"
+#include "models/qwen3_5/architecture.hpp"
+#include "models/qwen3_5/internal.hpp"
 
-namespace tessera::core {
+namespace tessera::models::qwen3_5 {
 
 namespace {
 
+namespace detail = ::tessera::core::detail;
+
+using core::Conv1dStepRef;
+using core::DecodeCache;
+using core::HybridDecodeCache;
 using detail::AddDevice;
 using detail::AppendKv;
 using detail::AttentionDevice;
@@ -298,11 +304,11 @@ std::expected<void, StatusCode> EnsureHybridReady(
   return {};
 }
 
-std::expected<void, StatusCode> HybridForward(
-    Backend& backend, const Model& model, DecodeCache& cache,
+std::expected<void, StatusCode> Qwen35Architecture::Forward(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out,
-    const std::vector<std::size_t>* capture_layers, std::vector<Buffer*>* capture,
-    const Buffer* embedding) {
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture, const Buffer* embedding) const {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -526,13 +532,13 @@ std::expected<void, StatusCode> HybridForward(
 
 // The output head is separate so a prompt prefill can run the block
 // forward for all but the last token without the vocab-sized projection.
-std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
-    Backend& backend, const Model& model, DecodeCache& cache,
+std::expected<std::vector<float>, StatusCode> Qwen35Architecture::Logits(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture, const Buffer* embedding) {
-  auto forward = HybridForward(backend, model, cache, token, hidden_out,
-                               capture_layers, capture, embedding);
+    std::vector<Buffer*>* capture, const Buffer* embedding) const {
+  auto forward = Forward(backend, model, cache, token, hidden_out,
+                         capture_layers, capture, embedding);
   if (!forward) {
     return std::unexpected(forward.error());
   }
@@ -562,14 +568,6 @@ std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
   return detail::DownloadF32(backend, *h.logits);
 }
 
-std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
-    Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out) {
-  auto logits = HybridDecodeLogits(backend, model, cache, token, hidden_out);
-  if (!logits) {
-    return std::unexpected(logits.error());
-  }
-  return detail::ArgMax(*logits);
-}
+std::string_view Qwen35Architecture::Name() const { return "qwen35"; }
 
-}  // namespace tessera::core
+}  // namespace tessera::models::qwen3_5

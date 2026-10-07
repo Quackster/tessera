@@ -1,5 +1,3 @@
-#include "core/decode_hybrid_internal.hpp"
-
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -7,11 +5,19 @@
 
 #include "core/decode_internal.hpp"
 #include "core/numerics/conv.hpp"
+#include "models/qwen3_5/architecture.hpp"
+#include "models/qwen3_5/internal.hpp"
 
-namespace tessera::core {
+namespace tessera::models::qwen3_5 {
 
 namespace {
 
+namespace detail = ::tessera::core::detail;
+
+using core::Conv1dStepRef;
+using core::DecodeCache;
+using core::HybridBatchScratch;
+using core::HybridDecodeCache;
 using detail::AddDevice;
 using detail::AppendKv;
 using detail::AttentionDevice;
@@ -384,11 +390,11 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
 
 }  // namespace
 
-std::expected<void, StatusCode> HybridForwardBatch(
-    Backend& backend, const Model& model, DecodeCache& cache,
+std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
     std::vector<float>* hidden_out, bool all_logits,
-    const Buffer* embeddings) {
+    const Buffer* embeddings) const {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -530,4 +536,80 @@ std::expected<void, StatusCode> HybridForwardBatch(
   return {};
 }
 
-}  // namespace tessera::core
+// Score a multi-token draft in one batched forward and roll the cache
+// back to the accepted prefix (full-attention KV rows, linear-attention
+// state, conv history and position).
+std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
+    std::span<const std::uint32_t> draft,
+    std::span<const float> prefix_logits, std::vector<float>* hidden_out) const {
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  auto geometry = DeriveGeometry(*config);
+  if (!geometry) {
+    return std::unexpected(geometry.error());
+  }
+  const LinearGeometry& g = *geometry;
+  const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
+  const std::size_t hist_len = g.conv_dim * (g.width - 1);
+  if (!cache.hybrid) {
+    cache.hybrid = std::make_unique<core::HybridDecodeCache>();
+  }
+  HybridDecodeCache& h = *cache.hybrid;
+  const std::size_t prefix = h.position;
+  std::vector<float> flat;
+  std::vector<float> last_hidden;
+  auto status = ForwardBatch(backend, model, cache, draft, &flat, &last_hidden,
+                             /*all_logits=*/true, nullptr);
+  if (!status) {
+    return std::unexpected(status.error());
+  }
+  const std::size_t vocab = config->vocab_size;
+  DraftVerification result;
+  std::span<const float> last(prefix_logits.begin(), prefix_logits.end());
+  std::size_t accepted = 0;
+  for (std::size_t i = 0; i < draft.size(); ++i) {
+    if (detail::ArgMax(last) != draft[i]) {
+      break;
+    }
+    ++accepted;
+    last = std::span<const float>(flat.data() + i * vocab, vocab);
+  }
+  result.accepted = accepted;
+  result.logits.assign(last.begin(), last.end());
+  result.next_token = detail::ArgMax(result.logits);
+  if (accepted < draft.size()) {
+    const std::size_t new_pos = prefix + accepted;
+    for (auto& kv : h.full) {
+      kv.rows = new_pos;
+    }
+    h.position = new_pos;
+    for (std::size_t l = 0; l < config->layers; ++l) {
+      if (config->IsFullAttentionLayer(l)) {
+        continue;
+      }
+      if (!backend.CopyD2D(*h.batch->state_hist[l], accepted * state_len * 4,
+                           *h.linear[l].state, 0, state_len * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      std::copy(h.batch->conv_hist_hist[l].begin() + accepted * hist_len,
+                h.batch->conv_hist_hist[l].begin() +
+                    (accepted + 1) * hist_len,
+                h.conv_hist[l].begin());
+    }
+  }
+  if (hidden_out != nullptr && accepted > 0) {
+    auto xh = detail::DownloadF32(backend, *h.batch->x);
+    if (xh) {
+      hidden_out->resize(config->hidden_dim);
+      std::copy(xh->begin() + (accepted - 1) * config->hidden_dim,
+                xh->begin() + accepted * config->hidden_dim,
+                hidden_out->begin());
+    }
+  }
+  return result;
+}
+
+}  // namespace tessera::models::qwen3_5

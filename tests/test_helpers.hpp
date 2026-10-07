@@ -249,19 +249,19 @@ inline std::filesystem::path WriteHybridFixture(const std::string& name,
   builder.Header(0x46554747, 3, 1,
                  complete ? (sections ? 20 : 19) : (sections ? 19 : 18));
   builder.KvString("general.name", "tiny-hybrid");
-  builder.KvString("general.architecture", "test-hybrid");
-  builder.KvU32("test-hybrid.block_count", 4);
-  builder.KvU32("test-hybrid.embedding_length", 256);
-  builder.KvU32("test-hybrid.feed_forward_length", 512);
-  builder.KvF32("test-hybrid.attention.layer_norm_rms_epsilon", 1e-5f);
-  builder.KvU32("test-hybrid.attention.head_count", 4);
-  builder.KvU32("test-hybrid.attention.head_count_kv", 2);
-  builder.KvU32("test-hybrid.attention.key_length", 64);
-  builder.KvU32("test-hybrid.attention.value_length", 64);
-  builder.KvU32("test-hybrid.rope.dimension_count", 32);
-  builder.KvF32("test-hybrid.rope.freq_base", 10000.0f);
+  builder.KvString("general.architecture", "qwen35");
+  builder.KvU32("qwen35.block_count", 4);
+  builder.KvU32("qwen35.embedding_length", 256);
+  builder.KvU32("qwen35.feed_forward_length", 512);
+  builder.KvF32("qwen35.attention.layer_norm_rms_epsilon", 1e-5f);
+  builder.KvU32("qwen35.attention.head_count", 4);
+  builder.KvU32("qwen35.attention.head_count_kv", 2);
+  builder.KvU32("qwen35.attention.key_length", 64);
+  builder.KvU32("qwen35.attention.value_length", 64);
+  builder.KvU32("qwen35.rope.dimension_count", 32);
+  builder.KvF32("qwen35.rope.freq_base", 10000.0f);
   if (sections) {
-    builder.PushString("test-hybrid.rope.dimension_sections");
+    builder.PushString("qwen35.rope.dimension_sections");
     builder.PushU32(9);
     builder.PushU32(4);
     builder.PushU64(4);
@@ -269,15 +269,15 @@ inline std::filesystem::path WriteHybridFixture(const std::string& name,
       builder.PushU32(s);
     }
   }
-  builder.KvU32("test-hybrid.ssm.conv_kernel", 2);
-  builder.KvU32("test-hybrid.ssm.state_size", 8);
-  builder.KvU32("test-hybrid.ssm.group_count", 2);
-  builder.KvU32("test-hybrid.ssm.time_step_rank", 4);
-  builder.KvU32("test-hybrid.ssm.inner_size", 32);
+  builder.KvU32("qwen35.ssm.conv_kernel", 2);
+  builder.KvU32("qwen35.ssm.state_size", 8);
+  builder.KvU32("qwen35.ssm.group_count", 2);
+  builder.KvU32("qwen35.ssm.time_step_rank", 4);
+  builder.KvU32("qwen35.ssm.inner_size", 32);
   if (complete) {
-    builder.KvU32("test-hybrid.full_attention_interval", 2);
+    builder.KvU32("qwen35.full_attention_interval", 2);
   }
-  builder.KvU32("test-hybrid.nextn_predict_layers", 1);
+  builder.KvU32("qwen35.nextn_predict_layers", 1);
   builder.Tensor("output.weight", 2, {256, 8}, 0, 0);
   builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 8192);
   auto dir = FreshTempDir("tessera_tests_hybrid_model");

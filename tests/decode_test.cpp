@@ -49,30 +49,30 @@ inline std::filesystem::path WriteGatedHybridFixture(const std::string& name) {
   GgufBuilder builder;
   builder.Header(0x46554747, 3, specs.size(), 19);
   builder.KvString("general.name", "tiny-gated");
-  builder.KvString("general.architecture", "test-hybrid");
-  builder.KvU32("test-hybrid.block_count", 1);
-  builder.KvU32("test-hybrid.embedding_length", 256);
-  builder.KvU32("test-hybrid.feed_forward_length", 256);
-  builder.KvF32("test-hybrid.attention.layer_norm_rms_epsilon", 1e-5f);
-  builder.KvU32("test-hybrid.attention.head_count", 8);
-  builder.KvU32("test-hybrid.attention.head_count_kv", 8);
-  builder.KvU32("test-hybrid.attention.key_length", 32);
-  builder.KvU32("test-hybrid.attention.value_length", 32);
-  builder.KvU32("test-hybrid.rope.dimension_count", 32);
-  builder.KvF32("test-hybrid.rope.freq_base", 10000.0f);
-  builder.PushString("test-hybrid.rope.dimension_sections");
+  builder.KvString("general.architecture", "qwen35");
+  builder.KvU32("qwen35.block_count", 1);
+  builder.KvU32("qwen35.embedding_length", 256);
+  builder.KvU32("qwen35.feed_forward_length", 256);
+  builder.KvF32("qwen35.attention.layer_norm_rms_epsilon", 1e-5f);
+  builder.KvU32("qwen35.attention.head_count", 8);
+  builder.KvU32("qwen35.attention.head_count_kv", 8);
+  builder.KvU32("qwen35.attention.key_length", 32);
+  builder.KvU32("qwen35.attention.value_length", 32);
+  builder.KvU32("qwen35.rope.dimension_count", 32);
+  builder.KvF32("qwen35.rope.freq_base", 10000.0f);
+  builder.PushString("qwen35.rope.dimension_sections");
   builder.PushU32(9);
   builder.PushU32(4);
   builder.PushU64(4);
   for (std::uint32_t s : {4u, 4u, 4u, 0u}) {
     builder.PushU32(s);
   }
-  builder.KvU32("test-hybrid.ssm.conv_kernel", 1);
-  builder.KvU32("test-hybrid.ssm.state_size", 1);
-  builder.KvU32("test-hybrid.ssm.group_count", 1);
-  builder.KvU32("test-hybrid.ssm.time_step_rank", 1);
-  builder.KvU32("test-hybrid.ssm.inner_size", 1);
-  builder.KvU32("test-hybrid.full_attention_interval", 1);
+  builder.KvU32("qwen35.ssm.conv_kernel", 1);
+  builder.KvU32("qwen35.ssm.state_size", 1);
+  builder.KvU32("qwen35.ssm.group_count", 1);
+  builder.KvU32("qwen35.ssm.time_step_rank", 1);
+  builder.KvU32("qwen35.ssm.inner_size", 1);
+  builder.KvU32("qwen35.full_attention_interval", 1);
   std::uint64_t offset = 0;
   for (const auto& spec : specs) {
     const std::uint64_t placed = offset;
@@ -160,30 +160,30 @@ inline std::filesystem::path WriteLinearHybridFixture(
   GgufBuilder builder;
   builder.Header(0x46554747, 3, specs.size(), 19);
   builder.KvString("general.name", "tiny-linear");
-  builder.KvString("general.architecture", "test-hybrid");
-  builder.KvU32("test-hybrid.block_count", 1);
-  builder.KvU32("test-hybrid.embedding_length", 256);
-  builder.KvU32("test-hybrid.feed_forward_length", 256);
-  builder.KvF32("test-hybrid.attention.layer_norm_rms_epsilon", 1e-5f);
-  builder.KvU32("test-hybrid.attention.head_count", 8);
-  builder.KvU32("test-hybrid.attention.head_count_kv", 8);
-  builder.KvU32("test-hybrid.attention.key_length", 32);
-  builder.KvU32("test-hybrid.attention.value_length", 32);
-  builder.KvU32("test-hybrid.rope.dimension_count", 32);
-  builder.KvF32("test-hybrid.rope.freq_base", 10000.0f);
-  builder.PushString("test-hybrid.rope.dimension_sections");
+  builder.KvString("general.architecture", "qwen35");
+  builder.KvU32("qwen35.block_count", 1);
+  builder.KvU32("qwen35.embedding_length", 256);
+  builder.KvU32("qwen35.feed_forward_length", 256);
+  builder.KvF32("qwen35.attention.layer_norm_rms_epsilon", 1e-5f);
+  builder.KvU32("qwen35.attention.head_count", 8);
+  builder.KvU32("qwen35.attention.head_count_kv", 8);
+  builder.KvU32("qwen35.attention.key_length", 32);
+  builder.KvU32("qwen35.attention.value_length", 32);
+  builder.KvU32("qwen35.rope.dimension_count", 32);
+  builder.KvF32("qwen35.rope.freq_base", 10000.0f);
+  builder.PushString("qwen35.rope.dimension_sections");
   builder.PushU32(9);
   builder.PushU32(4);
   builder.PushU64(4);
   for (std::uint32_t s : {4u, 4u, 4u, 0u}) {
     builder.PushU32(s);
   }
-  builder.KvU32("test-hybrid.ssm.conv_kernel", 4);
-  builder.KvU32("test-hybrid.ssm.state_size", 8);
-  builder.KvU32("test-hybrid.ssm.group_count", 2);
-  builder.KvU32("test-hybrid.ssm.time_step_rank", 4);
-  builder.KvU32("test-hybrid.ssm.inner_size", 256);
-  builder.KvU32("test-hybrid.full_attention_interval", 2);
+  builder.KvU32("qwen35.ssm.conv_kernel", 4);
+  builder.KvU32("qwen35.ssm.state_size", 8);
+  builder.KvU32("qwen35.ssm.group_count", 2);
+  builder.KvU32("qwen35.ssm.time_step_rank", 4);
+  builder.KvU32("qwen35.ssm.inner_size", 256);
+  builder.KvU32("qwen35.full_attention_interval", 2);
   std::uint64_t offset = 0;
   for (const auto& spec : specs) {
     const std::uint64_t placed = offset;
@@ -758,7 +758,7 @@ TEST(HybridDecodeTest, ForwardCapturesLayerHidden) {
   std::vector<tessera::Buffer*> captures = {buffer->get()};
   std::vector<float> hidden_out;
   tessera::core::DecodeCache cache;
-  auto forward = tessera::core::HybridForward(
+  auto forward = tessera::core::DecodeLogits(
       engine->Owner(), **model, cache, 0, &hidden_out, &layers, &captures);
   ASSERT_TRUE(forward.has_value()) << tessera::ToString(forward.error());
   engine->Owner().Synchronize();

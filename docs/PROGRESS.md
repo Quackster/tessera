@@ -890,14 +890,22 @@ through RADV GFX1201, rocm through the system ROCm).
   the module at load; `MtpDraftStep` dispatches through it. The hybrid
   trunk (`src/core/decode_hybrid*.cpp`) still moves to the module next.
 
+- 2026-10-07: hybrid trunk moved into the Qwen3.5 module (235/235
+  `ctest` on both builds). The `Architecture` interface gained Forward,
+  Logits, ForwardBatch and Verify; the hybrid trunk
+  (`src/models/qwen3_5/trunk.cpp`, `trunk_batch.cpp`) and its helpers
+  (`internal.hpp`) moved out of `src/core` behind it, and
+  `src/core/decode.cpp` dispatches by `model.Arch()`. The generic
+  fallback (null module) keeps the device path. The synthetic hybrid
+  fixtures now declare `general.architecture` qwen35.
+
 ## Next (in order)
 
 0. **Architecture modules (from AGENTS.md)**: the interface, registry and
-   the `qwen3_5` MTP head are done (see the Done entry). Remaining: move
-   the hybrid trunk (`src/core/decode_hybrid.cpp`,
-   `src/core/decode_hybrid_batch.cpp`) and the config parse/weight map
-   behind the `Architecture` interface under `src/models/qwen3_5/`, and
-   give the vanilla transformer a module, so `src/core/` no longer holds
+   the `qwen3_5` trunk plus MTP head are done (see the Done entry).
+   Remaining: give the vanilla transformer a module too, and move the
+   hybrid decode state (`HybridDecodeCache`/`HybridBatchScratch` in
+   `src/core/decode.hpp`) into the module, so `src/core/` holds no
    architecture-specific decode code. A new architecture is then a module
    plus one registry line, with zero edits under `src/core/`.
 1. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
