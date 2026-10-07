@@ -31,9 +31,13 @@ The boilerplate is complete and passes on both backends:
   range and base from GGUF metadata. The generic "rope" and
   "attention" built-ins take all dims as launch scalars and are
   verified against host references on both devices.
-- Single GoogleTest target. `ctest` passes 102/102 on both builds.
+- Single GoogleTest target. `ctest` passes 111/111 on both builds.
   Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
   through RADV GFX1201, rocm through the system ROCm).
+- K-quant and IQ GEMM paths (Q3_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS,
+  IQ3_S): dequant ports verified against llama.cpp, generic kernels
+  on both backends, exact codec unit tests. The 27B file still
+  needs fused QKV splitting and the SSM recurrence.
 - MXFP4 tensor map: the safetensors header parser reads the fixed
   schema with a bounded hand-rolled reader. MXFP4 blobs pair with
   their E8M0 scales by name; MTP FP8 weights map natively. Model
@@ -101,6 +105,16 @@ The boilerplate is complete and passes on both backends:
   OCP E4M3 top bin needed care (only mantissa-all-ones is NaN,
   max 448). `tests/backend_test.cpp` grows further (exemption
   stands); `src/core/loaders/safetensors.cpp` nears the 600 cap.
+- 2026-10-07: K-quant and IQ GEMM paths (111/111 `ctest` on both
+  builds). Unknown ggml ids pinned from llama.cpp as IQ4_NL,
+  IQ3_S, IQ4_XS (byte sizes match the file to the byte) and the
+  matching dequant math ported with host references. Six generic
+  kernels per backend with device-vs-reference tests. Fixed along
+  the way: Q8_0 blocks are 34 bytes (the old 33 truncated uploads),
+  a Q3_K scale-hoisting bug in GLSL, and unsigned wraparound in the
+  ROCm Q3_K kernel. The rocm backend split into focused translation
+  units (rule 4); shared device helpers are inline in the private
+  kernel header. Borrowed math is credited in CREDITS.md.
 - 2026-10-07: decode loop (91/91 `ctest` on both builds).
   `TransformerConfig` comes from GGUF metadata and `DecodeStep`
   runs one greedy step (device projections/RoPE/attention, host
@@ -114,10 +128,9 @@ The boilerplate is complete and passes on both backends:
 ## Next (in order)
 
 1. **Hybrid SSM decode** for the 27B target (arch `qwen35`): fused
-   QKV splitting, selective-scan and conv1d kernels, Q3_K and
-   2026-type layouts (ids 20, 21, 23), Q5_K/Q6_K GEMM paths. The
-   file probes as 866 tensors (248320 vocab, 65 blocks, hidden
-   5120); the loader reports the first unmapped layout today.
+   QKV splitting, selective-scan and conv1d kernels (see
+   llama.cpp qwen35.cpp). Quant paths are done; the loader still
+   reports the first tensor no kernel consumes today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.

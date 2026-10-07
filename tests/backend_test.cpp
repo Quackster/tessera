@@ -336,6 +336,366 @@ TEST(BackendTest, FpGemmRefsRejectBadArgs) {
   ASSERT_TRUE(ok_mx.has_value()) << tessera::ToString(ok_mx.error());
 }
 
+// Random weight bytes with small exact scales patched into every
+// block (d=2^-7, dmin=0.5 where present). Small magnitudes keep fma
+// order differences inside the tolerance; the reference and the
+// kernel decode the same bytes, so the test pins their agreement,
+// and exact formulas have unit tests below.
+static std::vector<std::byte> RandomBlocks(std::mt19937& rng,
+                                           std::size_t rows,
+                                           std::size_t bytes_per_row,
+                                           std::size_t d_off) {
+  std::vector<std::byte> w(rows * bytes_per_row);
+  for (auto& b : w) {
+    b = static_cast<std::byte>(rng() & 0xFF);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    w[r * bytes_per_row + d_off] = std::byte{0};
+    w[r * bytes_per_row + d_off + 1] = std::byte{0x20};
+  }
+  return w;
+}
+
+// Device: Q5_K GEMM matches the host reference (2 x 8 outputs).
+TEST(BackendTest, GemmQ5KDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(55);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 176, 0);
+  for (std::size_t r = 0; r < kN; ++r) {  // small dmin, keeps the min term
+    w[r * 176 + 2] = std::byte{0};
+    w[r * 176 + 3] = std::byte{0x20};
+  }
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+  auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+  ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+  auto kernel = backend->LoadKernel("gemm_q5k", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ5KRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: Q6_K GEMM matches the host reference (2 x 8 outputs).
+TEST(BackendTest, GemmQ6KDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(56);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 210, 208);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+  auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+  ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+  auto kernel = backend->LoadKernel("gemm_q6k", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ6KRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: Q3_K GEMM matches the host reference (2 x 8 outputs).
+TEST(BackendTest, GemmQ3KDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(57);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 110, 108);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+  auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+  ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+  auto kernel = backend->LoadKernel("gemm_q3k", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ3KRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: IQ4_NL GEMM matches the host reference (2 x 8 outputs).
+TEST(BackendTest, GemmIq4NlDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(58);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 32;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 18, 0);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+  auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+  ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+  auto kernel = backend->LoadKernel("gemm_iq4nl", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmIq4NlRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: IQ4_XS GEMM matches the host reference (2 x 8 outputs).
+TEST(BackendTest, GemmIq4XsDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(59);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 136, 0);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+  auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+  ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+  auto kernel = backend->LoadKernel("gemm_iq4xs", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmIq4XsRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: IQ3_S GEMM matches the host reference (2 x 8 outputs).
+TEST(BackendTest, GemmIq3SDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(60);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 110, 0);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+  auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+  ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+  auto kernel = backend->LoadKernel("gemm_iq3s", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmIq3SRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the K-quant and IQ GEMM contracts reject bad shapes.
+TEST(BackendTest, QuantGemmRejectsBadContract) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto q5k = backend->LoadKernel("gemm_q5k", {});
+  ASSERT_TRUE(q5k.has_value()) << tessera::ToString(q5k.error());
+  auto q6k = backend->LoadKernel("gemm_q6k", {});
+  ASSERT_TRUE(q6k.has_value()) << tessera::ToString(q6k.error());
+  auto iq4nl = backend->LoadKernel("gemm_iq4nl", {});
+  ASSERT_TRUE(iq4nl.has_value()) << tessera::ToString(iq4nl.error());
+  const std::vector<const tessera::Buffer*> two_buffers{nullptr, nullptr};
+  const std::vector<const tessera::Buffer*> three_buffers{
+      nullptr, nullptr, nullptr};
+  tessera::KernelLaunch launch;
+  launch.buffers = two_buffers;
+  launch.scalars = {2, 8, 256};
+  auto short_buffers = backend->LaunchKernel(**q5k, launch);
+  ASSERT_FALSE(short_buffers.has_value());
+  EXPECT_EQ(short_buffers.error(), StatusCode::InvalidArgument);
+  launch.buffers = three_buffers;
+  launch.scalars = {2, 8, 100};
+  auto bad_k = backend->LaunchKernel(**q6k, launch);
+  ASSERT_FALSE(bad_k.has_value());
+  EXPECT_EQ(bad_k.error(), StatusCode::InvalidArgument);
+  launch.scalars = {2, 8, 100};
+  auto bad_iq = backend->LaunchKernel(**iq4nl, launch);
+  ASSERT_FALSE(bad_iq.has_value());
+  EXPECT_EQ(bad_iq.error(), StatusCode::InvalidArgument);
+}
+
 // Device: the fp GEMM contracts reject bad shapes.
 TEST(BackendTest, FpGemmRejectsBadContract) {
   std::unique_ptr<Backend> backend;
@@ -359,6 +719,121 @@ TEST(BackendTest, FpGemmRejectsBadContract) {
   auto bad_k = backend->LaunchKernel(**mxfp4, launch);
   ASSERT_FALSE(bad_k.has_value());
   EXPECT_EQ(bad_k.error(), StatusCode::InvalidArgument);
+}
+
+// Host: the K-quant and IQ dequants hit hand-computed values.
+TEST(BackendTest, QuantDequantsExact) {
+  // Q5_K: d=1, s[0]=1 (sub-block 0 scale 1), qs[0]=0x12, qh[0]=0x01.
+  std::vector<std::byte> q5(176, std::byte{0});
+  q5[1] = std::byte{0x3C};
+  q5[4] = std::byte{1};
+  q5[48] = std::byte{0x12};
+  q5[16] = std::byte{0x01};
+  std::vector<float> out5(256);
+  core::DequantizeQ5K(std::span<const std::byte>(q5), std::span<float>(out5));
+  EXPECT_FLOAT_EQ(out5[0], 18.0f);
+  EXPECT_FLOAT_EQ(out5[32], 0.0f);
+  // Q6_K: d=1, scales[0]=1, ql[0]=0x12, qh[0]=0.
+  std::vector<std::byte> q6(210, std::byte{0});
+  q6[209] = std::byte{0x3C};
+  q6[192] = std::byte{1};
+  q6[0] = std::byte{0x12};
+  std::vector<float> out6(256);
+  core::DequantizeQ6K(std::span<const std::byte>(q6), std::span<float>(out6));
+  EXPECT_FLOAT_EQ(out6[0], -30.0f);
+  // Q3_K: d=1, everything else zero (dl=-32, qv-hb=-4).
+  std::vector<std::byte> q3(110, std::byte{0});
+  q3[109] = std::byte{0x3C};
+  std::vector<float> out3(256);
+  core::DequantizeQ3K(std::span<const std::byte>(q3), std::span<float>(out3));
+  EXPECT_FLOAT_EQ(out3[0], 128.0f);
+  EXPECT_FLOAT_EQ(out3[255], 128.0f);
+  // Q3_K scales 0x21 everywhere unpack to 17 (dl=-15); qs[32]=0xFF
+  // with full hmask gives qv=3, hb=0 on the first 16 elements.
+  for (std::size_t i = 96; i < 108; ++i) {
+    q3[i] = std::byte{0x21};
+  }
+  for (std::size_t i = 32; i < 48; ++i) {
+    q3[i] = std::byte{0xFF};
+  }
+  for (std::size_t i = 0; i < 16; ++i) {
+    q3[i] = std::byte{0xFF};
+  }
+  core::DequantizeQ3K(std::span<const std::byte>(q3), std::span<float>(out3));
+  for (std::size_t i = 0; i < 16; ++i) {
+    EXPECT_FLOAT_EQ(out3[i], -45.0f) << "element " << i;
+  }
+  // IQ4_NL: d=1, qs[0]=0x21 (codebook -104 and -83).
+  std::vector<std::byte> nl(18, std::byte{0});
+  nl[1] = std::byte{0x3C};
+  nl[2] = std::byte{0x21};
+  std::vector<float> outnl(32);
+  core::DequantizeIQ4NL(std::span<const std::byte>(nl),
+                        std::span<float>(outnl));
+  EXPECT_FLOAT_EQ(outnl[0], -104.0f);
+  EXPECT_FLOAT_EQ(outnl[16], -83.0f);
+  // IQ4_XS: d=1, scales_l[0]=0x21 (ls=1), qs[0]=0x21.
+  std::vector<std::byte> xs(136, std::byte{0});
+  xs[1] = std::byte{0x3C};
+  xs[4] = std::byte{0x21};
+  xs[8] = std::byte{0x21};
+  std::vector<float> outxs(256);
+  core::DequantizeIQ4XS(std::span<const std::byte>(xs),
+                        std::span<float>(outxs));
+  EXPECT_FLOAT_EQ(outxs[0], 3224.0f);
+  EXPECT_FLOAT_EQ(outxs[16], 2573.0f);
+  // IQ3_S: d=1, scales[0]=0 (db=1), zero quants/signs (grid 1s).
+  std::vector<std::byte> s3(110, std::byte{0});
+  s3[1] = std::byte{0x3C};
+  std::vector<float> outs3(256);
+  core::DequantizeIQ3S(std::span<const std::byte>(s3),
+                       std::span<float>(outs3));
+  EXPECT_FLOAT_EQ(outs3[0], 1.0f);
+  EXPECT_FLOAT_EQ(outs3[7], 1.0f);
+}
+
+// Host: the K-quant and IQ GEMM references reject malformed shapes.
+TEST(BackendTest, QuantGemmRefsRejectBadArgs) {
+  std::vector<float> a(2 * 256, 0.5f);
+  std::vector<float> c(2 * 4);
+  std::vector<std::byte> w5(4 * 176, std::byte{0});
+  auto bad = core::GemmQ5KRef(std::span<const float>(a),
+                              std::span<const std::byte>(w5),
+                              std::span<float>(c), 2, 4, 100);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<std::byte> w6(4 * 210, std::byte{0});
+  bad = core::GemmQ6KRef(std::span<const float>(a),
+                         std::span<const std::byte>(w6),
+                         std::span<float>(c), 0, 4, 256);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<std::byte> w3(3 * 110, std::byte{0});
+  bad = core::GemmQ3KRef(std::span<const float>(a),
+                         std::span<const std::byte>(w3),
+                         std::span<float>(c), 2, 4, 256);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<float> a32(2 * 32, 0.5f);
+  std::vector<std::byte> wnl(4 * 18, std::byte{0});
+  bad = core::GemmIq4NlRef(std::span<const float>(a32),
+                           std::span<const std::byte>(wnl),
+                           std::span<float>(c), 2, 4, 100);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<std::byte> wxs(4 * 136 - 1, std::byte{0});
+  bad = core::GemmIq4XsRef(std::span<const float>(a),
+                           std::span<const std::byte>(wxs),
+                           std::span<float>(c), 2, 4, 256);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<std::byte> ws3(4 * 110, std::byte{0});
+  std::vector<float> short_c(7);
+  bad = core::GemmIq3SRef(std::span<const float>(a),
+                          std::span<const std::byte>(ws3),
+                          std::span<float>(short_c), 2, 4, 256);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
 }
 
 TEST(BackendTest, CopyD2HAtReadsSlice) {

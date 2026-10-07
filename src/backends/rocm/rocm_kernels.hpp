@@ -1,0 +1,97 @@
+#pragma once
+
+// Device kernels owned by the rocm backend (defined in
+// rocm_kernels_*.cpp, launched through the registry in
+// rocm_backend.cpp). No vendor type crosses the backend boundary;
+// only this directory includes HIP headers.
+
+#include <hip/hip_runtime.h>
+
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+
+namespace tessera::backends::rocm {
+
+// IEEE binary16 (little-endian) -> fp32, exact (device port of the
+// core Fp16ToFloat in src/core/numerics/quant.cpp). Inline so every
+// kernel TU carries its own copy (no cross-TU device calls).
+inline __host__ __device__ float Fp16ToFloatDev(std::uint16_t half) {
+  const std::uint32_t sign = half >> 15;
+  const std::uint32_t exp = (half >> 10) & 0x1F;
+  const std::uint32_t mant = half & 0x3FF;
+  float value;
+  if (exp == 0) {
+    value = static_cast<float>(mant) * 0x1p-24f;
+  } else if (exp == 31) {
+    value = mant != 0
+        ? std::numeric_limits<float>::quiet_NaN()
+        : std::numeric_limits<float>::infinity();
+  } else {
+    value = (1.0f + static_cast<float>(mant) / 1024.0f) *
+            std::ldexp(1.0f, static_cast<int>(exp) - 15);
+  }
+  return sign != 0 ? -value : value;
+}
+
+// The 6-bit scale/min pair of sub-block j from the 12-byte packing
+// (device port of the core GetScaleMin; the vulkan kernel uses the
+// same formula). Inline, same reason as above.
+inline __host__ __device__ void GetScaleMinDev(
+    std::size_t j, const unsigned char* scales, std::uint8_t* scale,
+    std::uint8_t* min) {
+  if (j < 4) {
+    *scale = scales[j] & 63;
+    *min = scales[j + 4] & 63;
+  } else {
+    *scale = (scales[j + 4] & 15) | ((scales[j - 4] >> 6) << 4);
+    *min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+  }
+}
+__global__ void FillKernel(int* out, unsigned long long value,
+                           unsigned long long count);
+__global__ void RopeKernel(float* data, unsigned long long rows,
+                           unsigned long long heads,
+                           unsigned long long head_dim,
+                           unsigned long long rope_dim,
+                           unsigned long long pos_base,
+                           unsigned long long theta_bits);
+__global__ void AttentionKernel(const float* q, const float* k,
+                                const float* v, float* out,
+                                unsigned long long m, unsigned long long n,
+                                unsigned long long heads,
+                                unsigned long long kv_heads,
+                                unsigned long long head_dim,
+                                unsigned long long q_base);
+__global__ void GemmFp8Kernel(const float* a, const unsigned char* w,
+                              const float* s, float* c,
+                              unsigned long long m, unsigned long long n,
+                              unsigned long long k);
+__global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
+                                const unsigned char* s, float* c,
+                                unsigned long long m, unsigned long long n,
+                                unsigned long long k);
+__global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
+                              float* c, unsigned long long k,
+                              unsigned long long n, unsigned long long m);
+__global__ void GemmQ5KKernel(const float* a, const unsigned char* w,
+                              float* c, unsigned long long m,
+                              unsigned long long n, unsigned long long k);
+__global__ void GemmQ6KKernel(const float* a, const unsigned char* w,
+                              float* c, unsigned long long m,
+                              unsigned long long n, unsigned long long k);
+__global__ void GemmQ3KKernel(const float* a, const unsigned char* w,
+                              float* c, unsigned long long m,
+                              unsigned long long n, unsigned long long k);
+__global__ void GemmIq4NlKernel(const float* a, const unsigned char* w,
+                                float* c, unsigned long long m,
+                                unsigned long long n, unsigned long long k);
+__global__ void GemmIq4XsKernel(const float* a, const unsigned char* w,
+                                float* c, unsigned long long m,
+                                unsigned long long n, unsigned long long k);
+__global__ void GemmIq3SKernel(const float* a, const unsigned char* w,
+                                float* c, unsigned long long m,
+                                unsigned long long n, unsigned long long k);
+
+}  // namespace tessera::backends::rocm

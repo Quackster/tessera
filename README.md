@@ -17,7 +17,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. |
 | DFlash2 | Skeleton | Validates checkpoint layout. Draft logic is in work. |
 | CLI | Partial | Validates load path. Prints tensor summary. No decode loop yet. |
-| GEMM | Done | Generic GEMM with Q4_K dequant. Host reference check. Per backend tolerance. |
+| GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, IQ and FP8/MXFP4 dequant. Host reference check. Per backend tolerance. |
 | Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla GGUF. Hybrid SSM models report unsupported. |

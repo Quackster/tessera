@@ -1,60 +1,84 @@
-#pragma once
+#include "backends/rocm/rocm_kernels.hpp"
 
-#include <cstddef>
+#include <cmath>
 #include <cstdint>
-#include <span>
+#include <cstring>
 
-#include "tessera/types.hpp"
-
-namespace tessera::core {
-
-// Q4_K block layout (ggml 2026 numbering): kQ4KBlockElements (256)
-// elements in 144 bytes: d fp16, dmin fp16, 12 scale/min bytes, 128
-// nibble bytes.
-constexpr std::size_t kQ4KBlockBytes = 144;
-constexpr std::size_t kQ4KScaleBytes = 12;
-
-// Decode an IEEE 754 binary16 (little-endian) to fp32. The conversion
-// is exact (no rounding loss).
-//
-// Usage:
-//   std::uint16_t half = 0x3C00;  // 1.0
-//   float value = Fp16ToFloat(half);
-[[nodiscard]] float Fp16ToFloat(std::uint16_t half);
-
-// Decode an OCP FP8 E4M3 byte to fp32 (bias 8; only the all-ones
-// mantissa is NaN, no infinities, max 448). Exact for every finite
-// value.
-//
-// Usage:
-//   float value = Fp8E4M3ToFloat(0x40);  // 1.0
-[[nodiscard]] float Fp8E4M3ToFloat(std::uint8_t bits);
-
-// Decode an OCP MX E8M0 scale byte to its fp32 multiplier (2^(s - 127)
-// for finite s; NaN only for 0xFF, which yields fp32 infinity here and
-// never appears in checked files).
-//
-// Usage:
-//   float scale = E8M0ToFloat(127);  // 1.0
-[[nodiscard]] float E8M0ToFloat(std::uint8_t scale);
-
-// Decode one OCP MX E2M1 nibble (0..15) to fp32, unscaled (bias 1,
-// max 4.0; 0x7 is NaN and never appears in checked files).
-//
-// Usage:
-//   float value = F4E2M1ToFloat(3);  // 1.5
-[[nodiscard]] float F4E2M1ToFloat(std::uint8_t nibble);
-
-// IQ4 codebook shared by the IQ4_NL and IQ4_XS dequants (llama.cpp
-// kvalues_iq4nl; see CREDITS.md).
-inline constexpr std::int8_t kIq4NlValues[16] = {
+namespace tessera::backends::rocm {
+// IQ4 codebook (ports kvalues_iq4nl; see CREDITS.md).
+__constant__ std::int8_t kIq4NlValuesDev[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89,
     113};
 
-// IQ3_S 3-bit grid: 512 entries of 4 magnitude bytes (llama.cpp
-// iq3s_grid; see CREDITS.md). Index with 9 bits; byte j of the word
-// is grid value j, little-endian.
-inline constexpr std::uint32_t kIq3sGrid[512] = {
+// Built-in "gemm_iq4nl": C = A x dequant(W)^T; W holds IQ4_NL blocks
+// (18 bytes per 32).
+__global__ void GemmIq4NlKernel(const float* a, const unsigned char* w,
+                                float* c, unsigned long long m,
+                                unsigned long long n, unsigned long long k) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const unsigned long long blocks = k / 32;
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char* base = w + (row_w * blocks + b) * 18;
+    std::uint16_t d_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    for (unsigned long long j = 0; j < 16; ++j) {
+      const unsigned char q = base[2 + j];
+      const unsigned long long t = b * 32 + j;
+      acc = fmaf(a[row_a * k + t], d * kIq4NlValuesDev[q & 15], acc);
+      acc = fmaf(a[row_a * k + t + 16], d * kIq4NlValuesDev[q >> 4], acc);
+    }
+  }
+  c[idx] = acc;
+}
+
+// Built-in "gemm_iq4xs": C = A x dequant(W)^T; W holds IQ4_XS blocks
+// (136 bytes per 256).
+__global__ void GemmIq4XsKernel(const float* a, const unsigned char* w,
+                                float* c, unsigned long long m,
+                                unsigned long long n, unsigned long long k) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const unsigned long long blocks = k / 256;
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char* base = w + (row_w * blocks + b) * 136;
+    std::uint16_t d_bits = 0;
+    std::uint16_t scales_h = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&scales_h, base + 2, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    for (unsigned long long ib = 0; ib < 8; ++ib) {
+      const unsigned char packed = base[4 + ib / 2];
+      const int ls = ((packed >> (4 * (ib % 2))) & 15) |
+                     (((scales_h >> (2 * ib)) & 3) << 4);
+      const float dl = d * (ls - 32);
+      for (unsigned long long j = 0; j < 16; ++j) {
+        const unsigned char q = base[8 + ib * 16 + j];
+        const unsigned long long t = b * 256 + ib * 32 + j;
+        acc = fmaf(a[row_a * k + t], dl * kIq4NlValuesDev[q & 15], acc);
+        acc = fmaf(a[row_a * k + t + 16], dl * kIq4NlValuesDev[q >> 4],
+                   acc);
+      }
+    }
+  }
+  c[idx] = acc;
+}
+
+// IQ3_S 3-bit grid (ports iq3s_grid; see CREDITS.md).
+__constant__ std::uint32_t kIq3sGridDev[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301,
     0x01010303, 0x01010305, 0x01010309, 0x0101030d, 0x01010501, 0x01010503,
     0x0101050b, 0x01010707, 0x01010901, 0x01010905, 0x0101090b, 0x0101090f,
@@ -143,62 +167,48 @@ inline constexpr std::uint32_t kIq3sGrid[512] = {
     0x0f0d0703, 0x0f0f0101,
 };
 
-// Encode fp32 to OCP FP8 E4M3 bits (round to nearest, ties to even;
-// overflow and NaN become 0x7F). Used for fixtures and conversion.
-//
-// Usage:
-//   std::uint8_t bits = Fp32ToFp8E4M3Bits(1.0f);  // 0x40
-[[nodiscard]] std::uint8_t Fp32ToFp8E4M3Bits(float value);
-
-// Encode fp32 to the nearest OCP MX E2M1 nibble (0..15, ties away
-// from the grid midpoint order; NaN becomes 0x7, overflow clamps to
-// 4.0). Used for fixtures and conversion.
-//
-// Usage:
-//   std::uint8_t nibble = Fp32ToF4E2M1Nibble(1.5f);  // 3
-[[nodiscard]] std::uint8_t Fp32ToF4E2M1Nibble(float value);
-
-// Encode an fp32 value to IEEE 754 binary16 bits (round to nearest,
-// ties to even; overflow becomes inf).
-[[nodiscard]] std::uint16_t Fp32ToHalfBits(float value);
-
-// Dequantize one Q4_K block into 256 fp32 values.
-// `block` must hold kQ4KBlockBytes bytes; `out` kQ4KBlockElements
-// floats. The block bytes are the ggml layout (d, dmin, scales, qs).
-void DequantizeQ4K(std::span<const std::byte> block, std::span<float> out);
-
-// Deterministically quantize 256 fp32 values into one Q4_K block
-// (test fixtures and future weight conversion). Per element, the error
-// against the dequantized value is bounded by step/2 + dm/2 where step
-// is the sub-block's d*scale step and dm the block's dmin; the all
-// zero input produces the all zero block.
-void QuantizeQ4K(std::span<const float> values, std::byte* block);
-
-// Dequantize one Q5_K block (176 bytes) into 256 fp32 values.
-// Layout (llama.cpp block_q5_K): d, dmin, 12 scale/min bytes, 32 high
-// bits, 128 low nibbles. Ports dequantize_row_q5_K.
-void DequantizeQ5K(std::span<const std::byte> block, std::span<float> out);
-
-// Dequantize one Q6_K block (210 bytes) into 256 fp32 values.
-// Layout: 128 low nibbles, 64 2-bit highs, 16 int8 scales, d.
-// Ports dequantize_row_q6_K.
-void DequantizeQ6K(std::span<const std::byte> block, std::span<float> out);
-
-// Dequantize one Q3_K block (110 bytes) into 256 fp32 values.
-// Layout: 32 high-bit bytes, 64 low 2-bit bytes, 12 scale bytes, d.
-// Ports dequantize_row_q3_K.
-void DequantizeQ3K(std::span<const std::byte> block, std::span<float> out);
-
-// Dequantize one IQ4_NL block (18 bytes) into 32 fp32 values (d plus
-// 16 codebook nibbles through the 16-entry table below).
-void DequantizeIQ4NL(std::span<const std::byte> block, std::span<float> out);
-
-// Dequantize one IQ4_XS block (136 bytes) into 256 fp32 values (d,
-// packed 6-bit scales, codebook nibbles). Ports dequantize_row_iq4_xs.
-void DequantizeIQ4XS(std::span<const std::byte> block, std::span<float> out);
-
-// Dequantize one IQ3_S block (110 bytes) into 256 fp32 values (d, 3-bit
-// grid quants, signs, scales). Ports dequantize_row_iq3_s.
-void DequantizeIQ3S(std::span<const std::byte> block, std::span<float> out);
-
-}  // namespace tessera::core
+// Built-in "gemm_iq3s": C = A x dequant(W)^T; W holds IQ3_S
+// blocks (110 bytes per 256).
+__global__ void GemmIq3SKernel(const float* a, const unsigned char* w,
+                               float* c, unsigned long long m,
+                               unsigned long long n, unsigned long long k) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const unsigned long long blocks = k / 256;
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char* base = w + (row_w * blocks + b) * 110;
+    std::uint16_t d_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    for (unsigned long long ib = 0; ib < 8; ib += 2) {
+      const float db1 = d * (1 + 2 * (base[106 + ib / 2] & 15));
+      const float db2 = d * (1 + 2 * (base[106 + ib / 2] >> 4));
+      for (unsigned long long half = 0; half < 2; ++half) {
+        const float db = half == 0 ? db1 : db2;
+        const unsigned char qh = base[66 + ib + half];
+        for (unsigned long long l = 0; l < 4; ++l) {
+          const std::uint32_t g1 =
+              kIq3sGridDev[base[2 + ib * 8 + 2 * l] | ((qh << (8 - 2 * l)) & 256)];
+          const std::uint32_t g2 =
+              kIq3sGridDev[base[2 + ib * 8 + 2 * l + 1] | ((qh << (7 - 2 * l)) & 256)];
+          const unsigned char signs = base[74 + ib * 4 + half * 4 + l];
+          for (unsigned long long j = 0; j < 4; ++j) {
+            const float m1 = (signs & (1u << j)) ? -1.0f : 1.0f;
+            const float m2 = (signs & (1u << (j + 4))) ? -1.0f : 1.0f;
+            const unsigned long long t = b * 256 + ib * 32 + half * 32 + l * 8;
+            acc = fmaf(a[row_a * k + t + j], db * ((g1 >> (8 * j)) & 255) * m1, acc);
+            acc = fmaf(a[row_a * k + t + 4 + j], db * ((g2 >> (8 * j)) & 255) * m2, acc);
+          }
+        }
+      }
+    }
+  }
+  c[idx] = acc;
+}
+}  // namespace tessera::backends::rocm

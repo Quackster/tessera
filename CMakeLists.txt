@@ -41,9 +41,10 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     # Parallel lists: kernel file stems and their generated array
     # name prefixes.
     set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8
-        gemm_mxfp4)
+        gemm_mxfp4 gemm_q5k gemm_q6k gemm_q3k gemm_iq4nl gemm_iq4xs
+        gemm_iq3s)
     set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8
-        GemmMxfp4)
+        GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S)
     set(TESSERA_KERNEL_HEADER
 "#pragma once
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.
@@ -116,9 +117,15 @@ elseif(TESSERA_BACKEND STREQUAL "rocm")
     set_target_properties(tessera PROPERTIES
         POSITION_INDEPENDENT_CODE ON
         HIP_ARCHITECTURES ${HIP_ARCHITECTURES})
-    target_sources(tessera PRIVATE src/backends/rocm/rocm_backend.cpp)
+    target_sources(tessera PRIVATE src/backends/rocm/rocm_backend.cpp
+                                   src/backends/rocm/rocm_kernels_basic.cpp
+                                   src/backends/rocm/rocm_kernels_block.cpp
+                                   src/backends/rocm/rocm_kernels_iq.cpp)
     set_source_files_properties(
-        src/backends/rocm/rocm_backend.cpp PROPERTIES LANGUAGE HIP)
+        src/backends/rocm/rocm_backend.cpp
+        src/backends/rocm/rocm_kernels_basic.cpp
+        src/backends/rocm/rocm_kernels_block.cpp
+        src/backends/rocm/rocm_kernels_iq.cpp PROPERTIES LANGUAGE HIP)
     target_include_directories(tessera PRIVATE src/backends)
     # The ROCm headers require an explicit platform selection.
     target_compile_definitions(tessera PRIVATE __HIP_PLATFORM_AMD__)

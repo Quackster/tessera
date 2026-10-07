@@ -1,0 +1,104 @@
+#version 450
+
+// One workgroup per 256 output elements; the dispatch is
+// ceil(m * n / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "gemm_q3k" contract (tessera API): buffer 0 is the activation A
+// (fp32, m x k), buffer 1 the quantized weights W (Q3_K, n x k),
+// buffer 2 the output C (fp32, m x n). Scalars are 64-bit: m at
+// pc.v[0], n at pc.v[2], k at pc.v[4]. A Q3_K block is 110 bytes:
+// 32 high-bit bytes, 64 low 2-bit bytes, 12 scale bytes, d.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) buffer C {
+  float c[];
+};
+
+// Byte `offset` of the Q3_K buffer (little-endian extraction).
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+// IEEE binary16 (little-endian) -> fp32, exact.
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  if (idx >= m * n) {
+    return;
+  }
+  uint row_a = idx / n;
+  uint row_w = idx % n;
+  uint blocks = k / 256;
+  float acc = 0.0;
+  for (uint b = 0; b < blocks; ++b) {
+    uint base = row_w * (blocks * 110) + b * 110;
+    float d_all = fp16_at(base + 108);
+    // Unpack the 12 scale bytes into 16 int8 scales (ports the aux
+    // reshuffle of dequantize_row_q3_K).
+    uint aux0 = 0;
+    uint aux1 = 0;
+    uint aux2 = 0;
+    for (uint e = 0; e < 4; ++e) {
+      aux0 |= wbyte(base + 96 + e) << (8 * e);
+      aux1 |= wbyte(base + 100 + e) << (8 * e);
+      aux2 |= wbyte(base + 104 + e) << (8 * e);
+    }
+    uint s0 = (aux0 & 0x0f0f0f0f) | (((aux2 >> 0) & 0x03030303) << 4);
+    uint s1 = (aux1 & 0x0f0f0f0f) | (((aux2 >> 2) & 0x03030303) << 4);
+    uint s2 = ((aux0 >> 4) & 0x0f0f0f0f) | (((aux2 >> 4) & 0x03030303) << 4);
+    uint s3 = ((aux1 >> 4) & 0x0f0f0f0f) | (((aux2 >> 6) & 0x03030303) << 4);
+    uint is = 0;
+    uint mask = 1;
+    for (uint n2 = 0; n2 < 2; ++n2) {
+      uint shift = 0;
+      for (uint j = 0; j < 4; ++j) {
+        for (uint part = 0; part < 2; ++part) {
+          uint sword = is < 4 ? s0 : (is < 8 ? s1 : (is < 12 ? s2 : s3));
+          uint sby = (sword >> (8 * (is % 4))) & 0xFF;
+          int s8 = sby >= 128 ? int(sby) - 256 : int(sby);
+          float dl = d_all * (float(s8) - 32.0);
+          for (uint l = 0; l < 16; ++l) {
+            uint qv =
+                (wbyte(base + 32 + n2 * 32 + part * 16 + l) >> shift) & 3;
+            uint hb =
+                (wbyte(base + part * 16 + l) & mask) > 0 ? 0 : 4;
+            acc += a[row_a * k + b * 256 + n2 * 128 + j * 32 + part * 16 +
+                     l] * (dl * (float(qv) - float(hb)));
+          }
+          is += 1;
+        }
+        shift += 2;
+        mask <<= 1;
+      }
+    }
+  }
+  c[idx] = acc;
+}

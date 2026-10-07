@@ -230,6 +230,160 @@ std::uint8_t Fp32ToF4E2M1Nibble(float value) {
   return static_cast<std::uint8_t>(sign | (exp << 1) | mant);
 }
 
+void DequantizeQ5K(std::span<const std::byte> block, std::span<float> out) {
+  // d[0..1], dmin[2..3], scales[4..15], qh[16..47], qs[48..175].
+  const float d = Fp16ToFloat(ReadU16(block, 0));
+  const float dmin = Fp16ToFloat(ReadU16(block, 2));
+  const std::byte* scales = block.data() + 4;
+  const std::byte* qh = block.data() + 16;
+  const std::byte* qs = block.data() + 48;
+  std::uint8_t u1 = 1;
+  std::uint8_t u2 = 2;
+  for (std::size_t g = 0; g < 4; ++g) {
+    std::uint8_t sc0 = 0;
+    std::uint8_t mn0 = 0;
+    std::uint8_t sc1 = 0;
+    std::uint8_t mn1 = 0;
+    GetScaleMin(2 * g, scales, &sc0, &mn0);
+    GetScaleMin(2 * g + 1, scales, &sc1, &mn1);
+    const float d1 = d * sc0;
+    const float m1 = dmin * mn0;
+    const float d2 = d * sc1;
+    const float m2 = dmin * mn1;
+    for (std::size_t l = 0; l < 32; ++l) {
+      const std::uint8_t low = ReadByte(block, 48 + g * 32 + l);
+      const std::uint8_t high = ReadByte(block, 16 + l);
+      out[g * 64 + l] =
+          d1 * (static_cast<float>(low & 0xF) + (high & u1 ? 16 : 0)) - m1;
+      out[g * 64 + 32 + l] =
+          d2 * (static_cast<float>(low >> 4) + (high & u2 ? 16 : 0)) - m2;
+    }
+    u1 = static_cast<std::uint8_t>(u1 << 2);
+    u2 = static_cast<std::uint8_t>(u2 << 2);
+  }
+}
+
+void DequantizeQ6K(std::span<const std::byte> block, std::span<float> out) {
+  // ql[0..127], qh[128..191], scales[192..207] int8, d[208..209].
+  const float d = Fp16ToFloat(ReadU16(block, 208));
+  for (std::size_t n = 0; n < 2; ++n) {
+    for (std::size_t l = 0; l < 32; ++l) {
+      const std::size_t is = l / 16;
+      const int q1 = (ReadByte(block, n * 64 + l) & 0xF) |
+                     (((ReadByte(block, 128 + n * 32 + l) >> 0) & 3) << 4);
+      const int q2 = (ReadByte(block, n * 64 + 32 + l) & 0xF) |
+                     (((ReadByte(block, 128 + n * 32 + l) >> 2) & 3) << 4);
+      const int q3 = (ReadByte(block, n * 64 + l) >> 4) |
+                     (((ReadByte(block, 128 + n * 32 + l) >> 4) & 3) << 4);
+      const int q4 = (ReadByte(block, n * 64 + 32 + l) >> 4) |
+                     (((ReadByte(block, 128 + n * 32 + l) >> 6) & 3) << 4);
+      const std::int8_t s0 =
+          static_cast<std::int8_t>(block[192 + n * 8 + is + 0]);
+      const std::int8_t s2 =
+          static_cast<std::int8_t>(block[192 + n * 8 + is + 2]);
+      const std::int8_t s4 =
+          static_cast<std::int8_t>(block[192 + n * 8 + is + 4]);
+      const std::int8_t s6 =
+          static_cast<std::int8_t>(block[192 + n * 8 + is + 6]);
+      out[n * 128 + l] = d * s0 * (q1 - 32);
+      out[n * 128 + 32 + l] = d * s2 * (q2 - 32);
+      out[n * 128 + 64 + l] = d * s4 * (q3 - 32);
+      out[n * 128 + 96 + l] = d * s6 * (q4 - 32);
+    }
+  }
+}
+
+void DequantizeQ3K(std::span<const std::byte> block, std::span<float> out) {
+  // hmask[0..31], qs[32..95], scales[96..107], d[108..109].
+  const float d_all = Fp16ToFloat(ReadU16(block, 108));
+  std::uint32_t aux[4] = {};
+  std::memcpy(aux, block.data() + 96, 12);
+  const std::uint32_t tmp = aux[2];
+  aux[2] = ((aux[0] >> 4) & 0x0f0f0f0f) | (((tmp >> 4) & 0x03030303) << 4);
+  aux[3] = ((aux[1] >> 4) & 0x0f0f0f0f) | (((tmp >> 6) & 0x03030303) << 4);
+  aux[0] = (aux[0] & 0x0f0f0f0f) | (((tmp >> 0) & 0x03030303) << 4);
+  aux[1] = (aux[1] & 0x0f0f0f0f) | (((tmp >> 2) & 0x03030303) << 4);
+  const std::int8_t* scales = reinterpret_cast<const std::int8_t*>(aux);
+  std::size_t is = 0;
+  std::size_t o = 0;
+  std::uint8_t m = 1;
+  for (std::size_t n = 0; n < 2; ++n) {
+    int shift = 0;
+    for (std::size_t j = 0; j < 4; ++j) {
+      float dl = d_all * (scales[is++] - 32);
+      for (std::size_t l = 0; l < 16; ++l) {
+        const int qv = (ReadByte(block, 32 + n * 32 + l) >> shift) & 3;
+        out[o++] = dl * (qv - ((ReadByte(block, l) & m) ? 0 : 4));
+      }
+      dl = d_all * (scales[is++] - 32);
+      for (std::size_t l = 0; l < 16; ++l) {
+        const int qv = (ReadByte(block, 32 + n * 32 + 16 + l) >> shift) & 3;
+        out[o++] = dl * (qv - ((ReadByte(block, 16 + l) & m) ? 0 : 4));
+      }
+      shift += 2;
+      m = static_cast<std::uint8_t>(m << 1);
+    }
+  }
+}
+
+void DequantizeIQ4NL(std::span<const std::byte> block, std::span<float> out) {
+  // d[0..1], 16 codebook nibbles[2..17].
+  const float d = Fp16ToFloat(ReadU16(block, 0));
+  for (std::size_t j = 0; j < 16; ++j) {
+    const std::uint8_t q = ReadByte(block, 2 + j);
+    out[j] = d * kIq4NlValues[q & 0xF];
+    out[j + 16] = d * kIq4NlValues[q >> 4];
+  }
+}
+
+void DequantizeIQ4XS(std::span<const std::byte> block, std::span<float> out) {
+  // d[0..1], scales_h[2..3], scales_l[4..7], qs[8..135].
+  const float d = Fp16ToFloat(ReadU16(block, 0));
+  const std::uint16_t scales_h = ReadU16(block, 2);
+  for (std::size_t ib = 0; ib < 8; ++ib) {
+    const std::uint8_t packed = ReadByte(block, 4 + ib / 2);
+    const int ls = ((packed >> (4 * (ib % 2))) & 0xF) |
+                   (((scales_h >> (2 * ib)) & 3) << 4);
+    const float dl = d * (ls - 32);
+    for (std::size_t j = 0; j < 16; ++j) {
+      const std::uint8_t q = ReadByte(block, 8 + ib * 16 + j);
+      out[ib * 32 + j] = dl * kIq4NlValues[q & 0xF];
+      out[ib * 32 + 16 + j] = dl * kIq4NlValues[q >> 4];
+    }
+  }
+}
+
+void DequantizeIQ3S(std::span<const std::byte> block, std::span<float> out) {
+  // d[0..1], qs[2..65], qh[66..73], signs[74..105], scales[106..109].
+  const float d = Fp16ToFloat(ReadU16(block, 0));
+  std::size_t o = 0;
+  for (std::size_t ib = 0; ib < 8; ib += 2) {
+    const float db1 =
+        d * (1 + 2 * (ReadByte(block, 106 + ib / 2) & 0xF));
+    const float db2 = d * (1 + 2 * (ReadByte(block, 106 + ib / 2) >> 4));
+    for (std::size_t half = 0; half < 2; ++half) {
+      const float db = half == 0 ? db1 : db2;
+      const std::uint8_t qh = ReadByte(block, 66 + ib + half);
+      for (std::size_t l = 0; l < 4; ++l) {
+        const std::uint32_t g1 =
+            kIq3sGrid[ReadByte(block, 2 + ib * 8 + 2 * l) |
+                      ((qh << (8 - 2 * l)) & 256)];
+        const std::uint32_t g2 =
+            kIq3sGrid[ReadByte(block, 2 + ib * 8 + 2 * l + 1) |
+                      ((qh << (7 - 2 * l)) & 256)];
+        const std::uint8_t signs = ReadByte(block, 74 + ib * 4 + half * 4 + l);
+        for (std::size_t j = 0; j < 4; ++j) {
+          const float m1 = (signs & (1u << j)) ? -1.0f : 1.0f;
+          const float m2 = (signs & (1u << (j + 4))) ? -1.0f : 1.0f;
+          out[o + j] = db * ((g1 >> (8 * j)) & 0xFF) * m1;
+          out[o + 4 + j] = db * ((g2 >> (8 * j)) & 0xFF) * m2;
+        }
+        o += 8;
+      }
+    }
+  }
+}
+
 std::uint16_t Fp32ToHalfBits(float value) {
   std::uint32_t bits;
   static_assert(sizeof(bits) == sizeof(value));

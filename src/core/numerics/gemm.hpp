@@ -20,6 +20,34 @@ namespace tessera::core {
     std::span<const float> a, std::span<const std::byte> w,
     std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
 
+// Host references for the block-quantized GEMM built-ins below. Each
+// dequantizes W row by row and accumulates C = A x W'^T with fp32
+// sequential fma (deterministic, the same order the kernels use).
+// `a` is m x k fp32, `w` holds n rows of k/block_elements blocks,
+// `c` is m x n fp32. k must be a positive multiple of the block
+// elements and m, n nonzero; a size mismatch is InvalidArgument.
+//
+// Usage:
+//   auto status = GemmQ5KRef(a, w, c, m, n, k);
+[[nodiscard]] std::expected<void, StatusCode> GemmQ5KRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmQ6KRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmQ3KRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmIq4NlRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmIq4XsRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmIq3SRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+
 // Host reference for the "gemm_fp8" built-in: C = A x (diag(s) x W)^T
 // with fp32 sequential accumulation (deterministic, the same order
 // the kernels use). `a` is m x k fp32 row-major, `w` is n x k FP8

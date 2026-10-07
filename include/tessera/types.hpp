@@ -62,6 +62,9 @@ enum class DType : int {
   Q8K = 14,
   I32 = 15,
   I64 = 16,
+  IQ4_NL = 17,  // 4-bit codebook blocks (ggml 2026 numbering)
+  IQ4_XS = 18,  // 4-bit fine-scale blocks
+  IQ3_S = 19,   // 3-bit grid blocks
 };
 
 // Bytes per element of a plain (non-block) dtype.
@@ -104,18 +107,26 @@ constexpr std::size_t kQ4KBlockElements = 256;
   switch (dtype) {
     case DType::Q40:
     case DType::Q80:
+    case DType::Q3K:
     case DType::Q4K:
     case DType::Q5K:
     case DType::Q6K:
-    case DType::Q8K: {
+    case DType::Q8K:
+    case DType::IQ4_NL:
+    case DType::IQ4_XS:
+    case DType::IQ3_S: {
       std::size_t elements = 0;
       std::size_t bytes = 0;
       switch (dtype) {
         case DType::Q40: elements = 32; bytes = 17; break;
-        case DType::Q80: elements = 32; bytes = 33; break;
+        case DType::Q80: elements = 32; bytes = 34; break;
+        case DType::Q3K: elements = 256; bytes = 110; break;
         case DType::Q4K: elements = 256; bytes = 144; break;
         case DType::Q5K: elements = 256; bytes = 176; break;
         case DType::Q6K: elements = 256; bytes = 210; break;
+        case DType::IQ4_NL: elements = 32; bytes = 18; break;
+        case DType::IQ4_XS: elements = 256; bytes = 136; break;
+        case DType::IQ3_S: elements = 256; bytes = 110; break;
         default: elements = 256; bytes = 258; break;  // Q8K
       }
       if (numel % elements != 0 || numel / elements > kMax / bytes) {

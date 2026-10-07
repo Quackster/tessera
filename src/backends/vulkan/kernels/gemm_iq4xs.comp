@@ -1,0 +1,85 @@
+#version 450
+
+// One workgroup per 256 output elements; the dispatch is
+// ceil(m * n / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "gemm_iq4xs" contract (tessera API): buffer 0 is the activation A
+// (fp32, m x k), buffer 1 the quantized weights W (IQ4_XS, n x k),
+// buffer 2 the output C (fp32, m x n). Scalars are 64-bit: m at
+// pc.v[0], n at pc.v[2], k at pc.v[4] (a positive multiple of 256).
+// An IQ4_XS block is 136 bytes: d, packed 6-bit scales, codebook
+// nibbles.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) buffer C {
+  float c[];
+};
+
+// IQ4 codebook (ports kvalues_iq4nl).
+const int kValues[16] =
+    int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53,
+             69, 89, 113);
+
+// Byte `offset` of the weight buffer (little-endian extraction).
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+// IEEE binary16 (little-endian) -> fp32, exact.
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  if (idx >= m * n) {
+    return;
+  }
+  uint row_a = idx / n;
+  uint row_w = idx % n;
+  uint blocks = k / 256;
+  float acc = 0.0;
+  for (uint b = 0; b < blocks; ++b) {
+    uint base = row_w * (blocks * 136) + b * 136;
+    float d = fp16_at(base);
+    uint scales_h = wbyte(base + 2) | (wbyte(base + 3) << 8);
+    for (uint ib = 0; ib < 8; ++ib) {
+      uint packed = wbyte(base + 4 + ib / 2);
+      uint ls = ((packed >> (4 * (ib % 2))) & 15) |
+                (((scales_h >> (2 * ib)) & 3) << 4);
+      float dl = d * (float(ls) - 32.0);
+      for (uint j = 0; j < 16; ++j) {
+        uint q = wbyte(base + 8 + ib * 16 + j);
+        uint t = b * 256 + ib * 32 + j;
+        acc += a[row_a * k + t] * (dl * float(kValues[q & 15]));
+        acc += a[row_a * k + t + 16] * (dl * float(kValues[q >> 4]));
+      }
+    }
+  }
+  c[idx] = acc;
+}

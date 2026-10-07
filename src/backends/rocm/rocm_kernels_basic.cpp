@@ -1,0 +1,204 @@
+#include "backends/rocm/rocm_kernels.hpp"
+
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+
+namespace tessera::backends::rocm {
+
+// Built-in "fill": writes scalar 0 to every int32 element (scalar 1 is
+// the element count). Contract: CheckBuiltInArgs (tessera API).
+__global__ void FillKernel(int* out, unsigned long long value,
+                          unsigned long long count) {
+  unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < count) {
+    out[i] = static_cast<int>(value);
+  }
+}
+
+// Built-in "rope": NeoX-style rotary embedding over rows x heads x
+// head_dim fp32 in place (buffer 0); scalars are rows, heads,
+// head_dim, rope_dim, pos_base, theta fp32 bits. One thread per pair.
+__global__ void RopeKernel(float* data, unsigned long long rows,
+                           unsigned long long heads,
+                           unsigned long long head_dim,
+                           unsigned long long rope_dim,
+                           unsigned long long pos_base,
+                           unsigned long long theta_bits) {
+  const unsigned long long pairs = rope_dim / 2;
+  const unsigned long long t =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= rows * heads * pairs) {
+    return;
+  }
+  const unsigned long long row = t / (heads * pairs);
+  const unsigned long long rem = t % (heads * pairs);
+  const unsigned long long head = rem / pairs;
+  const unsigned long long j = rem % pairs;
+  float theta = 0.0f;
+  static_assert(sizeof(theta) == 4);
+  std::uint32_t bits = static_cast<std::uint32_t>(theta_bits);
+  std::memcpy(&theta, &bits, 4);
+  const float pos = static_cast<float>(pos_base + row);
+  const float angle =
+      pos * powf(theta, -2.0f * static_cast<float>(j) /
+                            static_cast<float>(rope_dim));
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+  float* base = data + (row * heads + head) * head_dim;
+  const float x1 = base[j];
+  const float x2 = base[j + pairs];
+  base[j] = x1 * c - x2 * s;
+  base[j + pairs] = x1 * s + x2 * c;
+}
+
+// Built-in "attention": causal grouped-query attention, scale
+// 1/sqrt(head_dim), fp32 sequential accumulation. Buffers are q, k, v
+// and out; scalars are m, n, heads, kv_heads, head_dim, q_base. One
+// thread per output element (two score passes, no scratch buffer).
+__global__ void AttentionKernel(const float* q, const float* k, const float* v,
+                                float* out, unsigned long long m,
+                                unsigned long long n,
+                                unsigned long long heads,
+                                unsigned long long kv_heads,
+                                unsigned long long head_dim,
+                                unsigned long long q_base) {
+  const unsigned long long t =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= m * heads * head_dim) {
+    return;
+  }
+  const unsigned long long i = t / (heads * head_dim);
+  const unsigned long long rem = t % (heads * head_dim);
+  const unsigned long long h = rem / head_dim;
+  const unsigned long long e = rem % head_dim;
+  const unsigned long long kv = h / (heads / kv_heads);
+  const unsigned long long pos = q_base + i;
+  const unsigned long long last = pos >= n ? n - 1 : pos;
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  const unsigned long long q_base_idx = (i * heads + h) * head_dim;
+  float row_max = 0.0f;
+  bool first = true;
+  for (unsigned long long j = 0; j <= last; ++j) {
+    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
+    float dot = 0.0f;
+    for (unsigned long long d = 0; d < head_dim; ++d) {
+      dot = fmaf(q[q_base_idx + d], k[k_base + d], dot);
+    }
+    dot *= scale;
+    if (first || dot > row_max) {
+      row_max = dot;
+      first = false;
+    }
+  }
+  float acc = 0.0f;
+  float denom = 0.0f;
+  for (unsigned long long j = 0; j <= last; ++j) {
+    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
+    float dot = 0.0f;
+    for (unsigned long long d = 0; d < head_dim; ++d) {
+      dot = fmaf(q[q_base_idx + d], k[k_base + d], dot);
+    }
+    const float w = expf(dot * scale - row_max);
+    denom += w;
+    acc = fmaf(w, v[k_base + e], acc);
+  }
+  out[t] = acc / denom;
+}
+
+// OCP FP8 E4M3 byte to fp32 (device port of the core Fp8E4M3ToFloat).
+__host__ __device__ float Fp8E4M3ToFloatDev(std::uint8_t bits) {
+  const std::uint32_t sign = bits >> 7;
+  const std::uint32_t exp = (bits >> 3) & 0xF;
+  const std::uint32_t mant = bits & 0x7;
+  float value;
+  if (exp == 0) {
+    value = static_cast<float>(mant) * 0x1p-10f;
+  } else if (exp == 15) {
+    if (mant == 7) {
+      return std::numeric_limits<float>::quiet_NaN();
+    }
+    value = (1.0f + static_cast<float>(mant) / 8.0f) * 256.0f;
+  } else {
+    value = (1.0f + static_cast<float>(mant) / 8.0f) *
+            std::ldexp(1.0f, static_cast<int>(exp) - 8);
+  }
+  return sign != 0 ? -value : value;
+}
+
+// OCP MX E8M0 scale byte to fp32 (device port of E8M0ToFloat).
+__host__ __device__ float E8M0ToFloatDev(std::uint8_t scale) {
+  return static_cast<float>(
+      std::ldexp(1.0, static_cast<int>(scale) - 127));
+}
+
+// OCP MX E2M1 nibble to fp32 (device port of F4E2M1ToFloat).
+__host__ __device__ float F4E2M1ToFloatDev(std::uint8_t nibble) {
+  const std::uint32_t sign = (nibble >> 3) & 1;
+  const std::uint32_t exp = (nibble >> 1) & 0x3;
+  const std::uint32_t mant = nibble & 1;
+  float value;
+  if (exp == 0) {
+    value = static_cast<float>(mant) * 0.5f;
+  } else if (exp == 3 && mant == 1) {
+    return std::numeric_limits<float>::quiet_NaN();
+  } else {
+    value = (1.0f + static_cast<float>(mant) / 2.0f) *
+            std::ldexp(1.0f, static_cast<int>(exp) - 1);
+  }
+  return sign != 0 ? -value : value;
+}
+
+// Built-in "gemm_fp8": C = A x (diag(s) x W)^T with fp32 sequential
+// accumulation; W holds FP8 E4M3 bytes, s one fp32 scale per row.
+__global__ void GemmFp8Kernel(const float* a, const unsigned char* w,
+                              const float* s, float* c,
+                              unsigned long long m, unsigned long long n,
+                              unsigned long long k) {
+  unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const float scale = s[row_w];
+  float acc = 0.0f;
+  for (unsigned long long t = 0; t < k; ++t) {
+    acc = fmaf(a[row_a * k + t],
+               scale * Fp8E4M3ToFloatDev(w[row_w * k + t]), acc);
+  }
+  c[idx] = acc;
+}
+
+// Built-in "gemm_mxfp4": C = A x W'^T with fp32 sequential
+// accumulation; W' dequantizes MXFP4 nibbles (low nibble first) with
+// one E8M0 scale byte per 32 elements. k is a multiple of 32.
+__global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
+                                const unsigned char* s, float* c,
+                                unsigned long long m, unsigned long long n,
+                                unsigned long long k) {
+  unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const unsigned long long blocks = k / 32;
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const float scale = E8M0ToFloatDev(s[row_w * blocks + b]);
+    for (unsigned long long l = 0; l < 32; ++l) {
+      const unsigned long long t = b * 32 + l;
+      const std::uint8_t packed = w[(row_w * k + t) / 2];
+      const std::uint8_t nibble =
+          (t % 2 == 0) ? (packed & 0xF) : (packed >> 4);
+      acc = fmaf(a[row_a * k + t], scale * F4E2M1ToFloatDev(nibble), acc);
+    }
+  }
+  c[idx] = acc;
+}
+}  // namespace tessera::backends::rocm

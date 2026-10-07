@@ -98,16 +98,18 @@ TEST(DTypeTest, TensorBytesSizesTensors) {
   EXPECT_EQ(*tessera::TensorBytes(DType::F16, 4), 8u);
   EXPECT_EQ(*tessera::TensorBytes(DType::I64, 3), 24u);
   EXPECT_EQ(*tessera::TensorBytes(DType::Q40, 32), 17u);
-  EXPECT_EQ(*tessera::TensorBytes(DType::Q80, 64), 66u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q80, 64), 68u);
   EXPECT_EQ(*tessera::TensorBytes(DType::Q4K, 256), 144u);
   EXPECT_EQ(*tessera::TensorBytes(DType::Q5K, 512), 352u);
   EXPECT_EQ(*tessera::TensorBytes(DType::Q6K, 256), 210u);
   EXPECT_EQ(*tessera::TensorBytes(DType::Q8K, 256), 258u);
   EXPECT_EQ(*tessera::TensorBytes(DType::F4E2M1, 256), 128u);
-  // No known layout for K-quant leftovers.
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q3K, 256), 110u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::IQ4_NL, 32), 18u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::IQ4_XS, 256), 136u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::IQ3_S, 256), 110u);
+  // No known layout for the K-quant leftover.
   EXPECT_EQ(tessera::TensorBytes(DType::Q2K, 256).error(),
-            StatusCode::UnsupportedFeature);
-  EXPECT_EQ(tessera::TensorBytes(DType::Q3K, 256).error(),
             StatusCode::UnsupportedFeature);
   // 100 elements are not a whole number of Q4_K blocks; 3 elements
   // are not a whole number of F4E2M1 pairs.

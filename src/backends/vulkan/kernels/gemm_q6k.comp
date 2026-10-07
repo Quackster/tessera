@@ -1,0 +1,99 @@
+#version 450
+
+// One workgroup per 256 output elements; the dispatch is
+// ceil(m * n / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "gemm_q6k" contract (tessera API): buffer 0 is the activation A
+// (fp32, m x k), buffer 1 the quantized weights W (Q6_K, n x k),
+// buffer 2 the output C (fp32, m x n). Scalars are 64-bit: m at
+// pc.v[0], n at pc.v[2], k at pc.v[4]. A Q6_K block is 210 bytes:
+// 128 low nibbles, 64 2-bit highs, 16 int8 scales, d.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) buffer C {
+  float c[];
+};
+
+// Byte `offset` of the Q6_K buffer (little-endian extraction).
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+// IEEE binary16 (little-endian) -> fp32, exact.
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  if (idx >= m * n) {
+    return;
+  }
+  uint row_a = idx / n;
+  uint row_w = idx % n;
+  uint blocks = k / 256;
+  float acc = 0.0;
+  for (uint b = 0; b < blocks; ++b) {
+    uint base = row_w * (blocks * 210) + b * 210;
+    float d = fp16_at(base + 208);
+    for (uint n2 = 0; n2 < 2; ++n2) {
+      for (uint l = 0; l < 32; ++l) {
+        uint is = l / 16;
+        uint ql0 = wbyte(base + n2 * 64 + l);
+        uint ql1 = wbyte(base + n2 * 64 + 32 + l);
+        uint qh = wbyte(base + 128 + n2 * 32 + l);
+        int s0 = int(wbyte(base + 192 + n2 * 8 + is));
+        int s2 = int(wbyte(base + 192 + n2 * 8 + is + 2));
+        int s4 = int(wbyte(base + 192 + n2 * 8 + is + 4));
+        int s6 = int(wbyte(base + 192 + n2 * 8 + is + 6));
+        if (s0 >= 128) {
+          s0 -= 256;
+        }
+        if (s2 >= 128) {
+          s2 -= 256;
+        }
+        if (s4 >= 128) {
+          s4 -= 256;
+        }
+        if (s6 >= 128) {
+          s6 -= 256;
+        }
+        int q1 = int((ql0 & 15) | (((qh >> 0) & 3) << 4)) - 32;
+        int q2 = int((ql1 & 15) | (((qh >> 2) & 3) << 4)) - 32;
+        int q3 = int((ql0 >> 4) | (((qh >> 4) & 3) << 4)) - 32;
+        int q4 = int((ql1 >> 4) | (((qh >> 6) & 3) << 4)) - 32;
+        uint t = b * 256 + n2 * 128 + l;
+        acc += a[row_a * k + t] * (d * float(s0) * float(q1));
+        acc += a[row_a * k + t + 32] * (d * float(s2) * float(q2));
+        acc += a[row_a * k + t + 64] * (d * float(s4) * float(q3));
+        acc += a[row_a * k + t + 96] * (d * float(s6) * float(q4));
+      }
+    }
+  }
+  c[idx] = acc;
+}

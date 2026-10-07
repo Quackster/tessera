@@ -207,6 +207,9 @@ std::optional<DType> GgmlTypeToDType(std::uint32_t id) {
     case 13: return DType::Q5K;
     case 14: return DType::Q6K;
     case 15: return DType::Q8K;
+    case 20: return DType::IQ4_NL;
+    case 21: return DType::IQ3_S;
+    case 23: return DType::IQ4_XS;
     case 26: return DType::I32;
     case 27: return DType::I64;
     case 30: return DType::BF16;
