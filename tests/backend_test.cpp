@@ -2345,16 +2345,19 @@ TEST(BackendTest, L2NormDeviceMatchesRef) {
   auto upload = backend->CopyH2D(**x_buf, std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(x.data()), x.size() * 4));
   ASSERT_TRUE(upload.has_value()) << tessera::ToString(upload.error());
+  constexpr float kScale = 0.37f;
   std::uint32_t eps_bits = 0;
+  std::uint32_t scale_bits = 0;
   static_assert(sizeof(eps_bits) == sizeof(kEps));
   std::memcpy(&eps_bits, &kEps, sizeof(eps_bits));
+  std::memcpy(&scale_bits, &kScale, sizeof(scale_bits));
   auto kernel = backend->LoadKernel("l2norm", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
   launch.grid_x = (kRows + 255) / 256;
   launch.block_x = 256;
   launch.buffers = {(*x_buf).get(), (*y_buf).get()};
-  launch.scalars = {kRows, kCols, eps_bits};
+  launch.scalars = {kRows, kCols, eps_bits, scale_bits};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -2364,7 +2367,8 @@ TEST(BackendTest, L2NormDeviceMatchesRef) {
   ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
   std::vector<float> ref(x.size());
   auto ref_status = core::L2NormRef(std::span<const float>(x),
-                                    std::span<float>(ref), kRows, kCols, kEps);
+                                    std::span<float>(ref), kRows, kCols, kEps,
+                                    kScale);
   ASSERT_TRUE(ref_status.has_value())
       << tessera::ToString(ref_status.error());
   const auto* device_out = reinterpret_cast<const float*>(readback.data());

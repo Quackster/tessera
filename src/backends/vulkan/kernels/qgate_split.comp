@@ -5,8 +5,8 @@
 layout(local_size_x = 256) in;
 
 // "qgate_split" contract: buffer 0 is the fused gated-attention
-// projection (all queries, then all gates), buffer 1 the queries,
-// buffer 2 the gates. Scalars: heads v[0], head_dim v[2].
+// projection (per head query then gate), buffer 1 the queries, buffer
+// 2 the gates. Scalars: heads v[0], head_dim v[2].
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -32,6 +32,7 @@ void main() {
   }
   uint head = t / head_dim;
   uint e = t % head_dim;
-  q[t] = fused[head * head_dim + e];
-  g[t] = fused[heads * head_dim + head * head_dim + e];
+  uint src = head * 2 * head_dim;
+  q[t] = fused[src + e];
+  g[t] = fused[src + head_dim + e];
 }

@@ -66,7 +66,7 @@ namespace tessera::core {
 //   auto status = L2NormRef(x, y, rows, cols, 1e-6f);
 [[nodiscard]] std::expected<void, StatusCode> L2NormRef(
     std::span<const float> x, std::span<float> y, std::size_t rows,
-    std::size_t cols, float eps);
+    std::size_t cols, float eps, float scale = 1.0f);
 
 // Host reference for the "rmsnorm_gated" built-in: row-wise RMS
 // normalization scaled by a SiLU gate over rows x cols fp32

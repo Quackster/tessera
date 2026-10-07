@@ -186,9 +186,9 @@ class Kernel {
 // (fp32, n); scalar 0 is n. O = A * sigmoid(G) elementwise. The
 // dispatch is ceil(n / 256) workgroups of 256.
 // "l2norm": buffer 0 is X (fp32, rows x cols), buffer 1 the output Y
-// (fp32, rows x cols); scalars are rows, cols and the fp32 epsilon
-// bits. Y = X / sqrt(sum(X^2) + eps) per row. The dispatch is
-// ceil(rows / 256) workgroups of 256.
+// (fp32, rows x cols); scalars are rows, cols, the fp32 epsilon bits
+// and the fp32 scale bits. Y = scale * X / sqrt(sum(X^2) + eps) per
+// row. The dispatch is ceil(rows / 256) workgroups of 256.
 // "rmsnorm_gated": buffer 0 is X (fp32, rows x cols), buffer 1 the
 // weight W (fp32, cols), buffer 2 the gate (fp32, rows x cols),
 // buffer 3 the output Y (fp32, rows x cols); scalars are rows, cols
@@ -207,7 +207,8 @@ class Kernel {
 // "repeat_heads": buffer 0 is IN (fp32, num_k_heads x head_k_dim),
 // buffer 1 the output OUT (fp32, num_v_heads x head_k_dim); scalars are
 // num_v_heads, head_k_dim and factor (num_v_heads is divisible by
-// factor; out[h] = in[h / factor]). The dispatch is
+// factor; out[h] = in[h % (num_v_heads / factor)], the interleaved
+// GQA layout). The dispatch is
 // ceil(num_v_heads * head_k_dim / 256) workgroups of 256.
 // "add": buffers 0 and 1 are A and B (fp32, n each) and buffer 2 the
 // output O (fp32, n); scalar 0 is n. O = A + B elementwise.
@@ -290,7 +291,7 @@ class Kernel {
 // the width id. The dispatch is
 // ceil(rows * heads * (rope_dim / 2) / 256) workgroups of 256.
 // "qgate_split": buffer 0 is the fused gated-attention projection
-// (fp32, heads*2*head_dim, all queries then all gates), buffer 1 the
+// (fp32, heads*2*head_dim, per head query then gate), buffer 1 the
 // queries Q (fp32, heads*head_dim), buffer 2 the gates G (fp32,
 // heads*head_dim); scalars are heads and head_dim. The dispatch is
 // ceil(heads * head_dim / 256) workgroups of 256.
@@ -430,7 +431,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "l2norm") {
-    if (launch.buffers.size() != 2 || launch.scalars.size() != 3) {
+    if (launch.buffers.size() != 2 || launch.scalars.size() != 4) {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {

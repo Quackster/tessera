@@ -5,7 +5,8 @@
 layout(local_size_x = 256) in;
 
 // "l2norm" contract: buffer 0 is X (rows x cols), buffer 1 the output
-// Y. Scalars: rows v[0], cols v[2], epsilon fp32 bits v[4].
+// Y. Scalars: rows v[0], cols v[2], epsilon fp32 bits v[4], scale fp32
+// bits v[6] (Y = scale * X / sqrt(sum(X^2) + eps)).
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -26,11 +27,12 @@ void main() {
   }
   uint cols = pc.v[2];
   float eps = uintBitsToFloat(pc.v[4]);
+  float scale = uintBitsToFloat(pc.v[6]);
   float sum = 0.0;
   for (uint c = 0; c < cols; ++c) {
     sum += x[r * cols + c] * x[r * cols + c];
   }
-  float gain = inversesqrt(sum + eps);
+  float gain = inversesqrt(sum + eps) * scale;
   for (uint c = 0; c < cols; ++c) {
     y[r * cols + c] = x[r * cols + c] * gain;
   }

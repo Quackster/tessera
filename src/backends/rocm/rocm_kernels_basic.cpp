@@ -332,21 +332,25 @@ __global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
 // One thread per row with sequential accumulation.
 __global__ void L2NormKernel(const float* x, float* y,
                              unsigned long long rows, unsigned long long cols,
-                             unsigned long long eps_bits) {
+                             unsigned long long eps_bits,
+                             unsigned long long scale_bits) {
   const unsigned long long r =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (r >= rows) {
     return;
   }
   float eps = 0.0f;
+  float scale = 0.0f;
   static_assert(sizeof(eps) == 4);
-  std::uint32_t bits = static_cast<std::uint32_t>(eps_bits);
-  std::memcpy(&eps, &bits, 4);
+  std::uint32_t eps_bits32 = static_cast<std::uint32_t>(eps_bits);
+  std::memcpy(&eps, &eps_bits32, 4);
+  std::uint32_t scale_bits32 = static_cast<std::uint32_t>(scale_bits);
+  std::memcpy(&scale, &scale_bits32, 4);
   float sum = 0.0f;
   for (unsigned long long c = 0; c < cols; ++c) {
     sum = fmaf(x[r * cols + c], x[r * cols + c], sum);
   }
-  const float gain = 1.0f / sqrtf(sum + eps);
+  const float gain = scale / sqrtf(sum + eps);
   for (unsigned long long c = 0; c < cols; ++c) {
     y[r * cols + c] = x[r * cols + c] * gain;
   }
@@ -473,7 +477,7 @@ __global__ void MropeKernel(float* data, const unsigned long long* pos,
 }
 
 // Built-in "qgate_split": split a fused gated-attention projection
-// into queries and gates (all queries, then all gates). One thread per
+// into queries and gates (per head query then gate). One thread per
 // (head, element).
 __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
                                  unsigned long long heads,
@@ -485,8 +489,9 @@ __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
   }
   const unsigned long long head = t / head_dim;
   const unsigned long long e = t % head_dim;
-  q[t] = fused[head * head_dim + e];
-  gate[t] = fused[heads * head_dim + head * head_dim + e];
+  const unsigned long long src = head * 2 * head_dim;
+  q[t] = fused[src + e];
+  gate[t] = fused[src + head_dim + e];
 }
 // Built-in "add": elementwise o = a + b over n fp32. One thread per
 // element.
@@ -526,7 +531,7 @@ __global__ void RepeatHeadsKernel(const float* in, float* out,
   }
   const unsigned long long h = i / head_k_dim;
   const unsigned long long e = i % head_k_dim;
-  out[i] = in[(h / factor) * head_k_dim + e];
+  out[i] = in[(h % (num_v_heads / factor)) * head_k_dim + e];
 }
 
 // Built-in "ssm_gate": the gated-delta decay/write gates per value head.

@@ -509,7 +509,8 @@ std::expected<void, StatusCode> HybridForward(
         !backend.CopyD2D(*h.conv_mixed, 2 * g.key_dim * 4, *h.v_l, 0,
                          g.value_dim * 4) ||
         !L2NormDevice(backend, *h.l2norm_kernel, *h.q_l, *h.q_l, g.num_k_heads,
-                      g.head_k_dim, 1e-6f) ||
+                      g.head_k_dim, 1e-6f,
+                      1.0 / std::sqrt(static_cast<double>(g.head_k_dim))) ||
         !L2NormDevice(backend, *h.l2norm_kernel, *h.k_l, *h.k_l, g.num_k_heads,
                       g.head_k_dim, 1e-6f) ||
         !RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *h.q_l, *h.q_exp,

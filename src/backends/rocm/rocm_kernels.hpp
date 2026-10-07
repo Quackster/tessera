@@ -139,7 +139,8 @@ __global__ void RmsnormKernel(const float* x, const float* w, float* y,
                               unsigned long long eps_bits);
 __global__ void L2NormKernel(const float* x, float* y,
                              unsigned long long rows, unsigned long long cols,
-                             unsigned long long eps_bits);
+                             unsigned long long eps_bits,
+                             unsigned long long scale_bits);
 __global__ void RmsnormGatedKernel(const float* x, const float* w,
                                    const float* gate, float* y,
                                    unsigned long long rows,

@@ -438,15 +438,18 @@ inline std::expected<void, StatusCode> MropeDevice(
 // Y = L2-normalize(X) per row on the device.
 inline std::expected<void, StatusCode> L2NormDevice(
     Backend& backend, const Kernel& kernel, const Buffer& x, Buffer& y,
-    std::size_t rows, std::size_t cols, double eps) {
+    std::size_t rows, std::size_t cols, double eps, double scale = 1.0) {
   const float eps_f = static_cast<float>(eps);
-  std::uint32_t bits = 0;
-  std::memcpy(&bits, &eps_f, sizeof(bits));
+  const float scale_f = static_cast<float>(scale);
+  std::uint32_t eps_bits = 0;
+  std::uint32_t scale_bits = 0;
+  std::memcpy(&eps_bits, &eps_f, sizeof(eps_bits));
+  std::memcpy(&scale_bits, &scale_f, sizeof(scale_bits));
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&x, &y};
-  launch.scalars = {rows, cols, bits};
+  launch.scalars = {rows, cols, eps_bits, scale_bits};
   return backend.LaunchKernel(kernel, launch);
 }
 

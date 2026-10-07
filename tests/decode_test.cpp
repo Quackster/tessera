@@ -357,14 +357,14 @@ std::vector<std::uint32_t> SpeculativeTokens(const std::string& path,
 TEST(HybridDecodeTest, GatedBaselineIsPinned) {
   const auto got = GreedyTokens(WriteGatedHybridFixture("gated.gguf").string(),
                                 8);
-  const std::vector<std::uint32_t> want = {17, 10, 10, 21, 24, 24, 24, 24};
+  const std::vector<std::uint32_t> want = {1, 0, 26, 18, 17, 3, 3, 3};
   EXPECT_EQ(got, want);
 }
 
 TEST(HybridDecodeTest, LinearBaselineIsPinned) {
   const auto got =
       GreedyTokens(WriteLinearHybridFixture("linear.gguf").string(), 8);
-  const std::vector<std::uint32_t> want = {8, 18, 30, 18, 6, 11, 29, 14};
+  const std::vector<std::uint32_t> want = {21, 28, 24, 6, 9, 15, 18, 24};
   EXPECT_EQ(got, want);
 }
 
@@ -398,7 +398,7 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
   auto rows = tessera::core::ScoreTokens(engine->Owner(), **model, prefix);
   ASSERT_TRUE(rows.has_value()) << tessera::ToString(rows.error());
   ASSERT_EQ(rows->size(), prefix.size());
-  const std::vector<std::uint32_t> want = {17, 12, 18, 3};
+  const std::vector<std::uint32_t> want = {1, 0, 26, 18};
   for (std::size_t i = 0; i < rows->size(); ++i) {
     EXPECT_EQ((*rows)[i].size(), cfg->vocab_size);
     EXPECT_EQ(RowArgMax((*rows)[i]), want[i]);
@@ -407,7 +407,7 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
   auto one = tessera::core::DecodeLogits(engine->Owner(), **model, cache, 0);
   ASSERT_TRUE(one.has_value()) << tessera::ToString(one.error());
   EXPECT_EQ(*one, (*rows)[0]);
-  EXPECT_EQ(RowArgMax(*one), 17u);
+  EXPECT_EQ(RowArgMax(*one), 1u);
 
   auto empty = tessera::core::ScoreTokens(
       engine->Owner(), **model, std::span<const std::uint32_t>{});
@@ -422,11 +422,11 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
 // full-attention and the stateful linear fixtures.
 TEST(HybridDecodeTest, SpeculationMatchesGreedy) {
   const std::string gated = WriteGatedHybridFixture("gated.gguf").string();
-  const std::vector<std::uint32_t> want_gated = {17, 10, 10, 21, 24, 24, 24, 24};
+  const std::vector<std::uint32_t> want_gated = {1, 0, 26, 18, 17, 3, 3, 3};
   EXPECT_EQ(SpeculativeTokens(gated, 8, 31), want_gated);
   EXPECT_EQ(SpeculativeTokens(gated, 8, 1), want_gated);
   const std::string linear = WriteLinearHybridFixture("linear.gguf").string();
-  const std::vector<std::uint32_t> want_linear = {8, 18, 30, 18, 6, 11, 29, 14};
+  const std::vector<std::uint32_t> want_linear = {21, 28, 24, 6, 9, 15, 18, 24};
   EXPECT_EQ(SpeculativeTokens(linear, 8, 31), want_linear);
   EXPECT_EQ(SpeculativeTokens(linear, 8, 5), want_linear);
 }

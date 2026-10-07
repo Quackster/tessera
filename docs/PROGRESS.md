@@ -825,59 +825,41 @@ through RADV GFX1201, rocm through the system ROCm).
   token ids to text with the model tokenizer and logs them; the default
   logs only `generated N token(s)` (the engine still logs the timing).
 
-- 2026-10-07: fused Q+gate split fix (230/230 `ctest` on vulkan). The
-  GGUF stores `attn_q.weight` as all queries then all gates; the old
-  per-head `[q, gate]` split made the residual stream explode to ~-7000
-  by layer 50 and the greedy output stayed degenerate. `QGateSplitRef`
-  and both `qgate_split` kernels now split queries from the first
-  `heads*head_dim` values and gates from the second. The synthetic
-  gated-fixture pins moved to `{17, 10, 10, 21, 24, 24, 24, 24}`. The
-  real 27B no longer explodes but is still incoherent.
+- 2026-10-07: coherent 27B decoding (230/230 `ctest` on vulkan). Greedy
+  generation on the real Qwen 3.8 27B GGUF answers coherently now
+  ("The capital of France is **Paris**."; "Once upon a time, in a land
+  far away, ..."). Two linear-attention bugs remained after the earlier
+  decay and conv fixes. First, the gated-delta query/key heads repeat to
+  the value heads with the interleaved GQA map (`value head h` uses
+  `key head h % num_k_heads`, not `h / factor`); the grouped map paired
+  the wrong key head with each value head. Second, the recurrence scales
+  the query by `1/sqrt(head_k_dim)`; without it the delta output was
+  ~11x too large, which changed the RMSNormGated eps behavior and the
+  gated norm. `RepeatHeadsRef` and both `repeat_heads` kernels use the
+  interleaved map; `l2norm` takes a scale scalar on both backends, with
+  the host reference and `BackendTest.L2NormDeviceMatchesRef` updated.
+  Confirmed against llama.cpp's per-node graph at layer 0: the predicted
+  delta output equals the reference `attn_output` exactly. The synthetic
+  linear-fixture pins moved to `{21, 28, 24, 6, 9, 15, 18, 24}`. (The
+  earlier fused Q+gate "all queries then all gates" change was wrong and
+  is reverted; the gate is per head `[q, gate]`.)
 
 ## Next (in order)
 
-0. **URGENT: fix the garbage decoding.** Greedy generation on the real
-   Qwen 3.8 27B GGUF is incoherent, so the model never answers. Examples
-   (greedy): `--prompt-text "The capital of France is"` (with the chat
-   template, `<think>` block) produces repeated newline tokens; a raw
-   `--no-chat "The capital of France is"` produces `.` then newlines
-   instead of ` Paris` (`ĠParis` = 11751). The tokenizer is correct:
-   `"The capital of France is"` encodes to `760 6511 314 9338 369`, and
-   the chat template renders correctly.
-   Fixed against the `llama-eval-callback` reference graph so far:
-   (a) the SSM decay had an extra `exp` (the checkpoint `ssm_a` is
-   already `-A`, so decay is `exp(ssm_a * softplus(a+dt))`); (b) the conv
-   taps were reversed (the reference `SSM_CONV` uses `[oldest..current]`,
-   PyTorch order); (c) the fused Q+gate split was wrong -- the GGUF stores
-   all queries then all gates, not per-head `[q, gate]` as the vLLM HF
-   layout does; the old split applied QK-Norm and mRoPE to gate values and
-   exploded the residual to ~-7000 by layer 50. With (c) the 27B no longer
-   explodes but is still incoherent.
-   Validated correct against ggml and vLLM (not the bug): embedding, the
-   layer `attn_norm`, the fused qkv GEMM and its Q5_K/IQ4_XS/Q3_K dequant
-   (byte-identical to `ggml`'s `to_float`), the SSM gating
-   (`alpha = exp(ssm_a*softplus(a+dt))`, `beta = sigmoid(b)`), the L2
-   norms, the delta recurrence (an independent numpy step reproduces
-   `DeltaStepHeads` to 1e-6), and the Q6_K output head.
-   Remaining lead: layer 0 (linear) already differs from the reference by
-   ~20% and grows; the FFN input (`attn_post_norm`) diverges, so trace the
-   linear-attention out-projection / gated norm at full width, not only
-   the first 3 elements. The tiny fixtures still pin determinism only.
-
-1. **Speculative decoding performance**: MTP speculation runs end to
+0. **Speculative decoding performance**: MTP speculation runs end to
    end (`Engine::GenerateSpeculative`, CLI `--speculate`) and is output
    preserving, but scores one token per target forward. Next: batch the
    draft scoring so k drafts cost one forward.
-2. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
+1. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
    grouped dynamic convolution, sliding attention, candidate selector and
    the verification loop, output equal to greedy. Remaining: acceptance
    tuning (context beyond the last token) and batching.
-3. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+2. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Models are data. No per
    model branches.
-4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
+3. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
    `/slots`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -886,17 +868,17 @@ through RADV GFX1201, rocm through the system ROCm).
    queue, keep-alive, `/v1/responses`, render/derender/batch,
    `/tokenizer_info`, `/load` and LoRA, and the 501
    embedding/rerank/audio/pooling/classify/score surfaces.
-5. **Runtime options**: context size, draft-block and the GPU index
+4. **Runtime options**: context size, draft-block and the GPU index
    (`--gpu`) are CLI flags now, and the KV cache can be fp16 (`--kv-f16`)
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-6. **Multimodal (mmproj)**: config, weights, encoder+merger, image
+5. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, and image-embedding injection into generation are done
    (`Engine::GenerateMultimodal`). Still to do: the CLI wiring, deepstack
    feature injection, and the image placeholder tokenizer mapping.
 
-7. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
+6. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism
    (shard attention heads and MLP rows across GPUs with an all-reduce per
    layer; vLLM tensor parallelism, Megatron-LM TP) or layer/pipeline

@@ -24,6 +24,13 @@ project, the version, the license, and where it is used.
   output sigmoid gate, and the 3:1 hybrid layout. Design references
   for src/core/numerics/norm.* and the hybrid roadmap; no code
   copied.
+- vLLM gated-delta attention (Apache-2.0,
+  vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py and
+  vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py):
+  the interleaved GQA repeat map (value head h uses key head
+  h % num_k_heads) and the 1/sqrt(head_k_dim) query scale applied inside
+  the recurrence. Design reference for RepeatHeadsRef and the l2norm
+  scale; no code copied.
 - Multimodal RoPE (Qwen2-VL, arXiv 2409.12191; vLLM
   MRotaryEmbedding docs): three-section pair layout with a global
   frequency index, text rows equivalent to 1D RoPE. Design reference

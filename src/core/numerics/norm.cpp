@@ -113,7 +113,7 @@ std::expected<void, StatusCode> SigmoidGateRef(std::span<const float> a,
 std::expected<void, StatusCode> L2NormRef(std::span<const float> x,
                                           std::span<float> y,
                                           std::size_t rows, std::size_t cols,
-                                          float eps) {
+                                          float eps, float scale) {
   if (rows == 0 || cols == 0 || eps < 0.0f) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -126,7 +126,7 @@ std::expected<void, StatusCode> L2NormRef(std::span<const float> x,
     for (std::size_t c = 0; c < cols; ++c) {
       sum = std::fma(x_row[c], x_row[c], sum);
     }
-    const float gain = 1.0f / std::sqrt(sum + eps);
+    const float gain = scale / std::sqrt(sum + eps);
     float* y_row = y.data() + r * cols;
     for (std::size_t c = 0; c < cols; ++c) {
       y_row[c] = x_row[c] * gain;

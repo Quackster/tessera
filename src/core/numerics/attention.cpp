@@ -272,13 +272,12 @@ std::expected<void, StatusCode> QGateSplitRef(
     return std::unexpected(StatusCode::InvalidArgument);
   }
   for (std::size_t h = 0; h < heads; ++h) {
-    const float* q_src = fused.data() + h * head_dim;
-    const float* g_src = fused.data() + per_head + h * head_dim;
+    const float* src = fused.data() + h * 2 * head_dim;
     float* q_row = q.data() + h * head_dim;
     float* gate_row = gate.data() + h * head_dim;
     for (std::size_t e = 0; e < head_dim; ++e) {
-      q_row[e] = q_src[e];
-      gate_row[e] = g_src[e];
+      q_row[e] = src[e];
+      gate_row[e] = src[head_dim + e];
     }
   }
   return {};
@@ -297,7 +296,7 @@ std::expected<void, StatusCode> RepeatHeadsRef(
     return std::unexpected(StatusCode::InvalidArgument);
   }
   for (std::size_t h = 0; h < num_v_heads; ++h) {
-    const std::size_t src_head = h / factor;
+    const std::size_t src_head = h % num_k_heads;
     for (std::size_t e = 0; e < head_k_dim; ++e) {
       out[h * head_k_dim + e] = in[src_head * head_k_dim + e];
     }

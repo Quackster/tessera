@@ -100,7 +100,7 @@ namespace tessera::core {
     std::size_t dv, float alpha, float beta);
 // Host reference for the "qgate_split" built-in: split a fused gated
 // attention projection into queries and gates. The fused projection is
-// heads*2*head_dim fp32 laid out as all queries then all gates (the
+// heads*2*head_dim fp32 laid out per head as query then gate (the
 // layout gated attention definitions use); `q` and `gate` are
 // heads*head_dim each. heads and head_dim must be nonzero and the
 // spans must match those lengths; else InvalidArgument.
@@ -112,7 +112,7 @@ namespace tessera::core {
     std::size_t heads, std::size_t head_dim);
 // Host reference for the "repeat_heads" built-in: expand `in`
 // (num_k_heads x head_k_dim) to `out` (num_v_heads x head_k_dim) by
-// repeating each key head `factor` times (out[h] = in[h / factor]).
+// cycling the key heads (out[h] = in[h % (num_v_heads / factor)]).
 // Gated-delta layers repeat query/key heads to the value heads before
 // the scan. num_v_heads must be nonzero and divisible by factor; a size
 // mismatch is InvalidArgument.
