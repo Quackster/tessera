@@ -92,11 +92,16 @@ int main(int argc, char** argv) {
   for (const auto& tensor : tensors) {
     total_numel += tensor.shape.Numel();
   }
+  std::size_t device_bytes = 0;
+  for (const auto& weight : loaded.Weights()) {
+    device_bytes += weight.device->Size();
+  }
   std::string summary =
       std::string(loaded.Format() == tessera::ModelFormat::Gguf ? "gguf"
                                                                : "mxfp4") +
       " model, " + std::to_string(tensors.size()) + " tensors, " +
-      std::to_string(total_numel) + " total elements";
+      std::to_string(total_numel) + " total elements, " +
+      std::to_string(device_bytes) + " bytes on device";
   if (!loaded.Name().empty()) {
     summary = std::string(loaded.Name()) + " (" + summary + ")";
   }

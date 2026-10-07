@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cstddef>
+#include <expected>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -85,6 +87,54 @@ enum class DType : int {
 // 144-byte Q4_K block holds. Shared by the "gemm_q4k" built-in
 // contract and the weight loaders.
 constexpr std::size_t kQ4KBlockElements = 256;
+
+// Byte size of a dense tensor with `numel` elements. Block types use
+// their block layout (ggml 2026 numbering); plain types use
+// ElementBytes. UnsupportedFeature for layouts without a known size
+// (Q2_K, Q3_K, microscaled types); InvalidArgument when numel is not
+// a multiple of the block elements or the product overflows. This is
+// the single canonical sizer (weight upload, file validation).
+//
+// Usage:
+//   auto bytes = TensorBytes(DType::Q4K, 256);  // 144 when present
+[[nodiscard]] inline std::expected<std::size_t, StatusCode> TensorBytes(
+    DType dtype, std::size_t numel) {
+  constexpr std::size_t kMax = std::numeric_limits<std::size_t>::max();
+  switch (dtype) {
+    case DType::Q40:
+    case DType::Q80:
+    case DType::Q4K:
+    case DType::Q5K:
+    case DType::Q6K:
+    case DType::Q8K: {
+      std::size_t elements = 0;
+      std::size_t bytes = 0;
+      switch (dtype) {
+        case DType::Q40: elements = 32; bytes = 17; break;
+        case DType::Q80: elements = 32; bytes = 33; break;
+        case DType::Q4K: elements = 256; bytes = 144; break;
+        case DType::Q5K: elements = 256; bytes = 176; break;
+        case DType::Q6K: elements = 256; bytes = 210; break;
+        default: elements = 256; bytes = 258; break;  // Q8K
+      }
+      if (numel % elements != 0 || numel / elements > kMax / bytes) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+      return numel / elements * bytes;
+    }
+    default: break;
+  }
+  try {
+    const int per_element = ElementBytes(dtype);
+    if (per_element <= 0 ||
+        numel > kMax / static_cast<std::size_t>(per_element)) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    return numel * static_cast<std::size_t>(per_element);
+  } catch (const std::invalid_argument&) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+}
 
 // Attention architecture parameters, parsed from the model definition
 // (Model::Attention). Query heads share key/value heads in groups of

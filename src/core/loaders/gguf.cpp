@@ -44,40 +44,6 @@ enum class GgufValueType : std::uint32_t {
 constexpr std::uint32_t kMaxGgufValueType =
     static_cast<std::uint32_t>(GgufValueType::Float64);
 
-// Known block layouts: elements per block + bytes per block. Types
-// without a pinned layout here (Q2_K, Q3_K, F4E2M1) skip the size
-// validation.
-struct BlockLayout {
-  std::uint64_t elements = 0;
-  std::uint64_t bytes = 0;
-};
-std::optional<BlockLayout> BlockLayoutFor(DType dtype) {
-  switch (dtype) {
-    case DType::Q40: return BlockLayout{32, 17};  // d + 16 nibbles
-    case DType::Q80: return BlockLayout{32, 33};  // d + 32 ints
-    case DType::Q4K: return BlockLayout{256, 144};
-    case DType::Q5K: return BlockLayout{256, 176};
-    case DType::Q6K: return BlockLayout{256, 210};
-    case DType::Q8K: return BlockLayout{256, 258};  // d + 256 ints
-    default: return std::nullopt;
-  }
-}
-
-// Plain (non-block) dtypes with a fixed element size.
-bool IsPlainType(DType dtype) {
-  switch (dtype) {
-    case DType::F32:
-    case DType::F16:
-    case DType::BF16:
-    case DType::F8E4M3:
-    case DType::F8E5M2:
-    case DType::F8E8M0:
-    case DType::I32:
-    case DType::I64: return true;
-    default: return false;
-  }
-}
-
 // Bounds-checked cursor over the GGUF byte stream (little-endian).
 struct Cursor {
   std::span<const std::byte> data;
@@ -402,24 +368,24 @@ std::expected<GgufFile, StatusCode> ParseGguf(
       return std::unexpected(StatusCode::MalformedFile);
     }
     prev_offset = record.offset;
-    // Exact size validation; block types use the block layout, plain
-    // types use ElementBytes.
+    // Exact size validation through the canonical sizer. Layouts
+    // without a known size keep the historical size 0 and are
+    // rejected at upload time instead.
     std::uint64_t tensor_bytes = 0;
-    if (auto layout = BlockLayoutFor(record.dtype)) {
-      if (record.shape.Numel() % layout->elements != 0) {
+    auto sized = TensorBytes(record.dtype, record.shape.Numel());
+    if (!sized) {
+      if (sized.error() != StatusCode::UnsupportedFeature) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      tensor_bytes = record.shape.Numel() / layout->elements * layout->bytes;
-    } else if (IsPlainType(record.dtype)) {
-      tensor_bytes =
-          static_cast<std::uint64_t>(record.shape.Numel()) *
-          static_cast<std::uint64_t>(ElementBytes(record.dtype));
+    } else {
+      tensor_bytes = static_cast<std::uint64_t>(*sized);
     }
     if (tensor_bytes > data_size - record.offset) {
       return std::unexpected(StatusCode::MalformedFile);
     }
   }
 
+  file.tensor_data_start = data_start;
   file.tensors.reserve(records.size());
   file.tensor_offsets.reserve(records.size());
   for (auto& record : records) {

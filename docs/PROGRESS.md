@@ -31,9 +31,13 @@ The boilerplate is complete and passes on both backends:
   range and base from GGUF metadata. The generic "rope" and
   "attention" built-ins take all dims as launch scalars and are
   verified against host references on both devices.
-- Single GoogleTest target. `ctest` passes 84/84 on both builds.
+- Single GoogleTest target. `ctest` passes 88/88 on both builds.
   Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
   through RADV GFX1201, rocm through the system ROCm).
+- Weight upload: `Model::Load` allocates one device buffer per
+  manifest tensor and copies the file bytes through the backend.
+  `Model::Weights` exposes them next to the manifest. Unsized
+  layouts stay in the manifest but fail the load as unsupported.
 
 ## Done
 
@@ -71,23 +75,26 @@ The boilerplate is complete and passes on both backends:
   rocm (HIP), checked against fp32 host references with per backend
   tolerance. Shared test helpers moved to `tests/test_helpers.hpp`;
   `tests/backend_test.cpp` exceeds 600 lines once (owner approved).
+- 2026-10-07: weight upload (88/88 `ctest` on both builds). The new
+  canonical `TensorBytes` sizer in `tessera/types.hpp` covers plain
+  and block dtypes; the GGUF parser uses it and exposes the tensor
+  data start. `Model::Load` reads the file once, uploads every
+  tensor, and keeps the buffers in `Model::Weights` with a
+  `FindWeight` lookup. The CLI prints the device byte count.
 
 ## Next (in order)
 
-1. **Weight upload**: manifest to device buffers via the backend.
-   Complete `Model::Load`. Today it only validates and parses the
-   manifest.
-2. **Decode loop**: single token generation in the core (backend
+1. **Decode loop**: single token generation in the core (backend
    agnostic). End to end smoke on `Qwen3.8-27B-UD-Q4_K_M`.
-3. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
+2. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
    the fixed schema, decision pending). fp8 and mxfp4 GEMM kernels.
    MTP-FP8 draft weights.
-4. **DFlash2**: local dynamic convolution (grouped causal convolutions),
+3. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
-5. **Baseline pinning**: run the non speculative path on both backends.
+4. **Baseline pinning**: run the non speculative path on both backends.
    Record per backend tolerance. Assert in tests (fixed seeds).
-6. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+5. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. Models are data. No per model branches.
 
 ## Notes and decisions

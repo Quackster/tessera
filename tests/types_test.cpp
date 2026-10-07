@@ -93,6 +93,28 @@ TEST(DTypeTest, ElementBytesRejectsBlockTypes) {
                std::invalid_argument);
 }
 
+TEST(DTypeTest, TensorBytesSizesTensors) {
+  EXPECT_EQ(*tessera::TensorBytes(DType::F32, 4), 16u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::F16, 4), 8u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::I64, 3), 24u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q40, 32), 17u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q80, 64), 66u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q4K, 256), 144u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q5K, 512), 352u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q6K, 256), 210u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q8K, 256), 258u);
+  // No known layout for microscaled and K-quant leftovers.
+  EXPECT_EQ(tessera::TensorBytes(DType::Q2K, 256).error(),
+            StatusCode::UnsupportedFeature);
+  EXPECT_EQ(tessera::TensorBytes(DType::Q3K, 256).error(),
+            StatusCode::UnsupportedFeature);
+  EXPECT_EQ(tessera::TensorBytes(DType::F4E2M1, 256).error(),
+            StatusCode::UnsupportedFeature);
+  // 100 elements are not a whole number of Q4_K blocks.
+  EXPECT_EQ(tessera::TensorBytes(DType::Q4K, 100).error(),
+            StatusCode::InvalidArgument);
+}
+
 TEST(TensorManifestTest, TotalNumelSumsTensors) {
   TensorManifest manifest;
   TensorEntry first;

@@ -29,6 +29,9 @@ struct GgufFile {
   // data (the aligned region after the tensor infos); parallel to
   // `tensors`.
   std::vector<std::uint64_t> tensor_offsets;
+  // File offset where the tensor data starts (tensor_offsets are
+  // relative to it); data.size() when the file holds no payload.
+  std::uint64_t tensor_data_start = 0;
   // Keys of array metadata values dropped by the parser (not supported).
   std::vector<std::string> dropped_array_keys;
 

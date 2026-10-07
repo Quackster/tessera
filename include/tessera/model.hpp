@@ -28,12 +28,19 @@ struct ModelOptions {
 };
 
 // A loaded model: format + options + parsed tensor manifest.
-// Weight upload to the device lands in milestone 4 (docs/PROGRESS.md);
-// Load today validates the file and parses the manifest only.
+// A tensor on the device: its manifest entry plus the buffer that
+// holds its bytes (allocated and uploaded by Model::Load).
+struct DeviceTensor {
+  TensorEntry manifest;
+  std::unique_ptr<Buffer> device;
+};
+
+// A loaded model: format + options + parsed tensor manifest + the
+// uploaded weight buffers (one per manifest tensor, GGUF only).
 //
 // Usage:
 //   auto model = engine.LoadModel(ModelOptions{path});
-//   if (model) for (auto& t : model->Tensors()) ...
+//   if (model) for (auto& t : model->Weights()) ...
 class Model {
  public:
   // Load and validate from options.path on `backend`. The format is
@@ -43,6 +50,11 @@ class Model {
 
   [[nodiscard]] ModelFormat Format() const;
   [[nodiscard]] std::span<const TensorEntry> Tensors() const;
+  // Uploaded weights, parallel to Tensors() (empty for MXFP4, whose
+  // manifest is parsed in a later milestone).
+  [[nodiscard]] std::span<const DeviceTensor> Weights() const;
+  // Device buffer for the tensor with this name; nullptr when absent.
+  [[nodiscard]] const Buffer* FindWeight(std::string_view name) const;
   [[nodiscard]] const std::string& Path() const;
   [[nodiscard]] std::size_t MaxContextLength() const;
   // Model name from the file metadata when present ("" otherwise).
@@ -62,7 +74,8 @@ class Model {
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,
         std::vector<TensorEntry> tensors, std::string name,
-        std::string architecture, std::optional<AttentionParams> attention);
+        std::string architecture, std::optional<AttentionParams> attention,
+        std::vector<DeviceTensor> weights);
   Backend& backend_;
   ModelOptions options_;
   ModelFormat format_;
@@ -70,6 +83,7 @@ class Model {
   std::string name_;
   std::string architecture_;
   std::optional<AttentionParams> attention_;
+  std::vector<DeviceTensor> weights_;
 };
 
 }  // namespace tessera

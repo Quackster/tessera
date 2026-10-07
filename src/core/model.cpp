@@ -3,10 +3,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <variant>
+#include <vector>
 
+#include "core/files.hpp"
 #include "core/loaders/gguf.hpp"
 #include "core/loaders/safetensors.hpp"
 
@@ -92,11 +95,46 @@ ParseAttention(const core::GgufFile& gguf, std::string_view architecture) {
 
 Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
              std::vector<TensorEntry> tensors, std::string name,
-             std::string architecture, std::optional<AttentionParams> attention)
+             std::string architecture, std::optional<AttentionParams> attention,
+             std::vector<DeviceTensor> weights)
     : backend_(backend), options_(std::move(options)), format_(format),
       tensors_(std::move(tensors)), name_(std::move(name)),
       architecture_(std::move(architecture)),
-      attention_(std::move(attention)) {}
+      attention_(std::move(attention)), weights_(std::move(weights)) {}
+
+// Upload every manifest tensor to a device buffer. `bytes` is the
+// whole file; offsets come from the parsed manifest.
+std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
+    Backend& backend, const std::vector<TensorEntry>& tensors,
+    const std::vector<std::uint64_t>& offsets, std::uint64_t data_start,
+    std::span<const std::byte> bytes) {
+  std::vector<DeviceTensor> weights;
+  weights.reserve(tensors.size());
+  for (std::size_t i = 0; i < tensors.size(); ++i) {
+    const auto& entry = tensors[i];
+    auto sized = TensorBytes(entry.dtype, entry.shape.Numel());
+    if (!sized) {
+      return std::unexpected(sized.error());
+    }
+    const std::size_t count = *sized;
+    const std::uint64_t begin = data_start + offsets[i];
+    if (begin > bytes.size() ||
+        static_cast<std::uint64_t>(count) > bytes.size() - begin) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    auto buffer = backend.AllocateBuffer(count, MemoryKind::Device);
+    if (!buffer) {
+      return std::unexpected(buffer.error());
+    }
+    auto uploaded = backend.CopyH2D(
+        **buffer, bytes.subspan(static_cast<std::size_t>(begin), count));
+    if (!uploaded) {
+      return std::unexpected(uploaded.error());
+    }
+    weights.push_back(DeviceTensor{entry, std::move(*buffer)});
+  }
+  return weights;
+}
 
 std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     Backend& backend, const ModelOptions& options) {
@@ -109,7 +147,11 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     return std::unexpected(StatusCode::FileNotFound);
   }
   if (std::filesystem::is_regular_file(path, ec) && !ec) {
-    auto gguf = core::ParseGgufFile(path);
+    auto bytes = core::ReadFile(path);
+    if (!bytes) {
+      return std::unexpected(bytes.error());
+    }
+    auto gguf = core::ParseGguf(std::span<const std::byte>(*bytes));
     if (!gguf) {
       return std::unexpected(gguf.error());
     }
@@ -130,9 +172,16 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!attention) {
       return std::unexpected(attention.error());
     }
+    auto weights =
+        UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
+                      gguf->tensor_data_start, std::span<const std::byte>(*bytes));
+    if (!weights) {
+      return std::unexpected(weights.error());
+    }
     return std::unique_ptr<Model>(new Model(
         backend, options, ModelFormat::Gguf, std::move(gguf->tensors),
-        std::move(name), std::move(architecture), std::move(*attention)));
+        std::move(name), std::move(architecture), std::move(*attention),
+        std::move(*weights)));
   }
   if (std::filesystem::is_directory(path, ec) && !ec) {
     // MXFP4 layout check; the tensor map is parsed in milestone 6, so the
@@ -141,10 +190,9 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!layout) {
       return std::unexpected(layout.error());
     }
-    return std::unique_ptr<Model>(new Model(backend, options,
-                                            ModelFormat::MxFp4, {},
-                                            std::string{}, std::string{},
-                                            std::nullopt));
+    return std::unique_ptr<Model>(
+        new Model(backend, options, ModelFormat::MxFp4, {}, std::string{},
+                  std::string{}, std::nullopt, {}));
   }
   return std::unexpected(StatusCode::InvalidArgument);
 }
@@ -155,6 +203,19 @@ ModelFormat Model::Format() const {
 
 std::span<const TensorEntry> Model::Tensors() const {
   return std::span<const TensorEntry>(tensors_);
+}
+
+std::span<const DeviceTensor> Model::Weights() const {
+  return std::span<const DeviceTensor>(weights_);
+}
+
+const Buffer* Model::FindWeight(std::string_view name) const {
+  for (const auto& weight : weights_) {
+    if (weight.manifest.name == name) {
+      return weight.device.get();
+    }
+  }
+  return nullptr;
 }
 
 const std::string& Model::Path() const {

@@ -63,6 +63,75 @@ TEST(EngineTest, LoadGgufModelParsesManifest) {
   EXPECT_EQ(loaded->Path(), path.string());
 }
 
+TEST(EngineTest, LoadGgufModelUploadsWeights) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 1);
+  builder.KvString("general.name", "test-model");
+  builder.Tensor("w_a", 1, {4}, 0, 0);  // F32, 1x4, offset 0
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  builder.PushF32(1.0f);
+  builder.PushF32(2.0f);
+  builder.PushF32(3.0f);
+  builder.PushF32(4.0f);
+  auto dir = FreshTempDir("tessera_tests_weights");
+  auto path = dir / "weights.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto& loaded = *model;
+  ASSERT_EQ(loaded->Weights().size(), 1u);
+  EXPECT_EQ(loaded->Weights()[0].manifest.name, "w_a");
+  const auto* buffer = loaded->FindWeight("w_a");
+  ASSERT_NE(buffer, nullptr);
+  EXPECT_EQ(buffer->Size(), 16u);
+  EXPECT_EQ(loaded->FindWeight("missing"), nullptr);
+  std::vector<std::byte> readback(16);
+  auto download = engine->Owner().CopyD2H(*buffer, readback.data(), 16);
+  ASSERT_TRUE(download.has_value())
+      << tessera::ToString(download.error());
+  const auto* values = reinterpret_cast<const float*>(readback.data());
+  EXPECT_FLOAT_EQ(values[0], 1.0f);
+  EXPECT_FLOAT_EQ(values[1], 2.0f);
+  EXPECT_FLOAT_EQ(values[2], 3.0f);
+  EXPECT_FLOAT_EQ(values[3], 4.0f);
+}
+
+TEST(EngineTest, LoadGgufModelUploadsQuantizedSize) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 1);
+  builder.KvString("general.name", "test-model");
+  builder.Tensor("w_q", 1, {256}, 12, 0);  // Q4_K, 256 elements
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  builder.PadPayload(144);
+  auto dir = FreshTempDir("tessera_tests_weights_q4k");
+  auto path = dir / "weights_q4k.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  ASSERT_EQ((*model)->Weights().size(), 1u);
+  EXPECT_EQ((*model)->Weights()[0].device->Size(), 144u);
+}
+
+TEST(EngineTest, LoadGgufModelRejectsUnsizedLayout) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 1);
+  builder.KvString("general.name", "test-model");
+  builder.Tensor("w_q2", 1, {256}, 10, 0);  // Q2_K has no sized layout
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  auto dir = FreshTempDir("tessera_tests_weights_q2k");
+  auto path = dir / "weights_q2k.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_FALSE(model.has_value());
+  EXPECT_EQ(model.error(), StatusCode::UnsupportedFeature);
+}
+
 TEST(EngineTest, LoadModelMissingFile) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
