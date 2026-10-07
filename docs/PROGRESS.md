@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 164/164 on both builds.
+`ctest` passes 166/166 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -361,6 +361,13 @@ through RADV GFX1201, rocm through the system ROCm).
   vulkan (GLSL) and rocm (HIP) with a host reference and
   device-vs-reference tests, a building block for the
   device-resident linear path.
+
+- 2026-10-07: ssm_gate and delta_step_heads kernels (166/166
+  `ctest` on both builds). Current head. "ssm_gate" computes the
+  gated-delta decay/write gates per value head; "delta_step_heads"
+  runs the gated-delta step for all heads in one launch with the
+  device state in place. Both on vulkan (GLSL) and rocm (HIP) with
+  host references and device-vs-reference tests.
 
 ## Next (in order)
 

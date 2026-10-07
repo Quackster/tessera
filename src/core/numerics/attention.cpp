@@ -206,4 +206,43 @@ std::expected<void, StatusCode> RepeatHeadsRef(
   return {};
 }
 
+std::expected<void, StatusCode> DeltaStepHeadsRef(
+    std::span<float> s, std::span<const float> k, std::span<const float> v,
+    std::span<const float> q, std::span<float> o,
+    std::span<const float> alpha, std::span<const float> beta,
+    std::size_t heads, std::size_t dk, std::size_t dv) {
+  if (heads == 0 || dk == 0 || dv == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (s.size() != heads * dk * dv || k.size() != heads * dk ||
+      q.size() != heads * dk || v.size() != heads * dv ||
+      o.size() != heads * dv || alpha.size() != heads ||
+      beta.size() != heads) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t h = 0; h < heads; ++h) {
+    float* state = s.data() + h * dk * dv;
+    const float* k_h = k.data() + h * dk;
+    const float* q_h = q.data() + h * dk;
+    const float* v_h = v.data() + h * dv;
+    float* o_h = o.data() + h * dv;
+    for (std::size_t d = 0; d < dv; ++d) {
+      float read = 0.0f;
+      for (std::size_t j = 0; j < dk; ++j) {
+        read = std::fma(state[j * dv + d], k_h[j], read);
+      }
+      float out = 0.0f;
+      for (std::size_t j = 0; j < dk; ++j) {
+        const float updated =
+            alpha[h] * (state[j * dv + d] - beta[h] * k_h[j] * read) +
+            beta[h] * v_h[d] * k_h[j];
+        state[j * dv + d] = updated;
+        out = std::fma(updated, q_h[j], out);
+      }
+      o_h[d] = out;
+    }
+  }
+  return {};
+}
+
 }  // namespace tessera::core

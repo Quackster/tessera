@@ -134,4 +134,25 @@ std::expected<void, StatusCode> SiluMulRef(std::span<const float> gate,
   return {};
 }
 
+std::expected<void, StatusCode> SsmGateRef(
+    std::span<const float> a_log, std::span<const float> dt,
+    std::span<const float> alpha_raw, std::span<const float> beta_raw,
+    std::span<float> alpha, std::span<float> beta, std::size_t heads) {
+  if (heads == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (a_log.size() != heads || dt.size() != heads ||
+      alpha_raw.size() != heads || beta_raw.size() != heads ||
+      alpha.size() != heads || beta.size() != heads) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t h = 0; h < heads; ++h) {
+    const float raw = alpha_raw[h] + dt[h];
+    const float softplus = raw > 20.0f ? raw : std::log1p(std::exp(raw));
+    alpha[h] = std::exp(-std::exp(a_log[h]) * softplus);
+    beta[h] = 1.0f / (1.0f + std::exp(-beta_raw[h]));
+  }
+  return {};
+}
+
 }  // namespace tessera::core

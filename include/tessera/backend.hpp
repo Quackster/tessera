@@ -179,6 +179,15 @@ class Kernel {
 // and the fp32 epsilon bits. Y = X / sqrt(mean(X^2) + eps) * W *
 // silu(gate) per row. The dispatch is ceil(rows / 256) workgroups of
 // 256.
+// "ssm_gate": buffers are a_log, dt, alpha_raw, beta_raw, alpha and
+// beta (fp32, heads each); scalar 0 is heads. alpha = exp(-exp(a_log) *
+// softplus(alpha_raw + dt)), beta = sigmoid(beta_raw). The dispatch is
+// ceil(heads / 256) workgroups of 256.
+// "delta_step_heads": buffer 0 is S (fp32, heads x dk x dv, updated in
+// place), buffers 1..4 are k (heads x dk), v (heads x dv), q (heads x
+// dk) and o (heads x dv), buffers 5 and 6 are alpha and beta (heads);
+// scalars are heads, dk, dv. One gated-delta step per head. The
+// dispatch is ceil(heads * dv / 256) workgroups of 256.
 // "repeat_heads": buffer 0 is IN (fp32, num_k_heads x head_k_dim),
 // buffer 1 the output OUT (fp32, num_v_heads x head_k_dim); scalars are
 // num_v_heads, head_k_dim and factor (num_v_heads is divisible by
@@ -334,6 +343,23 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "ssm_gate") {
+    if (launch.buffers.size() != 6 || launch.scalars.size() != 1) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "delta_step_heads") {
+    if (launch.buffers.size() != 7 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
+        launch.scalars[2] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

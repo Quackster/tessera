@@ -74,4 +74,14 @@ namespace tessera::core {
     std::span<const float> gate, std::span<const float> up,
     std::span<float> out, std::size_t n);
 
+// Host reference for the "ssm_gate" built-in: the gated-delta decay and
+// write gates over `heads` value heads.
+//   alpha = exp(-exp(a_log) * softplus(alpha_raw + dt))
+//   beta  = sigmoid(beta_raw)
+// Each span holds `heads` elements; heads must be nonzero.
+[[nodiscard]] std::expected<void, StatusCode> SsmGateRef(
+    std::span<const float> a_log, std::span<const float> dt,
+    std::span<const float> alpha_raw, std::span<const float> beta_raw,
+    std::span<float> alpha, std::span<float> beta, std::size_t heads);
+
 }  // namespace tessera::core

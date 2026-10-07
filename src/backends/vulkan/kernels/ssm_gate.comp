@@ -1,0 +1,28 @@
+#version 450
+
+// One thread per value head; dispatch ceil(heads / 256).
+layout(local_size_x = 256) in;
+
+// "ssm_gate" contract: buffers are a_log, dt, alpha_raw, beta_raw,
+// alpha_out, beta_out (fp32, heads each). Scalar 0 is heads.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer ALog { float a_log[]; };
+layout(set = 0, binding = 1) buffer Dt { float dt[]; };
+layout(set = 0, binding = 2) buffer AlphaRaw { float alpha_raw[]; };
+layout(set = 0, binding = 3) buffer BetaRaw { float beta_raw[]; };
+layout(set = 0, binding = 4) buffer Alpha { float alpha[]; };
+layout(set = 0, binding = 5) buffer Beta { float beta[]; };
+
+void main() {
+  uint h = gl_GlobalInvocationID.x;
+  if (h >= pc.v[0]) {
+    return;
+  }
+  float raw = alpha_raw[h] + dt[h];
+  float softplus = raw > 20.0 ? raw : log(1.0 + exp(raw));
+  alpha[h] = exp(-exp(a_log[h]) * softplus);
+  beta[h] = 1.0 / (1.0 + exp(-beta_raw[h]));
+}

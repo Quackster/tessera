@@ -1,0 +1,49 @@
+#version 450
+
+// One thread per (head, state column); dispatch ceil(heads * dv / 256).
+layout(local_size_x = 256) in;
+
+// "delta_step_heads" contract: buffer 0 is S (heads x dk x dv, updated
+// in place); buffers 1..4 are k (heads x dk), v (heads x dv), q
+// (heads x dk) and o (heads x dv); buffers 5 and 6 are alpha and beta
+// (heads each). Scalars: heads v[0], dk v[2], dv v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer S { float s[]; };
+layout(set = 0, binding = 1) buffer K { float k[]; };
+layout(set = 0, binding = 2) buffer V { float v[]; };
+layout(set = 0, binding = 3) buffer Q { float q[]; };
+layout(set = 0, binding = 4) buffer O { float o[]; };
+layout(set = 0, binding = 5) buffer Alpha { float alpha[]; };
+layout(set = 0, binding = 6) buffer Beta { float beta[]; };
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint heads = pc.v[0];
+  uint dk = pc.v[2];
+  uint dv = pc.v[4];
+  if (idx >= heads * dv) {
+    return;
+  }
+  uint h = idx / dv;
+  uint d = idx % dv;
+  uint s_base = h * dk * dv;
+  uint k_base = h * dk;
+  uint v_base = h * dv;
+  float a = alpha[h];
+  float b = beta[h];
+  float read = 0.0;
+  for (uint j = 0; j < dk; ++j) {
+    read += s[s_base + j * dv + d] * k[k_base + j];
+  }
+  float total = 0.0;
+  for (uint j = 0; j < dk; ++j) {
+    float updated = a * (s[s_base + j * dv + d] - b * k[k_base + j] * read) +
+                    b * v[v_base + d] * k[k_base + j];
+    s[s_base + j * dv + d] = updated;
+    total += updated * q[k_base + j];
+  }
+  o[idx] = total;
+}

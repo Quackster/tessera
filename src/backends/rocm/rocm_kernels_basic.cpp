@@ -440,4 +440,53 @@ __global__ void RepeatHeadsKernel(const float* in, float* out,
   out[i] = in[(h / factor) * head_k_dim + e];
 }
 
+// Built-in "ssm_gate": the gated-delta decay/write gates per value head.
+__global__ void SsmGateKernel(const float* a_log, const float* dt,
+                              const float* alpha_raw, const float* beta_raw,
+                              float* alpha, float* beta,
+                              unsigned long long heads) {
+  const unsigned long long h =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (h >= heads) {
+    return;
+  }
+  const float raw = alpha_raw[h] + dt[h];
+  const float softplus = raw > 20.0f ? raw : log1pf(expf(raw));
+  alpha[h] = expf(-expf(a_log[h]) * softplus);
+  beta[h] = 1.0f / (1.0f + expf(-beta_raw[h]));
+}
+
+// Built-in "delta_step_heads": one gated-delta step for all value
+// heads. One thread per (head, state column).
+__global__ void DeltaStepHeadsKernel(
+    float* s, const float* k, const float* v, const float* q, float* o,
+    const float* alpha, const float* beta, unsigned long long heads,
+    unsigned long long dk, unsigned long long dv) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= heads * dv) {
+    return;
+  }
+  const unsigned long long h = idx / dv;
+  const unsigned long long d = idx % dv;
+  const unsigned long long s_base = h * dk * dv;
+  const unsigned long long k_base = h * dk;
+  const unsigned long long v_base = h * dv;
+  const float a = alpha[h];
+  const float b = beta[h];
+  float read = 0.0f;
+  for (unsigned long long j = 0; j < dk; ++j) {
+    read = fmaf(s[s_base + j * dv + d], k[k_base + j], read);
+  }
+  float out = 0.0f;
+  for (unsigned long long j = 0; j < dk; ++j) {
+    const float updated =
+        a * (s[s_base + j * dv + d] - b * k[k_base + j] * read) +
+        b * v[v_base + d] * k[k_base + j];
+    s[s_base + j * dv + d] = updated;
+    out = fmaf(updated, q[k_base + j], out);
+  }
+  o[idx] = out;
+}
+
 }  // namespace tessera::backends::rocm

@@ -2787,3 +2787,126 @@ TEST(BackendTest, RepeatHeadsDeviceMatchesRef) {
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
 }
+
+// Device: the gated-delta gates match the host reference.
+TEST(BackendTest, SsmGateDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(83);
+  constexpr std::size_t kHeads = 8;
+  std::vector<float> a_log(kHeads), dt(kHeads), ar(kHeads), br(kHeads);
+  for (auto& v : a_log) v = DrawValue(rng);
+  for (auto& v : dt) v = DrawValue(rng);
+  for (auto& v : ar) v = DrawValue(rng);
+  for (auto& v : br) v = DrawValue(rng);
+  auto mk = [&](std::size_t n) {
+    return backend->AllocateBuffer(n * 4, MemoryKind::Device);
+  };
+  auto a_buf = mk(kHeads), d_buf = mk(kHeads), ar_buf = mk(kHeads);
+  auto br_buf = mk(kHeads), al_buf = mk(kHeads), be_buf = mk(kHeads);
+  ASSERT_TRUE(a_buf && d_buf && ar_buf && br_buf && al_buf && be_buf);
+  const auto upload = [&backend](auto& buf, const std::vector<float>& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(a_buf, a_log).has_value());
+  ASSERT_TRUE(upload(d_buf, dt).has_value());
+  ASSERT_TRUE(upload(ar_buf, ar).has_value());
+  ASSERT_TRUE(upload(br_buf, br).has_value());
+  auto kernel = backend->LoadKernel("ssm_gate", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = 1;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*d_buf).get(), (*ar_buf).get(),
+                    (*br_buf).get(), (*al_buf).get(), (*be_buf).get()};
+  launch.scalars = {kHeads};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> alpha_back(kHeads * 4), beta_back(kHeads * 4);
+  ASSERT_TRUE(backend->CopyD2H(**al_buf, alpha_back.data(), alpha_back.size())
+                  .has_value());
+  ASSERT_TRUE(backend->CopyD2H(**be_buf, beta_back.data(), beta_back.size())
+                  .has_value());
+  std::vector<float> alpha_ref(kHeads), beta_ref(kHeads);
+  ASSERT_TRUE(core::SsmGateRef(std::span<const float>(a_log),
+                               std::span<const float>(dt),
+                               std::span<const float>(ar),
+                               std::span<const float>(br),
+                               std::span<float>(alpha_ref),
+                               std::span<float>(beta_ref), kHeads)
+                  .has_value());
+  const auto* got_a = reinterpret_cast<const float*>(alpha_back.data());
+  const auto* got_b = reinterpret_cast<const float*>(beta_back.data());
+  for (std::size_t i = 0; i < kHeads; ++i) {
+    EXPECT_NEAR(got_a[i], alpha_ref[i], 1e-5f);
+    EXPECT_NEAR(got_b[i], beta_ref[i], 1e-5f);
+  }
+}
+
+// Device: the head-batched delta step matches the host reference.
+TEST(BackendTest, DeltaStepHeadsDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(84);
+  constexpr std::size_t kHeads = 2;
+  constexpr std::size_t kDk = 8;
+  constexpr std::size_t kDv = 6;
+  std::vector<float> s(kHeads * kDk * kDv), k(kHeads * kDk), v(kHeads * kDv);
+  std::vector<float> q(kHeads * kDk), alpha(kHeads), beta(kHeads);
+  for (auto& x : s) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : alpha) x = 0.9f;
+  for (auto& x : beta) x = 0.5f;
+  auto mk = [&](std::size_t n) {
+    return backend->AllocateBuffer(n * 4, MemoryKind::Device);
+  };
+  auto s_buf = mk(s.size()), k_buf = mk(k.size()), v_buf = mk(v.size());
+  auto q_buf = mk(q.size()), o_buf = mk(v.size());
+  auto al_buf = mk(kHeads), be_buf = mk(kHeads);
+  ASSERT_TRUE(s_buf && k_buf && v_buf && q_buf && o_buf && al_buf && be_buf);
+  const auto upload = [&backend](auto& buf, const std::vector<float>& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(s_buf, s).has_value());
+  ASSERT_TRUE(upload(k_buf, k).has_value());
+  ASSERT_TRUE(upload(v_buf, v).has_value());
+  ASSERT_TRUE(upload(q_buf, q).has_value());
+  ASSERT_TRUE(upload(al_buf, alpha).has_value());
+  ASSERT_TRUE(upload(be_buf, beta).has_value());
+  auto kernel = backend->LoadKernel("delta_step_heads", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kHeads * kDv + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*s_buf).get(), (*k_buf).get(), (*v_buf).get(),
+                    (*q_buf).get(), (*o_buf).get(), (*al_buf).get(),
+                    (*be_buf).get()};
+  launch.scalars = {kHeads, kDk, kDv};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<float> s_ref = s;
+  std::vector<float> o_ref(kHeads * kDv);
+  ASSERT_TRUE(core::DeltaStepHeadsRef(
+                  std::span<float>(s_ref), std::span<const float>(k),
+                  std::span<const float>(v), std::span<const float>(q),
+                  std::span<float>(o_ref), std::span<const float>(alpha),
+                  std::span<const float>(beta), kHeads, kDk, kDv)
+                  .has_value());
+  std::vector<std::byte> o_back(o_ref.size() * 4), s_back(s.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**o_buf, o_back.data(), o_back.size())
+                  .has_value());
+  ASSERT_TRUE(backend->CopyD2H(**s_buf, s_back.data(), s_back.size())
+                  .has_value());
+  const auto* got_o = reinterpret_cast<const float*>(o_back.data());
+  const auto* got_s = reinterpret_cast<const float*>(s_back.data());
+  for (std::size_t i = 0; i < o_ref.size(); ++i) {
+    EXPECT_NEAR(got_o[i], o_ref[i], 1e-4f);
+  }
+  for (std::size_t i = 0; i < s_ref.size(); ++i) {
+    EXPECT_NEAR(got_s[i], s_ref[i], 1e-4f);
+  }
+}

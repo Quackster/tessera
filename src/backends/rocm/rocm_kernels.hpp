@@ -134,6 +134,14 @@ __global__ void RepeatHeadsKernel(const float* in, float* out,
                                   unsigned long long num_v_heads,
                                   unsigned long long head_k_dim,
                                   unsigned long long factor);
+__global__ void SsmGateKernel(const float* a_log, const float* dt,
+                              const float* alpha_raw, const float* beta_raw,
+                              float* alpha, float* beta,
+                              unsigned long long heads);
+__global__ void DeltaStepHeadsKernel(
+    float* s, const float* k, const float* v, const float* q, float* o,
+    const float* alpha, const float* beta, unsigned long long heads,
+    unsigned long long dk, unsigned long long dv);
 __global__ void SiluMulKernel(const float* g, const float* u, float* o,
                               unsigned long long n);
 

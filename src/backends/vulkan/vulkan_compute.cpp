@@ -52,6 +52,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"qgate_split", kQgateSplitSpirV, sizeof(kQgateSplitSpirV)},
     {"add", kAddSpirV, sizeof(kAddSpirV)},
     {"repeat_heads", kRepeatHeadsSpirV, sizeof(kRepeatHeadsSpirV)},
+    {"ssm_gate", kSsmGateSpirV, sizeof(kSsmGateSpirV)},
+    {"delta_step_heads", kDeltaStepHeadsSpirV, sizeof(kDeltaStepHeadsSpirV)},
     {"silu_mul", kSiluMulSpirV, sizeof(kSiluMulSpirV)},
 };
 

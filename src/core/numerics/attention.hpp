@@ -100,4 +100,15 @@ namespace tessera::core {
     std::span<const float> in, std::span<float> out, std::size_t num_v_heads,
     std::size_t head_k_dim, std::size_t factor);
 
+// Host reference for the "delta_step_heads" built-in: the gated-delta
+// scan step for all value heads in one call. `s` is heads x dk x dv
+// (updated in place), `k`/`q` are heads x dk, `v`/`o` are heads x dv and
+// `alpha`/`beta` hold one value per head. Per head the state moves as in
+// DeltaStepRef. heads, dk and dv must be nonzero; else InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> DeltaStepHeadsRef(
+    std::span<float> s, std::span<const float> k, std::span<const float> v,
+    std::span<const float> q, std::span<float> o,
+    std::span<const float> alpha, std::span<const float> beta,
+    std::size_t heads, std::size_t dk, std::size_t dv);
+
 }  // namespace tessera::core
