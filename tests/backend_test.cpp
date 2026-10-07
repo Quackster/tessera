@@ -2740,3 +2740,50 @@ TEST(BackendTest, DeltaStepDeviceHelperMatchesRef) {
     EXPECT_NEAR(got_state[i], ref_state[i], 1e-4f);
   }
 }
+
+// Device: head repeat expands key heads to the value heads.
+TEST(BackendTest, RepeatHeadsDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(82);
+  constexpr std::size_t kNumV = 4;
+  constexpr std::size_t kHeadDim = 8;
+  constexpr std::size_t kFactor = 2;
+  const std::size_t in_n = (kNumV / kFactor) * kHeadDim;
+  std::vector<float> in(in_n);
+  for (auto& v : in) v = DrawValue(rng);
+  auto in_buf = backend->AllocateBuffer(in_n * 4, MemoryKind::Device);
+  auto out_buf =
+      backend->AllocateBuffer(kNumV * kHeadDim * 4, MemoryKind::Device);
+  ASSERT_TRUE(in_buf && out_buf);
+  ASSERT_TRUE(backend->CopyH2D(**in_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(in.data()), in.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("repeat_heads", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kNumV * kHeadDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*in_buf).get(), (*out_buf).get()};
+  launch.scalars = {kNumV, kHeadDim, kFactor};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kNumV * kHeadDim * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kNumV * kHeadDim);
+  ASSERT_TRUE(core::RepeatHeadsRef(std::span<const float>(in),
+                                   std::span<float>(ref), kNumV, kHeadDim,
+                                   kFactor)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    EXPECT_FLOAT_EQ(got[i], ref[i]);
+  }
+  // Contract: heads not divisible by factor is rejected.
+  launch.scalars = {kNumV, kHeadDim, 3};
+  auto bad = backend->LaunchKernel(**kernel, launch);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+}

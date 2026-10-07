@@ -56,6 +56,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"mrope", reinterpret_cast<void*>(&MropeKernel)},
     {"qgate_split", reinterpret_cast<void*>(&QGateSplitKernel)},
     {"add", reinterpret_cast<void*>(&AddKernel)},
+    {"repeat_heads", reinterpret_cast<void*>(&RepeatHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},
 };
 

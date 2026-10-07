@@ -424,4 +424,20 @@ __global__ void SiluMulKernel(const float* g, const float* u, float* o,
   o[i] = (gate / (1.0f + expf(-gate))) * u[i];
 }
 
+// Built-in "repeat_heads": expand q/k to the value heads. One thread
+// per output element.
+__global__ void RepeatHeadsKernel(const float* in, float* out,
+                                  unsigned long long num_v_heads,
+                                  unsigned long long head_k_dim,
+                                  unsigned long long factor) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= num_v_heads * head_k_dim) {
+    return;
+  }
+  const unsigned long long h = i / head_k_dim;
+  const unsigned long long e = i % head_k_dim;
+  out[i] = in[(h / factor) * head_k_dim + e];
+}
+
 }  // namespace tessera::backends::rocm

@@ -179,6 +179,11 @@ class Kernel {
 // and the fp32 epsilon bits. Y = X / sqrt(mean(X^2) + eps) * W *
 // silu(gate) per row. The dispatch is ceil(rows / 256) workgroups of
 // 256.
+// "repeat_heads": buffer 0 is IN (fp32, num_k_heads x head_k_dim),
+// buffer 1 the output OUT (fp32, num_v_heads x head_k_dim); scalars are
+// num_v_heads, head_k_dim and factor (num_v_heads is divisible by
+// factor; out[h] = in[h / factor]). The dispatch is
+// ceil(num_v_heads * head_k_dim / 256) workgroups of 256.
 // "add": buffers 0 and 1 are A and B (fp32, n each) and buffer 2 the
 // output O (fp32, n); scalar 0 is n. O = A + B elementwise.
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
@@ -329,6 +334,17 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "repeat_heads") {
+    if (launch.buffers.size() != 2 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t heads = launch.scalars[0];
+    const std::uint64_t head_dim = launch.scalars[1];
+    const std::uint64_t factor = launch.scalars[2];
+    if (heads == 0 || head_dim == 0 || factor == 0 || heads % factor != 0) {
       return StatusCode::InvalidArgument;
     }
   }

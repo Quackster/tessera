@@ -54,11 +54,11 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8
         gemm_mxfp4 gemm_q5k gemm_q6k gemm_q3k gemm_iq4nl gemm_iq4xs
         gemm_iq3s gemm_q80 rmsnorm sigmoid_gate l2norm rmsnorm_gated
-        conv1d delta_step mrope qgate_split add silu_mul)
+        conv1d delta_step mrope qgate_split add silu_mul repeat_heads)
     set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8
         GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S
         GemmQ80 Rmsnorm SigmoidGate L2Norm RmsnormGated Conv1d DeltaStep
-        Mrope QgateSplit Add SiluMul)
+        Mrope QgateSplit Add SiluMul RepeatHeads)
     set(TESSERA_KERNEL_HEADER
 "#pragma once
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.

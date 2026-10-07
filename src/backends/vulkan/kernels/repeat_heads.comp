@@ -1,0 +1,28 @@
+#version 450
+
+// One thread per output element; the dispatch is
+// ceil(num_v_heads * head_k_dim / 256) workgroups.
+layout(local_size_x = 256) in;
+
+// "repeat_heads" contract: buffer 0 is IN (num_k_heads x head_k_dim),
+// buffer 1 the output OUT (num_v_heads x head_k_dim). Scalars:
+// num_v_heads v[0], head_k_dim v[2], factor v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer In { float in_data[]; };
+layout(set = 0, binding = 1) buffer Out { float out_data[]; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint heads = pc.v[0];
+  uint head_dim = pc.v[2];
+  if (i >= heads * head_dim) {
+    return;
+  }
+  uint factor = pc.v[4];
+  uint h = i / head_dim;
+  uint e = i % head_dim;
+  out_data[i] = in_data[(h / factor) * head_dim + e];
+}

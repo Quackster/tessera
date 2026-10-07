@@ -90,4 +90,14 @@ namespace tessera::core {
     std::span<const float> fused, std::span<float> q, std::span<float> gate,
     std::size_t heads, std::size_t head_dim);
 
+// Host reference for the "repeat_heads" built-in: expand `in`
+// (num_k_heads x head_k_dim) to `out` (num_v_heads x head_k_dim) by
+// repeating each key head `factor` times (out[h] = in[h / factor]).
+// Gated-delta layers repeat query/key heads to the value heads before
+// the scan. num_v_heads must be nonzero and divisible by factor; a size
+// mismatch is InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> RepeatHeadsRef(
+    std::span<const float> in, std::span<float> out, std::size_t num_v_heads,
+    std::size_t head_k_dim, std::size_t factor);
+
 }  // namespace tessera::core

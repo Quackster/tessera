@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 163/163 on both builds.
+`ctest` passes 164/164 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -354,6 +354,13 @@ through RADV GFX1201, rocm through the system ROCm).
   RmsNormGatedDevice, Conv1dDevice and DeltaStepDevice, the
   device-to-device building blocks for a device-resident hybrid
   decode. A DeltaStepDevice test matches the host reference.
+
+- 2026-10-07: repeat_heads kernel (164/164 `ctest` on both builds).
+  Current head. The gated-delta layers repeat query/key heads to
+  the value heads before the scan; generic "repeat_heads" on
+  vulkan (GLSL) and rocm (HIP) with a host reference and
+  device-vs-reference tests, a building block for the
+  device-resident linear path.
 
 ## Next (in order)
 

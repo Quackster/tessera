@@ -185,4 +185,25 @@ std::expected<void, StatusCode> QGateSplitRef(
   return {};
 }
 
+std::expected<void, StatusCode> RepeatHeadsRef(
+    std::span<const float> in, std::span<float> out, std::size_t num_v_heads,
+    std::size_t head_k_dim, std::size_t factor) {
+  if (num_v_heads == 0 || head_k_dim == 0 || factor == 0 ||
+      num_v_heads % factor != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t num_k_heads = num_v_heads / factor;
+  if (in.size() != num_k_heads * head_k_dim ||
+      out.size() != num_v_heads * head_k_dim) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t h = 0; h < num_v_heads; ++h) {
+    const std::size_t src_head = h / factor;
+    for (std::size_t e = 0; e < head_k_dim; ++e) {
+      out[h * head_k_dim + e] = in[src_head * head_k_dim + e];
+    }
+  }
+  return {};
+}
+
 }  // namespace tessera::core

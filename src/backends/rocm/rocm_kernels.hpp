@@ -130,6 +130,10 @@ __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
                                  unsigned long long head_dim);
 __global__ void AddKernel(const float* a, const float* b, float* o,
                           unsigned long long n);
+__global__ void RepeatHeadsKernel(const float* in, float* out,
+                                  unsigned long long num_v_heads,
+                                  unsigned long long head_k_dim,
+                                  unsigned long long factor);
 __global__ void SiluMulKernel(const float* g, const float* u, float* o,
                               unsigned long long n);
 
