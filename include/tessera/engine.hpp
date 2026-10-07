@@ -53,6 +53,9 @@ struct GenerateOptions {
   SamplingOptions sampling;
   // RNG seed for sampling; a fixed value keeps sampling reproducible.
   std::uint64_t seed = 0;
+  // Draft tokens per speculative step for the DFlash2 draft; 0 uses the
+  // draft checkpoint's configured block size.
+  std::size_t draft_tokens = 0;
 };
 
 // Top-level facade: owns the backend and the loaded models.

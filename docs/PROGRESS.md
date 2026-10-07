@@ -689,16 +689,21 @@ through RADV GFX1201, rocm through the system ROCm).
   when the checkpoint has no selector. Output still equals greedy on
   the 27B.
 
+- 2026-10-07: DFlash2 draft-block override (207/207 `ctest` on both
+  builds). Current head. `GenerateOptions::draft_tokens` (CLI
+  `--draft-block`) caps the DFlash2 draft to that many tokens per step
+(at most the checkpoint block size); 0 uses the checkpoint size.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
    end (`Engine::GenerateSpeculative`, CLI `--speculate`) and is output
    preserving, but scores one token per target forward. Next: batch the
    draft scoring so k drafts cost one forward.
-2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
-   candidate selector (low rank transition scores), verification loop.
-   The verifier loop and the draft kernels are in place; the DFlash2 draft
-   forward and its selector-driven candidate block remain.
+2. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
+   grouped dynamic convolution, sliding attention, candidate selector and
+   the verification loop, output equal to greedy. Remaining: acceptance
+   tuning (context beyond the last token) and batching.
 3. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.

@@ -51,7 +51,10 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   }
   const std::size_t hidden = config->hidden_dim;
   const std::size_t vocab = draft_config->vocab_size;
-  const std::size_t block = draft_config->block_size;
+  std::size_t block = draft_config->block_size;
+  if (options.draft_tokens > 0 && options.draft_tokens < block) {
+    block = options.draft_tokens;
+  }
   const std::size_t n = draft_config->target_layer_ids.size();
   std::vector<std::size_t> capture_layers(draft_config->target_layer_ids.begin(),
                                           draft_config->target_layer_ids.end());

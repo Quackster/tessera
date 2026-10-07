@@ -34,9 +34,9 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. 27B generates. |
 | Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. |
-| Speculative decode | Partial | MTP draft and greedy verifier run end to end (`--speculate`); output equals greedy. DFlash2 draft forward built; engine wiring and batched scoring in work. |
+| Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculation run end to end; output equals greedy. Batched scoring in work. |
 | MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
-| DFlash2 decode | Partial | Draft block runs on the device with the real checkpoint. Engine integration (target hidden, mask block, accept/reject) in work. |
+| DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). Output equals greedy. |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
 | MoE, MLP, norms | Partial | RMSNorm and sigmoid-gate kernels done. MLP and embedding kernels in work. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
 

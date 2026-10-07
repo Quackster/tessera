@@ -258,6 +258,7 @@ int main(int argc, char** argv) {
     gen.sample = sample;
     gen.sampling = sampling;
     gen.seed = seed;
+    gen.draft_tokens = draft_block;
     if (!prompt_text.empty()) {
       const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
       if (tokenizer == nullptr) {
