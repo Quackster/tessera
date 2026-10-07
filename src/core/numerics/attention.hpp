@@ -23,6 +23,27 @@ namespace tessera::core {
     std::size_t head_dim, std::size_t rope_dim, std::uint64_t pos_base,
     double theta);
 
+// Host reference for the "mrope" built-in: multimodal rotary embedding
+// applied in place over rows x heads x head_dim fp32. The rope_dim/2
+// NeoX pairs split into temporal, height and width sections of sec_t,
+// sec_h and sec_w pairs; pair j rotates by its section position times
+// theta^(-2j/rope_dim) with the global pair index j, so frequencies
+// stay continuous across sections. `pos` holds one (t, h, w) triple
+// per row; text rows repeat the same id three times, which reduces to
+// plain RoPE. Pairs past the three sections reuse the width id.
+// Sections must sum to at most rope_dim/2, rope_dim must be even and
+// within head_dim, theta > 0; a size mismatch or a zero dim is
+// InvalidArgument. Deterministic: ascending pair order.
+//
+// Usage:
+//   auto status = MropeRef(io, pos, rows, heads, dim, rdim, 3, 3, 2,
+//                          1e7);
+[[nodiscard]] std::expected<void, StatusCode> MropeRef(
+    std::span<float> io, std::span<const std::uint64_t> pos,
+    std::size_t rows, std::size_t heads, std::size_t head_dim,
+    std::size_t rope_dim, std::size_t sec_t, std::size_t sec_h,
+    std::size_t sec_w, double theta);
+
 // Host reference for the "attention" built-in: causal grouped-query
 // attention with scale 1/sqrt(head_dim) and fp32 sequential
 // accumulation (deterministic, the same order the kernels use). Query

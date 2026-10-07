@@ -289,4 +289,42 @@ __global__ void DeltaStepKernel(float* s, const float* k, const float* v,
   }
   o[d] = out;
 }
+// Built-in "mrope": multimodal rotary embedding over rows x heads x
+// head_dim fp32 in place; pos holds one (t, h, w) u64 triple per row.
+// One thread per rotated pair with the global pair index.
+__global__ void MropeKernel(float* data, const unsigned long long* pos,
+                            unsigned long long rows, unsigned long long heads,
+                            unsigned long long head_dim,
+                            unsigned long long rope_dim,
+                            unsigned long long theta_bits,
+                            unsigned long long sec_t, unsigned long long sec_h,
+                            unsigned long long sec_w) {
+  const unsigned long long pairs = rope_dim / 2;
+  const unsigned long long t =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= rows * heads * pairs) {
+    return;
+  }
+  (void)sec_w;  // pairs past temporal+height reuse the width id
+  const unsigned long long row = t / (heads * pairs);
+  const unsigned long long rem = t % (heads * pairs);
+  const unsigned long long head = rem / pairs;
+  const unsigned long long j = rem % pairs;
+  float theta = 0.0f;
+  static_assert(sizeof(theta) == 4);
+  std::uint32_t bits = static_cast<std::uint32_t>(theta_bits);
+  std::memcpy(&theta, &bits, 4);
+  const unsigned long long section =
+      j < sec_t ? 0 : (j < sec_t + sec_h ? 1 : 2);
+  const float p = static_cast<float>(pos[row * 3 + section]);
+  const float angle = p * powf(theta, -2.0f * static_cast<float>(j) /
+                                          static_cast<float>(rope_dim));
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+  float* base = data + (row * heads + head) * head_dim;
+  const float x1 = base[j];
+  const float x2 = base[j + pairs];
+  base[j] = x1 * c - x2 * s;
+  base[j + pairs] = x1 * s + x2 * c;
+}
 }  // namespace tessera::backends::rocm

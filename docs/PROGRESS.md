@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 123/123 on both builds.
+`ctest` passes 126/126 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -50,6 +50,11 @@ through RADV GFX1201, rocm through the system ROCm).
   accumulation. One step reads, edits, and writes the recurrent state
   in place and reports the query read-out. Verified over three chained
   steps (outputs and carried state) against the host reference on both
+  devices.
+- Generic multimodal RoPE with fp32 sequential accumulation. Pair
+  sections take per-row temporal/height/width ids with a continuous
+  global frequency schedule. Text-only rows reduce to plain RoPE
+  (asserted on device). Verified against the host reference on both
   devices.
 - Weight upload: `Model::Load` allocates one device buffer per
   manifest tensor and copies the file bytes through the backend.
@@ -167,21 +172,28 @@ through RADV GFX1201, rocm through the system ROCm).
   `include/tessera/backend.hpp`; device-vs-reference and bad-arg
   tests use the per backend attention tolerance.
 - 2026-10-07: delta scan step (123/123 `ctest` on both builds).
-  Current head. Generic "delta_step" (one thread per state column,
+  Generic "delta_step" (one thread per state column,
   state updated in place) on vulkan (GLSL) and rocm (HIP) with a host
   reference next to the attention refs. Three chained steps prove the
   carried state matches on both devices. Contract in
   `include/tessera/backend.hpp`.
+- 2026-10-07: mRoPE kernel (126/126 `ctest` on both builds).
+  Current head. Generic "mrope" (one thread per rotated pair) on
+  vulkan (GLSL) and rocm (HIP) with a host reference next to the rope
+  ref. Sections count pairs with a global frequency index, so text
+  rows equal plain RoPE (asserted on device). Fixed along the way: the
+  shader read the wrong word of the u64 position triples, and CMake
+  keeps stale SPIR-V until `cmake -B` re-runs (see notes).
 
 ## Next (in order)
 
 1. **Hybrid SSM decode** for the 27B target (arch `qwen35`):
-   definition, load, and norm/gate/conv/scan kernels are done (the
-   file loads with 866 tensors on both backends). Still missing:
-   fused Q-plus-gate splitting with mRoPE on full layers, wiring the
-   scan into the decode loop (recurrent state, gate projections,
-   conv/SiLU/norm plumbing), and MTP handling. `DecodeStep` rejects
-   hybrid configs as unsupported today.
+   definition, load, and norm/gate/conv/scan/mrope kernels are done
+   (the file loads with 866 tensors on both backends). Still missing:
+   fused Q-plus-gate splitting, GGUF retention of the rope section
+   array (the parser drops arrays today), wiring the scan into the
+   decode loop, and MTP handling. `DecodeStep` rejects hybrid configs
+   as unsupported today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
@@ -227,3 +239,6 @@ through RADV GFX1201, rocm through the system ROCm).
 - This radv build crashes compiling a non-main SPIR-V entry name, so
   the vulkan built-ins keep the standard entry. It also crashes
   `vkCmdCopyBuffer` for buffers that were never bound to memory.
+- Vulkan shaders embed at configure time: editing a `.comp` file
+  needs a fresh `cmake -B` run, a plain `cmake --build` keeps the
+  stale SPIR-V.

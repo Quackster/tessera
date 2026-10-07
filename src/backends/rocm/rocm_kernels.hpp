@@ -107,5 +107,12 @@ __global__ void DeltaStepKernel(float* s, const float* k, const float* v,
                                 unsigned long long dk, unsigned long long dv,
                                 unsigned long long alpha_bits,
                                 unsigned long long beta_bits);
+__global__ void MropeKernel(float* data, const unsigned long long* pos,
+                            unsigned long long rows, unsigned long long heads,
+                            unsigned long long head_dim,
+                            unsigned long long rope_dim,
+                            unsigned long long theta_bits,
+                            unsigned long long sec_t, unsigned long long sec_h,
+                            unsigned long long sec_w);
 
 }  // namespace tessera::backends::rocm

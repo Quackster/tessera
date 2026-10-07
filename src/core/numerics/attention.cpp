@@ -96,6 +96,45 @@ std::expected<void, StatusCode> AttentionRef(
   return {};
 }
 
+std::expected<void, StatusCode> MropeRef(
+    std::span<float> io, std::span<const std::uint64_t> pos,
+    std::size_t rows, std::size_t heads, std::size_t head_dim,
+    std::size_t rope_dim, std::size_t sec_t, std::size_t sec_h,
+    std::size_t sec_w, double theta) {
+  if (rows == 0 || heads == 0 || head_dim == 0 || rope_dim == 0 ||
+      rope_dim > head_dim || (rope_dim % 2) != 0 || !(theta > 0.0)) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t pairs = rope_dim / 2;
+  if (sec_t + sec_h + sec_w > pairs) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (io.size() != rows * heads * head_dim || pos.size() != rows * 3) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t h = 0; h < heads; ++h) {
+      float* base = io.data() + (r * heads + h) * head_dim;
+      for (std::size_t j = 0; j < pairs; ++j) {
+        const std::uint64_t section_pos = j < sec_t ? pos[r * 3]
+                                          : j < sec_t + sec_h ? pos[r * 3 + 1]
+                                                              : pos[r * 3 + 2];
+        const double angle =
+            static_cast<double>(section_pos) *
+            std::pow(theta, -2.0 * static_cast<double>(j) /
+                                static_cast<double>(rope_dim));
+        const float c = static_cast<float>(std::cos(angle));
+        const float s = static_cast<float>(std::sin(angle));
+        const float x1 = base[j];
+        const float x2 = base[j + pairs];
+        base[j] = x1 * c - x2 * s;
+        base[j + pairs] = x1 * s + x2 * c;
+      }
+    }
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> DeltaStepRef(
     std::span<float> s, std::span<const float> k, std::span<const float> v,
     std::span<const float> q, std::span<float> o, std::size_t dk,

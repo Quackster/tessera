@@ -50,6 +50,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"sigmoid_gate", reinterpret_cast<void*>(&SigmoidGateKernel)},
     {"conv1d", reinterpret_cast<void*>(&Conv1dKernel)},
     {"delta_step", reinterpret_cast<void*>(&DeltaStepKernel)},
+    {"mrope", reinterpret_cast<void*>(&MropeKernel)},
 };
 
 int LookupBuiltIn(std::string_view name) {

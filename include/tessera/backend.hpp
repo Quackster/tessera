@@ -181,6 +181,14 @@ class Kernel {
 // S' = alpha*(S - beta*k*r^T) + beta*v*k^T, and reports o = S'^T q
 // with per-column sequential accumulation. The dispatch is
 // ceil(dv / 256) workgroups of 256.
+// "mrope": buffer 0 holds rows x heads x head_dim fp32 rotated in
+// place (NeoX pairing over rope_dim per head), buffer 1 the per-row
+// (t, h, w) position triples (u64); scalars are rows, heads,
+// head_dim, rope_dim, the fp32 theta bits, and the temporal, height
+// and width section pair counts. Pair j rotates by its section
+// position times theta^(-2j/rope_dim); pairs past the sections reuse
+// the width id. The dispatch is
+// ceil(rows * heads * (rope_dim / 2) / 256) workgroups of 256.
 [[nodiscard]] inline StatusCode CheckBuiltInArgs(const Kernel& kernel,
                                                  const KernelLaunch& launch) {
   if (kernel.Id() == "fill" &&
@@ -292,6 +300,20 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "mrope") {
+    if (launch.buffers.size() != 2 || launch.scalars.size() != 8) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t head_dim = launch.scalars[2];
+    const std::uint64_t rope_dim = launch.scalars[3];
+    const std::uint64_t sections =
+        launch.scalars[5] + launch.scalars[6] + launch.scalars[7];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || head_dim == 0 ||
+        rope_dim == 0 || rope_dim > head_dim || (head_dim % 2) != 0 ||
+        (rope_dim % 2) != 0 || sections > rope_dim / 2) {
       return StatusCode::InvalidArgument;
     }
   }

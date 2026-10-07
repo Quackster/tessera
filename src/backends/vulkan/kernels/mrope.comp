@@ -1,0 +1,52 @@
+#version 450
+
+// One thread per rotated pair; the dispatch is
+// ceil(rows * heads * (rope_dim / 2) / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "mrope" contract: buffer 0 holds rows x heads x head_dim fp32
+// rotated in place (NeoX pairing over rope_dim per head), buffer 1
+// the per-row (t, h, w) u64 position triples. Scalars: rows v[0],
+// heads v[2], head_dim v[4], rope_dim v[6], theta bits v[8],
+// section pairs v[10] (temporal), v[12] (height), v[14] (width).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer Data {
+  float data[];
+};
+
+layout(set = 0, binding = 1) buffer Pos {
+  uint pos[];
+};
+
+void main() {
+  uint t = gl_GlobalInvocationID.x;
+  uint rows = pc.v[0];
+  uint heads = pc.v[2];
+  uint rope_dim = pc.v[6];
+  uint pairs = rope_dim / 2;
+  if (t >= rows * heads * pairs) {
+    return;
+  }
+  uint row = t / (heads * pairs);
+  uint rem = t % (heads * pairs);
+  uint head = rem / pairs;
+  uint j = rem % pairs;
+  uint head_dim = pc.v[4];
+  uint base = (row * heads + head) * head_dim;
+  uint sec_t = pc.v[10];
+  uint sec_h = pc.v[12];
+  uint section = j < sec_t ? 0 : (j < sec_t + sec_h ? 1 : 2);
+  // Triples are u64 (two words); the ids fit in the low word.
+  uint p = pos[(row * 3 + section) * 2];
+  float theta = uintBitsToFloat(pc.v[8]);
+  float angle = float(p) * pow(theta, -2.0 * float(j) / float(rope_dim));
+  float c = cos(angle);
+  float s = sin(angle);
+  float x1 = data[base + j];
+  float x2 = data[base + j + pairs];
+  data[base + j] = x1 * c - x2 * s;
+  data[base + j + pairs] = x1 * s + x2 * c;
+}

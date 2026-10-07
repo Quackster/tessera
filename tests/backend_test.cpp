@@ -1933,3 +1933,179 @@ TEST(BackendTest, DeltaRejectsBadArgs) {
   ASSERT_FALSE(zero_dk.has_value());
   EXPECT_EQ(zero_dk.error(), StatusCode::InvalidArgument);
 }
+
+// Device: multimodal RoPE matches the host reference (4 rows, 2 heads,
+// head dim 32 with 16 rotated over 3+3+2 section pairs, distinct
+// temporal/height/width ids per row).
+TEST(BackendTest, MropeDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(45);
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kHeads = 2;
+  constexpr std::size_t kDim = 32;
+  constexpr std::size_t kRopeDim = 16;
+  constexpr std::size_t kSecT = 3;
+  constexpr std::size_t kSecH = 3;
+  constexpr std::size_t kSecW = 2;
+  constexpr float kTheta = 10000.0f;
+  std::vector<float> io(kRows * kHeads * kDim);
+  for (auto& v : io) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::uint64_t> pos(kRows * 3);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    pos[r * 3] = r;
+    pos[r * 3 + 1] = 2 * r;
+    pos[r * 3 + 2] = 3 * r;
+  }
+  auto io_buf = backend->AllocateBuffer(io.size() * 4, MemoryKind::Device);
+  auto pos_buf = backend->AllocateBuffer(pos.size() * 8, MemoryKind::Device);
+  ASSERT_TRUE(io_buf.has_value() && pos_buf.has_value());
+  auto upload_io = backend->CopyH2D(**io_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(io.data()), io.size() * 4));
+  ASSERT_TRUE(upload_io.has_value()) << tessera::ToString(upload_io.error());
+  auto upload_pos = backend->CopyH2D(**pos_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(pos.data()), pos.size() * 8));
+  ASSERT_TRUE(upload_pos.has_value())
+      << tessera::ToString(upload_pos.error());
+
+  std::uint32_t theta_bits = 0;
+  static_assert(sizeof(theta_bits) == sizeof(kTheta));
+  std::memcpy(&theta_bits, &kTheta, sizeof(theta_bits));
+  auto kernel = backend->LoadKernel("mrope", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows * kHeads * (kRopeDim / 2) + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*io_buf).get(), (*pos_buf).get()};
+  launch.scalars = {kRows, kHeads, kDim, kRopeDim, theta_bits, kSecT, kSecH,
+                    kSecW};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(io.size() * 4);
+  auto download =
+      backend->CopyD2H(**io_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref = io;
+  auto ref_status = core::MropeRef(
+      std::span<float>(ref), std::span<const std::uint64_t>(pos), kRows,
+      kHeads, kDim, kRopeDim, kSecT, kSecH, kSecW, kTheta);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(device_out[i] - ref[i]);
+    const float r =
+        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, r);
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Device: mRoPE with identical temporal/height/width ids matches the
+// plain RoPE host reference (text-only rows reduce to 1D RoPE).
+TEST(BackendTest, MropeMatchesRopeForText) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(46);
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kHeads = 2;
+  constexpr std::size_t kDim = 32;
+  constexpr std::size_t kRopeDim = 16;
+  constexpr std::uint64_t kPosBase = 5;
+  constexpr float kTheta = 10000.0f;
+  std::vector<float> io(kRows * kHeads * kDim);
+  for (auto& v : io) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::uint64_t> pos(kRows * 3);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    pos[r * 3] = kPosBase + r;
+    pos[r * 3 + 1] = kPosBase + r;
+    pos[r * 3 + 2] = kPosBase + r;
+  }
+  auto io_buf = backend->AllocateBuffer(io.size() * 4, MemoryKind::Device);
+  auto pos_buf = backend->AllocateBuffer(pos.size() * 8, MemoryKind::Device);
+  ASSERT_TRUE(io_buf.has_value() && pos_buf.has_value());
+  auto upload_io = backend->CopyH2D(**io_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(io.data()), io.size() * 4));
+  ASSERT_TRUE(upload_io.has_value()) << tessera::ToString(upload_io.error());
+  auto upload_pos = backend->CopyH2D(**pos_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(pos.data()), pos.size() * 8));
+  ASSERT_TRUE(upload_pos.has_value())
+      << tessera::ToString(upload_pos.error());
+
+  std::uint32_t theta_bits = 0;
+  static_assert(sizeof(theta_bits) == sizeof(kTheta));
+  std::memcpy(&theta_bits, &kTheta, sizeof(theta_bits));
+  auto kernel = backend->LoadKernel("mrope", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows * kHeads * (kRopeDim / 2) + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*io_buf).get(), (*pos_buf).get()};
+  launch.scalars = {kRows, kHeads, kDim, kRopeDim, theta_bits, 3, 3, 2};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(io.size() * 4);
+  auto download =
+      backend->CopyD2H(**io_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref = io;
+  auto ref_status = core::RopeRef(std::span<float>(ref), kRows, kHeads, kDim,
+                                  kRopeDim, kPosBase, kTheta);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Host and contract: the mRoPE reference and the launch contract reject
+// malformed shapes at the boundary (section overflow, size gaps).
+TEST(BackendTest, MropeRejectsBadArgs) {
+  std::vector<float> io(4 * 2 * 32, 0.5f);
+  std::vector<std::uint64_t> pos(4 * 3, 1);
+  std::vector<float> ref = io;
+  auto bad = core::MropeRef(std::span<float>(ref),
+                            std::span<const std::uint64_t>(pos), 4, 2, 32, 16,
+                            5, 5, 5, 1e4);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<std::uint64_t> short_pos(4, 1);
+  bad = core::MropeRef(std::span<float>(ref),
+                       std::span<const std::uint64_t>(short_pos), 4, 2, 32, 16,
+                       3, 3, 2, 1e4);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto mrope = backend->LoadKernel("mrope", {});
+  ASSERT_TRUE(mrope.has_value()) << tessera::ToString(mrope.error());
+  tessera::KernelLaunch launch;
+  // Mrope wants 2 buffers and 8 scalars; overflowing sections rejected.
+  const std::vector<const tessera::Buffer*> two_buffers{nullptr, nullptr};
+  launch.buffers = two_buffers;
+  launch.scalars = {4, 2, 32, 16, 0, 5, 5, 5};
+  auto bad_sections = backend->LaunchKernel(**mrope, launch);
+  ASSERT_FALSE(bad_sections.has_value());
+  EXPECT_EQ(bad_sections.error(), StatusCode::InvalidArgument);
+}
