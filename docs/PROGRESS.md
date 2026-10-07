@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 207/207 on both builds.
+`ctest` passes 208/208 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -693,6 +693,13 @@ through RADV GFX1201, rocm through the system ROCm).
   builds). Current head. `GenerateOptions::draft_tokens` (CLI
   `--draft-block`) caps the DFlash2 draft to that many tokens per step
 (at most the checkpoint block size); 0 uses the checkpoint size.
+
+- 2026-10-07: fp16 keys/values attention (208/208 `ctest` on both builds).
+  Current head. The "attention" built-in takes a kv_f16 flag: keys and
+  values are read as fp16 when set, fp32 otherwise. `AttentionRefF16`
+  decodes fp16 K/V for the host reference and `Fp16FromFloat` encodes
+  fp32 to fp16. Device-vs-reference test on both backends. This is the
+  kernel half of the fp16 KV cache (storage wiring next).
 
 ## Next (in order)
 

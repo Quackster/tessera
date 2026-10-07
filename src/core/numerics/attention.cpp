@@ -1,7 +1,10 @@
 #include "core/numerics/attention.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
+
+#include "core/numerics/quant.hpp"
 
 namespace tessera::core {
 
@@ -37,6 +40,33 @@ std::expected<void, StatusCode> RopeRef(std::span<float> io,
     }
   }
   return {};
+}
+
+std::expected<void, StatusCode> AttentionRefF16(
+    std::span<const float> q, std::span<const std::byte> k,
+    std::span<const std::byte> v, std::span<float> out, std::size_t m,
+    std::size_t n, std::size_t heads, std::size_t kv_heads,
+    std::size_t head_dim, std::uint64_t q_base, std::size_t window) {
+  const std::size_t count = n * kv_heads * head_dim;
+  if (k.size() != count * 2 || v.size() != count * 2) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  std::vector<float> kf(count);
+  std::vector<float> vf(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto half_k = static_cast<std::uint16_t>(
+        static_cast<std::uint8_t>(k[i * 2]) |
+        (static_cast<std::uint16_t>(static_cast<std::uint8_t>(k[i * 2 + 1]))
+         << 8));
+    const auto half_v = static_cast<std::uint16_t>(
+        static_cast<std::uint8_t>(v[i * 2]) |
+        (static_cast<std::uint16_t>(static_cast<std::uint8_t>(v[i * 2 + 1]))
+         << 8));
+    kf[i] = Fp16ToFloat(half_k);
+    vf[i] = Fp16ToFloat(half_v);
+  }
+  return AttentionRef(q, std::span<const float>(kf), std::span<const float>(vf),
+                      out, m, n, heads, kv_heads, head_dim, q_base, window);
 }
 
 std::expected<void, StatusCode> AttentionRef(

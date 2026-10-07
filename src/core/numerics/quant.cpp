@@ -96,6 +96,29 @@ float Bf16ToFloat(std::uint16_t bits) {
   return value;
 }
 
+std::uint16_t Fp16FromFloat(float value) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const std::uint32_t sign = (bits >> 16) & 0x8000;
+  std::int32_t exponent = static_cast<std::int32_t>((bits >> 23) & 0xFF) - 127;
+  std::uint32_t mantissa = bits & 0x7FFFFF;
+  if (exponent > 15) {
+    return static_cast<std::uint16_t>(sign | 0x7C00);  // overflow -> inf
+  }
+  if (exponent < -24) {
+    return static_cast<std::uint16_t>(sign);  // underflow -> zero
+  }
+  if (exponent < -14) {
+    mantissa |= 0x800000;
+    const std::uint32_t shift = static_cast<std::uint32_t>(-exponent - 14);
+    const std::uint32_t half = (mantissa >> (shift + 13));
+    return static_cast<std::uint16_t>(sign | half);
+  }
+  const std::uint32_t half =
+      (static_cast<std::uint32_t>(exponent + 15) << 10) | (mantissa >> 13);
+  return static_cast<std::uint16_t>(sign | half);
+}
+
 float Fp8E4M3ToFloat(std::uint8_t bits) {
   const std::uint32_t sign = bits >> 7;
   const std::uint32_t exp = (bits >> 3) & 0xF;

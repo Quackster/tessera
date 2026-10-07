@@ -65,7 +65,16 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
                                 unsigned long long kv_heads,
                                 unsigned long long head_dim,
                                 unsigned long long q_base,
-                                unsigned long long window) {
+                                unsigned long long window,
+                                unsigned long long kv_f16) {
+  const std::uint16_t* kh = reinterpret_cast<const std::uint16_t*>(k);
+  const std::uint16_t* vh = reinterpret_cast<const std::uint16_t*>(v);
+  const auto kat = [&](unsigned long long idx) {
+    return kv_f16 ? Fp16ToFloatDev(kh[idx]) : k[idx];
+  };
+  const auto vat = [&](unsigned long long idx) {
+    return kv_f16 ? Fp16ToFloatDev(vh[idx]) : v[idx];
+  };
   const unsigned long long t =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (t >= m * heads * head_dim) {
@@ -91,7 +100,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
     float dot = 0.0f;
     for (unsigned long long d = 0; d < head_dim; ++d) {
-      dot = fmaf(q[q_base_idx + d], k[k_base + d], dot);
+      dot = fmaf(q[q_base_idx + d], kat(k_base + d), dot);
     }
     dot *= scale;
     if (first || dot > row_max) {
@@ -105,11 +114,11 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
     float dot = 0.0f;
     for (unsigned long long d = 0; d < head_dim; ++d) {
-      dot = fmaf(q[q_base_idx + d], k[k_base + d], dot);
+      dot = fmaf(q[q_base_idx + d], kat(k_base + d), dot);
     }
     const float w = expf(dot * scale - row_max);
     denom += w;
-    acc = fmaf(w, v[k_base + e], acc);
+    acc = fmaf(w, vat(k_base + e), acc);
   }
   out[t] = acc / denom;
 }

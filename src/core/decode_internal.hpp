@@ -385,13 +385,14 @@ inline std::expected<void, StatusCode> AttentionDevice(
     Backend& backend, const Kernel& kernel, const Buffer& q, const Buffer& k,
     const Buffer& v, Buffer& out, std::size_t n, std::size_t heads,
     std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base,
-    std::uint64_t window = 0, std::size_t rows = 1) {
+    std::uint64_t window = 0, std::size_t rows = 1, bool kv_f16 = false) {
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>(
       (rows * heads * head_dim + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&q, &k, &v, &out};
-  launch.scalars = {rows, n, heads, kv_heads, head_dim, q_base, window};
+  launch.scalars = {rows, n, heads, kv_heads, head_dim, q_base, window,
+                    kv_f16 ? 1u : 0u};
   return backend.LaunchKernel(kernel, launch);
 }
 

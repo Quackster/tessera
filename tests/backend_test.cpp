@@ -1523,7 +1523,7 @@ TEST(BackendTest, AttentionDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -1613,12 +1613,12 @@ TEST(BackendTest, AttentionRejectsBadContract) {
   const std::vector<const tessera::Buffer*> four_buffers{
       nullptr, nullptr, nullptr, nullptr};
   launch.buffers = three_buffers;
-  launch.scalars = {1, 4, 4, 2, 16, 0, 0};
+  launch.scalars = {1, 4, 4, 2, 16, 0, 0, 0};
   auto short_buffers = backend->LaunchKernel(**attention, launch);
   ASSERT_FALSE(short_buffers.has_value());
   EXPECT_EQ(short_buffers.error(), StatusCode::InvalidArgument);
   launch.buffers = four_buffers;
-  launch.scalars = {1, 4, 3, 2, 16, 0, 0};
+  launch.scalars = {1, 4, 3, 2, 16, 0, 0, 0};
   auto bad_groups = backend->LaunchKernel(**attention, launch);
   ASSERT_FALSE(bad_groups.has_value());
   EXPECT_EQ(bad_groups.error(), StatusCode::InvalidArgument);
@@ -3002,7 +3002,7 @@ TEST(BackendTest, AttentionBatchedMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*o_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -3204,7 +3204,7 @@ TEST(BackendTest, AttentionWindowDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, kWindow};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, kWindow, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(kM * kHeads * kDim * 4);
@@ -4552,4 +4552,69 @@ TEST(BackendTest, DraftCandidatesTopK) {
       std::span<float>(unary), kRows, kVocab, kVocab + 1);
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), tessera::StatusCode::InvalidArgument);
+}
+
+// Device: fp16 keys/values attention (kv_f16) matches the fp16 host
+// reference (both decode the same half bits).
+TEST(BackendTest, AttentionF16DeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(103);
+  constexpr std::size_t kM = 2, kN = 4, kHeads = 4, kKvHeads = 2, kDim = 16;
+  constexpr std::uint64_t kQBase = 3;
+  std::vector<float> q(kM * kHeads * kDim);
+  std::vector<float> k(kN * kKvHeads * kDim), v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  std::vector<std::byte> k16(k.size() * 2), v16(v.size() * 2);
+  const auto encode = [](float value, std::byte* out) {
+    const std::uint16_t half = core::Fp16FromFloat(value);
+    out[0] = static_cast<std::byte>(half & 0xFF);
+    out[1] = static_cast<std::byte>((half >> 8) & 0xFF);
+  };
+  for (std::size_t i = 0; i < k.size(); ++i) {
+    encode(k[i], &k16[i * 2]);
+    encode(v[i], &v16[i * 2]);
+  }
+  auto q_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  auto k_buf = backend->AllocateBuffer(k16.size(), MemoryKind::Device);
+  auto v_buf = backend->AllocateBuffer(v16.size(), MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(q_buf && k_buf && v_buf && out_buf);
+  const auto upload = [&backend](auto& buf, const void* data, std::size_t bytes) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data), bytes));
+  };
+  ASSERT_TRUE(upload(q_buf, q.data(), q.size() * 4).has_value());
+  ASSERT_TRUE(upload(k_buf, k16.data(), k16.size()).has_value());
+  ASSERT_TRUE(upload(v_buf, v16.data(), v16.size()).has_value());
+  auto kernel = backend->LoadKernel("attention", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
+                    (*out_buf).get()};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 1};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kHeads * kDim * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kM * kHeads * kDim);
+  ASSERT_TRUE(core::AttentionRefF16(
+                  std::span<const float>(q), std::span<const std::byte>(k16),
+                  std::span<const std::byte>(v16), std::span<float>(ref), kM,
+                  kN, kHeads, kKvHeads, kDim, kQBase, 0)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
 }

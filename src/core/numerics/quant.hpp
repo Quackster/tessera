@@ -22,6 +22,11 @@ constexpr std::size_t kQ4KScaleBytes = 12;
 //   float value = Fp16ToFloat(half);
 [[nodiscard]] float Fp16ToFloat(std::uint16_t half);
 
+// Encode fp32 to IEEE 754 binary16 (round to nearest, ties to even;
+// overflow saturates to infinity). Lossy; the inverse of Fp16ToFloat for
+// representable values.
+[[nodiscard]] std::uint16_t Fp16FromFloat(float value);
+
 // Decode a bfloat16 (little-endian) to fp32. bf16 shares the fp32
 // exponent field, so the conversion is exact.
 [[nodiscard]] float Bf16ToFloat(std::uint16_t bits);

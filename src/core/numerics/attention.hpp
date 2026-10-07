@@ -57,6 +57,15 @@ namespace tessera::core {
 //
 // Usage:
 //   auto status = AttentionRef(q, k, v, out, m, n, h, kv, d, base);
+// Host reference for attention with fp16 keys and values: `k` and `v`
+// hold n x kv_heads*head_dim fp16 elements (little-endian). Decodes them
+// and runs AttentionRef. Other arguments as AttentionRef.
+[[nodiscard]] std::expected<void, StatusCode> AttentionRefF16(
+    std::span<const float> q, std::span<const std::byte> k,
+    std::span<const std::byte> v, std::span<float> out, std::size_t m,
+    std::size_t n, std::size_t heads, std::size_t kv_heads,
+    std::size_t head_dim, std::uint64_t q_base, std::size_t window = 0);
+
 [[nodiscard]] std::expected<void, StatusCode> AttentionRef(
     std::span<const float> q, std::span<const float> k,
     std::span<const float> v, std::span<float> out, std::size_t m,
