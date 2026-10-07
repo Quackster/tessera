@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/decode_internal.hpp"
 
 namespace tessera {
 
@@ -54,6 +55,91 @@ std::expected<std::unique_ptr<Model>, StatusCode> Engine::LoadModel(
       "model", std::string("loaded ") + format_name + " model with " +
                    std::to_string(loaded->Tensors().size()) + " tensors");
   return model;
+}
+
+std::expected<std::vector<std::uint32_t>, StatusCode>
+Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
+  if (options.max_tokens == 0) {
+    return std::vector<std::uint32_t>{};
+  }
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  if (!config->hybrid) {
+    diagnostics_.Warn("engine",
+                      "GenerateSpeculative: MTP needs a hybrid model");
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  core::DecodeCache cache;
+  std::vector<std::uint32_t> prompt = options.prompt_tokens;
+  if (prompt.empty()) {
+    prompt.push_back(options.first_token);
+  }
+  std::vector<float> hidden;
+  std::vector<float> current;
+  for (const std::uint32_t token : prompt) {
+    auto logits = core::DecodeLogits(*backend_, model, cache, token, &hidden);
+    if (!logits) {
+      diagnostics_.Warn(
+          "engine", std::string("speculative prefill failed: ") +
+                        std::string(ToString(logits.error())));
+      return std::unexpected(logits.error());
+    }
+    current = std::move(*logits);
+  }
+  std::vector<std::uint32_t> produced;
+  produced.reserve(options.max_tokens);
+  std::uint64_t pos = prompt.size();
+  std::uint32_t next = core::detail::ArgMax(current);
+  while (produced.size() < options.max_tokens) {
+    produced.push_back(next);
+    if (produced.size() >= options.max_tokens) {
+      break;
+    }
+    // Advance the target cache by the token just emitted; `current`/`hidden`
+    // now describe that token's position.
+    auto fed = core::DecodeLogits(*backend_, model, cache, next, &hidden);
+    if (!fed) {
+      diagnostics_.Warn(
+          "engine", std::string("speculative step failed: ") +
+                        std::string(ToString(fed.error())));
+      return std::unexpected(fed.error());
+    }
+    current = std::move(*fed);
+    ++pos;
+    auto draft = core::MtpDraftStep(*backend_, model, cache, hidden, next, pos);
+    if (!draft) {
+      if (draft.error() != StatusCode::UnsupportedFeature) {
+        return std::unexpected(draft.error());
+      }
+      // No MTP head: fall back to the target's greedy token.
+      next = core::detail::ArgMax(current);
+      continue;
+    }
+    const std::size_t mtp_rows = cache.hybrid ? cache.hybrid->mtp_kv.rows : 0;
+    const std::uint32_t proposed = *draft;
+    auto verify =
+        core::VerifyDraft(*backend_, model, cache,
+                          std::span<const std::uint32_t>(&proposed, 1),
+                          current, &hidden);
+    if (!verify) {
+      return std::unexpected(verify.error());
+    }
+    if (verify->accepted == 1) {
+      produced.push_back(proposed);
+      ++pos;
+      current = std::move(verify->logits);
+      next = core::detail::ArgMax(current);
+      continue;
+    }
+    // Rejected: drop the MTP key/value row the draft added.
+    if (cache.hybrid) {
+      cache.hybrid->mtp_kv.rows = mtp_rows;
+    }
+    next = verify->next_token;
+  }
+  return produced;
 }
 
 std::expected<std::uint32_t, StatusCode> Engine::MtpDraft(

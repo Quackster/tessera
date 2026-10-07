@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 175/175 on both builds.
+`ctest` passes 177/177 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -450,11 +450,22 @@ through RADV GFX1201, rocm through the system ROCm).
   output to the greedy baseline. Sequential today (one target forward
   per accepted token); batched scoring is the next speed step.
 
+- 2026-10-07: MTP speculative generation (177/177 `ctest` on both
+  builds; the real-model test is env-gated). Current head.
+  `Engine::GenerateSpeculative` drafts with the MTP head, verifies
+  with `VerifyDraft`, accepts matches and falls back to the target's
+  greedy token on rejection (truncating the MTP key/value row); the
+  output is identical to plain greedy. The CLI gains `--speculate`.
+  Verified on the 27B (866 tensors): speculative equals greedy on
+  vulkan and rocm. Sequential scoring today; batching is the next
+  speed step.
+
 ## Next (in order)
 
-1. **MTP verification**: the MTP head drafts and the greedy verifier
-   loop (`VerifyDraft`) exists. Still missing: wire `MtpDraftStep` into a
-   speculative generation loop (and the CLI) and batch the scoring.
+1. **Speculative decoding performance**: MTP speculation runs end to
+   end (`Engine::GenerateSpeculative`, CLI `--speculate`) and is output
+   preserving, but scores one token per target forward. Next: batch the
+   draft scoring so k drafts cost one forward.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    The verifier loop and the draft kernels are in place; the DFlash2 draft

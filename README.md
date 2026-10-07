@@ -32,7 +32,8 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. 27B generates. |
-| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head in work. |
+| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. |
+| Speculative decode | Partial | MTP draft and greedy verifier run end to end (`--speculate`); output equals greedy. Batched scoring and the DFlash2 draft are in work. |
 | MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
 | DFlash2 decode | Todo | Grouped causal convolutions. Low rank selector. Verify loop. |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |

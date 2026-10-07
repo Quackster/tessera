@@ -57,7 +57,7 @@ std::expected<std::vector<std::vector<float>>, StatusCode> ScoreTokens(
 std::expected<DraftVerification, StatusCode> VerifyDraft(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> draft,
-    std::span<const float> prefix_logits) {
+    std::span<const float> prefix_logits, std::vector<float>* hidden_out) {
   if (prefix_logits.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -70,7 +70,7 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
     if (detail::ArgMax(result.logits) != token) {
       break;
     }
-    auto logits = DecodeLogits(backend, model, cache, token);
+    auto logits = DecodeLogits(backend, model, cache, token, hidden_out);
     if (!logits) {
       return std::unexpected(logits.error());
     }

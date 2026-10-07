@@ -429,6 +429,49 @@ TEST(HybridDecodeTest, SpeculationMatchesGreedy) {
   EXPECT_EQ(SpeculativeTokens(linear, 8, 5), want_linear);
 }
 
+// GenerateSpeculative must agree with Generate. On the tiny hybrids there
+// is no MTP head, so the drafter is unavailable and every step falls back
+// to the target's greedy token; this exercises the loop and the fallback.
+TEST(HybridDecodeTest, SpeculativeFallbackMatchesGreedy) {
+  for (const std::string path :
+       {WriteGatedHybridFixture("gated.gguf").string(),
+        WriteLinearHybridFixture("linear.gguf").string()}) {
+    std::unique_ptr<Engine> engine;
+    MakeEngineOrSkip(engine);
+    auto model = engine->LoadModel(ModelOptions{path, 1024});
+    ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+    tessera::GenerateOptions options;
+    options.max_tokens = 6;
+    options.first_token = 0;
+    auto greedy = engine->Generate(**model, options);
+    ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());
+    auto spec = engine->GenerateSpeculative(**model, options);
+    ASSERT_TRUE(spec.has_value()) << tessera::ToString(spec.error());
+    EXPECT_EQ(*spec, *greedy);
+  }
+}
+
+// With the real MTP head the drafter runs and is verified; speculation
+// must still reproduce the greedy sequence (27B target; TESSERA_TEST_GGUF).
+TEST(HybridDecodeTest, SpeculativeMatchesGreedyOnModel) {
+  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{path, 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  tessera::GenerateOptions options;
+  options.max_tokens = 4;
+  options.first_token = 0;
+  auto greedy = engine->Generate(**model, options);
+  ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());
+  auto spec = engine->GenerateSpeculative(**model, options);
+  ASSERT_TRUE(spec.has_value()) << tessera::ToString(spec.error());
+  EXPECT_EQ(*spec, *greedy);
+}
+
 // The MTP head drafts a token from the backbone hidden state (27B target;
 // path via TESSERA_TEST_GGUF). Deterministic across fresh caches.
 TEST(HybridDecodeTest, MtpDraftWhenModelProvided) {

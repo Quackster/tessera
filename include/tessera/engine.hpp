@@ -77,6 +77,17 @@ class Engine {
   [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraft(
       Model& model, std::uint32_t token);
 
+  // Greedy generation with MTP speculative decoding. Each step drafts one
+  // token with the MTP head, verifies it against the target, and accepts
+  // it when it matches; a rejected draft falls back to the target's greedy
+  // token. The produced sequence is identical to Generate (speculation
+  // never changes the output). UnsupportedFeature on a non-hybrid model.
+  //
+  // Usage:
+  //   auto ids = engine->GenerateSpeculative(*model, {.max_tokens = 8});
+  [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
+  GenerateSpeculative(Model& model, const GenerateOptions& options = {});
+
   // The engine's compute backend.
   [[nodiscard]] Backend& Owner();
   // nullptr when no strategy is attached.

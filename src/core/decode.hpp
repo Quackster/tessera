@@ -193,9 +193,13 @@ struct DraftVerification {
 // (accepted draft tokens followed by `next_token`) is identical to plain
 // greedy decoding for any draft. `prefix_logits` must be the logits from
 // the step that produced the current cache position; empty is invalid.
+// When `hidden_out` is non-null it receives the final hidden state of the
+// last accepted token (unchanged when nothing is accepted), so an MTP
+// drafter can chain on it.
 [[nodiscard]] std::expected<DraftVerification, StatusCode> VerifyDraft(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> draft,
-    std::span<const float> prefix_logits);
+    std::span<const float> prefix_logits,
+    std::vector<float>* hidden_out = nullptr);
 
 }  // namespace tessera::core

@@ -37,6 +37,7 @@ void PrintUsage() {
                "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
                "  --mtp <id>        print the MTP draft after this token id\n"
                "  --tokens <n>      run n greedy decode steps and print them\n"
+               "  --speculate       verify MTP drafts instead of plain greedy\n"
                "  --host <ip>       serve bind address (default 127.0.0.1)\n"
                "  --port <n>        serve port (default 8080)\n"
                "  --api-key <k>     accepted API key (repeatable; env "
@@ -66,6 +67,7 @@ int main(int argc, char** argv) {
   std::uint32_t prompt = 0;
   std::uint32_t mtp_token = 0;
   bool mtp = false;
+  bool speculate = false;
   std::uint16_t port = 8080;
   std::size_t tokens = 0;
   std::size_t context = kDefaultContext;
@@ -95,6 +97,8 @@ int main(int argc, char** argv) {
     } else if (arg == "--mtp" && i + 1 < argc) {
       mtp_token = static_cast<std::uint32_t>(std::stoul(argv[++i]));
       mtp = true;
+    } else if (arg == "--speculate") {
+      speculate = true;
     } else if (arg == "--tokens" && i + 1 < argc) {
       tokens = std::stoul(argv[++i]);
     } else {
@@ -219,7 +223,8 @@ int main(int argc, char** argv) {
       }
       gen.prompt_tokens = *ids;
     }
-    auto generated = engine.Generate(loaded, gen);
+    auto generated = speculate ? engine.GenerateSpeculative(loaded, gen)
+                               : engine.Generate(loaded, gen);
     if (!generated) {
       log.Warn("cli", std::string("generation failed (") +
                           std::string(tessera::ToString(generated.error())) +
@@ -230,7 +235,9 @@ int main(int argc, char** argv) {
     for (std::uint32_t id : *generated) {
       produced += std::to_string(id) + " ";
     }
-    log.Info("cli", "generated tokens: " + produced);
+    log.Info("cli", std::string(speculate ? "speculative tokens: "
+                                         : "generated tokens: ") +
+                        produced);
   }
   return kExitOk;
 }
