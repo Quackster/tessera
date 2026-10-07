@@ -156,6 +156,42 @@ std::expected<std::optional<HybridDef>, StatusCode> ParseHybrid(
   return std::optional<HybridDef>{def};
 }
 
+// mRoPE section pair counts from the section array; nullopt when the
+// file carries none. Three integer entries, or four with a zero pad
+// (the file convention); the leading three cover at most rope_dim/2
+// pairs. MalformedFile on any other shape.
+std::expected<std::optional<std::vector<std::uint64_t>>, StatusCode>
+ParseRopeSections(const core::GgufFile& gguf, std::string_view architecture,
+                  std::size_t rope_dim) {
+  const auto found = gguf.small_arrays.find(
+      std::string(architecture) + ".rope.dimension_sections");
+  if (found == gguf.small_arrays.end()) {
+    return std::optional<std::vector<std::uint64_t>>{};
+  }
+  if (found->second.size() != 3 && found->second.size() != 4) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  std::vector<std::uint64_t> sections;
+  sections.reserve(found->second.size());
+  for (const auto& entry : found->second) {
+    const auto value = AsU64(entry);
+    if (!value) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    sections.push_back(*value);
+  }
+  if (sections.size() == 4) {
+    if (sections[3] != 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    sections.pop_back();
+  }
+  if (sections[0] + sections[1] + sections[2] > rope_dim / 2) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  return std::optional<std::vector<std::uint64_t>>{sections};
+}
+
 // Transformer config from GGUF metadata; nullopt without layer keys.
 // Hybrid layers counts trunk blocks (block_count minus nextn blocks).
 std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
@@ -239,6 +275,17 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
     config.ssm = (*hybrid)->ssm;
     config.full_attention_interval =
         static_cast<std::size_t>((*hybrid)->interval);
+  }
+  auto sections = ParseRopeSections(gguf, architecture,
+                                     config.attention.rope_dim);
+  if (!sections) {
+    return std::unexpected(sections.error());
+  }
+  if (*hybrid && !sections->has_value()) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (sections->has_value()) {
+    config.rope_sections = **sections;
   }
   return std::optional<TransformerConfig>{config};
 }

@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <span>
+#include <variant>
 
 #include "core/loaders/gguf.hpp"
 #include "test_helpers.hpp"
@@ -320,14 +321,67 @@ TEST(GgufTest, DropsArrayValuesAndRecordsKey) {
   builder.PushString("llama.tensor_list");
   builder.PushU32(9);  // GGUF_METADATA_VALUE_TYPE_ARRAY
   builder.PushU32(8);  // element type: string
-  builder.PushU64(2);  // two elements
-  builder.PushString("x");
-  builder.PushString("y");
+  builder.PushU64(17);  // past the retention bound
+  for (int i = 0; i < 17; ++i) {
+    builder.PushString("x");
+  }
   auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
   ASSERT_TRUE(file.has_value()) << tessera::ToString(file.error());
   EXPECT_EQ(file->metadata.size(), 0u);  // the array is not retained
+  EXPECT_EQ(file->small_arrays.size(), 0u);
   ASSERT_EQ(file->dropped_array_keys.size(), 1u);
   EXPECT_EQ(file->dropped_array_keys[0], "llama.tensor_list");
+}
+
+TEST(GgufTest, RetainsSmallArrays) {
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 0, 2);
+  builder.PushString("arch.rope.dimension_sections");
+  builder.PushU32(9);  // array
+  builder.PushU32(4);  // element type: u32
+  builder.PushU64(4);
+  for (std::uint32_t s : {11u, 11u, 10u, 0u}) {
+    builder.PushU32(s);
+  }
+  builder.PushString("arch.tags");
+  builder.PushU32(9);  // array
+  builder.PushU32(8);  // element type: string
+  builder.PushU64(1);
+  builder.PushString("hybrid");
+  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
+  ASSERT_TRUE(file.has_value()) << tessera::ToString(file.error());
+  EXPECT_EQ(file->dropped_array_keys.size(), 0u);
+  ASSERT_EQ(file->small_arrays.size(), 2u);
+  const auto sections =
+      file->small_arrays.find("arch.rope.dimension_sections");
+  ASSERT_TRUE(sections != file->small_arrays.end());
+  ASSERT_EQ(sections->second.size(), 4u);
+  const std::uint32_t want[4] = {11u, 11u, 10u, 0u};
+  for (std::size_t i = 0; i < 4; ++i) {
+    const auto* value = std::get_if<std::uint32_t>(&sections->second[i]);
+    ASSERT_NE(value, nullptr);
+    EXPECT_EQ(*value, want[i]);
+  }
+  const auto tags = file->small_arrays.find("arch.tags");
+  ASSERT_TRUE(tags != file->small_arrays.end());
+  ASSERT_EQ(tags->second.size(), 1u);
+  const auto* name = std::get_if<std::string>(&tags->second[0]);
+  ASSERT_NE(name, nullptr);
+  EXPECT_EQ(*name, "hybrid");
+}
+
+TEST(GgufTest, RejectsSmallArrayWithBadElementType) {
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 0, 1);
+  builder.PushString("list");
+  builder.PushU32(9);   // array
+  builder.PushU32(13);  // element type beyond the value table
+  builder.PushU64(2);
+  builder.PushU32(1);
+  builder.PushU32(2);
+  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
+  ASSERT_FALSE(file.has_value());
+  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
 }
 
 TEST(GgufTest, RejectsArrayCountOverflow) {

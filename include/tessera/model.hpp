@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <memory>
 #include <optional>
@@ -77,6 +79,11 @@ struct TransformerConfig {
     }
     return (layer + 1) % full_attention_interval == 0;
   }
+  // mRoPE section pair counts (temporal, height, width[, pad]) from the
+  // model definition. Empty when the file carries no section array;
+  // hybrid definitions require it (the mrope built-in takes the counts
+  // as launch scalars).
+  std::vector<std::uint64_t> rope_sections;
 };
 
 // A loaded model: format + options + parsed tensor manifest + the
@@ -120,9 +127,10 @@ class Model {
   // embedding_length, feed_forward_length and the attention keys above
   // plus <arch>.attention.layer_norm_rms_epsilon; the vocabulary comes
   // from the output weight shape. Hybrid definitions also provide the
-  // ssm.* keys and full_attention_interval; layers counts trunk blocks
-  // (block_count minus nextn_predict_layers). MalformedFile when the
-  // definition lacks them; UnsupportedFeature for MXFP4.
+  // ssm.* keys and full_attention_interval, plus the rope section
+  // array; layers counts trunk blocks (block_count minus
+  // nextn_predict_layers). MalformedFile when the definition lacks
+  // them; UnsupportedFeature for MXFP4.
   //
   // Usage:
   //   auto config = model.Config();

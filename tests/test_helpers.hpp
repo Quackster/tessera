@@ -224,9 +224,11 @@ inline std::filesystem::path FreshTempDir(const std::string& name) {
 // A tiny hybrid-shaped GGUF (interval 2, one MTP block, vocab 8).
 // Skipping the interval key leaves the ssm set partial for tests.
 inline std::filesystem::path WriteHybridFixture(const std::string& name,
-                                                bool complete) {
+                                                bool complete,
+                                                bool sections = true) {
   GgufBuilder builder;
-  builder.Header(0x46554747, 3, 1, complete ? 19 : 18);
+  builder.Header(0x46554747, 3, 1,
+                 complete ? (sections ? 20 : 19) : (sections ? 19 : 18));
   builder.KvString("general.name", "tiny-hybrid");
   builder.KvString("general.architecture", "test-hybrid");
   builder.KvU32("test-hybrid.block_count", 4);
@@ -239,6 +241,15 @@ inline std::filesystem::path WriteHybridFixture(const std::string& name,
   builder.KvU32("test-hybrid.attention.value_length", 64);
   builder.KvU32("test-hybrid.rope.dimension_count", 32);
   builder.KvF32("test-hybrid.rope.freq_base", 10000.0f);
+  if (sections) {
+    builder.PushString("test-hybrid.rope.dimension_sections");
+    builder.PushU32(9);
+    builder.PushU32(4);
+    builder.PushU64(4);
+    for (std::uint32_t s : {1u, 1u, 1u, 0u}) {
+      builder.PushU32(s);
+    }
+  }
   builder.KvU32("test-hybrid.ssm.conv_kernel", 2);
   builder.KvU32("test-hybrid.ssm.state_size", 8);
   builder.KvU32("test-hybrid.ssm.group_count", 2);

@@ -19,8 +19,11 @@ constexpr std::uint64_t kMaxGgufKvCount = 1ull << 16;
 // names at 64 bytes.
 constexpr std::uint64_t kMaxGgufStringLen = 65535;
 constexpr std::uint64_t kMaxGgufTensorNameLen = 64;
-// Array metadata is skipped without retention (bounds-checked walk),
-// so large counts are cheap; real vocabularies reach 248k entries.
+// Arrays above this length stay dropped (bulk data, e.g. vocabularies);
+// shorter ones are retained as definition metadata.
+constexpr std::uint64_t kMaxRetainedArrayElements = 16;
+// Skipped arrays are walked bounds-checked, so large counts are cheap;
+// real vocabularies reach 248k entries.
 constexpr std::uint64_t kMaxGgufArrayCount = 1ull << 20;
 constexpr std::uint32_t kMaxGgufRank = 4;
 constexpr std::uint64_t kMaxGgufDim = 1ull << 24;
@@ -274,20 +277,39 @@ std::expected<GgufFile, StatusCode> ParseGguf(
       return std::unexpected(StatusCode::MalformedFile);
     }
     if (type == static_cast<std::uint32_t>(GgufValueType::Array)) {
-      // Arrays are not retained; skip the payload and record the drop.
+      // Arrays are retained below the retention bound and skipped
+      // past it (recording the drop); either way the walk is bounded.
       const std::uint32_t elem_type = cursor.U32();
       const std::uint64_t count = cursor.U64();
       if (cursor.failed || count > kMaxGgufArrayCount) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      bool ok = true;
-      for (std::uint64_t e = 0; e < count && ok; ++e) {
-        ok = cursor.SkipScalar(elem_type);
+      if (count > kMaxRetainedArrayElements) {
+        bool ok = true;
+        for (std::uint64_t e = 0; e < count && ok; ++e) {
+          ok = cursor.SkipScalar(elem_type);
+        }
+        if (!ok) {
+          return std::unexpected(StatusCode::MalformedFile);
+        }
+        file.dropped_array_keys.push_back(std::move(key));
+      } else {
+        std::vector<GgufValue> kept;
+        kept.reserve(static_cast<std::size_t>(count));
+        bool ok = true;
+        for (std::uint64_t e = 0; e < count && ok; ++e) {
+          auto value = ReadScalar(cursor, elem_type);
+          if (!value || cursor.failed) {
+            ok = false;
+          } else {
+            kept.push_back(std::move(*value));
+          }
+        }
+        if (!ok) {
+          return std::unexpected(StatusCode::MalformedFile);
+        }
+        file.small_arrays[std::move(key)] = std::move(kept);
       }
-      if (!ok) {
-        return std::unexpected(StatusCode::MalformedFile);
-      }
-      file.dropped_array_keys.push_back(std::move(key));
     } else if (type <= kMaxGgufValueType) {
       if (auto value = ReadScalar(cursor, type)) {
         if (cursor.failed) {

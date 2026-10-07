@@ -280,6 +280,10 @@ TEST(EngineTest, RealModelLoadPathWhenProvided) {
   EXPECT_EQ(config->vocab_size, 248320u);
   EXPECT_EQ(config->ssm.inner_size, 6144u);
   EXPECT_EQ(config->full_attention_interval, 4u);
+  ASSERT_EQ(config->rope_sections.size(), 3u);
+  EXPECT_EQ(config->rope_sections[0], 11u);
+  EXPECT_EQ(config->rope_sections[1], 11u);
+  EXPECT_EQ(config->rope_sections[2], 10u);
   tessera::core::DecodeCache cache;
   auto step = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
   ASSERT_FALSE(step.has_value());
@@ -446,6 +450,10 @@ TEST(EngineTest, LoadGgufModelHybridConfig) {
   EXPECT_EQ(config->ssm.time_step_rank, 4u);
   EXPECT_EQ(config->ssm.inner_size, 32u);
   EXPECT_EQ(config->full_attention_interval, 2u);
+  ASSERT_EQ(config->rope_sections.size(), 3u);
+  EXPECT_EQ(config->rope_sections[0], 1u);
+  EXPECT_EQ(config->rope_sections[1], 1u);
+  EXPECT_EQ(config->rope_sections[2], 1u);
   EXPECT_FALSE(config->IsFullAttentionLayer(0));
   EXPECT_TRUE(config->IsFullAttentionLayer(1));
   EXPECT_FALSE(config->IsFullAttentionLayer(2));
@@ -457,6 +465,15 @@ TEST(EngineTest, LoadGgufModelHybridIncompleteKeys) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
   auto path = WriteHybridFixture("hybrid_bad.gguf", false);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_FALSE(model.has_value());
+  EXPECT_EQ(model.error(), StatusCode::MalformedFile);
+}
+
+TEST(EngineTest, LoadGgufModelHybridMissingSections) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteHybridFixture("hybrid_nosections.gguf", true, false);
   auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
   ASSERT_FALSE(model.has_value());
   EXPECT_EQ(model.error(), StatusCode::MalformedFile);
