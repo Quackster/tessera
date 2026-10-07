@@ -143,6 +143,9 @@ class Model {
   // Usage:
   //   if (auto* tok = model.Tokenizer()) tok->Encode("hi");
   [[nodiscard]] const Tokenizer* GetTokenizer() const;
+  // The model's chat template (GGUF tokenizer.chat_template); empty when
+  // the file carries none.
+  [[nodiscard]] std::string_view ChatTemplate() const;
 
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,
@@ -150,7 +153,7 @@ class Model {
         std::string architecture, std::optional<AttentionParams> attention,
         std::optional<TransformerConfig> config,
         std::vector<DeviceTensor> weights,
-        std::optional<Tokenizer> tokenizer);
+        std::optional<Tokenizer> tokenizer, std::string chat_template);
   Backend& backend_;
   ModelOptions options_;
   ModelFormat format_;
@@ -161,6 +164,7 @@ class Model {
   std::optional<TransformerConfig> config_;
   std::vector<DeviceTensor> weights_;
   std::optional<Tokenizer> tokenizer_;
+  std::string chat_template_;
 };
 
 }  // namespace tessera

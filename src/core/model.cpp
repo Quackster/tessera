@@ -350,12 +350,13 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
              std::string architecture, std::optional<AttentionParams> attention,
              std::optional<TransformerConfig> config,
              std::vector<DeviceTensor> weights,
-             std::optional<Tokenizer> tokenizer)
+             std::optional<Tokenizer> tokenizer, std::string chat_template)
     : backend_(backend), options_(std::move(options)), format_(format),
       tensors_(std::move(tensors)), name_(std::move(name)),
       architecture_(std::move(architecture)),
       attention_(std::move(attention)), config_(std::move(config)),
-      weights_(std::move(weights)), tokenizer_(std::move(tokenizer)) {}
+      weights_(std::move(weights)), tokenizer_(std::move(tokenizer)),
+      chat_template_(std::move(chat_template)) {}
 
 // Upload every manifest tensor to a device buffer. `bytes` is the
 // whole file; offsets come from the parsed manifest.
@@ -441,10 +442,18 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!tokenizer) {
       return std::unexpected(tokenizer.error());
     }
+    std::string chat_template;
+    if (const auto* value = gguf->Find("tokenizer.chat_template");
+        value != nullptr) {
+      if (const auto* text = std::get_if<std::string>(value)) {
+        chat_template = *text;
+      }
+    }
     return std::unique_ptr<Model>(new Model(
         backend, options, ModelFormat::Gguf, std::move(gguf->tensors),
         std::move(name), std::move(architecture), std::move(*attention),
-        std::move(*config), std::move(*weights), std::move(*tokenizer)));
+        std::move(*config), std::move(*weights), std::move(*tokenizer),
+        std::move(chat_template)));
   }
   if (std::filesystem::is_directory(path, ec) && !ec) {
     auto layout = core::InspectMxFp4Directory(path);
@@ -477,7 +486,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     return std::unique_ptr<Model>(
         new Model(backend, options, ModelFormat::MxFp4, std::move(tensors),
                   std::string{}, std::string{}, std::nullopt, std::nullopt,
-                  std::move(*weights), std::nullopt));
+                  std::move(*weights), std::nullopt, std::string{}));
   }
   return std::unexpected(StatusCode::InvalidArgument);
 }
@@ -538,5 +547,7 @@ std::expected<TransformerConfig, StatusCode> Model::Config() const {
 const Tokenizer* Model::GetTokenizer() const {
   return tokenizer_ ? &*tokenizer_ : nullptr;
 }
+
+std::string_view Model::ChatTemplate() const { return chat_template_; }
 
 }  // namespace tessera

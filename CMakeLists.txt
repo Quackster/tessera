@@ -26,6 +26,12 @@ add_library(tessera STATIC
     src/core/numerics/attention.cpp
     src/core/numerics/norm.cpp
     src/core/numerics/conv.cpp
+    src/serve/json.cpp
+    src/serve/http.cpp
+    src/serve/server.cpp
+    src/serve/jinja/value.cpp
+    src/serve/jinja/jinja_parse.cpp
+    src/serve/jinja/jinja_eval.cpp
     src/spec/dflash2.cpp
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
@@ -165,6 +171,8 @@ add_executable(tessera-tests
     tests/engine_test.cpp
     tests/decode_test.cpp
     tests/tokenizer_test.cpp
+    tests/serve_test.cpp
+    tests/jinja_test.cpp
     tests/backend_test.cpp
     tests/spec_test.cpp
 )

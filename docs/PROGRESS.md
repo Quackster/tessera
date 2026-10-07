@@ -82,6 +82,12 @@ through RADV GFX1201, rocm through the system ROCm).
 - Public generation API: `Engine::Generate(model, options)` runs greedy
   single-token decode on the non-speculative (reference) path and
   returns the produced token ids. The CLI drives it.
+- Chat-template renderer: a compact Jinja2-subset engine
+  (`tessera/serve/jinja`) that runs the model's GGUF chat template.
+  `Model::ChatTemplate` exposes the template. It matches the reference
+  HF Jinja2 output on the 27B template (system/user/assistant, thinking
+  on and off). Tools, images and video branches parse but need those
+  features.
 - Byte-level BPE tokenizer (`tessera::Tokenizer`) built from the GGUF
   tokenizer definition (vocab, merges, types). It applies the Qwen
   pre-tokenization split, matches the reference tokenizer on ASCII,
@@ -277,6 +283,14 @@ through RADV GFX1201, rocm through the system ROCm).
   `Engine::Generate` takes prompt tokens. Fixed the `\s+(?!\S)`
   backtracking the reference relies on. Not applied: NFC, special-
   token matching, combining marks and emoji.
+
+- 2026-10-07: chat-template renderer (157/157 `ctest` on both builds).
+  Current head. `src/serve/jinja` implements the Jinja2 subset the model
+  templates use (macros, namespace, filters, tests, slicing, loop vars,
+  whitespace control, tuples). `Model::ChatTemplate` exposes the GGUF
+  template; the 27B template renders byte-for-byte identical to the
+  reference HF Jinja2 output (thinking on and off). `tests/jinja_test.cpp`
+  covers the engine plus the real template (env-gated).
 
 ## Next (in order)
 
