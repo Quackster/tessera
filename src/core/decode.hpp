@@ -103,10 +103,11 @@ struct DeviceDecodeState {
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out = nullptr);
 
-// One multi-token-prediction draft step (Qwen3.5 nextn head): fuse the
-// token embedding and the backbone hidden (`hidden`, hidden_dim floats),
-// run the MTP full-attention block, and return the drafted token. `pos`
-// is the sequence position for the MTP block's RoPE.
+// One multi-token-prediction draft step. Dispatched to the model's
+// architecture module, which fuses the token embedding and the backbone
+// hidden (`hidden`, hidden_dim floats), runs its draft block and returns
+// the drafted token. `pos` is the sequence position for the draft block's
+// RoPE. UnsupportedFeature when the architecture has no draft head.
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraftStep(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
