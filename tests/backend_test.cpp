@@ -1513,7 +1513,7 @@ TEST(BackendTest, AttentionDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -1596,19 +1596,19 @@ TEST(BackendTest, AttentionRejectsBadContract) {
   auto no_buffers = backend->LaunchKernel(**rope, launch);
   ASSERT_FALSE(no_buffers.has_value());
   EXPECT_EQ(no_buffers.error(), StatusCode::InvalidArgument);
-  // Attention wants 4 buffers and 6 scalars; 3 heads do not split
+  // Attention wants 4 buffers and 7 scalars; 3 heads do not split
   // into 2 kv groups.
   const std::vector<const tessera::Buffer*> three_buffers{
       nullptr, nullptr, nullptr};
   const std::vector<const tessera::Buffer*> four_buffers{
       nullptr, nullptr, nullptr, nullptr};
   launch.buffers = three_buffers;
-  launch.scalars = {1, 4, 4, 2, 16, 0};
+  launch.scalars = {1, 4, 4, 2, 16, 0, 0};
   auto short_buffers = backend->LaunchKernel(**attention, launch);
   ASSERT_FALSE(short_buffers.has_value());
   EXPECT_EQ(short_buffers.error(), StatusCode::InvalidArgument);
   launch.buffers = four_buffers;
-  launch.scalars = {1, 4, 3, 2, 16, 0};
+  launch.scalars = {1, 4, 3, 2, 16, 0, 0};
   auto bad_groups = backend->LaunchKernel(**attention, launch);
   ASSERT_FALSE(bad_groups.has_value());
   EXPECT_EQ(bad_groups.error(), StatusCode::InvalidArgument);
@@ -2992,7 +2992,7 @@ TEST(BackendTest, AttentionBatchedMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*o_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -3142,6 +3142,69 @@ TEST(BackendTest, SelectorEdgeScoreDeviceMatchesRef) {
                   std::span<const std::int32_t>(anchor),
                   std::span<const float>(unary), std::span<float>(ref), kBatch,
                   kSeq, kTopK, kRank, kVocab)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: sliding-window attention matches the reference; a nonzero
+// window trims the visible keys for the later query rows.
+TEST(BackendTest, AttentionWindowDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(4321);
+  constexpr std::size_t kM = 3;
+  constexpr std::size_t kN = 5;
+  constexpr std::size_t kHeads = 4;
+  constexpr std::size_t kKvHeads = 2;
+  constexpr std::size_t kDim = 16;
+  constexpr std::uint64_t kQBase = 2;
+  constexpr std::uint64_t kWindow = 2;
+  std::vector<float> q(kM * kHeads * kDim), k(kN * kKvHeads * kDim);
+  std::vector<float> v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  auto q_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  auto k_buf = backend->AllocateBuffer(k.size() * 4, MemoryKind::Device);
+  auto v_buf = backend->AllocateBuffer(v.size() * 4, MemoryKind::Device);
+  auto out_buf =
+      backend->AllocateBuffer(kM * kHeads * kDim * 4, MemoryKind::Device);
+  ASSERT_TRUE(q_buf && k_buf && v_buf && out_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(q_buf, q).has_value());
+  ASSERT_TRUE(upload(k_buf, k).has_value());
+  ASSERT_TRUE(upload(v_buf, v).has_value());
+  auto kernel = backend->LoadKernel("attention", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
+                    (*out_buf).get()};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, kWindow};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kHeads * kDim * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kM * kHeads * kDim);
+  ASSERT_TRUE(core::AttentionRef(std::span<const float>(q),
+                                 std::span<const float>(k),
+                                 std::span<const float>(v),
+                                 std::span<float>(ref), kM, kN, kHeads,
+                                 kKvHeads, kDim, kQBase, kWindow)
                   .has_value());
   const auto* got = reinterpret_cast<const float*>(readback.data());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());

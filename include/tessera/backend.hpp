@@ -143,6 +143,9 @@ class Kernel {
 // ceil(rows * heads * (rope_dim / 2) / 256) workgroups of 256.
 // "attention": buffers are q (m x heads*head_dim fp32), k and v
 // (n x kv_heads*head_dim each), out (m x heads*head_dim); scalars are
+// m, n, heads, kv_heads, head_dim, q_base and window (0 = full
+// causal); a nonzero window keeps only the recent window keys (DFlash
+// sliding attention). Detail:
 // m, n, heads, kv_heads, head_dim, q_base. Query row i sits at
 // position q_base + i and attends keys 0..pos (clamped to n - 1) with
 // scale 1/sqrt(head_dim); head h reads kv head h / (heads/kv_heads).
@@ -270,7 +273,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "attention") {
-    if (launch.buffers.size() != 4 || launch.scalars.size() != 6) {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 7) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t heads = launch.scalars[2];

@@ -55,3 +55,7 @@ project, the version, the license, and where it is used.
   qwen3_dflash2.py): the low-rank predecessor/successor
   transition score that re-ranks the unary top-K. Design
   reference for the selector_edge_score built-in.
+- vLLM DFlash sliding attention (_resolve_layer_attention,
+  qwen3_dflash.py): the causal sliding-window mask used by
+  the DFlash2 draft layers. Design reference for the
+  attention window parameter.

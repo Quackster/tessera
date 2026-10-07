@@ -64,7 +64,8 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
                                 unsigned long long heads,
                                 unsigned long long kv_heads,
                                 unsigned long long head_dim,
-                                unsigned long long q_base) {
+                                unsigned long long q_base,
+                                unsigned long long window) {
   const unsigned long long t =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (t >= m * heads * head_dim) {
@@ -77,11 +78,16 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
   const unsigned long long kv = h / (heads / kv_heads);
   const unsigned long long pos = q_base + i;
   const unsigned long long last = pos >= n ? n - 1 : pos;
+  unsigned long long start =
+      (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+  if (start > last) {
+    start = last;
+  }
   const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
   const unsigned long long q_base_idx = (i * heads + h) * head_dim;
   float row_max = 0.0f;
   bool first = true;
-  for (unsigned long long j = 0; j <= last; ++j) {
+  for (unsigned long long j = start; j <= last; ++j) {
     const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
     float dot = 0.0f;
     for (unsigned long long d = 0; d < head_dim; ++d) {
@@ -95,7 +101,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
   }
   float acc = 0.0f;
   float denom = 0.0f;
-  for (unsigned long long j = 0; j <= last; ++j) {
+  for (unsigned long long j = start; j <= last; ++j) {
     const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
     float dot = 0.0f;
     for (unsigned long long d = 0; d < head_dim; ++d) {

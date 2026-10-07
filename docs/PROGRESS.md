@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 171/171 on both builds.
+`ctest` passes 172/172 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -416,6 +416,13 @@ through RADV GFX1201, rocm through the system ROCm).
   score that re-ranks the unary top-K, on vulkan (GLSL) and rocm
   (HIP) with int32 token-id gather, a host reference and
   device-vs-reference tests. Second kernel of the DFlash2 draft.
+
+- 2026-10-07: Sliding-window attention for DFlash2 (172/172 `ctest` on
+  both builds). Current head. The generic "attention" built-in takes
+  a window scalar: a nonzero window keeps only the recent window
+  keys, so DFlash2 draft layers (causal sliding attention, window
+  2048) run on vulkan (GLSL) and rocm (HIP). Host reference, contract
+  and device-vs-reference tests updated.
 
 ## Next (in order)
 

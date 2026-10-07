@@ -332,13 +332,14 @@ inline std::expected<void, StatusCode> DeltaStepHeadsDevice(
 inline std::expected<void, StatusCode> AttentionDevice(
     Backend& backend, const Kernel& kernel, const Buffer& q, const Buffer& k,
     const Buffer& v, Buffer& out, std::size_t n, std::size_t heads,
-    std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base) {
+    std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base,
+    std::uint64_t window = 0) {
   KernelLaunch launch;
   launch.grid_x =
       static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&q, &k, &v, &out};
-  launch.scalars = {1, n, heads, kv_heads, head_dim, q_base};
+  launch.scalars = {1, n, heads, kv_heads, head_dim, q_base, window};
   return backend.LaunchKernel(kernel, launch);
 }
 

@@ -43,7 +43,7 @@ std::expected<void, StatusCode> AttentionRef(
     std::span<const float> q, std::span<const float> k,
     std::span<const float> v, std::span<float> out, std::size_t m,
     std::size_t n, std::size_t heads, std::size_t kv_heads,
-    std::size_t head_dim, std::uint64_t q_base) {
+    std::size_t head_dim, std::uint64_t q_base, std::size_t window) {
   if (m == 0 || n == 0 || heads == 0 || kv_heads == 0 || head_dim == 0 ||
       (heads % kv_heads) != 0) {
     return std::unexpected(StatusCode::InvalidArgument);
@@ -57,14 +57,19 @@ std::expected<void, StatusCode> AttentionRef(
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
   std::vector<float> scores(n);
   for (std::size_t i = 0; i < m; ++i) {
-    const std::size_t last =
-        q_base + i >= n ? n - 1 : static_cast<std::size_t>(q_base + i);
+    const std::size_t pos = static_cast<std::size_t>(q_base + i);
+    const std::size_t last = pos >= n ? n - 1 : pos;
+    std::size_t start =
+        window != 0 && pos + 1 > window ? pos + 1 - window : 0;
+    if (start > last) {
+      start = last;
+    }
     for (std::size_t h = 0; h < heads; ++h) {
       const std::size_t kv = h / group;
       const float* q_row = q.data() + (i * heads + h) * head_dim;
       float row_max = 0.0f;
       bool first = true;
-      for (std::size_t j = 0; j <= last; ++j) {
+      for (std::size_t j = start; j <= last; ++j) {
         const float* k_row = k.data() + (j * kv_heads + kv) * head_dim;
         float dot = 0.0f;
         for (std::size_t e = 0; e < head_dim; ++e) {
@@ -78,14 +83,14 @@ std::expected<void, StatusCode> AttentionRef(
         }
       }
       float denom = 0.0f;
-      for (std::size_t j = 0; j <= last; ++j) {
+      for (std::size_t j = start; j <= last; ++j) {
         scores[j] = std::exp(scores[j] - row_max);
         denom += scores[j];
       }
       float* o_row = out.data() + (i * heads + h) * head_dim;
       for (std::size_t e = 0; e < head_dim; ++e) {
         float acc = 0.0f;
-        for (std::size_t j = 0; j <= last; ++j) {
+        for (std::size_t j = start; j <= last; ++j) {
           const float* v_row = v.data() + (j * kv_heads + kv) * head_dim;
           acc = std::fma(scores[j] / denom, v_row[e], acc);
         }

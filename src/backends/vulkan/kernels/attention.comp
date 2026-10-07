@@ -7,9 +7,11 @@ layout(local_size_x = 256) in;
 // "attention" contract (tessera API): q is m x heads*head_dim fp32,
 // k and v are n x kv_heads*head_dim, out is m x heads*head_dim.
 // Scalars are 64-bit, so field k lives at pc.v[2k]: m v[0], n v[2],
-// heads v[4], kv_heads v[6], head_dim v[8], q_base v[10]. Query row i
-// sits at q_base + i and attends keys 0..pos (clamped to n - 1) with
-// scale 1/sqrt(head_dim); head h reads kv head h / (heads/kv_heads).
+// heads v[4], kv_heads v[6], head_dim v[8], q_base v[10], window v[12].
+// Query row i sits at q_base + i and attends keys 0..pos (clamped to
+// n - 1); a nonzero window keeps only the recent window keys, so it
+// attends max(0, pos + 1 - window)..pos (DFlash sliding attention).
+// Scale is 1/sqrt(head_dim); head h reads kv head h / (heads/kv_heads).
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -46,15 +48,20 @@ void main() {
   uint e = rem % head_dim;
   uint kv = h / (heads / kv_heads);
   // Positions fit 32 bits (contexts stay far below 4G tokens).
+  uint window = pc.v[12];
   uint pos = pc.v[10] + i;
   uint last = pos >= n ? n - 1 : pos;
+  uint start = (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+  if (start > last) {
+    start = last;
+  }
   float scale = inversesqrt(float(head_dim));
   uint q_base = (i * heads + h) * head_dim;
   float row_max = 0.0;
   bool first = true;
   // Two passes over an implicit score row (no shared scratch): max,
   // then the normalized weighted sum of v.
-  for (uint j = 0; j <= last; ++j) {
+  for (uint j = start; j <= last; ++j) {
     uint k_base = (j * kv_heads + kv) * head_dim;
     float dot = 0.0;
     for (uint d = 0; d < head_dim; ++d) {
@@ -68,7 +75,7 @@ void main() {
   }
   float acc = 0.0;
   float denom = 0.0;
-  for (uint j = 0; j <= last; ++j) {
+  for (uint j = start; j <= last; ++j) {
     uint k_base = (j * kv_heads + kv) * head_dim;
     float dot = 0.0;
     for (uint d = 0; d < head_dim; ++d) {
