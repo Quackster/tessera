@@ -46,7 +46,7 @@ void PrintUsage() {
                "  --speculate       verify MTP drafts instead of plain greedy\n"
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
-               "  --image-token <id> placeholder token id for image rows\n"
+               "  --image-token <id> placeholder token id (default <|image_pad|>)\n"
                "  --quiet           print only the generated tokens\n"
                "  --log-tokens      log the input and output text (tokenizer)\n"
                "  --no-chat         do not apply the chat template\n"
@@ -99,6 +99,7 @@ int main(int argc, char** argv) {
   std::string mmproj_path;
   std::string image_path;
   std::uint32_t image_token = 0;
+  bool image_token_set = false;
   bool quiet = false;
   bool log_tokens = false;
   bool no_chat = false;
@@ -133,6 +134,7 @@ int main(int argc, char** argv) {
       image_path = argv[++i];
     } else if (arg == "--image-token" && i + 1 < argc) {
       image_token = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      image_token_set = true;
     } else if (arg == "--quiet") {
       quiet = true;
     } else if (arg == "--log-tokens") {
@@ -369,6 +371,19 @@ int main(int argc, char** argv) {
     }
     std::expected<std::vector<std::uint32_t>, tessera::StatusCode> generated;
     if (!image_path.empty()) {
+      if (!image_token_set) {
+        // Default to the model's image placeholder token.
+        const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
+        std::optional<std::uint32_t> id;
+        if (tokenizer != nullptr) {
+          id = tokenizer->SpecialTokenId("<|image_pad|>");
+        }
+        if (id.has_value()) {
+          image_token = *id;
+        } else {
+          log.Warn("cli", "no <|image_pad|> token; pass --image-token");
+        }
+      }
       if (mmproj_path.empty()) {
         log.Warn("cli", "--image needs --mmproj");
         return kExitError;

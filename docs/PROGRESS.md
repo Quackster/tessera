@@ -868,6 +868,11 @@ through RADV GFX1201, rocm through the system ROCm).
   passes one embedding per row (text rows gathered, image rows substituted)
   to the same batched prefill, so the image prompt is one forward too.
 
+- 2026-10-07: image-placeholder token mapping (235/235 `ctest` on both
+  builds). `Tokenizer::SpecialTokenId` looks up a special token by its
+  literal string. The CLI defaults `--image-token` to the model's
+  `<|image_pad|>` id so image prompts work without passing it.
+
 ## Next (in order)
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
@@ -899,9 +904,10 @@ through RADV GFX1201, rocm through the system ROCm).
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
 5. **Multimodal (mmproj)**: config, weights, encoder+merger, image
-   load/resize, and image-embedding injection into generation are done
-   (`Engine::GenerateMultimodal`). Still to do: the CLI wiring, deepstack
-   feature injection, and the image placeholder tokenizer mapping.
+   load/resize, image-embedding injection, the CLI wiring and the
+   `<|image_pad|>` placeholder default are done
+   (`Engine::GenerateMultimodal`). Still to do: deepstack feature
+   injection and the image prefill speed (attention kernel).
 
 6. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism

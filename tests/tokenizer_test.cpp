@@ -30,6 +30,16 @@ TEST(TokenizerTest, TinyAsciiRoundTrip) {
   EXPECT_EQ(*text, "abc");
 }
 
+// A special (control) token is found by its literal string, and a
+// missing one returns nullopt.
+TEST(TokenizerTest, SpecialTokenIdLookup) {
+  Tokenizer tok({"a", "b", "<|image_pad|>"}, {1, 1, 3}, {});
+  auto id = tok.SpecialTokenId("<|image_pad|>");
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(*id, 2u);
+  EXPECT_FALSE(tok.SpecialTokenId("<|nope|>").has_value());
+}
+
 // A merge rule collapses "a" "b" into the "ab" token.
 TEST(TokenizerTest, MergeApplies) {
   Tokenizer tok({"a", "b", "ab"}, {1, 1, 1}, {"a b"});

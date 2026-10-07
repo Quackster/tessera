@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -49,6 +50,12 @@ class Tokenizer {
       std::span<const std::uint32_t> ids) const;
 
   [[nodiscard]] std::size_t VocabSize() const;
+
+  // The id of a special (control or user-defined) token by its literal
+  // string, or nullopt when no such token exists. Use for the image and
+  // video placeholder ids (for example "<|image_pad|>").
+  [[nodiscard]] std::optional<std::uint32_t> SpecialTokenId(
+      std::string_view token) const;
 
  private:
   std::vector<std::string> vocab_;

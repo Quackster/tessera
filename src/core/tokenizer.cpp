@@ -272,6 +272,15 @@ Tokenizer::Tokenizer(std::vector<std::string> vocab,
 
 std::size_t Tokenizer::VocabSize() const { return vocab_.size(); }
 
+std::optional<std::uint32_t> Tokenizer::SpecialTokenId(
+    std::string_view token) const {
+  const auto it = token_to_id_.find(std::string(token));
+  if (it == token_to_id_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
 std::expected<std::vector<std::uint32_t>, StatusCode> Tokenizer::Encode(
     std::string_view text) const {
   const ByteUnicode& table = ByteTable();
