@@ -43,7 +43,8 @@ std::expected<DFlash2Drafter, StatusCode> DFlash2Drafter::Create(
 std::expected<void, StatusCode> DFlash2Drafter::Run(
     Backend& backend, const Buffer& mask_embeds, const Buffer& aux,
     const Buffer& output_w, const Kernel& head_gemm, Buffer& logits,
-    std::size_t rows, std::size_t ctx, std::size_t vocab) const {
+    std::size_t rows, std::size_t ctx, std::size_t vocab,
+    Buffer* hidden_out) const {
   const std::size_t n = config_.target_layer_ids.size();
   // The draft layer weights are fp32 after conversion, so gemm_f32 runs
   // them; the head uses `head_gemm` for the target's quantized shared head.
@@ -55,7 +56,7 @@ std::expected<void, StatusCode> DFlash2Drafter::Run(
       config_.num_heads, config_.num_kv_heads, config_.head_dim,
       config_.intermediate_size, config_.conv_kernel_size,
       config_.conv_group_size, config_.block_size, config_.sliding_window, 0,
-      config_.rope_theta, static_cast<float>(config_.rms_norm_eps));
+      config_.rope_theta, static_cast<float>(config_.rms_norm_eps), hidden_out);
 }
 
 }  // namespace tessera::spec

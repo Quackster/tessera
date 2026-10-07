@@ -59,7 +59,7 @@ std::expected<void, StatusCode> DraftBlockDevice(
     std::size_t vocab, std::size_t heads, std::size_t kv_heads,
     std::size_t head_dim, std::size_t ffn, std::size_t taps,
     std::size_t group_size, std::size_t block_size, std::size_t window,
-    std::uint64_t pos_base, double theta, float eps) {
+    std::uint64_t pos_base, double theta, float eps, Buffer* hidden_out) {
   auto fused = backend.AllocateBuffer(ctx * hidden_dim * 4, MemoryKind::Device);
   auto concat_scratch =
       backend.AllocateBuffer(ctx * n * features * 4, MemoryKind::Device);
@@ -79,6 +79,11 @@ std::expected<void, StatusCode> DraftBlockDevice(
       fused->get(), ctx);
   if (!stack) {
     return std::unexpected(stack.error());
+  }
+  if (hidden_out != nullptr &&
+      !backend.CopyD2D(**hidden, 0, *hidden_out, 0,
+                       rows * hidden_dim * 4)) {
+    return std::unexpected(StatusCode::DeviceError);
   }
   return core::detail::ProjectDevice(backend, head_gemm, **hidden, output_w,
                                      logits, rows, vocab, hidden_dim);

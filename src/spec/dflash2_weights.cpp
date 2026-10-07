@@ -157,6 +157,12 @@ std::expected<DraftWeightStore, StatusCode> DraftWeightStore::Load(
       store.weights_.final_norm == nullptr) {
     return std::unexpected(StatusCode::MalformedFile);
   }
+  // The candidate selector is optional; the drafter falls back to the
+  // unary top-1 when it is absent.
+  store.selector_.projection =
+      bind("candidate_selector.hidden_projection.weight");
+  store.selector_.predecessor = bind("candidate_selector.predecessor_codebook");
+  store.selector_.successor = bind("candidate_selector.successor_codebook");
   return store;
 }
 

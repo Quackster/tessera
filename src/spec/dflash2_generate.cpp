@@ -7,8 +7,10 @@
 #include "core/decode_internal.hpp"
 #include "core/loaders/safetensors.hpp"
 #include "spec/dflash2_config.hpp"
+#include "spec/dflash2_candidates.hpp"
 #include "spec/dflash2_drafter.hpp"
 #include "spec/dflash2_mask.hpp"
+#include "spec/dflash2_selector.hpp"
 
 namespace tessera::spec {
 
@@ -65,9 +67,13 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   }
   auto aux = backend.AllocateBuffer(n * hidden * 4, MemoryKind::Device);
   auto logits = backend.AllocateBuffer(block * vocab * 4, MemoryKind::Device);
-  if (!aux || !logits) {
+  auto draft_hidden = backend.AllocateBuffer(block * hidden * 4,
+                                             MemoryKind::Device);
+  if (!aux || !logits || !draft_hidden) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
+  auto selector_gemm = backend.LoadKernel("gemm_f32", {});
+  auto selector_kernel = backend.LoadKernel("selector_edge_score", {});
   core::DecodeCache cache;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
@@ -109,7 +115,7 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
       return std::unexpected(mask.error());
     }
     auto run = drafter->Run(backend, **mask, **aux, *output->device, **head_gemm,
-                            **logits, block, 1, vocab);
+                            **logits, block, 1, vocab, draft_hidden->get());
     if (!run) {
       return std::unexpected(run.error());
     }
@@ -121,9 +127,72 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
       return std::unexpected(StatusCode::DeviceError);
     }
     std::vector<std::uint32_t> draft_tokens(block);
-    for (std::size_t r = 0; r < block; ++r) {
-      std::span<const float> row(draft_logits.data() + r * vocab, vocab);
-      draft_tokens[r] = core::detail::ArgMax(row);
+    const DraftSelectorWeights& selector = drafter->Weights().Selector();
+    if (selector.projection != nullptr && selector_gemm.has_value() &&
+        selector_kernel.has_value()) {
+      const std::size_t topk = draft_config->selector_top_k;
+      const std::size_t rank = draft_config->selector_rank;
+      std::vector<std::uint32_t> cand_ids(block * topk);
+      std::vector<float> unary(block * topk);
+      auto candidates = DraftCandidates(std::span<const float>(draft_logits),
+                                        std::span<std::uint32_t>(cand_ids),
+                                        std::span<float>(unary), block, vocab,
+                                        topk);
+      if (!candidates) {
+        return std::unexpected(candidates.error());
+      }
+      std::vector<std::int32_t> anchors(block, static_cast<std::int32_t>(next));
+      auto upload = [&](const void* data, std::size_t bytes) {
+        auto buffer = backend.AllocateBuffer(bytes, MemoryKind::Device);
+        if (buffer) {
+          backend.CopyH2D(**buffer, std::span<const std::byte>(
+                                       reinterpret_cast<const std::byte*>(data),
+                                       bytes));
+        }
+        return buffer;
+      };
+      auto cand_buf = upload(cand_ids.data(), cand_ids.size() * 4);
+      auto anchor_buf = upload(anchors.data(), anchors.size() * 4);
+      auto unary_buf = upload(unary.data(), unary.size() * 4);
+      auto proj_buf = backend.AllocateBuffer(block * rank * 4,
+                                             MemoryKind::Device);
+      auto scores_buf = backend.AllocateBuffer(block * topk * topk * 4,
+                                               MemoryKind::Device);
+      if (!cand_buf || !anchor_buf || !unary_buf || !proj_buf || !scores_buf) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      auto scored = DraftSelectorDevice(
+          backend, **selector_gemm, **selector_kernel, **proj_buf,
+          **draft_hidden, *selector.projection, *selector.predecessor,
+          *selector.successor, **cand_buf, **anchor_buf, **unary_buf,
+          **scores_buf, block, hidden, rank, vocab, topk);
+      if (!scored) {
+        return std::unexpected(scored.error());
+      }
+      backend.Synchronize();
+      std::vector<float> scores(block * topk * topk);
+      if (!backend.CopyD2H(**scores_buf,
+                           reinterpret_cast<std::byte*>(scores.data()),
+                           scores.size() * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      std::size_t predecessor = 0;
+      for (std::size_t r = 0; r < block; ++r) {
+        const float* row = scores.data() + (r * topk + predecessor) * topk;
+        std::size_t best = 0;
+        for (std::size_t c = 1; c < topk; ++c) {
+          if (row[c] > row[best]) {
+            best = c;
+          }
+        }
+        draft_tokens[r] = cand_ids[r * topk + best];
+        predecessor = best;
+      }
+    } else {
+      for (std::size_t r = 0; r < block; ++r) {
+        std::span<const float> row(draft_logits.data() + r * vocab, vocab);
+        draft_tokens[r] = core::detail::ArgMax(row);
+      }
     }
     auto verify = core::VerifyDraft(backend, target, cache, draft_tokens,
                                     *current, &hidden_state);

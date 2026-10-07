@@ -22,6 +22,14 @@ struct DraftForwardWeights {
   const Buffer* final_norm = nullptr;
 };
 
+// The candidate selector weights in fp32 (null when the checkpoint omits
+// them; the drafter then uses the unary top-1).
+struct DraftSelectorWeights {
+  const Buffer* projection = nullptr;
+  const Buffer* predecessor = nullptr;
+  const Buffer* successor = nullptr;
+};
+
 // Loads a DFlash2 draft checkpoint: reads the safetensors file, converts
 // every forward tensor from bf16 or 128x128 block-scaled fp8 to fp32, and
 // uploads it. The token embedding and output weight are shared with the
@@ -43,10 +51,14 @@ class DraftWeightStore {
   [[nodiscard]] const DraftForwardWeights& Weights() const {
     return weights_;
   }
+  [[nodiscard]] const DraftSelectorWeights& Selector() const {
+    return selector_;
+  }
 
  private:
   std::vector<std::unique_ptr<Buffer>> owned_;
   DraftForwardWeights weights_;
+  DraftSelectorWeights selector_;
 };
 
 }  // namespace tessera::spec

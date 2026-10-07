@@ -680,6 +680,15 @@ through RADV GFX1201, rocm through the system ROCm).
   routes `--draft` generation through it. Output equals greedy on the
   27B. Fixed a double-emitted bonus token.
 
+- 2026-10-07: DFlash2 candidate selector wired (207/207 `ctest` on both
+  builds; the real-model test is env-gated). Current head. The draft
+  weight loader also loads the candidate selector (projection and
+  codebooks, fp32); generation takes the top-K draft candidates,
+  re-ranks them with the predecessor/successor transition scores, and
+  chains the best successor per position. Falls back to the unary top-1
+  when the checkpoint has no selector. Output still equals greedy on
+  the 27B.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
