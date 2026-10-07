@@ -18,6 +18,7 @@
 #include "spec/dflash2_mlp.hpp"
 #include "spec/dflash2_attention.hpp"
 #include "spec/dflash2_layer.hpp"
+#include "spec/dflash2_stack.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -3924,4 +3925,134 @@ TEST(BackendTest, DraftLayerMatchesRef) {
     EXPECT_LE(dout, tol.abs) << "residual=" << use_residual;
     EXPECT_LE(dres, tol.abs) << "residual=" << use_residual;
   }
+}
+
+// Device: a two-layer DFlash2 draft stack (residual chaining + final
+// norm) matches the host reference.
+TEST(BackendTest, DraftStackMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97);
+  constexpr std::size_t kRows = 2, kHidden = 4, kHeads = 2, kKvHeads = 1,
+                       kHeadDim = 2, kFfn = 8, kTaps = 2, kGroup = 2,
+                       kBlock = 2, kWindow = 2;
+  constexpr float kEps = 1e-6f;
+  constexpr double kTheta = 10000.0;
+  const std::size_t q_dim = kHeads * kHeadDim;
+  const std::size_t kv_dim = kKvHeads * kHeadDim;
+  const std::size_t proj_n = 2 * kTaps * (kHidden / kGroup);
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> out(n);
+    for (auto& v : out) v = DrawValue(rng);
+    return out;
+  };
+  std::vector<std::unique_ptr<tessera::Buffer>> keep;
+  auto mk = [&](const std::vector<float>& d) -> tessera::Buffer* {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                             reinterpret_cast<const std::byte*>(d.data()),
+                             d.size() * 4));
+    keep.push_back(std::move(*b));
+    return keep.back().get();
+  };
+  struct Layer {
+    std::vector<std::vector<float>> data;
+    tessera::spec::DraftLayerWeights ref;
+    tessera::spec::DraftLayerBuffers dev;
+    Layer() { data.reserve(15); }
+  };
+  std::vector<Layer> layers(2);
+  for (Layer& L : layers) {
+    auto add = [&](std::size_t n) -> const std::vector<float>* {
+      L.data.push_back(rnd(n));
+      return &L.data.back();
+    };
+    const auto* inorm = add(kHidden);
+    const auto* acp = add(proj_n * kHidden);
+    const auto* acb = add(2 * kTaps * kHidden);
+    const auto* qw = add(q_dim * kHidden);
+    const auto* kw = add(kv_dim * kHidden);
+    const auto* vw = add(kv_dim * kHidden);
+    const auto* ow = add(kHidden * q_dim);
+    const auto* qn = add(kHeadDim);
+    const auto* kn = add(kHeadDim);
+    const auto* pnorm = add(kHidden);
+    const auto* mcp = add(proj_n * kHidden);
+    const auto* mcb = add(2 * kTaps * kHidden);
+    const auto* gw = add(kFfn * kHidden);
+    const auto* uw = add(kFfn * kHidden);
+    const auto* dw = add(kHidden * kFfn);
+    L.ref.input_norm = *inorm;
+    L.ref.attn_conv_proj = *acp;
+    L.ref.attn_conv_base = *acb;
+    L.ref.q_w = *qw;
+    L.ref.k_w = *kw;
+    L.ref.v_w = *vw;
+    L.ref.o_w = *ow;
+    L.ref.q_norm_w = *qn;
+    L.ref.k_norm_w = *kn;
+    L.ref.post_norm = *pnorm;
+    L.ref.mlp_conv_proj = *mcp;
+    L.ref.mlp_conv_base = *mcb;
+    L.ref.gate_w = *gw;
+    L.ref.up_w = *uw;
+    L.ref.down_w = *dw;
+    L.dev.input_norm = mk(*inorm);
+    L.dev.attn_conv_proj = mk(*acp);
+    L.dev.attn_conv_base = mk(*acb);
+    L.dev.q_w = mk(*qw);
+    L.dev.k_w = mk(*kw);
+    L.dev.v_w = mk(*vw);
+    L.dev.o_w = mk(*ow);
+    L.dev.q_norm_w = mk(*qn);
+    L.dev.k_norm_w = mk(*kn);
+    L.dev.post_norm = mk(*pnorm);
+    L.dev.mlp_conv_proj = mk(*mcp);
+    L.dev.mlp_conv_base = mk(*mcb);
+    L.dev.gate_w = mk(*gw);
+    L.dev.up_w = mk(*uw);
+    L.dev.down_w = mk(*dw);
+  }
+  const std::vector<float> embed = rnd(kRows * kHidden);
+  const std::vector<float> fnormal = rnd(kHidden);
+  auto embed_b = mk(embed);
+  auto fnormal_b = mk(fnormal);
+  auto out_b = backend->AllocateBuffer(embed.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(out_b.has_value());
+  std::vector<tessera::spec::DraftLayerBuffers> dev_layers;
+  for (Layer& L : layers) dev_layers.push_back(L.dev);
+  std::vector<tessera::spec::DraftLayerWeights> ref_layers;
+  for (Layer& L : layers) ref_layers.push_back(L.ref);
+  auto rms = backend->LoadKernel("rmsnorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto conv = backend->LoadKernel("dflash_conv", {});
+  auto rope = backend->LoadKernel("rope", {});
+  auto attn = backend->LoadKernel("attention", {});
+  auto silu = backend->LoadKernel("silu_mul", {});
+  auto add = backend->LoadKernel("add", {});
+  ASSERT_TRUE(rms && gemm && conv && rope && attn && silu && add);
+  auto device = tessera::spec::DraftStackDevice(
+      *backend, **rms, **gemm, **conv, **rope, **attn, **silu, **add,
+      *embed_b, dev_layers, *fnormal_b, **out_b, kRows, kHidden, kHeads,
+      kKvHeads, kHeadDim, kFfn, kTaps, kGroup, kBlock, kWindow, 0, kTheta,
+      kEps);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<float> got(embed.size());
+  backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref(embed.size());
+  ASSERT_TRUE(tessera::spec::DraftStackRef(
+                  std::span<const float>(embed), ref_layers,
+                  std::span<const float>(fnormal), std::span<float>(ref),
+                  kRows, kHidden, kHeads, kKvHeads, kHeadDim, kFfn, kTaps,
+                  kGroup, kBlock, kWindow, 0, kTheta, kEps)
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
 }

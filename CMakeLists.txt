@@ -41,6 +41,7 @@ add_library(tessera STATIC
     src/spec/dflash2_mlp.cpp
     src/spec/dflash2_attention.cpp
     src/spec/dflash2_layer.cpp
+    src/spec/dflash2_stack.cpp
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
 target_compile_options(tessera PRIVATE -Wall -Wextra)

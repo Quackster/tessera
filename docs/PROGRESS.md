@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 192/192 on both builds.
+`ctest` passes 193/193 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -566,6 +566,12 @@ through RADV GFX1201, rocm through the system ROCm).
   MLP half, returning the MLP output and the new residual. Weight
   handles use small structs. Host reference and a device-vs-reference
   test, with and without a carried residual.
+
+- 2026-10-07: DFlash2 draft stack (193/193 `ctest` on both builds).
+  Current head. `src/spec/dflash2_stack.*` runs a list of draft layers
+  in order, chaining the residual and finishing with the final
+  RMSNorm over (last output + residual). Host reference and a
+  device-vs-reference test with two layers.
 
 ## Next (in order)
 
