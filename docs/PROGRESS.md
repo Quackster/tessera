@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 166/166 on both builds.
+`ctest` passes 167/167 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -368,6 +368,14 @@ through RADV GFX1201, rocm through the system ROCm).
   runs the gated-delta step for all heads in one launch with the
   device state in place. Both on vulkan (GLSL) and rocm (HIP) with
   host references and device-vs-reference tests.
+
+- 2026-10-07: conv1d_step kernel (167/167 `ctest` on both builds).
+  Current head. Generic "conv1d_step" computes the current-step
+  causal depthwise conv output (channels x width, newest first) as
+  one contiguous vector on vulkan (GLSL) and rocm (HIP) with a host
+  reference and device-vs-reference tests. The device-resident
+  linear path uses it so the conv output feeds the next kernel
+  without a strided gather.
 
 ## Next (in order)
 

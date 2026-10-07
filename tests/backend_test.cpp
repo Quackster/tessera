@@ -2910,3 +2910,47 @@ TEST(BackendTest, DeltaStepHeadsDeviceMatchesRef) {
     EXPECT_NEAR(got_s[i], s_ref[i], 1e-4f);
   }
 }
+
+// Device: the current-step conv matches the host reference.
+TEST(BackendTest, Conv1dStepDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(85);
+  constexpr std::size_t kChannels = 8;
+  constexpr std::size_t kWidth = 4;
+  std::vector<float> x(kChannels * kWidth);
+  std::vector<float> w(kChannels * kWidth);
+  for (auto& v : x) v = DrawValue(rng);
+  for (auto& v : w) v = DrawValue(rng);
+  auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size() * 4, MemoryKind::Device);
+  auto y_buf = backend->AllocateBuffer(kChannels * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf && w_buf && y_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(upload(w_buf, w).has_value());
+  auto kernel = backend->LoadKernel("conv1d_step", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kChannels + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*x_buf).get(), (*w_buf).get(), (*y_buf).get()};
+  launch.scalars = {kChannels, kWidth};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kChannels * 4);
+  ASSERT_TRUE(backend->CopyD2H(**y_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kChannels);
+  ASSERT_TRUE(core::Conv1dStepRef(std::span<const float>(x),
+                                  std::span<const float>(w),
+                                  std::span<float>(ref), kChannels, kWidth)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  for (std::size_t i = 0; i < kChannels; ++i) {
+    EXPECT_NEAR(got[i], ref[i], 1e-5f);
+  }
+}

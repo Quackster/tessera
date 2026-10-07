@@ -198,6 +198,11 @@ class Kernel {
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
 // for both is ceil(n / 256) workgroups of 256.
+// "conv1d_step": buffer 0 is X (fp32, channels x width, newest sample
+// first), buffer 1 the weights W (fp32, channels x width), buffer 2 the
+// output Y (fp32, channels); scalars are channels and width. Y is the
+// current-step causal depthwise convolution. The dispatch is
+// ceil(channels / 256) workgroups of 256.
 // "conv1d": buffer 0 is X (fp32, channels x length), buffer 1 the
 // weights W (fp32, channels x width), buffer 2 the output Y (fp32,
 // channels x length); scalars are channels, length, width. Y is the
@@ -379,6 +384,14 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "conv1d_step") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 2) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

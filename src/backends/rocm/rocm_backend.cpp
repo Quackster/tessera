@@ -57,6 +57,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"qgate_split", reinterpret_cast<void*>(&QGateSplitKernel)},
     {"add", reinterpret_cast<void*>(&AddKernel)},
     {"repeat_heads", reinterpret_cast<void*>(&RepeatHeadsKernel)},
+    {"conv1d_step", reinterpret_cast<void*>(&Conv1dStepKernel)},
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},

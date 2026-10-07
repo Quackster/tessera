@@ -32,4 +32,26 @@ std::expected<void, StatusCode> ConvRef(std::span<const float> x,
   return {};
 }
 
+std::expected<void, StatusCode> Conv1dStepRef(std::span<const float> x,
+                                              std::span<const float> w,
+                                              std::span<float> y,
+                                              std::size_t channels,
+                                              std::size_t width) {
+  if (channels == 0 || width == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (x.size() != channels * width || w.size() != channels * width ||
+      y.size() != channels) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t c = 0; c < channels; ++c) {
+    float acc = 0.0f;
+    for (std::size_t i = 0; i < width; ++i) {
+      acc = std::fma(w[c * width + i], x[c * width + i], acc);
+    }
+    y[c] = acc;
+  }
+  return {};
+}
+
 }  // namespace tessera::core

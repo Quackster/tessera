@@ -47,6 +47,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"l2norm", kL2NormSpirV, sizeof(kL2NormSpirV)},
     {"rmsnorm_gated", kRmsnormGatedSpirV, sizeof(kRmsnormGatedSpirV)},
     {"conv1d", kConv1dSpirV, sizeof(kConv1dSpirV)},
+    {"conv1d_step", kConv1dStepSpirV, sizeof(kConv1dStepSpirV)},
     {"delta_step", kDeltaStepSpirV, sizeof(kDeltaStepSpirV)},
     {"mrope", kMropeSpirV, sizeof(kMropeSpirV)},
     {"qgate_split", kQgateSplitSpirV, sizeof(kQgateSplitSpirV)},

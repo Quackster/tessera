@@ -1,0 +1,28 @@
+#version 450
+
+// One thread per channel; the dispatch is ceil(channels / 256).
+layout(local_size_x = 256) in;
+
+// "conv1d_step" contract: X is channels x width (newest sample first),
+// W is channels x width, Y is channels. Scalars: channels v[0],
+// width v[2]. Y[c] = sum_i W[c][i] * X[c][i].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) buffer W { float w[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+
+void main() {
+  uint c = gl_GlobalInvocationID.x;
+  if (c >= pc.v[0]) {
+    return;
+  }
+  uint width = pc.v[2];
+  float acc = 0.0;
+  for (uint i = 0; i < width; ++i) {
+    acc += w[c * width + i] * x[c * width + i];
+  }
+  y[c] = acc;
+}

@@ -134,6 +134,9 @@ __global__ void RepeatHeadsKernel(const float* in, float* out,
                                   unsigned long long num_v_heads,
                                   unsigned long long head_k_dim,
                                   unsigned long long factor);
+__global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
+                                 unsigned long long channels,
+                                 unsigned long long width);
 __global__ void SsmGateKernel(const float* a_log, const float* dt,
                               const float* alpha_raw, const float* beta_raw,
                               float* alpha, float* beta,

@@ -489,4 +489,21 @@ __global__ void DeltaStepHeadsKernel(
   o[idx] = out;
 }
 
+// Built-in "conv1d_step": current-step causal depthwise conv. One
+// thread per channel.
+__global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
+                                 unsigned long long channels,
+                                 unsigned long long width) {
+  const unsigned long long c =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (c >= channels) {
+    return;
+  }
+  float acc = 0.0f;
+  for (unsigned long long i = 0; i < width; ++i) {
+    acc = fmaf(w[c * width + i], x[c * width + i], acc);
+  }
+  y[c] = acc;
+}
+
 }  // namespace tessera::backends::rocm
