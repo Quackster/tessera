@@ -882,17 +882,24 @@ through RADV GFX1201, rocm through the system ROCm).
   O(n * head_dim) per query/head. head_dim is capped at 256. Both
   backends; the attention_q8/attention_q4 variants keep the old shape.
 
+- 2026-10-07: architecture module interface (235/235 `ctest` on both
+  builds). Added the `Architecture` interface
+  (`include/tessera/architecture.hpp`), the registry
+  (`src/models/registry.cpp`) and the first module `src/models/qwen3_5/`
+  (registered for `general.architecture` qwen35). `Model::Arch()` builds
+  the module at load; `MtpDraftStep` dispatches through it. The hybrid
+  trunk (`src/core/decode_hybrid*.cpp`) still moves to the module next.
+
 ## Next (in order)
 
-0. **Architecture modules (from AGENTS.md)**: the model layer is generic
-   plus a hybrid special case in `src/core/decode_hybrid.cpp`. Move the
-   architecture-specific behavior (config parse, weight map, layer
-   assembly, the gated-delta path, the MTP head) into one polymorphic
-   `Architecture` module per architecture under `src/models/<arch>/`
-   (`include/tessera/architecture.hpp`) built by a factory in
-   `src/models/registry.cpp`, and make `src/core/` model-agnostic. A new
-   architecture is then a module plus one registration line, with zero
-   edits under `src/core/`.
+0. **Architecture modules (from AGENTS.md)**: the interface, registry and
+   the `qwen3_5` MTP head are done (see the Done entry). Remaining: move
+   the hybrid trunk (`src/core/decode_hybrid.cpp`,
+   `src/core/decode_hybrid_batch.cpp`) and the config parse/weight map
+   behind the `Architecture` interface under `src/models/qwen3_5/`, and
+   give the vanilla transformer a module, so `src/core/` no longer holds
+   architecture-specific decode code. A new architecture is then a module
+   plus one registry line, with zero edits under `src/core/`.
 1. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
    grouped dynamic convolution, sliding attention, candidate selector and
    the verification loop, output equal to greedy. Remaining: acceptance

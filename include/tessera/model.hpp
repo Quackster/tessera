@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/tokenizer.hpp"
 #include "tessera/types.hpp"
@@ -152,6 +153,10 @@ class Model {
   // template.
   [[nodiscard]] std::expected<std::string, StatusCode> ChatPrompt(
       std::string_view user_text, bool enable_thinking = false) const;
+  // The architecture module for this model (from general.architecture), or
+  // nullptr when no module is registered. Generic code dispatches through
+  // it for architecture specific behavior.
+  [[nodiscard]] const Architecture* Arch() const;
 
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,
@@ -171,6 +176,7 @@ class Model {
   std::vector<DeviceTensor> weights_;
   std::optional<Tokenizer> tokenizer_;
   std::string chat_template_;
+  std::unique_ptr<Architecture> module_;
 };
 
 }  // namespace tessera

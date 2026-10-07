@@ -356,7 +356,11 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
       architecture_(std::move(architecture)),
       attention_(std::move(attention)), config_(std::move(config)),
       weights_(std::move(weights)), tokenizer_(std::move(tokenizer)),
-      chat_template_(std::move(chat_template)) {}
+      chat_template_(std::move(chat_template)) {
+  module_ = CreateArchitecture(architecture_);
+}
+
+const Architecture* Model::Arch() const { return module_.get(); }
 
 // Upload every manifest tensor to a device buffer. `bytes` is the
 // whole file; offsets come from the parsed manifest.
