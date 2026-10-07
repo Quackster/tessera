@@ -50,6 +50,7 @@ void PrintUsage() {
                "  --repetition-penalty <f> repetition penalty (default 1.0)\n"
                "  --seed <n>        sampling RNG seed (default 0)\n"
                "  --kv-f16          store the KV cache in fp16 (default fp32)\n"
+               "  --kv-q8           store the KV cache in int8\n"
                "  --host <ip>       serve bind address (default 127.0.0.1)\n"
                "  --port <n>        serve port (default 8080)\n"
                "  --api-key <k>     accepted API key (repeatable; env "
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
   bool speculate = false;
   tessera::SamplingOptions sampling;
   bool sample = false;
-  bool kv_f16 = false;
+  tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   std::uint64_t seed = 0;
   std::uint16_t port = 8080;
   std::size_t tokens = 0;
@@ -133,7 +134,9 @@ int main(int argc, char** argv) {
     } else if (arg == "--sample") {
       sample = true;
     } else if (arg == "--kv-f16") {
-      kv_f16 = true;
+      kv_type = tessera::KvCacheType::F16;
+    } else if (arg == "--kv-q8") {
+      kv_type = tessera::KvCacheType::Q8;
     } else if (arg == "--temperature" && i + 1 < argc) {
       sampling.temperature = std::stof(argv[++i]);
     } else if (arg == "--top-p" && i + 1 < argc) {
@@ -263,7 +266,7 @@ int main(int argc, char** argv) {
     gen.sampling = sampling;
     gen.seed = seed;
     gen.draft_tokens = draft_block;
-    gen.kv_f16 = kv_f16;
+    gen.kv_type = kv_type;
     if (!prompt_text.empty()) {
       const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
       if (tokenizer == nullptr) {

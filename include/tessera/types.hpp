@@ -11,6 +11,13 @@
 
 namespace tessera {
 
+// Storage type of the full-attention KV cache.
+enum class KvCacheType : int {
+  F32 = 0,
+  F16 = 1,
+  Q8 = 2,
+};
+
 // Status codes for result-style returns (runtime I/O, parsing, device errors).
 // See AGENTS.md rule 6: exceptions are for programmer errors only.
 enum class StatusCode : int {

@@ -109,13 +109,50 @@ inline std::expected<void, StatusCode> CastF16Device(
   return backend.LaunchKernel(kernel, launch);
 }
 
-// Append one key/value row. `kv.f16` selects fp16 storage (converted with
-// `cast` into `scratch`) or fp32; when fp16 both must be non-null.
+// Quantize one fp32 row (n elements, n a multiple of 4) to packed int8
+// with an absmax scale.
+inline std::expected<void, StatusCode> QuantizeQ8Device(
+    Backend& backend, const Kernel& kernel, const Buffer& in, Buffer& out,
+    Buffer& scale, std::size_t n) {
+  if (n == 0 || n % 4 != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  KernelLaunch launch;
+  launch.grid_x = 1;
+  launch.block_x = 1;
+  launch.buffers = {&in, &out, &scale};
+  launch.scalars = {1, n};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// int8 GQA attention: q fp32, k/v int8 with one fp32 scale per key row.
+inline std::expected<void, StatusCode> AttentionQ8Device(
+    Backend& backend, const Kernel& kernel, const Buffer& q, const Buffer& k,
+    const Buffer& v, const Buffer& k_scale, const Buffer& v_scale,
+    Buffer& out, std::size_t n, std::size_t heads, std::size_t kv_heads,
+    std::size_t head_dim, std::uint64_t q_base, std::uint64_t window,
+    std::size_t rows) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(
+      (rows * heads * head_dim + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&q, &k, &v, &k_scale, &v_scale, &out};
+  launch.scalars = {rows, n, heads, kv_heads, head_dim, q_base, window};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Append one key/value row. `kv.type` selects fp32, fp16 (via `cast` into
+// `f16_scratch`) or int8 (via `quant` into `q8_scratch`/`scale_scratch`).
 template <typename Kv>
 inline std::expected<void, StatusCode> AppendKv(
-    Backend& backend, const Kernel* cast, Buffer* scratch, Kv& kv,
+    Backend& backend, const Kernel* cast, const Kernel* quant,
+    Buffer* f16_scratch, Buffer* q8_scratch, Buffer* scale_scratch, Kv& kv,
     const Buffer& k_row, const Buffer& v_row, std::size_t kv_dim) {
-  const std::size_t row_bytes = kv_dim * (kv.f16 ? 2 : 4);
+  const std::size_t row_bytes =
+      kv_dim * (kv.type == KvCacheType::F32
+                    ? 4
+                    : (kv.type == KvCacheType::F16 ? 2 : 1));
+  const bool q8 = kv.type == KvCacheType::Q8;
   if (kv.rows == kv.capacity) {
     const std::size_t new_capacity =
         kv.capacity == 0 ? kInitialKvRows : kv.capacity * 2;
@@ -134,23 +171,57 @@ inline std::expected<void, StatusCode> AppendKv(
     }
     kv.k = std::move(*grown_k);
     kv.v = std::move(*grown_v);
+    if (q8) {
+      auto grown_ks = backend.AllocateBuffer(new_capacity * 4,
+                                             MemoryKind::Device);
+      auto grown_vs = backend.AllocateBuffer(new_capacity * 4,
+                                             MemoryKind::Device);
+      if (!grown_ks || !grown_vs) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      if (kv.rows > 0) {
+        if (!backend.CopyD2D(*kv.k_scale, 0, **grown_ks, 0, kv.rows * 4) ||
+            !backend.CopyD2D(*kv.v_scale, 0, **grown_vs, 0, kv.rows * 4)) {
+          return std::unexpected(StatusCode::DeviceError);
+        }
+      }
+      kv.k_scale = std::move(*grown_ks);
+      kv.v_scale = std::move(*grown_vs);
+    }
     kv.capacity = new_capacity;
   }
-  const auto store = [&](const Buffer& row, Buffer& dst) -> bool {
-    if (kv.f16) {
-      if (cast == nullptr || scratch == nullptr) {
-        return false;
-      }
-      if (!CastF16Device(backend, *cast, row, *scratch, kv_dim)) {
-        return false;
-      }
-      return backend.CopyD2D(*scratch, 0, dst, kv.rows * row_bytes, row_bytes)
-                 .has_value();
+  const auto store = [&](const Buffer& row, Buffer& dst,
+                         Buffer* scale_dst) -> bool {
+    if (kv.type == KvCacheType::F32) {
+      return backend.CopyD2D(row, 0, dst, kv.rows * row_bytes, row_bytes)
+          .has_value();
     }
-    return backend.CopyD2D(row, 0, dst, kv.rows * row_bytes, row_bytes)
-        .has_value();
+    if (kv.type == KvCacheType::F16) {
+      if (cast == nullptr || f16_scratch == nullptr) {
+        return false;
+      }
+      if (!CastF16Device(backend, *cast, row, *f16_scratch, kv_dim)) {
+        return false;
+      }
+      return backend.CopyD2D(*f16_scratch, 0, dst, kv.rows * row_bytes,
+                             row_bytes)
+          .has_value();
+    }
+    if (quant == nullptr || q8_scratch == nullptr || scale_scratch == nullptr ||
+        scale_dst == nullptr) {
+      return false;
+    }
+    if (!QuantizeQ8Device(backend, *quant, row, *q8_scratch, *scale_scratch,
+                          kv_dim)) {
+      return false;
+    }
+    return backend.CopyD2D(*q8_scratch, 0, dst, kv.rows * row_bytes, row_bytes)
+               .has_value() &&
+           backend.CopyD2D(*scale_scratch, 0, *scale_dst, kv.rows * 4, 4)
+               .has_value();
   };
-  if (!store(k_row, *kv.k) || !store(v_row, *kv.v)) {
+  if (!store(k_row, *kv.k, kv.k_scale.get()) ||
+      !store(v_row, *kv.v, kv.v_scale.get())) {
     return std::unexpected(StatusCode::DeviceError);
   }
   ++kv.rows;

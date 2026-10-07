@@ -606,14 +606,35 @@ TEST(HybridDecodeTest, Fp16KvDecodesDeterministically) {
       ModelOptions{WriteGatedHybridFixture("gated.gguf").string(), 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   tessera::core::DecodeCache cache;
-  cache.kv_f16 = true;
+  cache.kv_type = tessera::KvCacheType::F16;
   auto first = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
   ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
   auto second =
       tessera::core::DecodeStep(engine->Owner(), **model, cache, *first);
   ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
   tessera::core::DecodeCache replay;
-  replay.kv_f16 = true;
+  replay.kv_type = tessera::KvCacheType::F16;
+  auto again = tessera::core::DecodeStep(engine->Owner(), **model, replay, 0);
+  ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
+  EXPECT_EQ(*again, *first);
+}
+
+// The q8 KV cache path decodes deterministically.
+TEST(HybridDecodeTest, Q8KvDecodesDeterministically) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  tessera::core::DecodeCache cache;
+  cache.kv_type = tessera::KvCacheType::Q8;
+  auto first = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
+  ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
+  auto second =
+      tessera::core::DecodeStep(engine->Owner(), **model, cache, *first);
+  ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
+  tessera::core::DecodeCache replay;
+  replay.kv_type = tessera::KvCacheType::Q8;
   auto again = tessera::core::DecodeStep(engine->Owner(), **model, replay, 0);
   ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
   EXPECT_EQ(*again, *first);

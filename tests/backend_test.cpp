@@ -3295,9 +3295,11 @@ TEST(BackendTest, AppendKvGrowsGeometrically) {
   struct Kv {
     std::unique_ptr<tessera::Buffer> k;
     std::unique_ptr<tessera::Buffer> v;
+    std::unique_ptr<tessera::Buffer> k_scale;
+    std::unique_ptr<tessera::Buffer> v_scale;
     std::size_t rows = 0;
     std::size_t capacity = 0;
-    bool f16 = false;
+    tessera::KvCacheType type = tessera::KvCacheType::F32;
   };
   Kv kv;
   constexpr std::size_t kElems = 3;
@@ -3321,8 +3323,8 @@ TEST(BackendTest, AppendKvGrowsGeometrically) {
     ASSERT_TRUE(upload(k_buf, k_row).has_value());
     ASSERT_TRUE(upload(v_buf, v_row).has_value());
     auto status =
-        core::detail::AppendKv(*backend, nullptr, nullptr, kv, **k_buf, **v_buf,
-                             kElems);
+        core::detail::AppendKv(*backend, nullptr, nullptr, nullptr, nullptr,
+                             nullptr, kv, **k_buf, **v_buf, kElems);
     ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
     want_k.insert(want_k.end(), k_row.begin(), k_row.end());
     want_v.insert(want_v.end(), v_row.begin(), v_row.end());

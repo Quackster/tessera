@@ -11,6 +11,7 @@ namespace tessera::core {
 namespace {
 
 using detail::AppendKv;
+using detail::AttentionQ8Device;
 using detail::DownloadF32;
 using detail::GatherEmbedding;
 using detail::AttentionDevice;
@@ -62,10 +63,12 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
         !load(state->add_kernel, "add") ||
         !load(state->silu_mul_kernel, "silu_mul") ||
         !load(state->rope_kernel, "rope") ||
-        !load(state->attention_kernel, "attention")) {
+        !load(state->attention_kernel,
+              cache.kv_type == KvCacheType::Q8 ? "attention_q8"
+                                               : "attention")) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    if (cache.kv_f16) {
+    if (cache.kv_type == KvCacheType::F16) {
       if (!load(state->cast_kernel, "cast_f32_f16")) {
         return std::unexpected(StatusCode::DeviceError);
       }
@@ -74,6 +77,17 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
         return std::unexpected(StatusCode::OutOfMemory);
       }
       state->kv_scratch = std::move(*scratch);
+    } else if (cache.kv_type == KvCacheType::Q8) {
+      if (!load(state->quant_kernel, "quantize_q8")) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      auto scratch = backend.AllocateBuffer(kv_dim, MemoryKind::Device);
+      auto scale = backend.AllocateBuffer(4, MemoryKind::Device);
+      if (!scratch || !scale) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      state->kv_scratch = std::move(*scratch);
+      state->scale_scratch = std::move(*scale);
     }
     const std::size_t h4 = hidden * 4;
     const std::size_t q4 = heads * head_dim * 4;
@@ -110,7 +124,7 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
     state->logits = std::move(*logits);
     state->kv.resize(cfg.layers);
     for (auto& kv : state->kv) {
-      kv.f16 = cache.kv_f16;
+      kv.type = cache.kv_type;
     }
     cache.device = std::move(state);
   }
@@ -182,15 +196,25 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
                     cfg.attention.rope_dim, pos, cfg.attention.rope_theta)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    if (auto appended = AppendKv(backend, st.cast_kernel.get(),
-                                 st.kv_scratch.get(), kv, *st.k, *st.v,
-                                 kv_dim);
+    if (auto appended =
+            AppendKv(backend, st.cast_kernel.get(), st.quant_kernel.get(),
+                     st.kv_scratch.get(), st.kv_scratch.get(),
+                     st.scale_scratch.get(), kv, *st.k, *st.v, kv_dim);
         !appended) {
       return std::unexpected(appended.error());
     }
-    if (!AttentionDevice(backend, *st.attention_kernel, *st.q, *kv.k, *kv.v,
-                         *st.attn, kv.rows, heads, kv_heads, head_dim, pos, 0,
-                         1, kv.f16)) {
+    const bool attention_ok =
+        kv.type == KvCacheType::Q8
+            ? AttentionQ8Device(backend, *st.attention_kernel, *st.q, *kv.k,
+                                *kv.v, *kv.k_scale, *kv.v_scale, *st.attn,
+                                kv.rows, heads, kv_heads, head_dim, pos, 0, 1)
+                  .has_value()
+            : AttentionDevice(backend, *st.attention_kernel, *st.q, *kv.k,
+                              *kv.v, *st.attn, kv.rows, heads, kv_heads,
+                              head_dim, pos, 0, 1,
+                              kv.type == KvCacheType::F16)
+                  .has_value();
+    if (!attention_ok) {
       return std::unexpected(StatusCode::DeviceError);
     }
     if (!detail::ProjectDevice(backend, *(*gemm_o), *st.attn, *(*wo)->device,

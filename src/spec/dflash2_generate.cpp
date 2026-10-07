@@ -78,7 +78,7 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   auto selector_gemm = backend.LoadKernel("gemm_f32", {});
   auto selector_kernel = backend.LoadKernel("selector_edge_score", {});
   core::DecodeCache cache;
-  cache.kv_f16 = options.kv_f16;
+  cache.kv_type = options.kv_type;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
