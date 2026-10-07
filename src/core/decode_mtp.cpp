@@ -11,6 +11,7 @@ namespace tessera::core {
 
 namespace {
 
+using detail::DownloadF32;
 using detail::GatherEmbedding;
 using detail::GemmFor;
 using detail::NeedWeight;
@@ -27,7 +28,8 @@ using detail::UploadF32;
 // the shared head norm and the shared output weight.
 std::expected<std::uint32_t, StatusCode> MtpDraftStep(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::span<const float> hidden, std::uint32_t token, std::uint64_t pos) {
+    std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
+    std::vector<float>* mtp_hidden_out) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -111,6 +113,14 @@ std::expected<std::uint32_t, StatusCode> MtpDraftStep(
       !ProjectDevice(backend, *(*gemm_out), *h.xn, *(*output)->device,
                      *h.logits, 1, cfg.vocab_size, hidden_dim)) {
     return std::unexpected(StatusCode::DeviceError);
+  }
+  if (mtp_hidden_out != nullptr) {
+    // The shared-head norm output is the MTP hidden to chain the next draft.
+    auto down = DownloadF32(backend, *h.xn);
+    if (!down) {
+      return std::unexpected(down.error());
+    }
+    *mtp_hidden_out = std::move(*down);
   }
   backend.Synchronize();
   std::vector<float> logits(cfg.vocab_size);

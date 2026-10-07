@@ -105,6 +105,7 @@ namespace tessera::core {
 [[nodiscard]] std::expected<void, StatusCode> SsmGateRef(
     std::span<const float> a_log, std::span<const float> dt,
     std::span<const float> alpha_raw, std::span<const float> beta_raw,
-    std::span<float> alpha, std::span<float> beta, std::size_t heads);
+    std::span<float> alpha, std::span<float> beta, std::size_t heads,
+    std::size_t rows = 1);
 
 }  // namespace tessera::core

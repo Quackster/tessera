@@ -477,21 +477,25 @@ __global__ void MropeKernel(float* data, const unsigned long long* pos,
 }
 
 // Built-in "qgate_split": split a fused gated-attention projection
-// into queries and gates (per head query then gate). One thread per
-// (head, element).
+// into queries and gates (per row, per head query then gate). One thread
+// per (row, head, element).
 __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
                                  unsigned long long heads,
-                                 unsigned long long head_dim) {
+                                 unsigned long long head_dim,
+                                 unsigned long long rows) {
   const unsigned long long t =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= heads * head_dim) {
+  if (t >= rows * heads * head_dim) {
     return;
   }
-  const unsigned long long head = t / head_dim;
-  const unsigned long long e = t % head_dim;
-  const unsigned long long src = head * 2 * head_dim;
-  q[t] = fused[src + e];
-  gate[t] = fused[src + head_dim + e];
+  const unsigned long long row = t / (heads * head_dim);
+  const unsigned long long rem = t % (heads * head_dim);
+  const unsigned long long head = rem / head_dim;
+  const unsigned long long e = rem % head_dim;
+  const unsigned long long fbase = (row * heads + head) * 2 * head_dim;
+  const unsigned long long obase = row * heads * head_dim + head * head_dim;
+  q[obase + e] = fused[fbase + e];
+  gate[obase + e] = fused[fbase + head_dim + e];
 }
 // Built-in "add": elementwise o = a + b over n fp32. One thread per
 // element.
@@ -538,16 +542,18 @@ __global__ void RepeatHeadsKernel(const float* in, float* out,
 __global__ void SsmGateKernel(const float* a_log, const float* dt,
                               const float* alpha_raw, const float* beta_raw,
                               float* alpha, float* beta,
-                              unsigned long long heads) {
-  const unsigned long long h =
+                              unsigned long long heads,
+                              unsigned long long rows) {
+  const unsigned long long t =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (h >= heads) {
+  if (t >= rows * heads) {
     return;
   }
-  const float raw = alpha_raw[h] + dt[h];
+  const unsigned long long h = t % heads;
+  const float raw = alpha_raw[t] + dt[h];
   const float softplus = raw > 20.0f ? raw : log1pf(expf(raw));
-  alpha[h] = expf(a_log[h] * softplus);
-  beta[h] = 1.0f / (1.0f + expf(-beta_raw[h]));
+  alpha[t] = expf(a_log[h] * softplus);
+  beta[t] = 1.0f / (1.0f + expf(-beta_raw[t]));
 }
 
 // Built-in "delta_step_heads": one gated-delta step for all value

@@ -406,13 +406,14 @@ inline std::expected<void, StatusCode> SigmoidGateDevice(
 // Split a fused gated-attention projection into queries and gates.
 inline std::expected<void, StatusCode> QGateSplitDevice(
     Backend& backend, const Kernel& kernel, const Buffer& fused, Buffer& q,
-    Buffer& gate, std::size_t heads, std::size_t head_dim) {
+    Buffer& gate, std::size_t heads, std::size_t head_dim,
+    std::size_t rows = 1) {
   KernelLaunch launch;
-  launch.grid_x =
-      static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
+  launch.grid_x = static_cast<std::uint32_t>(
+      (rows * heads * head_dim + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&fused, &q, &gate};
-  launch.scalars = {heads, head_dim};
+  launch.scalars = {heads, head_dim, rows};
   return backend.LaunchKernel(kernel, launch);
 }
 
@@ -558,12 +559,13 @@ inline std::expected<void, StatusCode> RopeDevice(
 inline std::expected<void, StatusCode> SsmGateDevice(
     Backend& backend, const Kernel& kernel, const Buffer& a_log,
     const Buffer& dt, const Buffer& alpha_raw, const Buffer& beta_raw,
-    Buffer& alpha, Buffer& beta, std::size_t heads) {
+    Buffer& alpha, Buffer& beta, std::size_t heads,
+    std::size_t rows = 1) {
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((heads + 255) / 256);
+  launch.grid_x = static_cast<std::uint32_t>((rows * heads + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&a_log, &dt, &alpha_raw, &beta_raw, &alpha, &beta};
-  launch.scalars = {heads};
+  launch.scalars = {heads, rows};
   return backend.LaunchKernel(kernel, launch);
 }
 

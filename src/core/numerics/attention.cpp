@@ -262,22 +262,24 @@ std::expected<void, StatusCode> DeltaStepRef(
 
 std::expected<void, StatusCode> QGateSplitRef(
     std::span<const float> fused, std::span<float> q, std::span<float> gate,
-    std::size_t heads, std::size_t head_dim) {
-  if (heads == 0 || head_dim == 0) {
+    std::size_t heads, std::size_t head_dim, std::size_t rows) {
+  if (heads == 0 || head_dim == 0 || rows == 0) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
   const std::size_t per_head = heads * head_dim;
-  if (fused.size() != per_head * 2 || q.size() != per_head ||
-      gate.size() != per_head) {
+  if (fused.size() != rows * per_head * 2 || q.size() != rows * per_head ||
+      gate.size() != rows * per_head) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
-  for (std::size_t h = 0; h < heads; ++h) {
-    const float* src = fused.data() + h * 2 * head_dim;
-    float* q_row = q.data() + h * head_dim;
-    float* gate_row = gate.data() + h * head_dim;
-    for (std::size_t e = 0; e < head_dim; ++e) {
-      q_row[e] = src[e];
-      gate_row[e] = src[head_dim + e];
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t h = 0; h < heads; ++h) {
+      const float* src = fused.data() + (r * heads + h) * 2 * head_dim;
+      float* q_row = q.data() + (r * heads + h) * head_dim;
+      float* gate_row = gate.data() + (r * heads + h) * head_dim;
+      for (std::size_t e = 0; e < head_dim; ++e) {
+        q_row[e] = src[e];
+        gate_row[e] = src[head_dim + e];
+      }
     }
   }
   return {};

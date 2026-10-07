@@ -2243,16 +2243,17 @@ TEST(BackendTest, QGateSplitDeviceMatchesRef) {
   std::mt19937 rng(47);
   constexpr std::size_t kHeads = 3;
   constexpr std::size_t kHeadDim = 8;
-  std::vector<float> fused(kHeads * 2 * kHeadDim);
+  constexpr std::size_t kRows = 2;
+  std::vector<float> fused(kRows * kHeads * 2 * kHeadDim);
   for (auto& v : fused) {
     v = DrawValue(rng);
   }
   auto fused_buf =
       backend->AllocateBuffer(fused.size() * 4, MemoryKind::Device);
   auto q_buf =
-      backend->AllocateBuffer(kHeads * kHeadDim * 4, MemoryKind::Device);
+      backend->AllocateBuffer(kRows * kHeads * kHeadDim * 4, MemoryKind::Device);
   auto gate_buf =
-      backend->AllocateBuffer(kHeads * kHeadDim * 4, MemoryKind::Device);
+      backend->AllocateBuffer(kRows * kHeads * kHeadDim * 4, MemoryKind::Device);
   ASSERT_TRUE(fused_buf.has_value() && q_buf.has_value() &&
               gate_buf.has_value());
   auto upload = backend->CopyH2D(**fused_buf, std::span<const std::byte>(
@@ -2262,23 +2263,23 @@ TEST(BackendTest, QGateSplitDeviceMatchesRef) {
   auto kernel = backend->LoadKernel("qgate_split", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kHeads * kHeadDim + 255) / 256;
+  launch.grid_x = (kRows * kHeads * kHeadDim + 255) / 256;
   launch.block_x = 256;
   launch.buffers = {(*fused_buf).get(), (*q_buf).get(), (*gate_buf).get()};
-  launch.scalars = {kHeads, kHeadDim};
+  launch.scalars = {kHeads, kHeadDim, kRows};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
 
-  std::vector<float> ref_q(kHeads * kHeadDim);
-  std::vector<float> ref_gate(kHeads * kHeadDim);
+  std::vector<float> ref_q(kRows * kHeads * kHeadDim);
+  std::vector<float> ref_gate(kRows * kHeads * kHeadDim);
   auto ref_status = core::QGateSplitRef(
       std::span<const float>(fused), std::span<float>(ref_q),
-      std::span<float>(ref_gate), kHeads, kHeadDim);
+      std::span<float>(ref_gate), kHeads, kHeadDim, kRows);
   ASSERT_TRUE(ref_status.has_value())
       << tessera::ToString(ref_status.error());
-  std::vector<std::byte> readback_q(kHeads * kHeadDim * 4);
-  std::vector<std::byte> readback_gate(kHeads * kHeadDim * 4);
+  std::vector<std::byte> readback_q(kRows * kHeads * kHeadDim * 4);
+  std::vector<std::byte> readback_gate(kRows * kHeads * kHeadDim * 4);
   ASSERT_TRUE(backend->CopyD2H(**q_buf, readback_q.data(), readback_q.size())
                   .has_value());
   ASSERT_TRUE(backend->CopyD2H(**gate_buf, readback_gate.data(),
@@ -2813,7 +2814,9 @@ TEST(BackendTest, SsmGateDeviceMatchesRef) {
   MakeBackendOrSkip(backend);
   std::mt19937 rng(83);
   constexpr std::size_t kHeads = 8;
-  std::vector<float> a_log(kHeads), dt(kHeads), ar(kHeads), br(kHeads);
+  constexpr std::size_t kRows = 3;
+  std::vector<float> a_log(kHeads), dt(kHeads), ar(kRows * kHeads),
+      br(kRows * kHeads);
   for (auto& v : a_log) v = DrawValue(rng);
   for (auto& v : dt) v = DrawValue(rng);
   for (auto& v : ar) v = DrawValue(rng);
@@ -2821,8 +2824,9 @@ TEST(BackendTest, SsmGateDeviceMatchesRef) {
   auto mk = [&](std::size_t n) {
     return backend->AllocateBuffer(n * 4, MemoryKind::Device);
   };
-  auto a_buf = mk(kHeads), d_buf = mk(kHeads), ar_buf = mk(kHeads);
-  auto br_buf = mk(kHeads), al_buf = mk(kHeads), be_buf = mk(kHeads);
+  auto a_buf = mk(kHeads), d_buf = mk(kHeads), ar_buf = mk(kRows * kHeads);
+  auto br_buf = mk(kRows * kHeads), al_buf = mk(kRows * kHeads),
+       be_buf = mk(kRows * kHeads);
   ASSERT_TRUE(a_buf && d_buf && ar_buf && br_buf && al_buf && be_buf);
   const auto upload = [&backend](auto& buf, const std::vector<float>& data) {
     return backend->CopyH2D(**buf, std::span<const std::byte>(
@@ -2835,29 +2839,30 @@ TEST(BackendTest, SsmGateDeviceMatchesRef) {
   auto kernel = backend->LoadKernel("ssm_gate", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = 1;
+  launch.grid_x = (kRows * kHeads + 255) / 256;
   launch.block_x = 256;
   launch.buffers = {(*a_buf).get(), (*d_buf).get(), (*ar_buf).get(),
                     (*br_buf).get(), (*al_buf).get(), (*be_buf).get()};
-  launch.scalars = {kHeads};
+  launch.scalars = {kHeads, kRows};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
-  std::vector<std::byte> alpha_back(kHeads * 4), beta_back(kHeads * 4);
+  std::vector<std::byte> alpha_back(kRows * kHeads * 4),
+      beta_back(kRows * kHeads * 4);
   ASSERT_TRUE(backend->CopyD2H(**al_buf, alpha_back.data(), alpha_back.size())
                   .has_value());
   ASSERT_TRUE(backend->CopyD2H(**be_buf, beta_back.data(), beta_back.size())
                   .has_value());
-  std::vector<float> alpha_ref(kHeads), beta_ref(kHeads);
+  std::vector<float> alpha_ref(kRows * kHeads), beta_ref(kRows * kHeads);
   ASSERT_TRUE(core::SsmGateRef(std::span<const float>(a_log),
                                std::span<const float>(dt),
                                std::span<const float>(ar),
                                std::span<const float>(br),
                                std::span<float>(alpha_ref),
-                               std::span<float>(beta_ref), kHeads)
+                               std::span<float>(beta_ref), kHeads, kRows)
                   .has_value());
   const auto* got_a = reinterpret_cast<const float*>(alpha_back.data());
   const auto* got_b = reinterpret_cast<const float*>(beta_back.data());
-  for (std::size_t i = 0; i < kHeads; ++i) {
+  for (std::size_t i = 0; i < kRows * kHeads; ++i) {
     EXPECT_NEAR(got_a[i], alpha_ref[i], 1e-5f);
     EXPECT_NEAR(got_b[i], beta_ref[i], 1e-5f);
   }

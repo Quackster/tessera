@@ -109,7 +109,7 @@ namespace tessera::core {
 //   auto status = QGateSplitRef(fused, q, gate, heads, head_dim);
 [[nodiscard]] std::expected<void, StatusCode> QGateSplitRef(
     std::span<const float> fused, std::span<float> q, std::span<float> gate,
-    std::size_t heads, std::size_t head_dim);
+    std::size_t heads, std::size_t head_dim, std::size_t rows = 1);
 // Host reference for the "repeat_heads" built-in: expand `in`
 // (num_k_heads x head_k_dim) to `out` (num_v_heads x head_k_dim) by
 // cycling the key heads (out[h] = in[h % (num_v_heads / factor)]).

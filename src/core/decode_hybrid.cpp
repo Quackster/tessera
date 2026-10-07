@@ -35,40 +35,6 @@ using detail::SiluMulDevice;
 using detail::SsmGateDevice;
 using detail::UploadF32;
 
-// Derived recurrent-layer geometry from the SSM config.
-struct LinearGeometry {
-  std::size_t key_dim = 0;
-  std::size_t value_dim = 0;
-  std::size_t num_v_heads = 0;
-  std::size_t head_v_dim = 0;
-  std::size_t num_k_heads = 0;
-  std::size_t head_k_dim = 0;
-  std::size_t conv_dim = 0;
-  std::size_t width = 0;
-  std::size_t factor = 0;
-};
-
-std::expected<LinearGeometry, StatusCode> DeriveGeometry(
-    const TransformerConfig& cfg) {
-  LinearGeometry g;
-  g.head_k_dim = cfg.ssm.state_size;
-  g.num_k_heads = cfg.ssm.group_count;
-  g.value_dim = cfg.ssm.inner_size;
-  g.num_v_heads = cfg.ssm.time_step_rank;
-  g.width = cfg.ssm.conv_kernel;
-  if (g.head_k_dim == 0 || g.num_k_heads == 0 || g.value_dim == 0 ||
-      g.num_v_heads == 0 || g.width == 0 ||
-      g.value_dim % g.num_v_heads != 0 ||
-      g.num_v_heads % g.num_k_heads != 0) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  g.key_dim = g.head_k_dim * g.num_k_heads;
-  g.head_v_dim = g.value_dim / g.num_v_heads;
-  g.factor = g.num_v_heads / g.num_k_heads;
-  g.conv_dim = g.key_dim * 2 + g.value_dim;
-  return g;
-}
-
 std::expected<void, StatusCode> InitScratch(Backend& backend,
                                             const TransformerConfig& cfg,
                                             HybridDecodeCache& h,
@@ -253,28 +219,9 @@ std::expected<void, StatusCode> RunFullBlock(
   return RunFfn(backend, model, cfg, h, layer);
 }
 
-std::expected<void, StatusCode> HybridForward(
-    Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out,
-    const std::vector<std::size_t>* capture_layers, std::vector<Buffer*>* capture,
-    const Buffer* embedding) {
-  auto config = model.Config();
-  if (!config) {
-    return std::unexpected(config.error());
-  }
-  const TransformerConfig& cfg = *config;
-  if (!cfg.hybrid || cfg.full_attention_interval == 0 ||
-      cfg.rope_sections.size() != 3) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  if (token >= cfg.vocab_size) {
-    return std::unexpected(StatusCode::InvalidArgument);
-  }
-  auto geometry = DeriveGeometry(cfg);
-  if (!geometry) {
-    return std::unexpected(geometry.error());
-  }
-  const LinearGeometry& g = *geometry;
+std::expected<void, StatusCode> EnsureHybridReady(
+    Backend& backend, const TransformerConfig& cfg, DecodeCache& cache,
+    const LinearGeometry& g) {
   if (!cache.hybrid) {
     cache.hybrid = std::make_unique<HybridDecodeCache>();
   }
@@ -348,6 +295,36 @@ std::expected<void, StatusCode> HybridForward(
     }
     h.ready = true;
   }
+  return {};
+}
+
+std::expected<void, StatusCode> HybridForward(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out,
+    const std::vector<std::size_t>* capture_layers, std::vector<Buffer*>* capture,
+    const Buffer* embedding) {
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const TransformerConfig& cfg = *config;
+  if (!cfg.hybrid || cfg.full_attention_interval == 0 ||
+      cfg.rope_sections.size() != 3) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (token >= cfg.vocab_size) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  auto geometry = DeriveGeometry(cfg);
+  if (!geometry) {
+    return std::unexpected(geometry.error());
+  }
+  const LinearGeometry& g = *geometry;
+  auto ready = EnsureHybridReady(backend, cfg, cache, g);
+  if (!ready) {
+    return std::unexpected(ready.error());
+  }
+  HybridDecodeCache& h = *cache.hybrid;
   const std::size_t hidden = cfg.hidden_dim;
   auto embed = NeedWeightAny(model, "token_embd.weight");
   if (!embed) {

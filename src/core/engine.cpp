@@ -12,6 +12,11 @@
 
 namespace tessera {
 
+namespace {
+// MTP drafts per batched verification when the caller does not set one.
+constexpr std::size_t kDefaultMtpBlock = 4;
+}  // namespace
+
 Engine::Engine(std::unique_ptr<Backend> backend, log::Diagnostics diagnostics)
     : backend_(std::move(backend)), diagnostics_(std::move(diagnostics)) {}
 
@@ -225,6 +230,9 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
   produced.reserve(options.max_tokens);
   std::uint64_t pos = prompt.size();
   std::uint32_t next = core::detail::ArgMax(current);
+  // Number of MTP tokens to draft before one batched verification forward.
+  const std::size_t block =
+      options.draft_tokens > 0 ? options.draft_tokens : kDefaultMtpBlock;
   while (produced.size() < options.max_tokens) {
     produced.push_back(next);
     if (produced.size() >= options.max_tokens) {
@@ -241,36 +249,60 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     }
     current = std::move(*fed);
     ++pos;
-    auto draft = core::MtpDraftStep(*backend_, model, cache, hidden, next, pos);
-    if (!draft) {
-      if (draft.error() != StatusCode::UnsupportedFeature) {
-        return std::unexpected(draft.error());
+    // Draft up to `block` tokens by chaining the MTP head (each draft fuses
+    // the target hidden with the previous draft token).
+    const std::size_t mtp_base = cache.hybrid ? cache.hybrid->mtp_kv.rows : 0;
+    std::vector<std::uint32_t> drafts;
+    std::vector<float> chain = hidden;
+    std::uint32_t tok = next;
+    std::uint64_t p = pos;
+    bool mtp_missing = false;
+    for (std::size_t i = 0; i < block; ++i) {
+      std::vector<float> next_chain;
+      auto draft =
+          core::MtpDraftStep(*backend_, model, cache, chain, tok, p, &next_chain);
+      if (!draft) {
+        if (draft.error() != StatusCode::UnsupportedFeature) {
+          return std::unexpected(draft.error());
+        }
+        mtp_missing = true;
+        break;
       }
+      drafts.push_back(*draft);
+      chain = std::move(next_chain);
+      tok = *draft;
+      ++p;
+    }
+    if (mtp_missing) {
       // No MTP head: fall back to the target's greedy token.
+      if (cache.hybrid) {
+        cache.hybrid->mtp_kv.rows = mtp_base;
+      }
       next = core::detail::ArgMax(current);
       continue;
     }
-    const std::size_t mtp_rows = cache.hybrid ? cache.hybrid->mtp_kv.rows : 0;
-    const std::uint32_t proposed = *draft;
+    // One batched target forward scores every draft; accept the matching
+    // prefix and roll the MTP key/value cache back to it.
     auto verify =
-        core::VerifyDraft(*backend_, model, cache,
-                          std::span<const std::uint32_t>(&proposed, 1),
-                          current, &hidden);
+        core::VerifyDraft(*backend_, model, cache, drafts, current, &hidden);
     if (!verify) {
       return std::unexpected(verify.error());
     }
-    if (verify->accepted == 1) {
-      produced.push_back(proposed);
-      ++pos;
-      current = std::move(verify->logits);
-      next = core::detail::ArgMax(current);
-      continue;
-    }
-    // Rejected: drop the MTP key/value row the draft added.
     if (cache.hybrid) {
-      cache.hybrid->mtp_kv.rows = mtp_rows;
+      cache.hybrid->mtp_kv.rows = mtp_base + verify->accepted;
     }
+    for (std::size_t i = 0; i < verify->accepted; ++i) {
+      produced.push_back(drafts[i]);
+      if (produced.size() >= options.max_tokens) {
+        break;
+      }
+    }
+    if (produced.size() >= options.max_tokens) {
+      break;
+    }
+    current = std::move(verify->logits);
     next = verify->next_token;
+    pos += verify->accepted;
   }
   return produced;
 }

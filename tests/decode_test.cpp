@@ -415,6 +415,111 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
   EXPECT_TRUE(empty->empty());
 }
 
+// Batched scoring must equal the sequential per-token scoring on both
+// the gated (full attention) and the stateful linear hybrid fixtures.
+TEST(HybridDecodeTest, BatchedLogitsMatchSequential) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  const std::vector<std::string> fixtures = {
+      WriteGatedHybridFixture("batch-gated.gguf").string(),
+      WriteLinearHybridFixture("batch-linear.gguf").string()};
+  const std::vector<std::uint32_t> tokens = {0, 1, 0, 26};
+  for (const std::string& path : fixtures) {
+    auto model = engine->LoadModel(ModelOptions{path, 1024});
+    ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+    tessera::core::DecodeCache batched_cache;
+    auto batched = tessera::core::DecodeLogitsBatch(
+        engine->Owner(), **model, batched_cache, tokens);
+    ASSERT_TRUE(batched.has_value()) << tessera::ToString(batched.error());
+    ASSERT_EQ(batched->size(), tokens.size());
+    tessera::core::DecodeCache seq_cache;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      auto one = tessera::core::DecodeLogits(engine->Owner(), **model,
+                                             seq_cache, tokens[i]);
+      ASSERT_TRUE(one.has_value()) << tessera::ToString(one.error());
+      ASSERT_EQ((*batched)[i].size(), one->size());
+      float max_abs = 0.0f;
+      for (std::size_t j = 0; j < one->size(); ++j) {
+        max_abs = std::max(max_abs, std::abs((*batched)[i][j] - (*one)[j]));
+      }
+      EXPECT_LE(max_abs, 1e-3f)
+          << "fixture " << path << " row " << i << " max_abs " << max_abs;
+    }
+  }
+}
+
+// Batched verification must be output preserving: for any draft the
+// accepted tokens plus the bonus token equal the plain greedy sequence,
+// and the rolled-back cache continues greedily from the accepted prefix.
+TEST(HybridDecodeTest, BatchedVerifyPreservesGreedy) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  const std::vector<std::string> fixtures = {
+      WriteGatedHybridFixture("verify-gated.gguf").string(),
+      WriteLinearHybridFixture("verify-linear.gguf").string()};
+  const std::vector<std::uint32_t> prefix = {0, 1, 0, 26};
+  for (const std::string& path : fixtures) {
+    auto model = engine->LoadModel(ModelOptions{path, 1024});
+    ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+    auto cfg = (*model)->Config();
+    ASSERT_TRUE(cfg.has_value());
+    const std::uint32_t vocab = static_cast<std::uint32_t>(cfg->vocab_size);
+    const auto prime = [&](tessera::core::DecodeCache& cache,
+                           std::vector<float>& logits) {
+      for (std::size_t i = 0; i + 1 < prefix.size(); ++i) {
+        EXPECT_TRUE(tessera::core::DecodeLogits(engine->Owner(), **model, cache,
+                                                prefix[i])
+                        .has_value());
+      }
+      auto pl = tessera::core::DecodeLogits(engine->Owner(), **model, cache,
+                                            prefix.back());
+      EXPECT_TRUE(pl.has_value());
+      logits = *pl;
+    };
+    // Greedy continuation reference.
+    std::vector<float> pl;
+    tessera::core::DecodeCache ref_cache;
+    prime(ref_cache, pl);
+    std::vector<std::uint32_t> greedy;
+    {
+      std::vector<float> lg = pl;
+      for (int i = 0; i < 6; ++i) {
+        const std::uint32_t t = RowArgMax(lg);
+        greedy.push_back(t);
+        auto nxt =
+            tessera::core::DecodeLogits(engine->Owner(), **model, ref_cache, t);
+        EXPECT_TRUE(nxt.has_value());
+        lg = *nxt;
+      }
+    }
+    const std::size_t kDraft = 4;
+    for (int corrupt = -1; corrupt < static_cast<int>(kDraft); ++corrupt) {
+      std::vector<std::uint32_t> draft(greedy.begin(),
+                                       greedy.begin() + kDraft);
+      if (corrupt >= 0) {
+        draft[corrupt] = (draft[corrupt] + 1) % vocab;
+      }
+      tessera::core::DecodeCache cache;
+      std::vector<float> logits;
+      prime(cache, logits);
+      auto v = tessera::core::VerifyDraft(engine->Owner(), **model, cache,
+                                          draft, logits);
+      ASSERT_TRUE(v.has_value()) << tessera::ToString(v.error());
+      const std::size_t want_accepted =
+          corrupt < 0 ? kDraft : static_cast<std::size_t>(corrupt);
+      EXPECT_EQ(v->accepted, want_accepted) << path << " corrupt " << corrupt;
+      EXPECT_EQ(v->next_token, greedy[want_accepted]);
+      // The cache continues greedily from the accepted prefix.
+      std::vector<float> lg = v->logits;
+      EXPECT_EQ(RowArgMax(lg), greedy[want_accepted]);
+      auto nxt = tessera::core::DecodeLogits(engine->Owner(), **model, cache,
+                                             v->next_token);
+      ASSERT_TRUE(nxt.has_value());
+      EXPECT_EQ(RowArgMax(*nxt), greedy[want_accepted + 1]);
+    }
+  }
+}
+
 // Greedy speculative decoding must be output preserving: for any draft,
 // accepted tokens plus the bonus token equal the plain greedy sequence.
 // A fixed wrong draft exercises the all-rejected path; a draft that

@@ -78,6 +78,22 @@ struct DeviceDecodeState {
   bool ready = false;
 };
 
+// Scratch for the multi-token (batched) hybrid forward used by
+// speculative verification. Buffers hold `capacity` rows. The
+// recurrent-state history keeps one state per processed token so a
+// verification can roll back to the accepted prefix.
+struct HybridBatchScratch {
+  std::size_t capacity = 0;
+  std::unique_ptr<Buffer> x, xn, proj, logits, pos;
+  std::unique_ptr<Buffer> fused, q, gate, kf, vf, attn;
+  std::unique_ptr<Buffer> fgate, fup, fmlp;
+  std::unique_ptr<Buffer> qkv, z, alpha_raw, beta_raw, alpha, beta, out;
+  // Per linear layer: capacity device-state snapshots (capacity x state)
+  // and the matching host conv histories.
+  std::vector<std::unique_ptr<Buffer>> state_hist;
+  std::vector<std::vector<float>> conv_hist_hist;
+};
+
 // Per-step device-resident state for a hybrid model: the loaded
 // kernels, scratch device buffers, and per-layer state (full-attention
 // KV caches and linear-attention conv/recurrent state) on the device.
@@ -129,6 +145,8 @@ struct HybridDecodeCache {
   };
   std::vector<FullKv> full;
   std::vector<LinearState> linear;
+  // Batched-forward scratch, created on the first batched step.
+  std::unique_ptr<HybridBatchScratch> batch;
   FullKv mtp_kv;
   // Host-side cache of constant weights (conv kernels) and the sequence
   // position (full-layer KV rows equal the position).
@@ -167,7 +185,8 @@ struct HybridDecodeCache {
 // is the sequence position for the MTP block's RoPE.
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraftStep(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::span<const float> hidden, std::uint32_t token, std::uint64_t pos);
+    std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
+    std::vector<float>* mtp_hidden_out = nullptr);
 
 // The full vocab logits for one hybrid decoder step (same forward as
 // HybridDecodeStep, but the whole row comes back). Dispatched from
@@ -227,6 +246,15 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
 [[nodiscard]] std::expected<std::vector<std::vector<float>>, StatusCode>
 ScoreTokens(Backend& backend, const Model& model,
             std::span<const std::uint32_t> tokens);
+
+// Score a token sequence in one batched forward: run tokens[0..k-1] in
+// order and return one logits row per token (row i is the distribution
+// after tokens[0..i]), advancing `cache` by all of them. The hybrid path
+// batches the GEMMs and attention; other models fall back to a
+// sequential loop. Used by speculative verification.
+[[nodiscard]] std::expected<std::vector<std::vector<float>>, StatusCode>
+DecodeLogitsBatch(Backend& backend, const Model& model, DecodeCache& cache,
+                  std::span<const std::uint32_t> tokens);
 
 // The outcome of verifying a greedy draft against the target model.
 // `accepted` leading draft tokens match the target's greedy distribution

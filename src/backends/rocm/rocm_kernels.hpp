@@ -166,7 +166,8 @@ __global__ void MropeKernel(float* data, const unsigned long long* pos,
                             unsigned long long sec_w);
 __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
                                  unsigned long long heads,
-                                 unsigned long long head_dim);
+                                 unsigned long long head_dim,
+                                 unsigned long long rows);
 __global__ void AddKernel(const float* a, const float* b, float* o,
                           unsigned long long n);
 __global__ void RepeatHeadsKernel(const float* in, float* out,
@@ -246,7 +247,8 @@ __global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
 __global__ void SsmGateKernel(const float* a_log, const float* dt,
                               const float* alpha_raw, const float* beta_raw,
                               float* alpha, float* beta,
-                              unsigned long long heads);
+                              unsigned long long heads,
+                              unsigned long long rows);
 __global__ void DeltaStepHeadsKernel(
     float* s, const float* k, const float* v, const float* q, float* o,
     const float* alpha, const float* beta, unsigned long long heads,

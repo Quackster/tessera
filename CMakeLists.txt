@@ -15,6 +15,7 @@ add_library(tessera STATIC
     src/core/decode.cpp
     src/core/decode_device.cpp
     src/core/decode_hybrid.cpp
+    src/core/decode_hybrid_batch.cpp
     src/core/decode_mtp.cpp
     src/core/engine.cpp
     src/core/model.cpp

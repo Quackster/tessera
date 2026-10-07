@@ -844,22 +844,33 @@ through RADV GFX1201, rocm through the system ROCm).
   earlier fused Q+gate "all queries then all gates" change was wrong and
   is reverted; the gate is per head `[q, gate]`.)
 
+- 2026-10-07: batched speculative scoring (232/232 `ctest` on both
+  builds). `VerifyDraft` now scores a multi-token draft in one target
+  forward. `HybridForwardBatch` runs the whole hybrid trunk with the GEMMs
+  and attention at m = draft length (causal within the block) and records
+  per-token linear-attention state snapshots; verification accepts the
+  matching prefix and rolls the cache back (full-attention KV rows,
+  recurrent state, conv history and position). `qgate_split` and
+  `ssm_gate` gained a `rows` scalar on both backends; the gemm, rmsnorm,
+  l2norm, mrope and attention helpers were already row based.
+  `Engine::GenerateSpeculative` drafts up to `draft_tokens` tokens by
+  chaining the MTP head (the shared-head-norm output feeds the next step)
+  and verifies them in one forward; on the 27B this is about 1.5x faster
+  than greedy and output equal. The DFlash2 block draft uses the same
+  batched verifier.
+
 ## Next (in order)
 
-0. **Speculative decoding performance**: MTP speculation runs end to
-   end (`Engine::GenerateSpeculative`, CLI `--speculate`) and is output
-   preserving, but scores one token per target forward. Next: batch the
-   draft scoring so k drafts cost one forward.
-1. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
+0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
    grouped dynamic convolution, sliding attention, candidate selector and
    the verification loop, output equal to greedy. Remaining: acceptance
    tuning (context beyond the last token) and batching.
-2. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Models are data. No per
    model branches.
-3. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
+2. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
    `/slots`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -868,17 +879,17 @@ through RADV GFX1201, rocm through the system ROCm).
    queue, keep-alive, `/v1/responses`, render/derender/batch,
    `/tokenizer_info`, `/load` and LoRA, and the 501
    embedding/rerank/audio/pooling/classify/score surfaces.
-4. **Runtime options**: context size, draft-block and the GPU index
+3. **Runtime options**: context size, draft-block and the GPU index
    (`--gpu`) are CLI flags now, and the KV cache can be fp16 (`--kv-f16`)
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-5. **Multimodal (mmproj)**: config, weights, encoder+merger, image
+4. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, and image-embedding injection into generation are done
    (`Engine::GenerateMultimodal`). Still to do: the CLI wiring, deepstack
    feature injection, and the image placeholder tokenizer mapping.
 
-6. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
+5. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism
    (shard attention heads and MLP rows across GPUs with an all-reduce per
    layer; vLLM tensor parallelism, Megatron-LM TP) or layer/pipeline

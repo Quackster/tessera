@@ -34,7 +34,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. The 27B hybrid path generates coherent text. |
 | Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. |
-| Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculation run end to end; output equals greedy. Batched scoring in work. |
+| Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculation run end to end; output equals greedy. Multi-token drafts are scored in one batched target forward. |
 | MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
 | DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). Output equals greedy. |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
