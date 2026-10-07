@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 199/199 on both builds.
+`ctest` passes 200/200 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -620,6 +620,14 @@ through RADV GFX1201, rocm through the system ROCm).
   attends over it; the stack passes the fused context hidden to each
   layer. The layer test now covers the residual x context combinations
   on both backends.
+
+- 2026-10-07: DFlash2 draft block (200/200 `ctest` on both builds).
+  Current head. `src/spec/dflash2_block.*` ties the draft forward
+  together: fuse the target hidden states with `fc`, run the mask-query
+  layer stack with that fused hidden as context, and project the final
+  normed hidden to logits with the shared output weight. Host reference
+  and a device-vs-reference test. Fixes a dropped `ctx` argument in the
+  device stack call.
 
 ## Next (in order)
 

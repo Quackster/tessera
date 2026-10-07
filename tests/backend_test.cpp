@@ -22,6 +22,7 @@
 #include "spec/dflash2_selector.hpp"
 #include "spec/dflash2_fuse.hpp"
 #include "spec/dflash2_context.hpp"
+#include "spec/dflash2_block.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -4339,6 +4340,134 @@ TEST(BackendTest, DraftAttentionContextMatchesRef) {
                   std::span<float>(ref), kRows, kHidden, kHeads, kKvHeads,
                   kHeadDim, kTaps, kGroup, kBlock, 0, 0, kTheta, kEps,
                   std::span<const float>(ck), std::span<const float>(cv), kCtx)
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the full DFlash2 draft block (fc fusion of the target hidden,
+// mask-query stack with context, final norm, logits head) matches the host
+// reference.
+TEST(BackendTest, DraftBlockMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(102);
+  constexpr std::size_t kRows = 2, kCtx = 3, kHidden = 4, kN = 2,
+                       kFeatures = 2, kVocab = 5, kHeads = 2, kKvHeads = 1,
+                       kHeadDim = 2, kFfn = 8, kTaps = 2, kGroup = 2,
+                       kBlock = 2, kWindow = 2;
+  constexpr float kEps = 1e-6f;
+  constexpr double kTheta = 10000.0;
+  const std::size_t q_dim = kHeads * kHeadDim;
+  const std::size_t kv_dim = kKvHeads * kHeadDim;
+  const std::size_t proj_n = 2 * kTaps * (kHidden / kGroup);
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = DrawValue(rng);
+    return v;
+  };
+  std::vector<std::unique_ptr<tessera::Buffer>> keep;
+  auto mk = [&](const std::vector<float>& d) -> tessera::Buffer* {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                             reinterpret_cast<const std::byte*>(d.data()),
+                             d.size() * 4));
+    keep.push_back(std::move(*b));
+    return keep.back().get();
+  };
+  struct Layer {
+    std::vector<std::vector<float>> data;
+    tessera::spec::DraftLayerWeights ref;
+    tessera::spec::DraftLayerBuffers dev;
+    Layer() { data.reserve(16); }
+  };
+  std::vector<Layer> layers(2);
+  for (Layer& L : layers) {
+    auto add = [&](std::size_t n) -> const std::vector<float>* {
+      L.data.push_back(rnd(n));
+      return &L.data.back();
+    };
+    const auto* inorm = add(kHidden);
+    const auto* acp = add(proj_n * kHidden);
+    const auto* acb = add(2 * kTaps * kHidden);
+    const auto* qw = add(q_dim * kHidden);
+    const auto* kw = add(kv_dim * kHidden);
+    const auto* vw = add(kv_dim * kHidden);
+    const auto* ow = add(kHidden * q_dim);
+    const auto* qn = add(kHeadDim);
+    const auto* kn = add(kHeadDim);
+    const auto* pnorm = add(kHidden);
+    const auto* mcp = add(proj_n * kHidden);
+    const auto* mcb = add(2 * kTaps * kHidden);
+    const auto* gw = add(kFfn * kHidden);
+    const auto* uw = add(kFfn * kHidden);
+    const auto* dw = add(kHidden * kFfn);
+    const auto* hnorm = add(kHidden);
+    L.ref = {*inorm, *acp, *acb, *qw, *kw,      *vw,   *ow, *qn,
+             *kn,    *pnorm, *mcp, *mcb, *gw,    *uw,   *dw, *hnorm};
+    L.dev.input_norm = mk(*inorm);
+    L.dev.attn_conv_proj = mk(*acp);
+    L.dev.attn_conv_base = mk(*acb);
+    L.dev.q_w = mk(*qw);
+    L.dev.k_w = mk(*kw);
+    L.dev.v_w = mk(*vw);
+    L.dev.o_w = mk(*ow);
+    L.dev.q_norm_w = mk(*qn);
+    L.dev.k_norm_w = mk(*kn);
+    L.dev.post_norm = mk(*pnorm);
+    L.dev.mlp_conv_proj = mk(*mcp);
+    L.dev.mlp_conv_base = mk(*mcb);
+    L.dev.gate_w = mk(*gw);
+    L.dev.up_w = mk(*uw);
+    L.dev.down_w = mk(*dw);
+    L.dev.hidden_norm = mk(*hnorm);
+  }
+  const std::vector<float> mask = rnd(kRows * kHidden);
+  const std::vector<float> aux = rnd(kN * kCtx * kFeatures);
+  const std::vector<float> fc = rnd(kHidden * kN * kFeatures);
+  const std::vector<float> fnormal = rnd(kHidden);
+  const std::vector<float> outw = rnd(kVocab * kHidden);
+  auto mask_b = mk(mask), aux_b = mk(aux), fc_b = mk(fc), fnormal_b = mk(fnormal);
+  auto outw_b = mk(outw);
+  auto logits_b = backend->AllocateBuffer(kRows * kVocab * 4,
+                                          MemoryKind::Device);
+  ASSERT_TRUE(logits_b.has_value());
+  std::vector<tessera::spec::DraftLayerBuffers> dev_layers;
+  for (Layer& L : layers) dev_layers.push_back(L.dev);
+  std::vector<tessera::spec::DraftLayerWeights> ref_layers;
+  for (Layer& L : layers) ref_layers.push_back(L.ref);
+  auto rms = backend->LoadKernel("rmsnorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto conv = backend->LoadKernel("dflash_conv", {});
+  auto rope = backend->LoadKernel("rope", {});
+  auto attn = backend->LoadKernel("attention", {});
+  auto silu = backend->LoadKernel("silu_mul", {});
+  auto add = backend->LoadKernel("add", {});
+  auto concat = backend->LoadKernel("concat_features", {});
+  ASSERT_TRUE(rms && gemm && conv && rope && attn && silu && add && concat);
+  auto device = tessera::spec::DraftBlockDevice(
+      *backend, **rms, **gemm, **conv, **rope, **attn, **silu, **add, **concat,
+      *mask_b, *aux_b, *fc_b, dev_layers, *fnormal_b, *outw_b, **logits_b,
+      kRows, kCtx, kHidden, kN, kFeatures, kVocab, kHeads, kKvHeads, kHeadDim,
+      kFfn, kTaps, kGroup, kBlock, kWindow, 0, kTheta, kEps);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<float> got(kRows * kVocab);
+  backend->CopyD2H(**logits_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref(kRows * kVocab);
+  ASSERT_TRUE(tessera::spec::DraftBlockRef(
+                  std::span<const float>(mask), std::span<const float>(aux),
+                  std::span<const float>(fc), ref_layers,
+                  std::span<const float>(fnormal), std::span<const float>(outw),
+                  std::span<float>(ref), kRows, kCtx, kHidden, kN, kFeatures,
+                  kVocab, kHeads, kKvHeads, kHeadDim, kFfn, kTaps, kGroup,
+                  kBlock, kWindow, 0, kTheta, kEps)
                   .has_value());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   float max_abs = 0.0f;

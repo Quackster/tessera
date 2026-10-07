@@ -92,7 +92,7 @@ std::expected<void, StatusCode> DraftStackDevice(
         backend, rmsnorm, gemm, conv, rope, attention, silu, add, *in,
         l == 0 ? nullptr : residual->get(), layers[l], *out_swap, **residual,
         rows, hidden_dim, heads, kv_heads, head_dim, ffn, taps, group_size,
-        block_size, window, pos_base, theta, eps, context_hidden);
+        block_size, window, pos_base, theta, eps, context_hidden, ctx);
     if (!status) {
       return std::unexpected(status.error());
     }
