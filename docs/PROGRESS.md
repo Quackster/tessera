@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 213/213 on both builds.
+`ctest` passes 216/216 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -721,6 +721,13 @@ through RADV GFX1201, rocm through the system ROCm).
   fp32; the fp16 and q8 paths are deterministic on the fixtures and run
   on the 27B (same leading tokens).
 
+- 2026-10-07: q4 KV cache (216/216 `ctest` on both builds). Current
+  head. `KvCacheType::Q4` (`--kv-q4`) stores the full-attention KV in
+  symmetric 4-bit with a per-row scale (`quantize_q4` + `attention_q4`,
+  eight nibbles per word). Default fp32; fp16/q8/q4 are opt-in. The q4
+  path is deterministic on the fixtures and runs on the 27B (a lossy
+  mode, so the greedy tokens differ from fp32 by design).
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
@@ -747,9 +754,9 @@ through RADV GFX1201, rocm through the system ROCm).
    embedding/rerank/audio/pooling/classify/score surfaces.
 5. **Runtime options**: context size, draft-block and the GPU index
    (`--gpu`) are CLI flags now, and the KV cache can be fp16 (`--kv-f16`)
-   or int8 (`--kv-q8`). Still to wire: q4 KV quantization, mmproj path for
-   vision input, and batch caps (features that do not exist yet). No
-   hard-coded paths or sizes.
+   (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
+   input and batch caps (features that do not exist yet). No hard-coded
+   paths or sizes.
 6. **Multimodal (mmproj)**: load the vision projector next to the
    model, encode images to embeddings, prepend them to the prompt
    sequence. Covers the mmproj file in the model directory.

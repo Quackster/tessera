@@ -67,6 +67,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"cast_f32_f16", reinterpret_cast<void*>(&CastF32F16Kernel)},
     {"quantize_q8", reinterpret_cast<void*>(&QuantizeQ8Kernel)},
     {"attention_q8", reinterpret_cast<void*>(&AttentionQ8Kernel)},
+    {"quantize_q4", reinterpret_cast<void*>(&QuantizeQ4Kernel)},
+    {"attention_q4", reinterpret_cast<void*>(&AttentionQ4Kernel)},
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},

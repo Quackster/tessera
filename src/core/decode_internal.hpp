@@ -111,7 +111,7 @@ inline std::expected<void, StatusCode> CastF16Device(
 
 // Quantize one fp32 row (n elements, n a multiple of 4) to packed int8
 // with an absmax scale.
-inline std::expected<void, StatusCode> QuantizeQ8Device(
+inline std::expected<void, StatusCode> QuantizeRowDevice(
     Backend& backend, const Kernel& kernel, const Buffer& in, Buffer& out,
     Buffer& scale, std::size_t n) {
   if (n == 0 || n % 4 != 0) {
@@ -126,7 +126,7 @@ inline std::expected<void, StatusCode> QuantizeQ8Device(
 }
 
 // int8 GQA attention: q fp32, k/v int8 with one fp32 scale per key row.
-inline std::expected<void, StatusCode> AttentionQ8Device(
+inline std::expected<void, StatusCode> AttentionQuantDevice(
     Backend& backend, const Kernel& kernel, const Buffer& q, const Buffer& k,
     const Buffer& v, const Buffer& k_scale, const Buffer& v_scale,
     Buffer& out, std::size_t n, std::size_t heads, std::size_t kv_heads,
@@ -149,10 +149,12 @@ inline std::expected<void, StatusCode> AppendKv(
     Buffer* f16_scratch, Buffer* q8_scratch, Buffer* scale_scratch, Kv& kv,
     const Buffer& k_row, const Buffer& v_row, std::size_t kv_dim) {
   const std::size_t row_bytes =
-      kv_dim * (kv.type == KvCacheType::F32
-                    ? 4
-                    : (kv.type == KvCacheType::F16 ? 2 : 1));
-  const bool q8 = kv.type == KvCacheType::Q8;
+      kv.type == KvCacheType::F32   ? kv_dim * 4
+      : kv.type == KvCacheType::F16 ? kv_dim * 2
+      : kv.type == KvCacheType::Q8  ? kv_dim
+                                    : kv_dim / 2;
+  const bool quantized =
+      kv.type == KvCacheType::Q8 || kv.type == KvCacheType::Q4;
   if (kv.rows == kv.capacity) {
     const std::size_t new_capacity =
         kv.capacity == 0 ? kInitialKvRows : kv.capacity * 2;
@@ -171,7 +173,7 @@ inline std::expected<void, StatusCode> AppendKv(
     }
     kv.k = std::move(*grown_k);
     kv.v = std::move(*grown_v);
-    if (q8) {
+    if (quantized) {
       auto grown_ks = backend.AllocateBuffer(new_capacity * 4,
                                              MemoryKind::Device);
       auto grown_vs = backend.AllocateBuffer(new_capacity * 4,
@@ -211,8 +213,8 @@ inline std::expected<void, StatusCode> AppendKv(
         scale_dst == nullptr) {
       return false;
     }
-    if (!QuantizeQ8Device(backend, *quant, row, *q8_scratch, *scale_scratch,
-                          kv_dim)) {
+    if (!QuantizeRowDevice(backend, *quant, row, *q8_scratch, *scale_scratch,
+                           kv_dim)) {
       return false;
     }
     return backend.CopyD2D(*q8_scratch, 0, dst, kv.rows * row_bytes, row_bytes)

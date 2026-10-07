@@ -146,6 +146,37 @@ std::expected<void, StatusCode> QuantizeQ8Ref(std::span<const float> in,
   return {};
 }
 
+std::expected<void, StatusCode> QuantizeQ4Ref(std::span<const float> in,
+                                              std::span<std::byte> out,
+                                              std::span<float> scale,
+                                              std::size_t rows,
+                                              std::size_t cols) {
+  if (rows == 0 || cols == 0 || cols % 8 != 0 || in.size() != rows * cols ||
+      out.size() != rows * cols / 2 || scale.size() != rows) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    float amax = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      amax = std::max(amax, std::abs(in[r * cols + c]));
+    }
+    const float s = amax > 0.0f ? amax / 7.0f : 1.0f;
+    scale[r] = s;
+    for (std::size_t c = 0; c < cols; c += 2) {
+      const auto quant = [&](std::size_t idx) {
+        const float x = in[r * cols + idx] / s;
+        long q = std::lround(x);
+        q = std::clamp<long>(q, -7, 7);
+        return static_cast<std::uint8_t>(static_cast<std::uint8_t>(q) & 0xF);
+      };
+      const std::uint8_t packed =
+          static_cast<std::uint8_t>(quant(c) | (quant(c + 1) << 4));
+      out[r * cols / 2 + c / 2] = static_cast<std::byte>(packed);
+    }
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> CastF32F16Ref(std::span<const float> in,
                                               std::span<std::byte> out) {
   if (in.size() % 2 != 0 || out.size() != in.size() * 2) {

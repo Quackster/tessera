@@ -16,6 +16,7 @@ enum class KvCacheType : int {
   F32 = 0,
   F16 = 1,
   Q8 = 2,
+  Q4 = 3,
 };
 
 // Status codes for result-style returns (runtime I/O, parsing, device errors).

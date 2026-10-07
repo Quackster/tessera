@@ -229,12 +229,14 @@ std::expected<void, StatusCode> RunFullBlock(
       !appended) {
     return std::unexpected(appended.error());
   }
+  const bool quantized =
+      kv.type == KvCacheType::Q8 || kv.type == KvCacheType::Q4;
   const bool attention_ok =
-      kv.type == KvCacheType::Q8
-          ? detail::AttentionQ8Device(backend, *h.attention_kernel, *h.q, *kv.k,
-                                      *kv.v, *kv.k_scale, *kv.v_scale, *h.attn,
-                                      kv.rows, heads, kv_heads, head_dim, pos,
-                                      0, 1)
+      quantized
+          ? detail::AttentionQuantDevice(backend, *h.attention_kernel, *h.q,
+                                         *kv.k, *kv.v, *kv.k_scale,
+                                         *kv.v_scale, *h.attn, kv.rows, heads,
+                                         kv_heads, head_dim, pos, 0, 1)
                 .has_value()
           : AttentionDevice(backend, *h.attention_kernel, *h.q, *kv.k, *kv.v,
                             *h.attn, kv.rows, heads, kv_heads, head_dim, pos,
@@ -291,9 +293,10 @@ std::expected<void, StatusCode> HybridForward(
         !load(h.sigmoid_gate_kernel, "sigmoid_gate") ||
         !load(h.qgate_split_kernel, "qgate_split") ||
         !load(h.mrope_kernel, "mrope") ||
-        !load(h.attention_kernel, cache.kv_type == KvCacheType::Q8
-                                       ? "attention_q8"
-                                       : "attention") ||
+        !load(h.attention_kernel,
+              cache.kv_type == KvCacheType::Q8   ? "attention_q8"
+              : cache.kv_type == KvCacheType::Q4 ? "attention_q4"
+                                                 : "attention") ||
         !load(h.repeat_heads_kernel, "repeat_heads") ||
         !load(h.l2norm_kernel, "l2norm") ||
         !load(h.ssm_gate_kernel, "ssm_gate") ||
@@ -319,14 +322,17 @@ std::expected<void, StatusCode> HybridForward(
         return std::unexpected(StatusCode::OutOfMemory);
       }
       h.kv_scratch = std::move(*kv_scratch);
-    } else if (cache.kv_type == KvCacheType::Q8) {
-      auto quant = backend.LoadKernel("quantize_q8", {});
+    } else if (cache.kv_type == KvCacheType::Q8 ||
+               cache.kv_type == KvCacheType::Q4) {
+      const bool q8 = cache.kv_type == KvCacheType::Q8;
+      auto quant =
+          backend.LoadKernel(q8 ? "quantize_q8" : "quantize_q4", {});
       if (!quant) {
         return std::unexpected(quant.error());
       }
       h.quant_kernel = std::move(*quant);
-      auto kv_scratch =
-          backend.AllocateBuffer(cache_kv_dim, MemoryKind::Device);
+      auto kv_scratch = backend.AllocateBuffer(
+          q8 ? cache_kv_dim : cache_kv_dim / 2, MemoryKind::Device);
       auto scale = backend.AllocateBuffer(4, MemoryKind::Device);
       if (!kv_scratch || !scale) {
         return std::unexpected(StatusCode::OutOfMemory);

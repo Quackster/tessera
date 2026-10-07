@@ -35,6 +35,15 @@ constexpr std::size_t kQ4KScaleBytes = 12;
     std::span<const float> in, std::span<std::byte> out,
     std::span<float> scale, std::size_t rows, std::size_t cols);
 
+// Host reference for the "quantize_q4" built-in: symmetric 4-bit over
+// rows x cols fp32 (per-row absmax scale amax/7, round half away from
+// zero, clamped to [-7, 7]). `out` is rows*cols/2 bytes (element 2i in the
+// low nibble, 2i+1 in the high) and `scale` has one fp32 per row. cols
+// must be a multiple of 8.
+[[nodiscard]] std::expected<void, StatusCode> QuantizeQ4Ref(
+    std::span<const float> in, std::span<std::byte> out,
+    std::span<float> scale, std::size_t rows, std::size_t cols);
+
 // Host reference for the "cast_f32_f16" built-in: encode `in` (an even
 // number of fp32) to fp16, little-endian, into `out` (in.size()*2 bytes).
 [[nodiscard]] std::expected<void, StatusCode> CastF32F16Ref(

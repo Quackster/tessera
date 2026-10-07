@@ -57,6 +57,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"cast_f32_f16", kCastF32F16SpirV, sizeof(kCastF32F16SpirV)},
     {"quantize_q8", kQuantizeQ8SpirV, sizeof(kQuantizeQ8SpirV)},
     {"attention_q8", kAttentionQ8SpirV, sizeof(kAttentionQ8SpirV)},
+    {"quantize_q4", kQuantizeQ4SpirV, sizeof(kQuantizeQ4SpirV)},
+    {"attention_q4", kAttentionQ4SpirV, sizeof(kAttentionQ4SpirV)},
     {"delta_step", kDeltaStepSpirV, sizeof(kDeltaStepSpirV)},
     {"mrope", kMropeSpirV, sizeof(kMropeSpirV)},
     {"qgate_split", kQgateSplitSpirV, sizeof(kQgateSplitSpirV)},

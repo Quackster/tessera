@@ -42,6 +42,39 @@ std::expected<void, StatusCode> RopeRef(std::span<float> io,
   return {};
 }
 
+std::expected<void, StatusCode> AttentionQ4Ref(
+    std::span<const float> q, std::span<const std::byte> k,
+    std::span<const std::byte> v, std::span<const float> k_scale,
+    std::span<const float> v_scale, std::span<float> out, std::size_t m,
+    std::size_t n, std::size_t heads, std::size_t kv_heads,
+    std::size_t head_dim, std::uint64_t q_base, std::size_t window) {
+  const std::size_t count = n * kv_heads * head_dim;
+  if (k.size() != count / 2 || v.size() != count / 2 ||
+      k_scale.size() != n || v_scale.size() != n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const auto nibble = [](std::span<const std::byte> bytes, std::size_t idx) {
+    const std::uint8_t byte = static_cast<std::uint8_t>(bytes[idx / 2]);
+    int value = static_cast<int>((byte >> ((idx % 2) * 4)) & 0xF);
+    value = (value & 0x8) != 0 ? value - 16 : value;
+    return value;
+  };
+  std::vector<float> kf(count);
+  std::vector<float> vf(count);
+  for (std::size_t j = 0; j < n; ++j) {
+    for (std::size_t d = 0; d < kv_heads * head_dim; ++d) {
+      kf[j * kv_heads * head_dim + d] =
+          static_cast<float>(nibble(k, j * kv_heads * head_dim + d)) *
+          k_scale[j];
+      vf[j * kv_heads * head_dim + d] =
+          static_cast<float>(nibble(v, j * kv_heads * head_dim + d)) *
+          v_scale[j];
+    }
+  }
+  return AttentionRef(q, std::span<const float>(kf), std::span<const float>(vf),
+                      out, m, n, heads, kv_heads, head_dim, q_base, window);
+}
+
 std::expected<void, StatusCode> AttentionQ8Ref(
     std::span<const float> q, std::span<const std::byte> k,
     std::span<const std::byte> v, std::span<const float> k_scale,

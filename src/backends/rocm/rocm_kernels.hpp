@@ -183,6 +183,18 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
                                   unsigned long long head_dim,
                                   unsigned long long q_base,
                                   unsigned long long window);
+__global__ void QuantizeQ4Kernel(const float* in, unsigned int* packed,
+                                 float* scale, unsigned long long rows,
+                                 unsigned long long cols);
+__global__ void AttentionQ4Kernel(const float* q, const unsigned int* k,
+                                  const unsigned int* v, const float* ks,
+                                  const float* vs, float* out,
+                                  unsigned long long m, unsigned long long n,
+                                  unsigned long long heads,
+                                  unsigned long long kv_heads,
+                                  unsigned long long head_dim,
+                                  unsigned long long q_base,
+                                  unsigned long long window);
 __global__ void CastF32F16Kernel(const float* in, unsigned int* out,
                                  unsigned long long n);
 __global__ void ConcatFeaturesKernel(const float* in, float* out,

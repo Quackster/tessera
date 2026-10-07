@@ -67,6 +67,16 @@ namespace tessera::core {
     std::size_t n, std::size_t heads, std::size_t kv_heads,
     std::size_t head_dim, std::uint64_t q_base, std::size_t window = 0);
 
+// Host reference for "attention_q4": symmetric 4-bit keys and values
+// (`k`/`v` are n x kv_heads*head_dim nibbles, two per byte) with one fp32
+// scale per key row. Decodes and runs AttentionRef.
+[[nodiscard]] std::expected<void, StatusCode> AttentionQ4Ref(
+    std::span<const float> q, std::span<const std::byte> k,
+    std::span<const std::byte> v, std::span<const float> k_scale,
+    std::span<const float> v_scale, std::span<float> out, std::size_t m,
+    std::size_t n, std::size_t heads, std::size_t kv_heads,
+    std::size_t head_dim, std::uint64_t q_base, std::size_t window = 0);
+
 // Host reference for attention with fp16 keys and values: `k` and `v`
 // hold n x kv_heads*head_dim fp16 elements (little-endian). Decodes them
 // and runs AttentionRef. Other arguments as AttentionRef.

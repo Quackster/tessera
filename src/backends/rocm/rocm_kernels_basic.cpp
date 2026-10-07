@@ -720,6 +720,101 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
   out[t] = acc / denom;
 }
 
+// Built-in "quantize_q4": one thread per row; symmetric 4-bit with a
+// per-row absmax scale, packed eight nibbles per word.
+__global__ void QuantizeQ4Kernel(const float* in, unsigned int* packed,
+                                 float* scale, unsigned long long rows,
+                                 unsigned long long cols) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  const unsigned long long base = r * cols;
+  float amax = 0.0f;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    amax = fmaxf(amax, fabsf(in[base + c]));
+  }
+  const float s = amax > 0.0f ? amax / 7.0f : 1.0f;
+  scale[r] = s;
+  const unsigned long long words = cols / 8;
+  for (unsigned long long w = 0; w < words; ++w) {
+    unsigned int word = 0u;
+    for (unsigned int b = 0u; b < 8u; ++b) {
+      const float x = in[base + w * 8 + b] / s;
+      int q = static_cast<int>(x >= 0.0f ? floorf(x + 0.5f) : ceilf(x - 0.5f));
+      q = q < -7 ? -7 : (q > 7 ? 7 : q);
+      word |= (static_cast<unsigned int>(q) & 0xFu) << (b * 4u);
+    }
+    packed[r * words + w] = word;
+  }
+}
+
+// Built-in "attention_q4": GQA with symmetric 4-bit keys/values.
+__global__ void AttentionQ4Kernel(const float* q, const unsigned int* k,
+                                  const unsigned int* v, const float* ks,
+                                  const float* vs, float* out,
+                                  unsigned long long m, unsigned long long n,
+                                  unsigned long long heads,
+                                  unsigned long long kv_heads,
+                                  unsigned long long head_dim,
+                                  unsigned long long q_base,
+                                  unsigned long long window) {
+  const unsigned long long t =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= m * heads * head_dim) {
+    return;
+  }
+  const unsigned long long i = t / (heads * head_dim);
+  const unsigned long long rem = t % (heads * head_dim);
+  const unsigned long long h = rem / head_dim;
+  const unsigned long long e = rem % head_dim;
+  const unsigned long long kv = h / (heads / kv_heads);
+  const unsigned long long pos = q_base + i;
+  const unsigned long long last = pos >= n ? n - 1 : pos;
+  unsigned long long start =
+      (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+  if (start > last) {
+    start = last;
+  }
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  const unsigned long long q_base_idx = (i * heads + h) * head_dim;
+  const auto nib = [](unsigned long long idx, unsigned int word, float s) {
+    int value = static_cast<int>((word >> ((idx & 7u) << 2u)) & 0xFu);
+    value = (value & 0x8) != 0 ? value - 16 : value;
+    return static_cast<float>(value) * s;
+  };
+  float row_max = 0.0f;
+  bool first = true;
+  for (unsigned long long j = start; j <= last; ++j) {
+    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
+    float dot = 0.0f;
+    for (unsigned long long d = 0; d < head_dim; ++d) {
+      dot = fmaf(q[q_base_idx + d],
+                 nib(k_base + d, k[(k_base + d) >> 3], ks[j]), dot);
+    }
+    dot *= scale;
+    if (first || dot > row_max) {
+      row_max = dot;
+      first = false;
+    }
+  }
+  float acc = 0.0f;
+  float denom = 0.0f;
+  for (unsigned long long j = start; j <= last; ++j) {
+    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
+    float dot = 0.0f;
+    for (unsigned long long d = 0; d < head_dim; ++d) {
+      dot = fmaf(q[q_base_idx + d],
+                 nib(k_base + d, k[(k_base + d) >> 3], ks[j]), dot);
+    }
+    const float w = expf(dot * scale - row_max);
+    denom += w;
+    acc = fmaf(w, nib(k_base + e, v[(k_base + e) >> 3], vs[j]), acc);
+  }
+  out[t] = acc / denom;
+}
+
 // Built-in "cast_f32_f16": two fp32 -> one packed fp16 word.
 __global__ void CastF32F16Kernel(const float* in, unsigned int* out,
                                  unsigned long long n) {

@@ -11,7 +11,7 @@ namespace tessera::core {
 namespace {
 
 using detail::AppendKv;
-using detail::AttentionQ8Device;
+using detail::AttentionQuantDevice;
 using detail::DownloadF32;
 using detail::GatherEmbedding;
 using detail::AttentionDevice;
@@ -64,8 +64,9 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
         !load(state->silu_mul_kernel, "silu_mul") ||
         !load(state->rope_kernel, "rope") ||
         !load(state->attention_kernel,
-              cache.kv_type == KvCacheType::Q8 ? "attention_q8"
-                                               : "attention")) {
+              cache.kv_type == KvCacheType::Q8   ? "attention_q8"
+              : cache.kv_type == KvCacheType::Q4 ? "attention_q4"
+                                                 : "attention")) {
       return std::unexpected(StatusCode::DeviceError);
     }
     if (cache.kv_type == KvCacheType::F16) {
@@ -77,11 +78,16 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
         return std::unexpected(StatusCode::OutOfMemory);
       }
       state->kv_scratch = std::move(*scratch);
-    } else if (cache.kv_type == KvCacheType::Q8) {
-      if (!load(state->quant_kernel, "quantize_q8")) {
+    } else if (cache.kv_type == KvCacheType::Q8 ||
+               cache.kv_type == KvCacheType::Q4) {
+      const std::size_t quant_bytes =
+          cache.kv_type == KvCacheType::Q8 ? kv_dim : kv_dim / 2;
+      if (!load(state->quant_kernel, cache.kv_type == KvCacheType::Q8
+                                         ? "quantize_q8"
+                                         : "quantize_q4")) {
         return std::unexpected(StatusCode::DeviceError);
       }
-      auto scratch = backend.AllocateBuffer(kv_dim, MemoryKind::Device);
+      auto scratch = backend.AllocateBuffer(quant_bytes, MemoryKind::Device);
       auto scale = backend.AllocateBuffer(4, MemoryKind::Device);
       if (!scratch || !scale) {
         return std::unexpected(StatusCode::OutOfMemory);
@@ -203,11 +209,13 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
         !appended) {
       return std::unexpected(appended.error());
     }
+    const bool quantized =
+        kv.type == KvCacheType::Q8 || kv.type == KvCacheType::Q4;
     const bool attention_ok =
-        kv.type == KvCacheType::Q8
-            ? AttentionQ8Device(backend, *st.attention_kernel, *st.q, *kv.k,
-                                *kv.v, *kv.k_scale, *kv.v_scale, *st.attn,
-                                kv.rows, heads, kv_heads, head_dim, pos, 0, 1)
+        quantized
+            ? AttentionQuantDevice(backend, *st.attention_kernel, *st.q, *kv.k,
+                                   *kv.v, *kv.k_scale, *kv.v_scale, *st.attn,
+                                   kv.rows, heads, kv_heads, head_dim, pos, 0, 1)
                   .has_value()
             : AttentionDevice(backend, *st.attention_kernel, *st.q, *kv.k,
                               *kv.v, *st.attn, kv.rows, heads, kv_heads,
