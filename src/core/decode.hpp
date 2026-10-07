@@ -177,7 +177,8 @@ HybridDecodeLogits(Backend& backend, const Model& model, DecodeCache& cache,
                    std::uint32_t token,
                    std::vector<float>* hidden_out = nullptr,
                    const std::vector<std::size_t>* capture_layers = nullptr,
-                   std::vector<Buffer*>* capture = nullptr);
+                   std::vector<Buffer*>* capture = nullptr,
+                   const Buffer* embedding = nullptr);
 
 // The full vocab logits for one device-resident vanilla step.
 [[nodiscard]] std::expected<std::vector<float>, StatusCode>
@@ -192,7 +193,8 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out = nullptr,
     const std::vector<std::size_t>* capture_layers = nullptr,
-    std::vector<Buffer*>* capture = nullptr);
+    std::vector<Buffer*>* capture = nullptr,
+    const Buffer* embedding = nullptr);
 
 // The block forward of one device-resident vanilla step without the head.
 [[nodiscard]] std::expected<void, StatusCode> DecodeStepDeviceForward(
@@ -204,7 +206,8 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
 // device path. Use for prompt tokens that do not need logits.
 [[nodiscard]] std::expected<void, StatusCode> DecodeForward(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr,
+    const Buffer* embedding = nullptr);
 
 // One decoder step returning the vocab logits instead of the argmax
 // token. Dispatches to the hybrid or device path, preserving the cache
@@ -214,7 +217,8 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out = nullptr,
     const std::vector<std::size_t>* capture_layers = nullptr,
-    std::vector<Buffer*>* capture = nullptr);
+    std::vector<Buffer*>* capture = nullptr,
+    const Buffer* embedding = nullptr);
 
 // Score a token sequence with a fresh cache: run each token in order and
 // return the logits at every position (row i is the distribution after

@@ -660,3 +660,51 @@ TEST(HybridDecodeTest, Q4KvDecodesDeterministically) {
   ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
   EXPECT_EQ(*again, *first);
 }
+
+// A precomputed embedding buffer (an image token) is equivalent to the
+// gathered embedding of the same token.
+TEST(HybridDecodeTest, FeedEmbeddingMatchesToken) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value()) << tessera::ToString(cfg.error());
+  const std::size_t hidden = cfg->hidden_dim;
+  const tessera::DeviceTensor* embed = nullptr;
+  for (const auto& weight : (*model)->Weights()) {
+    if (weight.manifest.name == "token_embd.weight") {
+      embed = &weight;
+    }
+  }
+  ASSERT_NE(embed, nullptr);
+  std::vector<float> row(hidden);
+  ASSERT_TRUE(tessera::core::detail::GatherEmbedding(engine->Owner(), *embed, 0,
+                                                     hidden, row)
+                  .has_value());
+  auto buffer = engine->Owner().AllocateBuffer(hidden * 4,
+                                               tessera::MemoryKind::Device);
+  ASSERT_TRUE(buffer.has_value());
+  engine->Owner().CopyH2D(**buffer, std::span<const std::byte>(
+                                       reinterpret_cast<const std::byte*>(
+                                           row.data()),
+                                       row.size() * 4));
+
+  tessera::core::DecodeCache token_cache;
+  auto a = tessera::core::DecodeForward(engine->Owner(), **model, token_cache,
+                                        0);
+  ASSERT_TRUE(a.has_value()) << tessera::ToString(a.error());
+  auto logits_a = tessera::core::DecodeLogits(engine->Owner(), **model,
+                                              token_cache, 1);
+  ASSERT_TRUE(logits_a.has_value()) << tessera::ToString(logits_a.error());
+
+  tessera::core::DecodeCache embed_cache;
+  auto b = tessera::core::DecodeForward(engine->Owner(), **model, embed_cache,
+                                        0, nullptr, buffer->get());
+  ASSERT_TRUE(b.has_value()) << tessera::ToString(b.error());
+  auto logits_b = tessera::core::DecodeLogits(engine->Owner(), **model,
+                                              embed_cache, 1);
+  ASSERT_TRUE(logits_b.has_value()) << tessera::ToString(logits_b.error());
+  EXPECT_EQ(*logits_a, *logits_b);
+}

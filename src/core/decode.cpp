@@ -26,7 +26,8 @@ std::expected<void, StatusCode> DecodeForward(Backend& backend,
                                               const Model& model,
                                               DecodeCache& cache,
                                               std::uint32_t token,
-                                              std::vector<float>* hidden) {
+                                              std::vector<float>* hidden,
+                                              const Buffer* embedding) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -35,7 +36,11 @@ std::expected<void, StatusCode> DecodeForward(Backend& backend,
     if (!cache.hybrid) {
       cache.hybrid = std::make_unique<HybridDecodeCache>();
     }
-    return HybridForward(backend, model, cache, token, hidden);
+    return HybridForward(backend, model, cache, token, hidden, nullptr, nullptr,
+                         embedding);
+  }
+  if (embedding != nullptr) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
   }
   return DecodeStepDeviceForward(backend, model, cache, token, hidden);
 }
@@ -44,7 +49,7 @@ std::expected<std::vector<float>, StatusCode> DecodeLogits(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden,
     const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture) {
+    std::vector<Buffer*>* capture, const Buffer* embedding) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -54,7 +59,10 @@ std::expected<std::vector<float>, StatusCode> DecodeLogits(
       cache.hybrid = std::make_unique<HybridDecodeCache>();
     }
     return HybridDecodeLogits(backend, model, cache, token, hidden,
-                              capture_layers, capture);
+                              capture_layers, capture, embedding);
+  }
+  if (embedding != nullptr) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
   }
   return DecodeStepDeviceLogits(backend, model, cache, token, hidden);
 }

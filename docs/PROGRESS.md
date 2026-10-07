@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 226/226 on both builds.
+`ctest` passes 227/227 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -783,6 +783,13 @@ through RADV GFX1201, rocm through the system ROCm).
   merger weights, and `Encode` runs patchify -> stack -> merger to
   image embeddings. The real Qwen3.8 mmproj loads and encodes a
   synthetic image to finite embeddings.
+
+- 2026-10-07: image-embedding injection (227/227 `ctest` on both
+  builds). Current head. `DecodeForward`/`DecodeLogits` (and the hybrid
+  forward) take an optional device embedding buffer that replaces the
+  gathered token embedding, so a precomputed image embedding can be fed
+  as a prompt token. Test: feeding a gathered embedding buffer equals
+  decoding the same token.
 
 ## Next (in order)
 

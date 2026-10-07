@@ -256,7 +256,8 @@ std::expected<void, StatusCode> RunFullBlock(
 std::expected<void, StatusCode> HybridForward(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out,
-    const std::vector<std::size_t>* capture_layers, std::vector<Buffer*>* capture) {
+    const std::vector<std::size_t>* capture_layers, std::vector<Buffer*>* capture,
+    const Buffer* embedding) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -352,7 +353,13 @@ std::expected<void, StatusCode> HybridForward(
   if (!embed) {
     return std::unexpected(embed.error());
   }
-  if ((*embed)->manifest.dtype == DType::F32) {
+  if (embedding != nullptr) {
+    // A precomputed embedding (an image token) replaces the gathered row.
+    if (embedding->Size() < hidden * 4 ||
+        !backend.CopyD2D(*embedding, 0, *h.x, 0, hidden * 4)) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+  } else if ((*embed)->manifest.dtype == DType::F32) {
     const std::size_t offset = static_cast<std::size_t>(token) * hidden * 4;
     auto copy = backend.CopyD2D(*(*embed)->device, offset, *h.x, 0, hidden * 4);
     if (!copy) {
@@ -535,9 +542,9 @@ std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture) {
+    std::vector<Buffer*>* capture, const Buffer* embedding) {
   auto forward = HybridForward(backend, model, cache, token, hidden_out,
-                               capture_layers, capture);
+                               capture_layers, capture, embedding);
   if (!forward) {
     return std::unexpected(forward.error());
   }
