@@ -136,6 +136,17 @@ class Kernel {
 // output C (fp32, m x n); scalar 0 is k (a positive multiple of
 // kQ4KBlockElements), scalar 1 is n, scalar 2 is m. The dispatch is
 // ceil(m * n / 256) workgroups of 256.
+// "rope": buffer 0 holds rows x heads x head_dim fp32 rotated in place
+// (NeoX pairing over rope_dim per head); scalars are rows, heads,
+// head_dim, rope_dim, pos_base, and the fp32 theta bits. head_dim and
+// rope_dim are even, rope_dim <= head_dim. The dispatch is
+// ceil(rows * heads * (rope_dim / 2) / 256) workgroups of 256.
+// "attention": buffers are q (m x heads*head_dim fp32), k and v
+// (n x kv_heads*head_dim each), out (m x heads*head_dim); scalars are
+// m, n, heads, kv_heads, head_dim, q_base. Query row i sits at
+// position q_base + i and attends keys 0..pos (clamped to n - 1) with
+// scale 1/sqrt(head_dim); head h reads kv head h / (heads/kv_heads).
+// The dispatch is ceil(m * heads * head_dim / 256) workgroups of 256.
 [[nodiscard]] inline StatusCode CheckBuiltInArgs(const Kernel& kernel,
                                                  const KernelLaunch& launch) {
   if (kernel.Id() == "fill" &&
@@ -149,6 +160,30 @@ class Kernel {
     const std::uint64_t k = launch.scalars[0];
     if (k == 0 || k % kQ4KBlockElements != 0 || launch.scalars[1] == 0 ||
         launch.scalars[2] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "rope") {
+    if (launch.buffers.size() != 1 || launch.scalars.size() != 6) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t head_dim = launch.scalars[2];
+    const std::uint64_t rope_dim = launch.scalars[3];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || head_dim == 0 ||
+        rope_dim == 0 || rope_dim > head_dim || (head_dim % 2) != 0 ||
+        (rope_dim % 2) != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "attention") {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 6) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t heads = launch.scalars[2];
+    const std::uint64_t kv_heads = launch.scalars[3];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
+        kv_heads == 0 || launch.scalars[4] == 0 ||
+        (heads % kv_heads) != 0) {
       return StatusCode::InvalidArgument;
     }
   }

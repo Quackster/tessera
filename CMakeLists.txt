@@ -20,6 +20,7 @@ add_library(tessera STATIC
     src/core/loaders/safetensors.cpp
     src/core/numerics/quant.cpp
     src/core/numerics/gemm.cpp
+    src/core/numerics/attention.cpp
     src/spec/dflash2.cpp
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
@@ -38,8 +39,8 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/vulkan_kernels)
     # Parallel lists: kernel file stems and their generated array
     # name prefixes.
-    set(TESSERA_KERNEL_STEMS fill gemm_q4k)
-    set(TESSERA_KERNEL_NAMES Fill GemmQ4k)
+    set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope)
+    set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope)
     set(TESSERA_KERNEL_HEADER
 "#pragma once
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.

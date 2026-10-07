@@ -86,6 +86,24 @@ enum class DType : int {
 // contract and the weight loaders.
 constexpr std::size_t kQ4KBlockElements = 256;
 
+// Attention architecture parameters, parsed from the model definition
+// (Model::Attention). Query heads share key/value heads in groups of
+// heads / kv_heads (grouped-query attention). RoPE rotates rope_dim
+// elements of every head with base rope_theta; the tail of a wider
+// head is left alone. All fields come from model data; no kernel
+// branches on the architecture.
+//
+// Usage:
+//   auto params = model.Attention();
+//   if (params) launch.buffers = {...};  // heads=params->heads, ...
+struct AttentionParams {
+  std::size_t heads = 0;
+  std::size_t kv_heads = 0;
+  std::size_t head_dim = 0;
+  std::size_t rope_dim = 0;
+  double rope_theta = 10000.0;
+};
+
 // Dense tensor shape, at most 4 dimensions, row-major.
 //
 // Usage:

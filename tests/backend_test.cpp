@@ -4,12 +4,16 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <span>
+#include <string_view>
 #include <vector>
 
+#include "core/numerics/attention.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/quant.hpp"
+#include "test_helpers.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/types.hpp"
 
@@ -18,6 +22,12 @@ using tessera::CreateBackend;
 using tessera::MemoryKind;
 using tessera::StatusCode;
 using tessera::kQ4KBlockElements;
+using tessera::testing::BlockU16;
+using tessera::testing::DrawValue;
+using tessera::testing::GemmTolerance;
+using tessera::testing::QuantizeRows;
+using tessera::testing::TestGetScaleMin;
+using tessera::testing::ToleranceFor;
 namespace core = tessera::core;
 
 namespace {
@@ -33,74 +43,6 @@ void MakeBackendOrSkip(std::unique_ptr<Backend>& backend) {
     GTEST_SKIP() << "no device available: "
                  << tessera::ToString(init.error());
   }
-}
-
-// Per backend tolerance (AGENTS.md: assert per backend tolerance, never
-// a single hard-coded epsilon). Both backends run fp32 sequential
-// accumulation; the table is the assertion point per device.
-struct GemmTolerance {
-  float abs = 0.0f;
-  float rel = 0.0f;
-};
-GemmTolerance ToleranceFor(std::string_view backend) {
-  if (backend == "vulkan") {
-    return {1.0e-4f, 1.0e-5f};
-  }
-  if (backend == "rocm") {
-    return {1.0e-4f, 1.0e-5f};
-  }
-  return {1.0e-3f, 1.0e-4f};
-}
-
-// Deterministic draw in [-1, 1] (fixed seeds, no wall clock).
-float DrawValue(std::mt19937& rng) {
-  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-  return dist(rng);
-}
-
-// The 6-bit scale/min pair of sub-block j (test oracle mirroring the
-// core packing).
-void TestGetScaleMin(std::size_t j, const std::byte* scales,
-                     std::uint8_t* scale, std::uint8_t* min) {
-  const auto byte = [scales](std::size_t i) {
-    return static_cast<std::uint8_t>(scales[i]);
-  };
-  if (j < 4) {
-    *scale = byte(j) & 63;
-    *min = byte(j + 4) & 63;
-  } else {
-    *scale = (byte(j + 4) & 15) | ((byte(j - 4) >> 6) << 4);
-    *min = (byte(j + 4) >> 4) | ((byte(j) >> 6) << 4);
-  }
-}
-
-// Quantize n rows of k values (k % 256 == 0) into Q4_K blocks.
-std::vector<std::byte> QuantizeRows(const std::vector<float>& values,
-                                    std::size_t n, std::size_t k) {
-  std::vector<std::byte> out(n * (k / kQ4KBlockElements) *
-                            core::kQ4KBlockBytes);
-  std::vector<float> block(kQ4KBlockElements);
-  for (std::size_t r = 0; r < n; ++r) {
-    for (std::size_t b = 0; b < k / kQ4KBlockElements; ++b) {
-      for (std::size_t i = 0; i < kQ4KBlockElements; ++i) {
-        block[i] = values[r * k + b * kQ4KBlockElements + i];
-      }
-      core::QuantizeQ4K(
-          std::span<const float>(block),
-          out.data() + (r * (k / kQ4KBlockElements) + b) *
-              core::kQ4KBlockBytes);
-    }
-  }
-  return out;
-}
-
-// The fp16 header bytes of a block, read little-endian.
-std::uint16_t BlockU16(const std::byte* block, std::size_t offset) {
-  return static_cast<std::uint16_t>(
-      static_cast<std::uint16_t>(
-          static_cast<std::uint8_t>(block[offset])) |
-      (static_cast<std::uint16_t>(
-          static_cast<std::uint8_t>(block[offset + 1])) << 8));
 }
 
 }  // namespace
@@ -558,4 +500,231 @@ TEST(BackendTest, GemmQ4KDeviceMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
   EXPECT_LE(max_rel, tol.rel)
       << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Per backend attention tolerance (same shape as the GEMM table).
+struct AttentionTolerance {
+  float abs = 0.0f;
+  float rel = 0.0f;
+};
+AttentionTolerance AttentionToleranceFor(std::string_view backend) {
+  if (backend == "vulkan") {
+    return {2.0e-4f, 2.0e-4f};
+  }
+  if (backend == "rocm") {
+    return {2.0e-4f, 2.0e-4f};
+  }
+  return {1.0e-3f, 1.0e-3f};
+}
+
+// Device: in-place RoPE matches the host reference (8 rows, 4 heads,
+// head dim 32 with the first 16 rotated, positions start at 5).
+TEST(BackendTest, RopeDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(99);
+  constexpr std::size_t kRows = 8;
+  constexpr std::size_t kHeads = 4;
+  constexpr std::size_t kDim = 32;
+  constexpr std::size_t kRopeDim = 16;
+  constexpr std::uint64_t kPosBase = 5;
+  constexpr float kTheta = 10000.0f;
+  std::vector<float> io(kRows * kHeads * kDim);
+  for (auto& v : io) {
+    v = DrawValue(rng);
+  }
+  auto buffer = backend->AllocateBuffer(io.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(buffer.has_value()) << tessera::ToString(buffer.error());
+  auto upload = backend->CopyH2D(**buffer, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(io.data()), io.size() * 4));
+  ASSERT_TRUE(upload.has_value()) << tessera::ToString(upload.error());
+
+  std::uint32_t theta_bits = 0;
+  static_assert(sizeof(theta_bits) == sizeof(kTheta));
+  std::memcpy(&theta_bits, &kTheta, sizeof(theta_bits));
+  auto kernel = backend->LoadKernel("rope", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows * kHeads * (kRopeDim / 2) + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*buffer).get()};
+  launch.scalars = {kRows, kHeads, kDim, kRopeDim, kPosBase, theta_bits};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(io.size() * 4);
+  auto download =
+      backend->CopyD2H(**buffer, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref = io;
+  auto ref_status = core::RopeRef(std::span<float>(ref), kRows, kHeads,
+                                  kDim, kRopeDim, kPosBase, kTheta);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(device_out[i] - ref[i]);
+    const float r =
+        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, r);
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Device: causal GQA attention matches the host reference (2 queries
+// over 4 keys, 4 heads in 2 kv groups, query positions start at 3 so
+// the second row clamps to the last key).
+TEST(BackendTest, AttentionDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(1234);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 4;
+  constexpr std::size_t kHeads = 4;
+  constexpr std::size_t kKvHeads = 2;
+  constexpr std::size_t kDim = 16;
+  constexpr std::uint64_t kQBase = 3;
+  std::vector<float> q(kM * kHeads * kDim);
+  std::vector<float> k(kN * kKvHeads * kDim);
+  std::vector<float> v(kN * kKvHeads * kDim);
+  for (auto& x : q) {
+    x = DrawValue(rng);
+  }
+  for (auto& x : k) {
+    x = DrawValue(rng);
+  }
+  for (auto& x : v) {
+    x = DrawValue(rng);
+  }
+  auto q_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  auto k_buf = backend->AllocateBuffer(k.size() * 4, MemoryKind::Device);
+  auto v_buf = backend->AllocateBuffer(v.size() * 4, MemoryKind::Device);
+  auto out_buf =
+      backend->AllocateBuffer(kM * kHeads * kDim * 4, MemoryKind::Device);
+  ASSERT_TRUE(q_buf.has_value() && k_buf.has_value() &&
+              v_buf.has_value() && out_buf.has_value());
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(q_buf, q).has_value());
+  ASSERT_TRUE(upload(k_buf, k).has_value());
+  ASSERT_TRUE(upload(v_buf, v).has_value());
+
+  auto kernel = backend->LoadKernel("attention", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
+                    (*out_buf).get()};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(kM * kHeads * kDim * 4);
+  auto download =
+      backend->CopyD2H(**out_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kHeads * kDim);
+  auto ref_status = core::AttentionRef(
+      std::span<const float>(q), std::span<const float>(k),
+      std::span<const float>(v), std::span<float>(ref), kM, kN, kHeads,
+      kKvHeads, kDim, kQBase);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(device_out[i] - ref[i]);
+    const float r =
+        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, r);
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Host: the attention references reject malformed shapes at the
+// boundary (zero dims, rope range wider than the head, size gaps,
+// heads that do not split into kv groups).
+TEST(BackendTest, AttentionRefsRejectBadArgs) {
+  std::vector<float> io(2 * 2 * 8, 1.0f);
+  auto bad = core::RopeRef(std::span<float>(io), 0, 2, 8, 8, 0, 1e4);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  bad = core::RopeRef(std::span<float>(io), 2, 2, 8, 16, 0, 1e4);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_io(8, 1.0f);
+  bad = core::RopeRef(std::span<float>(short_io), 2, 2, 8, 8, 0, 1e4);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+
+  std::vector<float> q(2 * 4 * 8, 0.5f);
+  std::vector<float> k(4 * 2 * 8, 0.5f);
+  std::vector<float> v(4 * 2 * 8, 0.5f);
+  std::vector<float> out(2 * 4 * 8);
+  auto bad_attn = core::AttentionRef(
+      std::span<const float>(q), std::span<const float>(k),
+      std::span<const float>(v), std::span<float>(out), 2, 4, 4, 3, 8, 0);
+  ASSERT_FALSE(bad_attn.has_value());
+  EXPECT_EQ(bad_attn.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_q(8, 0.5f);
+  bad_attn = core::AttentionRef(
+      std::span<const float>(short_q), std::span<const float>(k),
+      std::span<const float>(v), std::span<float>(out), 2, 4, 4, 2, 8, 0);
+  ASSERT_FALSE(bad_attn.has_value());
+  EXPECT_EQ(bad_attn.error(), StatusCode::InvalidArgument);
+}
+
+// Device: the rope and attention contracts (backend.hpp) reject bad
+// shapes before anything reaches the device.
+TEST(BackendTest, AttentionRejectsBadContract) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto rope = backend->LoadKernel("rope", {});
+  ASSERT_TRUE(rope.has_value()) << tessera::ToString(rope.error());
+  auto attention = backend->LoadKernel("attention", {});
+  ASSERT_TRUE(attention.has_value())
+      << tessera::ToString(attention.error());
+
+  tessera::KernelLaunch launch;
+  // Rope wants 1 buffer and 6 scalars.
+  launch.scalars = {8, 4, 32, 16, 0, 0};
+  auto no_buffers = backend->LaunchKernel(**rope, launch);
+  ASSERT_FALSE(no_buffers.has_value());
+  EXPECT_EQ(no_buffers.error(), StatusCode::InvalidArgument);
+  // Attention wants 4 buffers and 6 scalars; 3 heads do not split
+  // into 2 kv groups.
+  const std::vector<const tessera::Buffer*> three_buffers{
+      nullptr, nullptr, nullptr};
+  const std::vector<const tessera::Buffer*> four_buffers{
+      nullptr, nullptr, nullptr, nullptr};
+  launch.buffers = three_buffers;
+  launch.scalars = {1, 4, 4, 2, 16, 0};
+  auto short_buffers = backend->LaunchKernel(**attention, launch);
+  ASSERT_FALSE(short_buffers.has_value());
+  EXPECT_EQ(short_buffers.error(), StatusCode::InvalidArgument);
+  launch.buffers = four_buffers;
+  launch.scalars = {1, 4, 3, 2, 16, 0};
+  auto bad_groups = backend->LaunchKernel(**attention, launch);
+  ASSERT_FALSE(bad_groups.has_value());
+  EXPECT_EQ(bad_groups.error(), StatusCode::InvalidArgument);
 }

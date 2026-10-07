@@ -18,7 +18,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | DFlash2 | Skeleton | Validates checkpoint layout. Draft logic is in work. |
 | CLI | Partial | Validates load path. Prints tensor summary. No decode loop yet. |
 | GEMM | Done | Generic GEMM with Q4_K dequant. Host reference check. Per backend tolerance. |
-| Attention and RoPE | Todo | GQA path driven by model data. RoPE kernel is in work. |
+| Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
 | Weight upload | Todo | Manifest to device buffers. Completes `Model::Load`. |
 | Decode loop | Todo | Single token generation in core. Smoke test on GGUF model. |
 | MXFP4 path | Todo | Full tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights. |

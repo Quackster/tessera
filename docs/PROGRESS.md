@@ -26,7 +26,12 @@ The boilerplate is complete and passes on both backends:
 - Generic GEMM kernel with GGUF Q4_K dequantization (fp32
   accumulation). A host reference check verifies it on both devices
   with per backend tolerance.
-- Single GoogleTest target. `ctest` passes 76/76 on both builds.
+- Attention (GQA) and RoPE kernels driven by the model definition.
+  `Model::Attention` reads heads, kv groups, head dim and the RoPE
+  range and base from GGUF metadata. The generic "rope" and
+  "attention" built-ins take all dims as launch scalars and are
+  verified against host references on both devices.
+- Single GoogleTest target. `ctest` passes 84/84 on both builds.
   Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
   through RADV GFX1201, rocm through the system ROCm).
 
@@ -57,24 +62,32 @@ The boilerplate is complete and passes on both backends:
   The ROCm device helpers carry `__host__ __device__` (first ROCm
   build). The fix was verified on RADV and also reproduces on
   llvmpipe, so it is a backend bug, not a driver bug.
+- 2026-10-07: attention (GQA) and RoPE kernels (84/84 `ctest` on
+  both builds). `Model::Attention` parses the attention config from
+  GGUF metadata (`<arch>.attention.head_count`, head_count_kv,
+  embedding_length, `<arch>.rope.dimension_count`, rope.freq_base).
+  New generic built-ins "rope" (NeoX pairing, in place) and
+  "attention" (causal GQA, scale 1/sqrt(d)) on vulkan (GLSL) and
+  rocm (HIP), checked against fp32 host references with per backend
+  tolerance. Shared test helpers moved to `tests/test_helpers.hpp`;
+  `tests/backend_test.cpp` exceeds 600 lines once (owner approved).
 
 ## Next (in order)
 
-1. **Attention (GQA) and RoPE kernels** driven by the model definition.
-2. **Weight upload**: manifest to device buffers via the backend.
+1. **Weight upload**: manifest to device buffers via the backend.
    Complete `Model::Load`. Today it only validates and parses the
    manifest.
-3. **Decode loop**: single token generation in the core (backend
+2. **Decode loop**: single token generation in the core (backend
    agnostic). End to end smoke on `Qwen3.8-27B-UD-Q4_K_M`.
-4. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
+3. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
    the fixed schema, decision pending). fp8 and mxfp4 GEMM kernels.
    MTP-FP8 draft weights.
-5. **DFlash2**: local dynamic convolution (grouped causal convolutions),
+4. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
-6. **Baseline pinning**: run the non speculative path on both backends.
+5. **Baseline pinning**: run the non speculative path on both backends.
    Record per backend tolerance. Assert in tests (fixed seeds).
-7. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+6. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. Models are data. No per model branches.
 
 ## Notes and decisions

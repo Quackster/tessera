@@ -3,13 +3,19 @@
 // Shared helpers for the tessera test suite (single test binary; see
 // AGENTS.md "Building and Testing").
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <random>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include "core/numerics/quant.hpp"
 
 namespace tessera::testing {
 
@@ -229,6 +235,74 @@ inline std::vector<std::byte> MakeSafetensorsContainer(
     out.push_back(static_cast<std::byte>(c));
   }
   return out;
+}
+
+// Per backend tolerance (AGENTS.md: assert per backend tolerance, never
+// a single hard-coded epsilon). Both backends run fp32 sequential
+// accumulation; the table is the assertion point per device.
+struct GemmTolerance {
+  float abs = 0.0f;
+  float rel = 0.0f;
+};
+inline GemmTolerance ToleranceFor(std::string_view backend) {
+  if (backend == "vulkan") {
+    return {1.0e-4f, 1.0e-5f};
+  }
+  if (backend == "rocm") {
+    return {1.0e-4f, 1.0e-5f};
+  }
+  return {1.0e-3f, 1.0e-4f};
+}
+
+// Deterministic draw in [-1, 1] (fixed seeds, no wall clock).
+inline float DrawValue(std::mt19937& rng) {
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  return dist(rng);
+}
+
+// The 6-bit scale/min pair of sub-block j (test oracle mirroring the
+// core packing).
+inline void TestGetScaleMin(std::size_t j, const std::byte* scales,
+                            std::uint8_t* scale, std::uint8_t* min) {
+  const auto byte = [scales](std::size_t i) {
+    return static_cast<std::uint8_t>(scales[i]);
+  };
+  if (j < 4) {
+    *scale = byte(j) & 63;
+    *min = byte(j + 4) & 63;
+  } else {
+    *scale = (byte(j + 4) & 15) | ((byte(j - 4) >> 6) << 4);
+    *min = (byte(j + 4) >> 4) | ((byte(j) >> 6) << 4);
+  }
+}
+
+// Quantize n rows of k values (k % 256 == 0) into Q4_K blocks.
+inline std::vector<std::byte> QuantizeRows(const std::vector<float>& values,
+                                           std::size_t n, std::size_t k) {
+  std::vector<std::byte> out(n * (k / tessera::kQ4KBlockElements) *
+                             core::kQ4KBlockBytes);
+  std::vector<float> block(tessera::kQ4KBlockElements);
+  for (std::size_t r = 0; r < n; ++r) {
+    for (std::size_t b = 0; b < k / tessera::kQ4KBlockElements; ++b) {
+      for (std::size_t i = 0; i < tessera::kQ4KBlockElements; ++i) {
+        block[i] = values[r * k + b * tessera::kQ4KBlockElements + i];
+      }
+      core::QuantizeQ4K(
+          std::span<const float>(block),
+          out.data() + (r * (k / tessera::kQ4KBlockElements) + b) *
+              core::kQ4KBlockBytes);
+    }
+  }
+  return out;
+}
+
+// The fp16 header bytes of a block, read little-endian.
+inline std::uint16_t BlockU16(const std::byte* block, std::size_t offset) {
+  return static_cast<std::uint16_t>(
+      static_cast<std::uint16_t>(
+          static_cast<std::uint8_t>(block[offset])) |
+      (static_cast<std::uint16_t>(
+          static_cast<std::uint8_t>(block[offset + 1])) << 8));
 }
 
 // A config.json placeholder good enough for layout checks.

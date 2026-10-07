@@ -31,6 +31,8 @@ struct BuiltInKernel {
 const BuiltInKernel kBuiltInKernels[] = {
     {"fill", kFillSpirV, sizeof(kFillSpirV)},
     {"gemm_q4k", kGemmQ4kSpirV, sizeof(kGemmQ4kSpirV)},
+    {"attention", kAttentionSpirV, sizeof(kAttentionSpirV)},
+    {"rope", kRopeSpirV, sizeof(kRopeSpirV)},
 };
 
 int LookupBuiltIn(std::string_view name) {

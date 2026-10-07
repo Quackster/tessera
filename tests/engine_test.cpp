@@ -11,6 +11,7 @@ using tessera::ModelFormat;
 using tessera::ModelOptions;
 using tessera::StatusCode;
 using tessera::testing::FreshTempDir;
+using tessera::testing::GgufBuilder;
 using tessera::testing::MakeValidGguf;
 using tessera::testing::WriteBytes;
 using tessera::testing::WritePlaceholderConfig;
@@ -77,6 +78,80 @@ TEST(EngineTest, LoadModelEmptyPath) {
   auto model = engine->LoadModel(ModelOptions{"", 1024});
   ASSERT_FALSE(model.has_value());
   EXPECT_EQ(model.error(), StatusCode::InvalidArgument);
+}
+
+TEST(EngineTest, LoadGgufModelAttentionParams) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 7);
+  builder.KvString("general.name", "test-model");
+  builder.KvString("general.architecture", "test-arch");
+  builder.KvU32("test-arch.attention.head_count", 8);
+  builder.KvU32("test-arch.attention.head_count_kv", 2);
+  builder.KvU32("test-arch.embedding_length", 256);
+  builder.KvU32("test-arch.rope.dimension_count", 16);
+  builder.KvF32("test-arch.rope.freq_base", 10000.0f);
+  builder.Tensor("w_a", 1, {4}, 0, 0);
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 16);
+  auto dir = FreshTempDir("tessera_tests_attention");
+  auto path = dir / "attn.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto params = (*model)->Attention();
+  ASSERT_TRUE(params.has_value()) << tessera::ToString(params.error());
+  EXPECT_EQ(params->heads, 8u);
+  EXPECT_EQ(params->kv_heads, 2u);
+  EXPECT_EQ(params->head_dim, 32u);
+  EXPECT_EQ(params->rope_dim, 16u);
+  EXPECT_DOUBLE_EQ(params->rope_theta, 10000.0);
+}
+
+TEST(EngineTest, LoadGgufModelAttentionMissingKeys) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteGgufFixture("model.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto params = (*model)->Attention();
+  ASSERT_FALSE(params.has_value());
+  EXPECT_EQ(params.error(), StatusCode::MalformedFile);
+}
+
+TEST(EngineTest, LoadGgufModelAttentionBadValues) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 7);
+  builder.KvString("general.name", "test-model");
+  builder.KvString("general.architecture", "test-arch");
+  builder.KvU32("test-arch.attention.head_count", 0);
+  builder.KvU32("test-arch.attention.head_count_kv", 2);
+  builder.KvU32("test-arch.embedding_length", 256);
+  builder.KvU32("test-arch.rope.dimension_count", 16);
+  builder.KvF32("test-arch.rope.freq_base", 10000.0f);
+  builder.Tensor("w_a", 1, {4}, 0, 0);
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 16);
+  auto dir = FreshTempDir("tessera_tests_attention_bad");
+  auto path = dir / "bad_attn.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_FALSE(model.has_value());
+  EXPECT_EQ(model.error(), StatusCode::MalformedFile);
+}
+
+TEST(EngineTest, LoadModelAttentionMxFp4Unsupported) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto dir = FreshTempDir("tessera_tests_attention_mxfp4");
+  WritePlaceholderConfig(dir);
+  WritePlaceholderWeights(dir);
+  auto model = engine->LoadModel(ModelOptions{dir.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto params = (*model)->Attention();
+  ASSERT_FALSE(params.has_value());
+  EXPECT_EQ(params.error(), StatusCode::UnsupportedFeature);
 }
 
 TEST(EngineTest, LoadModelRejectsMalformedGguf) {

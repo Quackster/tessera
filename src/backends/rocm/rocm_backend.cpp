@@ -121,6 +121,96 @@ __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
   c[idx] = acc;
 }
 
+// Built-in "rope": NeoX-style rotary embedding over rows x heads x
+// head_dim fp32 in place (buffer 0); scalars are rows, heads,
+// head_dim, rope_dim, pos_base, theta fp32 bits. One thread per pair.
+__global__ void RopeKernel(float* data, unsigned long long rows,
+                           unsigned long long heads,
+                           unsigned long long head_dim,
+                           unsigned long long rope_dim,
+                           unsigned long long pos_base,
+                           unsigned long long theta_bits) {
+  const unsigned long long pairs = rope_dim / 2;
+  const unsigned long long t =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= rows * heads * pairs) {
+    return;
+  }
+  const unsigned long long row = t / (heads * pairs);
+  const unsigned long long rem = t % (heads * pairs);
+  const unsigned long long head = rem / pairs;
+  const unsigned long long j = rem % pairs;
+  float theta = 0.0f;
+  static_assert(sizeof(theta) == 4);
+  std::uint32_t bits = static_cast<std::uint32_t>(theta_bits);
+  std::memcpy(&theta, &bits, 4);
+  const float pos = static_cast<float>(pos_base + row);
+  const float angle =
+      pos * powf(theta, -2.0f * static_cast<float>(j) /
+                            static_cast<float>(rope_dim));
+  const float c = cosf(angle);
+  const float s = sinf(angle);
+  float* base = data + (row * heads + head) * head_dim;
+  const float x1 = base[j];
+  const float x2 = base[j + pairs];
+  base[j] = x1 * c - x2 * s;
+  base[j + pairs] = x1 * s + x2 * c;
+}
+
+// Built-in "attention": causal grouped-query attention, scale
+// 1/sqrt(head_dim), fp32 sequential accumulation. Buffers are q, k, v
+// and out; scalars are m, n, heads, kv_heads, head_dim, q_base. One
+// thread per output element (two score passes, no scratch buffer).
+__global__ void AttentionKernel(const float* q, const float* k, const float* v,
+                                float* out, unsigned long long m,
+                                unsigned long long n,
+                                unsigned long long heads,
+                                unsigned long long kv_heads,
+                                unsigned long long head_dim,
+                                unsigned long long q_base) {
+  const unsigned long long t =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= m * heads * head_dim) {
+    return;
+  }
+  const unsigned long long i = t / (heads * head_dim);
+  const unsigned long long rem = t % (heads * head_dim);
+  const unsigned long long h = rem / head_dim;
+  const unsigned long long e = rem % head_dim;
+  const unsigned long long kv = h / (heads / kv_heads);
+  const unsigned long long pos = q_base + i;
+  const unsigned long long last = pos >= n ? n - 1 : pos;
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  const unsigned long long q_base_idx = (i * heads + h) * head_dim;
+  float row_max = 0.0f;
+  bool first = true;
+  for (unsigned long long j = 0; j <= last; ++j) {
+    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
+    float dot = 0.0f;
+    for (unsigned long long d = 0; d < head_dim; ++d) {
+      dot = fmaf(q[q_base_idx + d], k[k_base + d], dot);
+    }
+    dot *= scale;
+    if (first || dot > row_max) {
+      row_max = dot;
+      first = false;
+    }
+  }
+  float acc = 0.0f;
+  float denom = 0.0f;
+  for (unsigned long long j = 0; j <= last; ++j) {
+    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
+    float dot = 0.0f;
+    for (unsigned long long d = 0; d < head_dim; ++d) {
+      dot = fmaf(q[q_base_idx + d], k[k_base + d], dot);
+    }
+    const float w = expf(dot * scale - row_max);
+    denom += w;
+    acc = fmaf(w, v[k_base + e], acc);
+  }
+  out[t] = acc / denom;
+}
+
 // The kernels compiled into the rocm backend.
 struct BuiltInKernel {
   std::string_view name;
@@ -129,6 +219,8 @@ struct BuiltInKernel {
 const BuiltInKernel kBuiltInKernels[] = {
     {"fill", reinterpret_cast<void*>(&FillKernel)},
     {"gemm_q4k", reinterpret_cast<void*>(&GemmQ4KKernel)},
+    {"attention", reinterpret_cast<void*>(&AttentionKernel)},
+    {"rope", reinterpret_cast<void*>(&RopeKernel)},
 };
 
 int LookupBuiltIn(std::string_view name) {

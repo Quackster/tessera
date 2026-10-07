@@ -1,0 +1,44 @@
+#version 450
+
+// One thread per rotated pair; the dispatch is
+// ceil(rows * heads * (rope_dim / 2) / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "rope" contract (tessera API): buffer 0 holds rows x heads x
+// head_dim fp32 rotated in place (NeoX pairing over rope_dim per
+// head, tail past rope_dim untouched). Scalars are 64-bit, so field k
+// lives at pc.v[2k]: rows v[0], heads v[2], head_dim v[4], rope_dim
+// v[6], pos_base v[8], theta fp32 bits v[10].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer Data {
+  float data[];
+};
+
+void main() {
+  uint t = gl_GlobalInvocationID.x;
+  uint rows = pc.v[0];
+  uint heads = pc.v[2];
+  uint rope_dim = pc.v[6];
+  uint pairs = rope_dim / 2;
+  if (t >= rows * heads * pairs) {
+    return;
+  }
+  uint row = t / (heads * pairs);
+  uint rem = t % (heads * pairs);
+  uint head = rem / pairs;
+  uint j = rem % pairs;
+  uint head_dim = pc.v[4];
+  uint base = (row * heads + head) * head_dim;
+  float pos = float(pc.v[8] + row);
+  float theta = uintBitsToFloat(pc.v[10]);
+  float angle = pos * pow(theta, -2.0 * float(j) / float(rope_dim));
+  float c = cos(angle);
+  float s = sin(angle);
+  float x1 = data[base + j];
+  float x2 = data[base + j + pairs];
+  data[base + j] = x1 * c - x2 * s;
+  data[base + j + pairs] = x1 * s + x2 * c;
+}

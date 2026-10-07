@@ -2,6 +2,7 @@
 
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,15 +47,29 @@ class Model {
   [[nodiscard]] std::size_t MaxContextLength() const;
   // Model name from the file metadata when present ("" otherwise).
   [[nodiscard]] std::string_view Name() const;
+  // Attention parameters from the model definition, for sizing kernel
+  // launches (heads, kv groups, head dim, RoPE range and base). GGUF
+  // reads <arch>.attention.head_count, head_count_kv, embedding_length
+  // and <arch>.rope.dimension_count, rope.freq_base. MalformedFile
+  // when the definition lacks them; UnsupportedFeature for MXFP4
+  // (config.json parsing is a later milestone).
+  //
+  // Usage:
+  //   auto params = model.Attention();
+  //   if (params) launch.scalars = {m, n, params->heads, ...};
+  [[nodiscard]] std::expected<AttentionParams, StatusCode> Attention() const;
 
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,
-        std::vector<TensorEntry> tensors, std::string name);
+        std::vector<TensorEntry> tensors, std::string name,
+        std::string architecture, std::optional<AttentionParams> attention);
   Backend& backend_;
   ModelOptions options_;
   ModelFormat format_;
   std::vector<TensorEntry> tensors_;
   std::string name_;
+  std::string architecture_;
+  std::optional<AttentionParams> attention_;
 };
 
 }  // namespace tessera
