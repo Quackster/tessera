@@ -626,6 +626,20 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
   y[i] = acc;
 }
 
+// Built-in "cast_f32_f16": two fp32 -> one packed fp16 word.
+__global__ void CastF32F16Kernel(const float* in, unsigned int* out,
+                                 unsigned long long n) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx * 2 >= n) {
+    return;
+  }
+  const std::uint16_t lo = FloatToFp16Dev(in[idx * 2]);
+  const std::uint16_t hi = FloatToFp16Dev(in[idx * 2 + 1]);
+  out[idx] = static_cast<unsigned int>(lo) |
+             (static_cast<unsigned int>(hi) << 16);
+}
+
 // Built-in "concat_features": stack n tensors of rows x features along
 // the feature axis.
 __global__ void ConcatFeaturesKernel(const float* in, float* out,

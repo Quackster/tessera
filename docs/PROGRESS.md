@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 208/208 on both builds.
+`ctest` passes 209/209 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -700,6 +700,12 @@ through RADV GFX1201, rocm through the system ROCm).
   decodes fp16 K/V for the host reference and `Fp16FromFloat` encodes
   fp32 to fp16. Device-vs-reference test on both backends. This is the
   kernel half of the fp16 KV cache (storage wiring next).
+
+- 2026-10-07: fp32 -> fp16 cast kernel (209/209 `ctest` on both builds).
+  Current head. Generic "cast_f32_f16" packs two fp32 into one fp16
+  word (vulkan + rocm, host reference, device test). `Fp16FromFloat`
+  encodes fp32 to fp16. With the fp16 attention flag this covers both
+  halves of the fp16 KV cache; cache/storage wiring is next.
 
 ## Next (in order)
 

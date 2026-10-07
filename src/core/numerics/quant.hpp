@@ -27,6 +27,11 @@ constexpr std::size_t kQ4KScaleBytes = 12;
 // representable values.
 [[nodiscard]] std::uint16_t Fp16FromFloat(float value);
 
+// Host reference for the "cast_f32_f16" built-in: encode `in` (an even
+// number of fp32) to fp16, little-endian, into `out` (in.size()*2 bytes).
+[[nodiscard]] std::expected<void, StatusCode> CastF32F16Ref(
+    std::span<const float> in, std::span<std::byte> out);
+
 // Decode a bfloat16 (little-endian) to fp32. bf16 shares the fp32
 // exponent field, so the conversion is exact.
 [[nodiscard]] float Bf16ToFloat(std::uint16_t bits);

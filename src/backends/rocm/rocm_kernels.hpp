@@ -17,6 +17,28 @@ namespace tessera::backends::rocm {
 // IEEE binary16 (little-endian) -> fp32, exact (device port of the
 // core Fp16ToFloat in src/core/numerics/quant.cpp). Inline so every
 // kernel TU carries its own copy (no cross-TU device calls).
+inline __host__ __device__ std::uint16_t FloatToFp16Dev(float value) {
+  std::uint32_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  const std::uint32_t sign = (bits >> 16) & 0x8000u;
+  int exponent = static_cast<int>((bits >> 23) & 0xFFu) - 127;
+  std::uint32_t mantissa = bits & 0x7FFFFFu;
+  if (exponent > 15) {
+    return static_cast<std::uint16_t>(sign | 0x7C00u);
+  }
+  if (exponent < -24) {
+    return static_cast<std::uint16_t>(sign);
+  }
+  if (exponent < -14) {
+    mantissa |= 0x800000u;
+    const std::uint32_t shift = static_cast<std::uint32_t>(-exponent - 14);
+    return static_cast<std::uint16_t>(sign | (mantissa >> (shift + 13)));
+  }
+  return static_cast<std::uint16_t>(
+      sign | (static_cast<std::uint32_t>(exponent + 15) << 10) |
+      (mantissa >> 13));
+}
+
 inline __host__ __device__ float Fp16ToFloatDev(std::uint16_t half) {
   const std::uint32_t sign = half >> 15;
   const std::uint32_t exp = (half >> 10) & 0x1F;
@@ -149,6 +171,8 @@ __global__ void RepeatHeadsKernel(const float* in, float* out,
                                   unsigned long long num_v_heads,
                                   unsigned long long head_k_dim,
                                   unsigned long long factor);
+__global__ void CastF32F16Kernel(const float* in, unsigned int* out,
+                                 unsigned long long n);
 __global__ void ConcatFeaturesKernel(const float* in, float* out,
                                      unsigned long long n,
                                      unsigned long long rows,

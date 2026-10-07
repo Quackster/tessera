@@ -64,6 +64,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"dflash_conv", reinterpret_cast<void*>(&DflashConvKernel)},
     {"selector_edge_score", reinterpret_cast<void*>(&SelectorEdgeScoreKernel)},
     {"concat_features", reinterpret_cast<void*>(&ConcatFeaturesKernel)},
+    {"cast_f32_f16", reinterpret_cast<void*>(&CastF32F16Kernel)},
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},

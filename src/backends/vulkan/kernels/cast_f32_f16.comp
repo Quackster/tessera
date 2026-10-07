@@ -1,0 +1,25 @@
+#version 450
+
+// One thread per output word (two fp32 -> one packed fp16 word).
+layout(local_size_x = 256) in;
+
+// "cast_f32_f16" contract: buffer 0 is In (fp32, n elements), buffer 1 the
+// output (fp16, n elements, two per uint). Scalars: n at pc.v[0] (must be
+// even). Dispatch ceil(n/2 / 256).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer In { float a[]; };
+layout(set = 0, binding = 1) buffer Out { uint out_words[]; };
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint n = pc.v[0];
+  if (idx * 2 >= n) {
+    return;
+  }
+  float lo = a[idx * 2];
+  float hi = a[idx * 2 + 1];
+  out_words[idx] = packHalf2x16(vec2(lo, hi));
+}

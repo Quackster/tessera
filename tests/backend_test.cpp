@@ -4618,3 +4618,38 @@ TEST(BackendTest, AttentionF16DeviceMatchesRef) {
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
+
+// Device: the fp32 -> fp16 cast matches the host reference (packed two per
+// word).
+TEST(BackendTest, CastF32F16MatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(104);
+  constexpr std::size_t kN = 8;
+  std::vector<float> in(kN);
+  for (auto& v : in) v = DrawValue(rng);
+  auto in_buf = backend->AllocateBuffer(in.size() * 4, MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(in.size() * 2, MemoryKind::Device);
+  ASSERT_TRUE(in_buf && out_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **in_buf, std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(in.data()),
+                                in.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("cast_f32_f16", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kN / 2 + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*in_buf).get(), (*out_buf).get()};
+  launch.scalars = {kN};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> got(in.size() * 2);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, got.data(), got.size()).has_value());
+  std::vector<std::byte> ref(in.size() * 2);
+  ASSERT_TRUE(core::CastF32F16Ref(std::span<const float>(in),
+                                  std::span<std::byte>(ref))
+                  .has_value());
+  EXPECT_EQ(got, ref);
+}

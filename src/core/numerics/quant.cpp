@@ -119,6 +119,19 @@ std::uint16_t Fp16FromFloat(float value) {
   return static_cast<std::uint16_t>(sign | half);
 }
 
+std::expected<void, StatusCode> CastF32F16Ref(std::span<const float> in,
+                                              std::span<std::byte> out) {
+  if (in.size() % 2 != 0 || out.size() != in.size() * 2) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < in.size(); ++i) {
+    const std::uint16_t half = Fp16FromFloat(in[i]);
+    out[i * 2] = static_cast<std::byte>(half & 0xFF);
+    out[i * 2 + 1] = static_cast<std::byte>((half >> 8) & 0xFF);
+  }
+  return {};
+}
+
 float Fp8E4M3ToFloat(std::uint8_t bits) {
   const std::uint32_t sign = bits >> 7;
   const std::uint32_t exp = (bits >> 3) & 0xF;
