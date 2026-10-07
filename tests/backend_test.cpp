@@ -2675,3 +2675,68 @@ TEST(BackendTest, BufferD2DCopy) {
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
 }
+
+// Device: the DeltaStepDevice helper updates the state in place and
+// matches the host reference.
+TEST(BackendTest, DeltaStepDeviceHelperMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(81);
+  constexpr std::size_t kDk = 8;
+  constexpr std::size_t kDv = 12;
+  constexpr float kAlpha = 0.9f;
+  constexpr float kBeta = 0.5f;
+  std::vector<float> state(kDk * kDv);
+  std::vector<float> k(kDk);
+  std::vector<float> v(kDv);
+  std::vector<float> q(kDk);
+  for (auto& x : state) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  for (auto& x : q) x = DrawValue(rng);
+  auto s_buf = backend->AllocateBuffer(state.size() * 4, MemoryKind::Device);
+  auto k_buf = backend->AllocateBuffer(kDk * 4, MemoryKind::Device);
+  auto v_buf = backend->AllocateBuffer(kDv * 4, MemoryKind::Device);
+  auto q_buf = backend->AllocateBuffer(kDk * 4, MemoryKind::Device);
+  auto o_buf = backend->AllocateBuffer(kDv * 4, MemoryKind::Device);
+  ASSERT_TRUE(s_buf && k_buf && v_buf && q_buf && o_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(s_buf, state).has_value());
+  ASSERT_TRUE(upload(k_buf, k).has_value());
+  ASSERT_TRUE(upload(v_buf, v).has_value());
+  ASSERT_TRUE(upload(q_buf, q).has_value());
+  auto delta = backend->LoadKernel("delta_step", {});
+  ASSERT_TRUE(delta.has_value());
+  ASSERT_TRUE(core::detail::DeltaStepDevice(*backend, **delta, **s_buf, **k_buf,
+                                            **v_buf, **q_buf, **o_buf, kDk,
+                                            kDv, kAlpha, kBeta)
+                  .has_value());
+  backend->Synchronize();
+  std::vector<float> ref_state = state;
+  std::vector<float> ref_out(kDv);
+  ASSERT_TRUE(core::DeltaStepRef(std::span<float>(ref_state),
+                                 std::span<const float>(k),
+                                 std::span<const float>(v),
+                                 std::span<const float>(q),
+                                 std::span<float>(ref_out), kDk, kDv, kAlpha,
+                                 kBeta)
+                  .has_value());
+  std::vector<std::byte> out_back(kDv * 4);
+  std::vector<std::byte> state_back(state.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**o_buf, out_back.data(), out_back.size())
+                  .has_value());
+  ASSERT_TRUE(backend
+                  ->CopyD2H(**s_buf, state_back.data(), state_back.size())
+                  .has_value());
+  const auto* got_out = reinterpret_cast<const float*>(out_back.data());
+  const auto* got_state = reinterpret_cast<const float*>(state_back.data());
+  for (std::size_t i = 0; i < kDv; ++i) {
+    EXPECT_NEAR(got_out[i], ref_out[i], 1e-4f);
+  }
+  for (std::size_t i = 0; i < state.size(); ++i) {
+    EXPECT_NEAR(got_state[i], ref_state[i], 1e-4f);
+  }
+}

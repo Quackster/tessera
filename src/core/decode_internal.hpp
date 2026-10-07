@@ -236,6 +236,111 @@ inline std::expected<void, StatusCode> SiluMulDevice(
   return backend.LaunchKernel(kernel, launch);
 }
 
+// O = A * sigmoid(G) on the device.
+inline std::expected<void, StatusCode> SigmoidGateDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& a, const Buffer& g,
+    Buffer& o, std::size_t n) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((n + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&a, &g, &o};
+  launch.scalars = {n};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Split a fused gated-attention projection into queries and gates.
+inline std::expected<void, StatusCode> QGateSplitDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& fused, Buffer& q,
+    Buffer& gate, std::size_t heads, std::size_t head_dim) {
+  KernelLaunch launch;
+  launch.grid_x =
+      static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&fused, &q, &gate};
+  launch.scalars = {heads, head_dim};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// In-place multimodal RoPE with per-row (t, h, w) position triples.
+inline std::expected<void, StatusCode> MropeDevice(
+    Backend& backend, const Kernel& kernel, Buffer& io, const Buffer& pos,
+    std::size_t rows, std::size_t heads, std::size_t head_dim,
+    std::size_t rope_dim, std::size_t sec_t, std::size_t sec_h,
+    std::size_t sec_w, double theta) {
+  const float theta_f = static_cast<float>(theta);
+  std::uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(theta_f));
+  std::memcpy(&bits, &theta_f, sizeof(bits));
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(
+      (rows * heads * (rope_dim / 2) + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&io, &pos};
+  launch.scalars = {rows, heads, head_dim, rope_dim, bits, sec_t, sec_h, sec_w};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Y = L2-normalize(X) per row on the device.
+inline std::expected<void, StatusCode> L2NormDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& x, Buffer& y,
+    std::size_t rows, std::size_t cols, double eps) {
+  const float eps_f = static_cast<float>(eps);
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &eps_f, sizeof(bits));
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&x, &y};
+  launch.scalars = {rows, cols, bits};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Y = rmsnorm(X, W) * silu(gate) per row on the device.
+inline std::expected<void, StatusCode> RmsNormGatedDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& x, const Buffer& w,
+    const Buffer& gate, Buffer& y, std::size_t rows, std::size_t cols,
+    double eps) {
+  const float eps_f = static_cast<float>(eps);
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &eps_f, sizeof(bits));
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&x, &w, &gate, &y};
+  launch.scalars = {rows, cols, bits};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Y = causal depthwise conv1d(X, W) on the device.
+inline std::expected<void, StatusCode> Conv1dDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& x, const Buffer& w,
+    Buffer& y, std::size_t channels, std::size_t length, std::size_t width) {
+  KernelLaunch launch;
+  launch.grid_x =
+      static_cast<std::uint32_t>((channels * length + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&x, &w, &y};
+  launch.scalars = {channels, length, width};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// One gated-delta step updating the device state in place.
+inline std::expected<void, StatusCode> DeltaStepDevice(
+    Backend& backend, const Kernel& kernel, Buffer& state, const Buffer& k,
+    const Buffer& v, const Buffer& q, Buffer& o, std::size_t dk,
+    std::size_t dv, float alpha, float beta) {
+  std::uint32_t alpha_bits = 0;
+  std::uint32_t beta_bits = 0;
+  std::memcpy(&alpha_bits, &alpha, 4);
+  std::memcpy(&beta_bits, &beta, 4);
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((dv + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&state, &k, &v, &q, &o};
+  launch.scalars = {dk, dv, alpha_bits, beta_bits};
+  return backend.LaunchKernel(kernel, launch);
+}
+
 // Causal GQA attention over one query row; the key/value matrices
 // upload fresh every step.
 inline std::expected<std::vector<float>, StatusCode> Attend(

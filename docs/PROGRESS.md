@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 162/162 on both builds.
+`ctest` passes 163/163 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -347,6 +347,13 @@ through RADV GFX1201, rocm through the system ROCm).
   attention kernels with a single sync per step and only the
   logits downloaded. `DecodeStep` dispatches vanilla configs to it;
   the hybrid path is still host-orchestrated (next).
+
+- 2026-10-07: hybrid device launch helpers (163/163 `ctest` on
+  both builds). Current head. `decode_internal.hpp` adds
+  QGateSplitDevice, MropeDevice, SigmoidGateDevice, L2NormDevice,
+  RmsNormGatedDevice, Conv1dDevice and DeltaStepDevice, the
+  device-to-device building blocks for a device-resident hybrid
+  decode. A DeltaStepDevice test matches the host reference.
 
 ## Next (in order)
 
