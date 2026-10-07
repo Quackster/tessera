@@ -325,10 +325,15 @@ through RADV GFX1201, rocm through the system ROCm).
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Models are data. No per
    model branches.
-4. **Serving API**: OpenAI-style `/v1/chat/completions` plus an
-   Anthropic-style `/v1/messages` endpoint, served over HTTP from the
-   engine. Streaming and non-streaming responses. The same limits
-   apply to both shapes.
+4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
+   explicitly told. A first slice lives in `src/serve/` (`/health`,
+   `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
+   `/slots`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
+   `/v1/messages/count_tokens`, SSE for completions/chat/messages,
+   API-key auth, CORS). Not done and deferred: thread pool/engine
+   queue, keep-alive, `/v1/responses`, render/derender/batch,
+   `/tokenizer_info`, `/load` and LoRA, and the 501
+   embedding/rerank/audio/pooling/classify/score surfaces.
 5. **Runtime options**: context size and draft-block are CLI flags
    now. Still to wire: KV cache quantization (q4, q8, fp16), mmproj
    path for vision input, and batch caps (features that do not exist
@@ -339,6 +344,11 @@ through RADV GFX1201, rocm through the system ROCm).
 
 ## Notes and decisions
 
+- HTTP serving is deferred. `src/serve/` already serves a first
+  endpoint set; do not add endpoints, SSE variants, auth changes, or
+  concurrency there unless the project owner explicitly asks. The
+  decode loop is host-orchestrated and slow (chat prefill on the 27B
+  exceeds minutes), so performance work comes before more endpoints.
 - `std::expected` is mandated by AGENTS.md. It is a C++23 feature of
   libstdc++. The project compiles with `-std=c++23`. The code stays
   C++20 style.
