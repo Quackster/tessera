@@ -55,10 +55,10 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8
         gemm_mxfp4 gemm_q5k gemm_q6k gemm_q3k gemm_iq4nl gemm_iq4xs
         gemm_iq3s gemm_q80 rmsnorm sigmoid_gate l2norm rmsnorm_gated
-        conv1d conv1d_step delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads)
+        conv1d conv1d_step dflash_conv delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads)
     set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8
         GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S
-        GemmQ80 Rmsnorm SigmoidGate L2Norm RmsnormGated Conv1d Conv1dStep DeltaStep
+        GemmQ80 Rmsnorm SigmoidGate L2Norm RmsnormGated Conv1d Conv1dStep DflashConv DeltaStep
         Mrope QgateSplit Add SiluMul RepeatHeads SsmGate DeltaStepHeads)
     set(TESSERA_KERNEL_HEADER
 "#pragma once

@@ -3014,3 +3014,60 @@ TEST(BackendTest, AttentionBatchedMatchesRef) {
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
+
+// Device: the DFlash2 grouped dynamic convolution matches the reference.
+TEST(BackendTest, DflashConvDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(87);
+  constexpr std::size_t kRows = 8;
+  constexpr std::size_t kChannels = 8;
+  constexpr std::size_t kTaps = 2;
+  constexpr std::size_t kGroup = 4;
+  constexpr std::size_t kBlock = 4;
+  const std::size_t num_groups = kChannels / kGroup;
+  std::vector<float> x(kRows * kChannels), base(kTaps * kChannels);
+  std::vector<float> delta(kRows * kTaps * num_groups);
+  for (auto& v : x) v = DrawValue(rng);
+  for (auto& v : base) v = DrawValue(rng);
+  for (auto& v : delta) v = DrawValue(rng);
+  auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto d_buf = backend->AllocateBuffer(delta.size() * 4, MemoryKind::Device);
+  auto b_buf = backend->AllocateBuffer(base.size() * 4, MemoryKind::Device);
+  auto y_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf && d_buf && b_buf && y_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(upload(d_buf, delta).has_value());
+  ASSERT_TRUE(upload(b_buf, base).has_value());
+  auto kernel = backend->LoadKernel("dflash_conv", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows * kChannels + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*x_buf).get(), (*d_buf).get(), (*b_buf).get(),
+                    (*y_buf).get()};
+  launch.scalars = {kRows, kChannels, kTaps, kGroup, kBlock};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(x.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**y_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(x.size());
+  ASSERT_TRUE(core::DflashConvRef(
+                  std::span<const float>(x), std::span<const float>(delta),
+                  std::span<const float>(base), std::span<float>(ref), kRows,
+                  kChannels, kTaps, kGroup, kBlock)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}

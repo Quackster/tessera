@@ -46,3 +46,8 @@ project, the version, the license, and where it is used.
   nextn.eh_proj to one hidden vector, one full-attention block,
   shared head norm and the shared output weight). Design reference
   for src/core/decode_mtp.cpp; no code copied.
+- vLLM DFlash2 draft model (Apache-2.0,
+  vllm/model_executor/models/qwen3_dflash2.py): the grouped dynamic
+  convolution (per-tap base kernel plus a per-token per-group offset
+  from kernel_projection, reset every block_size positions). Design
+  reference for the dflash_conv built-in; no code copied.

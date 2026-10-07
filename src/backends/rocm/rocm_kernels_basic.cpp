@@ -506,4 +506,36 @@ __global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
   y[c] = acc;
 }
 
+// Built-in "dflash_conv": DFlash2 grouped dynamic convolution. One
+// thread per output element.
+__global__ void DflashConvKernel(const float* x, const float* delta,
+                                 const float* base, float* y,
+                                 unsigned long long rows,
+                                 unsigned long long channels,
+                                 unsigned long long taps,
+                                 unsigned long long group_size,
+                                 unsigned long long block_size) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= rows * channels) {
+    return;
+  }
+  const unsigned long long num_groups = channels / group_size;
+  const unsigned long long row = i / channels;
+  const unsigned long long c = i % channels;
+  const unsigned long long grp = c / group_size;
+  const unsigned long long position = row % block_size;
+  const unsigned long long delta_base = row * taps * num_groups + grp;
+  float acc = (base[c] + delta[delta_base]) * x[i];
+  for (unsigned long long tap = 1; tap < taps; ++tap) {
+    if (position < tap) {
+      continue;
+    }
+    const float coeff =
+        base[tap * channels + c] + delta[delta_base + tap * num_groups];
+    acc = fmaf(coeff, x[(row - tap) * channels + c], acc);
+  }
+  y[i] = acc;
+}
+
 }  // namespace tessera::backends::rocm

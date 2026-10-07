@@ -1,0 +1,45 @@
+#version 450
+
+// One thread per output element; dispatch ceil(rows * channels / 256).
+layout(local_size_x = 256) in;
+
+// "dflash_conv" contract: buffers X (rows x channels), Delta
+// (rows x taps x num_groups), Base (taps x channels), Y (rows x
+// channels). Scalars: rows v[0], channels v[2], taps v[4],
+// group_size v[6], block_size v[8].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) buffer Delta { float delta[]; };
+layout(set = 0, binding = 2) buffer Base { float base[]; };
+layout(set = 0, binding = 3) buffer Y { float y[]; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint rows = pc.v[0];
+  uint channels = pc.v[2];
+  if (i >= rows * channels) {
+    return;
+  }
+  uint taps = pc.v[4];
+  uint group_size = pc.v[6];
+  uint block_size = pc.v[8];
+  uint num_groups = channels / group_size;
+  uint row = i / channels;
+  uint c = i % channels;
+  uint grp = c / group_size;
+  uint position = row % block_size;
+  uint delta_base = row * taps * num_groups + grp;
+  float acc = (base[c] + delta[delta_base]) * x[i];
+  for (uint tap = 1; tap < taps; ++tap) {
+    if (position < tap) {
+      continue;
+    }
+    float coeff = base[tap * channels + c] +
+                  delta[delta_base + tap * num_groups];
+    acc += coeff * x[(row - tap) * channels + c];
+  }
+  y[i] = acc;
+}

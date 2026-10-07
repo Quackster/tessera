@@ -33,4 +33,21 @@ namespace tessera::core {
     std::span<const float> x, std::span<const float> w, std::span<float> y,
     std::size_t channels, std::size_t width);
 
+// Host reference for the "dflash_conv" built-in: the DFlash2 grouped
+// dynamic convolution (token-position local, reset every block). `x` is
+// rows x channels, `base` is taps x channels (a static per-tap kernel),
+// `delta` is rows x taps x (channels/group_size) (per-token per-group
+// offsets). With num_groups = channels / group_size, position =
+// row % block_size and group = channel / group_size:
+//   y[r,c] = (base[0,c] + delta[r,0,g]) * x[r,c]
+//          + sum_{tap=1..taps-1, position>=tap}
+//                (base[tap,c] + delta[r,tap,g]) * x[r-tap,c]
+// channels must be a multiple of group_size; every size must match; else
+// InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> DflashConvRef(
+    std::span<const float> x, std::span<const float> delta,
+    std::span<const float> base, std::span<float> y, std::size_t rows,
+    std::size_t channels, std::size_t taps, std::size_t group_size,
+    std::size_t block_size);
+
 }  // namespace tessera::core

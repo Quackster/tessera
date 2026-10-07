@@ -54,4 +54,41 @@ std::expected<void, StatusCode> Conv1dStepRef(std::span<const float> x,
   return {};
 }
 
+std::expected<void, StatusCode> DflashConvRef(
+    std::span<const float> x, std::span<const float> delta,
+    std::span<const float> base, std::span<float> y, std::size_t rows,
+    std::size_t channels, std::size_t taps, std::size_t group_size,
+    std::size_t block_size) {
+  if (rows == 0 || channels == 0 || taps == 0 || group_size == 0 ||
+      block_size == 0 || channels % group_size != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t num_groups = channels / group_size;
+  if (x.size() != rows * channels || y.size() != rows * channels ||
+      base.size() != taps * channels ||
+      delta.size() != rows * taps * num_groups) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    const std::size_t position = r % block_size;
+    for (std::size_t c = 0; c < channels; ++c) {
+      const std::size_t grp = c / group_size;
+      float acc = (base[c] +
+                   delta[r * taps * num_groups + grp]) *
+                  x[r * channels + c];
+      for (std::size_t tap = 1; tap < taps; ++tap) {
+        if (position < tap) {
+          continue;
+        }
+        const float coeff =
+            base[tap * channels + c] +
+            delta[r * taps * num_groups + tap * num_groups + grp];
+        acc = std::fma(coeff, x[(r - tap) * channels + c], acc);
+      }
+      y[r * channels + c] = acc;
+    }
+  }
+  return {};
+}
+
 }  // namespace tessera::core

@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 169/169 on both builds.
+`ctest` passes 170/170 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -401,6 +401,14 @@ through RADV GFX1201, rocm through the system ROCm).
   builds). Current head. The attention kernel already handles
   several query rows (m > 1); a device-vs-reference test pins it,
   a prerequisite for the speculative verifier.
+
+- 2026-10-07: DFlash2 grouped conv kernel (170/170 `ctest` on both
+  builds). Current head. Generic "dflash_conv" implements the
+  DFlash2 local dynamic convolution: a per-tap base kernel plus a
+  per-token per-group offset, reset every block_size positions, on
+  vulkan (GLSL) and rocm (HIP) with a host reference and
+  device-vs-reference tests. Layout from vLLM qwen3_dflash2.py
+  (credited). First kernel of the DFlash2 draft.
 
 ## Next (in order)
 
