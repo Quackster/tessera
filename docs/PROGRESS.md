@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 178/178 on both builds.
+`ctest` passes 179/179 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -469,6 +469,15 @@ through RADV GFX1201, rocm through the system ROCm).
   `AppendKv` in `decode_internal.hpp`. A device test covers the growth
   boundary; the pinned baselines and the 27B MTP path are unchanged.
 
+- 2026-10-07: explicit GPU selection (179/179 `ctest` on both builds).
+  Current head. `EngineOptions::device_index` (CLI `--gpu <n>`) selects
+  the GPU; the default is 0, the first device. Backends no longer
+  assume device 0: vulkan picks `devices[index]` and rocm calls
+  `hipSetDevice(index)`, both rejecting an out-of-range index as
+  InvalidArgument. The backend logs the selected index and name, and
+  the engine start line carries the device index. Verified on the
+  host (vulkan sees 3 devices, rocm 2).
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
@@ -493,10 +502,10 @@ through RADV GFX1201, rocm through the system ROCm).
    queue, keep-alive, `/v1/responses`, render/derender/batch,
    `/tokenizer_info`, `/load` and LoRA, and the 501
    embedding/rerank/audio/pooling/classify/score surfaces.
-5. **Runtime options**: context size and draft-block are CLI flags
-   now. Still to wire: KV cache quantization (q4, q8, fp16), mmproj
-   path for vision input, and batch caps (features that do not exist
-   yet). No hard-coded paths or sizes.
+5. **Runtime options**: context size, draft-block and the GPU index
+   (`--gpu`) are CLI flags now. Still to wire: KV cache quantization
+   (q4, q8, fp16), mmproj path for vision input, and batch caps
+   (features that do not exist yet). No hard-coded paths or sizes.
 6. **Multimodal (mmproj)**: load the vision projector next to the
    model, encode images to embeddings, prepend them to the prompt
    sequence. Covers the mmproj file in the model directory.

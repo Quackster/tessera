@@ -26,7 +26,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. |
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. |
 | DFlash2 | Skeleton | Validates checkpoint layout. Draft logic is in work. |
-| CLI | Partial | Loads model, prints summary, generates tokens (`--tokens`). Text prompts need a tokenizer. |
+| CLI | Partial | Loads model, prints summary, generates tokens (`--tokens`), picks the GPU (`--gpu`). Text prompts need a tokenizer. |
 | Generation | Done | `Engine::Generate` greedy decode on the non-speculative path. Runtime options: `--context`, `--draft-block`. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ and FP8/MXFP4 dequant. Host reference check. Per backend tolerance. |
 | Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |

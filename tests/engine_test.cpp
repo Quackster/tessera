@@ -578,3 +578,15 @@ TEST(EngineTest, AttachSpeculativeValid) {
   ASSERT_NE(engine->Speculative(), nullptr);
   EXPECT_EQ(engine->Speculative()->Name(), "dflash2");
 }
+
+// Engine::Create selects the GPU by index (default 0). An out-of-range
+// index is InvalidArgument, not a crash or a silent fallback.
+TEST(EngineTest, RejectsOutOfRangeDeviceIndex) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  EngineOptions options;
+  options.device_index = 100000;
+  auto bad = Engine::Create(options);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+}

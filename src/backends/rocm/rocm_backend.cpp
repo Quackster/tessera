@@ -104,20 +104,29 @@ class RocmBackend final : public Backend {
                "KFD group");
       return std::unexpected(StatusCode::DeviceError);
     }
-    error = hipSetDevice(0);
+    if (device_index_ < 0 || device_index_ >= device_count) {
+      LogError("requested GPU " + std::to_string(device_index_) + " but only " +
+               std::to_string(device_count) + " device(s) are present; pass "
+               "--gpu in the range [0, " + std::to_string(device_count - 1) +
+               "] (defaults to the first GPU)");
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    error = hipSetDevice(device_index_);
     if (error != hipSuccess) {
-      LogError(std::string("hipSetDevice(0) failed (") + HipErrorName(error) +
-               "); cannot use GPU 0");
+      LogError(std::string("hipSetDevice(") + std::to_string(device_index_) +
+               ") failed (" + HipErrorName(error) + "); cannot use that GPU");
       return std::unexpected(FromHip(error));
     }
     hipDeviceProp_t props;
-    error = hipGetDeviceProperties(&props, 0);
+    error = hipGetDeviceProperties(&props, device_index_);
     if (error != hipSuccess) {
       LogError(std::string("hipGetDeviceProperties failed (") +
                HipErrorName(error) + ")");
       return std::unexpected(FromHip(error));
     }
     device_name_ = props.name;
+    LogInfo("selected GPU " + std::to_string(device_index_) + " of " +
+            std::to_string(device_count) + ": " + device_name_);
     initialized_ = true;
     return {};
   }

@@ -107,7 +107,8 @@ class VulkanBackend final : public Backend {
                "); no Vulkan device available, check the ICD list");
       return std::unexpected(FromVkResult(result));
     }
-    // First physical device with a compute queue.
+    // Select the requested GPU index (default 0, the first GPU); it must
+    // expose a compute queue family.
     std::uint32_t device_count = 0;
     result = vkEnumeratePhysicalDevices(state_.instance, &device_count, nullptr);
     if (result != VK_SUCCESS || device_count == 0) {
@@ -125,40 +126,45 @@ class VulkanBackend final : public Backend {
       DestroyState(state_);
       return std::unexpected(FromVkResult(result));
     }
+    if (device_index_ < 0 ||
+        static_cast<std::uint32_t>(device_index_) >= device_count) {
+      LogError("requested GPU " + std::to_string(device_index_) + " but only " +
+               std::to_string(device_count) + " device(s) are present; pass "
+               "--gpu in the range [0, " + std::to_string(device_count - 1) +
+               "] (defaults to the first GPU)");
+      DestroyState(state_);
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
     // Vulkan 1.4 removed the shaderCompute feature; a compute-capable
     // device is one with a compute queue family.
-    for (auto candidate : devices) {
-      std::uint32_t family_count = 0;
-      vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count,
-                                              nullptr);
-      std::vector<VkQueueFamilyProperties> probe(family_count);
-      vkGetPhysicalDeviceQueueFamilyProperties(candidate, &family_count,
-                                              probe.data());
-      bool has_compute = false;
-      for (const auto& family : probe) {
-        if ((family.queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
-          has_compute = true;
-          break;
-        }
-      }
-      if (has_compute) {
-        state_.physical = candidate;
+    state_.physical = devices[static_cast<std::size_t>(device_index_)];
+    bool has_compute = false;
+    std::uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(state_.physical, &family_count,
+                                            nullptr);
+    std::vector<VkQueueFamilyProperties> probe(family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(state_.physical, &family_count,
+                                            probe.data());
+    for (const auto& family : probe) {
+      if ((family.queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+        has_compute = true;
         break;
       }
     }
-    if (state_.physical == VK_NULL_HANDLE) {
-      LogError("no physical device with a compute queue family; the device "
-               "cannot run kernels");
+    if (!has_compute) {
+      LogError("GPU " + std::to_string(device_index_) +
+               " has no compute queue family; pick another --gpu");
       DestroyState(state_);
       return std::unexpected(StatusCode::DeviceError);
     }
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(state_.physical, &props);
     device_name_ = props.deviceName;
+    LogInfo("selected GPU " + std::to_string(device_index_) + " of " +
+            std::to_string(device_count) + ": " + device_name_);
 
     std::uint32_t queue_family = 0;
     bool found_family = false;
-    std::uint32_t family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(state_.physical, &family_count,
                                             nullptr);
     std::vector<VkQueueFamilyProperties> families(family_count);

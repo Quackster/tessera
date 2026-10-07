@@ -127,6 +127,16 @@ void Backend::SetDiagnostics(log::Diagnostics* diagnostics) {
   diagnostics_ = diagnostics;
 }
 
+void Backend::SetDeviceIndex(int index) {
+  device_index_ = index;
+}
+
+void Backend::LogInfo(std::string_view message) const {
+  if (diagnostics_ != nullptr) {
+    diagnostics_->Info("backend", message);
+  }
+}
+
 void Backend::LogWarn(std::string_view message) const {
   if (diagnostics_ != nullptr) {
     diagnostics_->Warn("backend", message);

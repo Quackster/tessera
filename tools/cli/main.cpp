@@ -32,6 +32,7 @@ void PrintUsage() {
                "  --model <path>    a .gguf file or an MXFP4 model directory\n"
                "  --draft <dir>     DFlash2 draft checkpoint directory\n"
                "  --context <n>     maximum context length (default %zu)\n"
+               "  --gpu <n>         GPU index to use (default 0, the first)\n"
                "  --draft-block <n> draft block tokens (default %zu)\n"
                "  --prompt <id>     first token id for generation (default 0)\n"
                "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
@@ -72,6 +73,7 @@ int main(int argc, char** argv) {
   std::size_t tokens = 0;
   std::size_t context = kDefaultContext;
   std::size_t draft_block = kDefaultDraftBlock;
+  int gpu = 0;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "--model" && i + 1 < argc) {
@@ -90,6 +92,8 @@ int main(int argc, char** argv) {
       port = static_cast<std::uint16_t>(std::stoul(argv[++i]));
     } else if (arg == "--context" && i + 1 < argc) {
       context = std::stoul(argv[++i]);
+    } else if (arg == "--gpu" && i + 1 < argc) {
+      gpu = std::stoi(argv[++i]);
     } else if (arg == "--draft-block" && i + 1 < argc) {
       draft_block = std::stoul(argv[++i]);
     } else if (arg == "--prompt" && i + 1 < argc) {
@@ -121,6 +125,7 @@ int main(int argc, char** argv) {
   }
 
   tessera::EngineOptions options;  // default stderr diagnostics sink
+  options.device_index = gpu;
   auto created = tessera::Engine::Create(options);
   if (!created) {
     std::fprintf(stderr, "cli: engine create failed (%s)\n",

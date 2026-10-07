@@ -23,6 +23,7 @@ std::expected<std::unique_ptr<Engine>, StatusCode> Engine::Create(
       std::unique_ptr<Engine>(new Engine(std::move(backend), log));
   // The backend logs through the engine's diagnostics copy.
   engine->backend_->SetDiagnostics(&engine->diagnostics_);
+  engine->backend_->SetDeviceIndex(options.device_index);
   auto init = engine->backend_->Init();
   if (!init) {
     engine->diagnostics_.Error(
@@ -33,7 +34,8 @@ std::expected<std::unique_ptr<Engine>, StatusCode> Engine::Create(
   }
   engine->diagnostics_.Info(
       "engine", std::string("engine started on ") +
-                   std::string(engine->backend_->Name()) + " (" +
+                   std::string(engine->backend_->Name()) + " (device " +
+                   std::to_string(options.device_index) + ": " +
                    std::string(engine->backend_->DeviceName()) + ")");
   return engine;
 }

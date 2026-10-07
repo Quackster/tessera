@@ -497,6 +497,11 @@ class Backend {
   // after construction; before Init).
   virtual void SetDiagnostics(log::Diagnostics* diagnostics);
 
+  // Select the GPU index this backend uses. Default 0 (the first GPU).
+  // Call before Init; Init fails with InvalidArgument when the index is
+  // out of range. The selected index and device name are logged.
+  virtual void SetDeviceIndex(int index);
+
   // One-time device initialization. Returns Ok when already done.
   virtual std::expected<void, StatusCode> Init() = 0;
 
@@ -564,9 +569,12 @@ class Backend {
   virtual void Synchronize() = 0;
 
  protected:
+  void LogInfo(std::string_view message) const;
   void LogWarn(std::string_view message) const;
   void LogError(std::string_view message) const;
   log::Diagnostics* diagnostics_ = nullptr;
+  // GPU index chosen by SetDeviceIndex (default 0, the first GPU).
+  int device_index_ = 0;
 };
 
 // Construct the configured backend. Returns nullptr only when the build

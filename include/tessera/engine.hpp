@@ -20,6 +20,9 @@ struct EngineOptions {
   // The channel the engine (and its backend) logs through. A default
   // stderr sink is used unless the caller replaces it.
   log::Diagnostics diagnostics;
+  // GPU index to run on (default 0, the first GPU). Create fails with
+  // InvalidArgument when the index is out of range.
+  int device_index = 0;
 };
 
 // Options for Engine::Generate.
