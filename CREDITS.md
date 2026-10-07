@@ -51,3 +51,7 @@ project, the version, the license, and where it is used.
   convolution (per-tap base kernel plus a per-token per-group offset
   from kernel_projection, reset every block_size positions). Design
   reference for the dflash_conv built-in; no code copied.
+- vLLM DFlash2 candidate selector (_score_edges / CandidateSelector,
+  qwen3_dflash2.py): the low-rank predecessor/successor
+  transition score that re-ranks the unary top-K. Design
+  reference for the selector_edge_score built-in.

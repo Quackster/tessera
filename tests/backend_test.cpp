@@ -13,6 +13,7 @@
 #include "core/decode_internal.hpp"
 #include "core/numerics/attention.hpp"
 #include "core/numerics/conv.hpp"
+#include "core/numerics/selector.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -3061,6 +3062,86 @@ TEST(BackendTest, DflashConvDeviceMatchesRef) {
                   std::span<const float>(x), std::span<const float>(delta),
                   std::span<const float>(base), std::span<float>(ref), kRows,
                   kChannels, kTaps, kGroup, kBlock)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the DFlash2 candidate-selector edge score matches the reference.
+TEST(BackendTest, SelectorEdgeScoreDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(88);
+  constexpr std::size_t kBatch = 1;
+  constexpr std::size_t kSeq = 3;
+  constexpr std::size_t kTopK = 3;
+  constexpr std::size_t kRank = 4;
+  constexpr std::size_t kVocab = 7;
+  const std::size_t positions = kBatch * kSeq;
+  std::vector<float> pred(kVocab * kRank), succ(kVocab * kRank);
+  std::vector<float> hidden(positions * kRank), unary(positions * kTopK);
+  for (auto& v : pred) v = DrawValue(rng);
+  for (auto& v : succ) v = DrawValue(rng);
+  for (auto& v : hidden) v = DrawValue(rng);
+  for (auto& v : unary) v = DrawValue(rng);
+  std::vector<std::int32_t> cand(positions * kTopK), anchor(positions);
+  std::uniform_int_distribution<std::int32_t> pick(
+      0, static_cast<std::int32_t>(kVocab - 1));
+  for (auto& v : cand) v = pick(rng);
+  for (auto& v : anchor) v = pick(rng);
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto pred_buf = alloc(pred.size() * 4);
+  auto succ_buf = alloc(succ.size() * 4);
+  auto hid_buf = alloc(hidden.size() * 4);
+  auto cand_buf = alloc(cand.size() * 4);
+  auto anchor_buf = alloc(anchor.size() * 4);
+  auto unary_buf = alloc(unary.size() * 4);
+  auto out_buf = alloc(positions * kTopK * kTopK * 4);
+  ASSERT_TRUE(pred_buf && succ_buf && hid_buf && cand_buf && anchor_buf &&
+              unary_buf && out_buf);
+  const auto upload = [&backend](auto& buf, const void* data, std::size_t bytes) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data), bytes));
+  };
+  ASSERT_TRUE(upload(pred_buf, pred.data(), pred.size() * 4).has_value());
+  ASSERT_TRUE(upload(succ_buf, succ.data(), succ.size() * 4).has_value());
+  ASSERT_TRUE(upload(hid_buf, hidden.data(), hidden.size() * 4).has_value());
+  ASSERT_TRUE(upload(cand_buf, cand.data(), cand.size() * 4).has_value());
+  ASSERT_TRUE(upload(anchor_buf, anchor.data(), anchor.size() * 4).has_value());
+  ASSERT_TRUE(upload(unary_buf, unary.data(), unary.size() * 4).has_value());
+  auto kernel = backend->LoadKernel("selector_edge_score", {});
+  ASSERT_TRUE(kernel.has_value());
+  const std::size_t total = positions * kTopK * kTopK;
+  tessera::KernelLaunch launch;
+  launch.grid_x = (total + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*pred_buf).get(),   (*succ_buf).get(),
+                    (*hid_buf).get(),    (*cand_buf).get(),
+                    (*anchor_buf).get(), (*unary_buf).get(),
+                    (*out_buf).get()};
+  launch.scalars = {kBatch, kSeq, kTopK, kRank, kVocab};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(total * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(total);
+  ASSERT_TRUE(core::SelectorEdgeScoreRef(
+                  std::span<const float>(pred), std::span<const float>(succ),
+                  std::span<const float>(hidden),
+                  std::span<const std::int32_t>(cand),
+                  std::span<const std::int32_t>(anchor),
+                  std::span<const float>(unary), std::span<float>(ref), kBatch,
+                  kSeq, kTopK, kRank, kVocab)
                   .has_value());
   const auto* got = reinterpret_cast<const float*>(readback.data());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());

@@ -59,6 +59,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"repeat_heads", reinterpret_cast<void*>(&RepeatHeadsKernel)},
     {"conv1d_step", reinterpret_cast<void*>(&Conv1dStepKernel)},
     {"dflash_conv", reinterpret_cast<void*>(&DflashConvKernel)},
+    {"selector_edge_score", reinterpret_cast<void*>(&SelectorEdgeScoreKernel)},
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},

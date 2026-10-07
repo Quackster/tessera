@@ -1,0 +1,50 @@
+#version 450
+
+// One thread per output element; dispatch ceil(batch*seq*top_k^2 / 256).
+layout(local_size_x = 256) in;
+
+// "selector_edge_score" contract: buffers PredecessorCodebook (vocab x
+// rank), SuccessorCodebook (vocab x rank), Hidden (batch x seq x rank),
+// CandidateIds (int32, batch x seq x top_k), AnchorIds (int32,
+// batch x seq), Unary (batch x seq x top_k), Out (batch x seq x top_k x
+// top_k). Scalars: batch v[0], seq v[2], top_k v[4], rank v[6],
+// vocab v[8].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer Pred { float predecessor[]; };
+layout(set = 0, binding = 1) buffer Succ { float successor[]; };
+layout(set = 0, binding = 2) buffer Hidden { float hidden[]; };
+layout(set = 0, binding = 3) buffer CandidateIds { int candidate_ids[]; };
+layout(set = 0, binding = 4) buffer AnchorIds { int anchor_ids[]; };
+layout(set = 0, binding = 5) buffer Unary { float unary[]; };
+layout(set = 0, binding = 6) buffer Out { float out_scores[]; };
+
+void main() {
+  uint batch = pc.v[0];
+  uint seq = pc.v[2];
+  uint top_k = pc.v[4];
+  uint rank = pc.v[6];
+  uint index = gl_GlobalInvocationID.x;
+  uint positions = batch * seq;
+  if (index >= positions * top_k * top_k) {
+    return;
+  }
+  uint c = index % top_k;
+  uint p = (index / top_k) % top_k;
+  uint pos = index / (top_k * top_k);
+  uint l = pos % seq;
+  int pred_id = (l == 0) ? anchor_ids[pos]
+                         : candidate_ids[pos * top_k - top_k + p];
+  int succ_id = candidate_ids[pos * top_k + c];
+  float dot = 0.0;
+  uint hidden_row = pos * rank;
+  uint pred_row = uint(pred_id) * rank;
+  uint succ_row = uint(succ_id) * rank;
+  for (uint r = 0; r < rank; ++r) {
+    dot += predecessor[pred_row + r] * hidden[hidden_row + r] *
+           successor[succ_row + r];
+  }
+  out_scores[index] = unary[pos * top_k + p] + dot;
+}

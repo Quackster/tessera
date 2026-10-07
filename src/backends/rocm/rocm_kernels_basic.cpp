@@ -538,4 +538,38 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
   y[i] = acc;
 }
 
+// Built-in "selector_edge_score": DFlash2 candidate-selector transition
+// score. One thread per output element.
+__global__ void SelectorEdgeScoreKernel(
+    const float* predecessor_codebook, const float* successor_codebook,
+    const float* hidden, const int* candidate_ids, const int* anchor_ids,
+    const float* unary, float* out_scores, unsigned long long batch,
+    unsigned long long seq, unsigned long long top_k,
+    unsigned long long rank) {
+  const unsigned long long index =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const unsigned long long positions = batch * seq;
+  if (index >= positions * top_k * top_k) {
+    return;
+  }
+  const unsigned long long c = index % top_k;
+  const unsigned long long p = (index / top_k) % top_k;
+  const unsigned long long pos = index / (top_k * top_k);
+  const unsigned long long l = pos % seq;
+  const int pred_id =
+      (l == 0) ? anchor_ids[pos] : candidate_ids[pos * top_k - top_k + p];
+  const int succ_id = candidate_ids[pos * top_k + c];
+  float dot = 0.0f;
+  const unsigned long long hidden_row = pos * rank;
+  const unsigned long long pred_row =
+      static_cast<unsigned long long>(pred_id) * rank;
+  const unsigned long long succ_row =
+      static_cast<unsigned long long>(succ_id) * rank;
+  for (unsigned long long r = 0; r < rank; ++r) {
+    dot = fmaf(predecessor_codebook[pred_row + r] * hidden[hidden_row + r],
+               successor_codebook[succ_row + r], dot);
+  }
+  out_scores[index] = unary[pos * top_k + p] + dot;
+}
+
 }  // namespace tessera::backends::rocm

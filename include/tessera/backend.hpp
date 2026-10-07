@@ -198,6 +198,13 @@ class Kernel {
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
 // for both is ceil(n / 256) workgroups of 256.
+// "selector_edge_score": buffers are PredecessorCodebook (fp32,
+// vocab x rank), SuccessorCodebook (fp32, vocab x rank), Hidden (fp32,
+// batch x seq x rank), CandidateIds (int32, batch x seq x top_k),
+// AnchorIds (int32, batch x seq), Unary (fp32, batch x seq x top_k) and
+// the output Out (fp32, batch x seq x top_k x top_k); scalars are
+// batch, seq, top_k, rank and vocab. This is the DFlash2 candidate
+// selector transition score. Dispatch is ceil(batch*seq*top_k*top_k / 256).
 // "dflash_conv": buffers are X (fp32, rows x channels), Delta (fp32,
 // rows x taps x num_groups), Base (fp32, taps x channels) and the
 // output Y (fp32, rows x channels); scalars are rows, channels, taps,
@@ -391,6 +398,16 @@ class Kernel {
     }
     if (launch.scalars[0] == 0) {
       return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "selector_edge_score") {
+    if (launch.buffers.size() != 7 || launch.scalars.size() != 5) {
+      return StatusCode::InvalidArgument;
+    }
+    for (std::uint64_t value : launch.scalars) {
+      if (value == 0) {
+        return StatusCode::InvalidArgument;
+      }
     }
   }
   if (kernel.Id() == "dflash_conv") {
