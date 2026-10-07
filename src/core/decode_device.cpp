@@ -10,6 +10,7 @@ namespace tessera::core {
 
 namespace {
 
+using detail::DownloadF32;
 using detail::GatherEmbedding;
 using detail::AttentionDevice;
 using detail::GemmFor;
@@ -58,7 +59,7 @@ std::expected<void, StatusCode> AppendKv(Backend& backend,
 
 std::expected<std::uint32_t, StatusCode> DecodeStepDevice(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token) {
+    std::uint32_t token, std::vector<float>* hidden_out) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -228,6 +229,13 @@ std::expected<std::uint32_t, StatusCode> DecodeStepDevice(
                            hidden)) {
       return std::unexpected(StatusCode::DeviceError);
     }
+  }
+  if (hidden_out != nullptr) {
+    auto snapshot = detail::DownloadF32(backend, *st.x);
+    if (!snapshot) {
+      return std::unexpected(snapshot.error());
+    }
+    *hidden_out = std::move(*snapshot);
   }
   auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
   auto output = NeedWeightAny(model, "output.weight");

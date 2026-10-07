@@ -56,6 +56,17 @@ std::expected<std::unique_ptr<Model>, StatusCode> Engine::LoadModel(
   return model;
 }
 
+std::expected<std::uint32_t, StatusCode> Engine::MtpDraft(
+    Model& model, std::uint32_t token) {
+  core::DecodeCache cache;
+  std::vector<float> hidden;
+  auto step = core::DecodeStep(*backend_, model, cache, token, &hidden);
+  if (!step) {
+    return std::unexpected(step.error());
+  }
+  return core::MtpDraftStep(*backend_, model, cache, hidden, *step, 1);
+}
+
 std::expected<void, StatusCode> Engine::AttachSpeculative(
     std::unique_ptr<SpeculativeStrategy>&& strategy) {
   if (!strategy) {

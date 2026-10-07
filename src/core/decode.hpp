@@ -89,6 +89,8 @@ struct HybridDecodeCache {
   std::unique_ptr<Buffer> conv_mixed;
   std::unique_ptr<Buffer> q_l, k_l;
   std::unique_ptr<Buffer> q_exp, k_exp, v_l, core, out;
+  // MTP head scratch (fused embedding+hidden, hidden norms).
+  std::unique_ptr<Buffer> mtp_fused, mtp_h;
   // Per linear layer, the conv input history on the host (oldest first).
   std::vector<std::vector<float>> conv_hist;
   struct FullKv {
@@ -102,6 +104,7 @@ struct HybridDecodeCache {
   };
   std::vector<FullKv> full;
   std::vector<LinearState> linear;
+  FullKv mtp_kv;
   // Host-side cache of constant weights (conv kernels) and the sequence
   // position (full-layer KV rows equal the position).
   std::unordered_map<std::string, std::vector<float>> host_weights;
@@ -110,10 +113,12 @@ struct HybridDecodeCache {
 };
 
 // One vanilla decoder step: embed, block forward, greedy argmax.
-// Q4_K projections and F32 vectors only.
+// Q4_K projections and F32 vectors only. When `hidden` is non-null it
+// receives the final hidden state (hidden_dim floats) before the output
+// norm, for the MTP head.
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> DecodeStep(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token);
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
 
 // One hybrid decoder step (interleaved full-attention and linear
 // attention). Dispatched from DecodeStep when the config is hybrid. The
@@ -121,7 +126,7 @@ struct HybridDecodeCache {
 // UnsupportedFeature until the recurrent path lands.
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token);
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
 
 // One device-resident vanilla decoder step: activations stay on the
 // device and chain through the elementwise/projection kernels; only the
@@ -129,6 +134,14 @@ struct HybridDecodeCache {
 // non-hybrid config.
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> DecodeStepDevice(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token);
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
+
+// One multi-token-prediction draft step (Qwen3.5 nextn head): fuse the
+// token embedding and the backbone hidden (`hidden`, hidden_dim floats),
+// run the MTP full-attention block, and return the drafted token. `pos`
+// is the sequence position for the MTP block's RoPE.
+[[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraftStep(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::span<const float> hidden, std::uint32_t token, std::uint64_t pos);
 
 }  // namespace tessera::core

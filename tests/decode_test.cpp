@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <vector>
@@ -317,4 +318,38 @@ TEST(HybridDecodeTest, LinearBaselineIsPinned) {
       GreedyTokens(WriteLinearHybridFixture("linear.gguf").string(), 8);
   const std::vector<std::uint32_t> want = {5, 5, 31, 0, 30, 4, 19, 19};
   EXPECT_EQ(got, want);
+}
+
+// The MTP head drafts a token from the backbone hidden state (27B target;
+// path via TESSERA_TEST_GGUF). Deterministic across fresh caches.
+TEST(HybridDecodeTest, MtpDraftWhenModelProvided) {
+  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{path, 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value()) << tessera::ToString(cfg.error());
+  tessera::core::DecodeCache cache;
+  std::vector<float> hidden;
+  auto step =
+      tessera::core::DecodeStep(engine->Owner(), **model, cache, 0, &hidden);
+  ASSERT_TRUE(step.has_value()) << tessera::ToString(step.error());
+  ASSERT_EQ(hidden.size(), cfg->hidden_dim);
+  auto draft = tessera::core::MtpDraftStep(engine->Owner(), **model, cache,
+                                           hidden, *step, 1);
+  ASSERT_TRUE(draft.has_value()) << tessera::ToString(draft.error());
+  EXPECT_LT(*draft, cfg->vocab_size);
+  tessera::core::DecodeCache replay;
+  std::vector<float> hidden2;
+  auto step2 =
+      tessera::core::DecodeStep(engine->Owner(), **model, replay, 0, &hidden2);
+  ASSERT_TRUE(step2.has_value()) << tessera::ToString(step2.error());
+  auto draft2 = tessera::core::MtpDraftStep(engine->Owner(), **model, replay,
+                                            hidden2, *step2, 1);
+  ASSERT_TRUE(draft2.has_value()) << tessera::ToString(draft2.error());
+  EXPECT_EQ(*draft2, *draft);
 }

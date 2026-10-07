@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "core/decode_hybrid_internal.hpp"
 #include "core/decode_internal.hpp"
 #include "core/numerics/conv.hpp"
 
@@ -13,7 +14,10 @@ namespace tessera::core {
 namespace {
 
 using detail::AddDevice;
+using detail::AttentionDevice;
 using detail::DeltaStepHeadsDevice;
+using detail::DownloadF32;
+using detail::DownloadF32Cached;
 using detail::GatherEmbedding;
 using detail::GemmFor;
 using detail::L2NormDevice;
@@ -22,10 +26,12 @@ using detail::NeedWeight;
 using detail::NeedWeightAny;
 using detail::ProjectDevice;
 using detail::QGateSplitDevice;
+using detail::RepeatHeadsDevice;
 using detail::RmsNormDevice;
 using detail::RmsNormGatedDevice;
 using detail::SigmoidGateDevice;
 using detail::SiluMulDevice;
+using detail::SsmGateDevice;
 using detail::UploadF32;
 
 // Derived recurrent-layer geometry from the SSM config.
@@ -60,12 +66,6 @@ std::expected<LinearGeometry, StatusCode> DeriveGeometry(
   g.factor = g.num_v_heads / g.num_k_heads;
   g.conv_dim = g.key_dim * 2 + g.value_dim;
   return g;
-}
-
-std::uint32_t FloatBits(float value) {
-  std::uint32_t bits = 0;
-  std::memcpy(&bits, &value, sizeof(bits));
-  return bits;
 }
 
 // Grow a full-attention KV cache by one row.
@@ -103,8 +103,7 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
                                             const LinearGeometry& g) {
   const std::size_t q_dim = cfg.attention.heads * cfg.attention.head_dim;
   const std::size_t kv_dim = cfg.attention.kv_heads * cfg.attention.head_dim;
-  auto alloc = [&backend](std::size_t bytes)
-      -> std::expected<std::unique_ptr<Buffer>, StatusCode> {
+  auto alloc = [&backend](std::size_t bytes) {
     return backend.AllocateBuffer(bytes, MemoryKind::Device);
   };
   auto make = [&](std::unique_ptr<Buffer>& slot,
@@ -129,7 +128,8 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
       !make(h.q_exp, g.num_v_heads * g.head_k_dim) ||
       !make(h.k_exp, g.num_v_heads * g.head_k_dim) ||
       !make(h.v_l, g.value_dim) || !make(h.core, g.value_dim) ||
-      !make(h.out, g.value_dim)) {
+      !make(h.out, g.value_dim) || !make(h.mtp_fused, 2 * cfg.hidden_dim) ||
+      !make(h.mtp_h, cfg.hidden_dim)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   auto pos = alloc(3 * 8);  // three u64 triples
@@ -163,9 +163,112 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
 
 }  // namespace
 
+std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
+                                       const TransformerConfig& cfg,
+                                       HybridDecodeCache& h,
+                                       std::size_t layer) {
+  const std::string base = "blk." + std::to_string(layer) + ".";
+  auto mlp_norm =
+      NeedWeight(model, base + "post_attention_norm.weight", DType::F32);
+  auto fg = NeedWeightAny(model, base + "ffn_gate.weight");
+  auto fu = NeedWeightAny(model, base + "ffn_up.weight");
+  auto fd = NeedWeightAny(model, base + "ffn_down.weight");
+  if (!mlp_norm || !fg || !fu || !fd) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  auto gemm_fgate = GemmFor(backend, h.gemms, (*fg)->manifest.dtype);
+  auto gemm_fup = GemmFor(backend, h.gemms, (*fu)->manifest.dtype);
+  auto gemm_fdown = GemmFor(backend, h.gemms, (*fd)->manifest.dtype);
+  if (!gemm_fgate || !gemm_fup || !gemm_fdown) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*mlp_norm)->device,
+                     *h.xn, 1, cfg.hidden_dim, cfg.norm_eps) ||
+      !ProjectDevice(backend, *(*gemm_fgate), *h.xn, *(*fg)->device, *h.fgate,
+                     1, cfg.ffn_dim, cfg.hidden_dim) ||
+      !ProjectDevice(backend, *(*gemm_fup), *h.xn, *(*fu)->device, *h.fup, 1,
+                     cfg.ffn_dim, cfg.hidden_dim) ||
+      !SiluMulDevice(backend, *h.silu_mul_kernel, *h.fgate, *h.fup, *h.fmlp,
+                     cfg.ffn_dim) ||
+      !ProjectDevice(backend, *(*gemm_fdown), *h.fmlp, *(*fd)->device, *h.proj,
+                     1, cfg.hidden_dim, cfg.ffn_dim) ||
+      !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, cfg.hidden_dim)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> RunFullBlock(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    HybridDecodeCache& h, std::size_t layer, std::uint64_t pos,
+    HybridDecodeCache::FullKv& kv) {
+  const std::size_t hidden = cfg.hidden_dim;
+  const std::size_t heads = cfg.attention.heads;
+  const std::size_t kv_heads = cfg.attention.kv_heads;
+  const std::size_t head_dim = cfg.attention.head_dim;
+  const std::size_t kv_dim = kv_heads * head_dim;
+  const std::size_t rope_dim = cfg.attention.rope_dim;
+  const std::size_t sec_t = static_cast<std::size_t>(cfg.rope_sections[0]);
+  const std::size_t sec_h = static_cast<std::size_t>(cfg.rope_sections[1]);
+  const std::size_t sec_w = static_cast<std::size_t>(cfg.rope_sections[2]);
+  const std::string base = "blk." + std::to_string(layer) + ".";
+  auto norm = NeedWeight(model, base + "attn_norm.weight", DType::F32);
+  auto wq = NeedWeightAny(model, base + "attn_q.weight");
+  auto wk = NeedWeightAny(model, base + "attn_k.weight");
+  auto wv = NeedWeightAny(model, base + "attn_v.weight");
+  auto wo = NeedWeightAny(model, base + "attn_output.weight");
+  auto q_norm = NeedWeight(model, base + "attn_q_norm.weight", DType::F32);
+  auto k_norm = NeedWeight(model, base + "attn_k_norm.weight", DType::F32);
+  if (!norm || !wq || !wk || !wv || !wo || !q_norm || !k_norm) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  auto gemm_q = GemmFor(backend, h.gemms, (*wq)->manifest.dtype);
+  auto gemm_k = GemmFor(backend, h.gemms, (*wk)->manifest.dtype);
+  auto gemm_v = GemmFor(backend, h.gemms, (*wv)->manifest.dtype);
+  auto gemm_o = GemmFor(backend, h.gemms, (*wo)->manifest.dtype);
+  if (!gemm_q || !gemm_k || !gemm_v || !gemm_o) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*norm)->device, *h.xn,
+                     1, hidden, cfg.norm_eps) ||
+      !ProjectDevice(backend, *(*gemm_q), *h.xn, *(*wq)->device, *h.fused, 1,
+                     heads * head_dim * 2, hidden) ||
+      !QGateSplitDevice(backend, *h.qgate_split_kernel, *h.fused, *h.q, *h.gate,
+                        heads, head_dim) ||
+      !ProjectDevice(backend, *(*gemm_k), *h.xn, *(*wk)->device, *h.kf, 1,
+                     kv_dim, hidden) ||
+      !ProjectDevice(backend, *(*gemm_v), *h.xn, *(*wv)->device, *h.vf, 1,
+                     kv_dim, hidden) ||
+      !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.q, *(*q_norm)->device, *h.q,
+                     heads, head_dim, cfg.norm_eps) ||
+      !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.kf, *(*k_norm)->device,
+                     *h.kf, kv_heads, head_dim, cfg.norm_eps) ||
+      !MropeDevice(backend, *h.mrope_kernel, *h.q, *h.pos, 1, heads, head_dim,
+                   rope_dim, sec_t, sec_h, sec_w, cfg.attention.rope_theta) ||
+      !MropeDevice(backend, *h.mrope_kernel, *h.kf, *h.pos, 1, kv_heads,
+                   head_dim, rope_dim, sec_t, sec_h, sec_w,
+                   cfg.attention.rope_theta)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (auto appended = AppendKv(backend, kv, *h.kf, *h.vf, kv_dim * 4);
+      !appended) {
+    return std::unexpected(appended.error());
+  }
+  if (!AttentionDevice(backend, *h.attention_kernel, *h.q, *kv.k, *kv.v,
+                       *h.attn, kv.rows, heads, kv_heads, head_dim, pos) ||
+      !SigmoidGateDevice(backend, *h.sigmoid_gate_kernel, *h.attn, *h.gate,
+                         *h.attn, heads * head_dim) ||
+      !ProjectDevice(backend, *(*gemm_o), *h.attn, *(*wo)->device, *h.proj, 1,
+                     hidden, heads * head_dim) ||
+      !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, hidden)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return RunFfn(backend, model, cfg, h, layer);
+}
+
 std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token) {
+    std::uint32_t token, std::vector<float>* hidden_out) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -217,14 +320,6 @@ std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
     h.ready = true;
   }
   const std::size_t hidden = cfg.hidden_dim;
-  const std::size_t heads = cfg.attention.heads;
-  const std::size_t kv_heads = cfg.attention.kv_heads;
-  const std::size_t head_dim = cfg.attention.head_dim;
-  const std::size_t kv_dim = kv_heads * head_dim;
-  const std::size_t rope_dim = cfg.attention.rope_dim;
-  const std::size_t sec_t = static_cast<std::size_t>(cfg.rope_sections[0]);
-  const std::size_t sec_h = static_cast<std::size_t>(cfg.rope_sections[1]);
-  const std::size_t sec_w = static_cast<std::size_t>(cfg.rope_sections[2]);
   auto embed = NeedWeightAny(model, "token_embd.weight");
   if (!embed) {
     return std::unexpected(embed.error());
@@ -245,7 +340,6 @@ std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
       return std::unexpected(StatusCode::DeviceError);
     }
   }
-  // Position triple (t, h, w) all equal for text.
   const std::uint64_t p = h.position;
   const std::uint64_t triples[3] = {p, p, p};
   if (!backend.CopyH2D(*h.pos, std::span<const std::byte>(
@@ -254,200 +348,133 @@ std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
     return std::unexpected(StatusCode::DeviceError);
   }
   for (std::size_t l = 0; l < cfg.layers; ++l) {
+    if (cfg.IsFullAttentionLayer(l)) {
+      if (auto block = RunFullBlock(backend, model, cfg, h, l, p, h.full[l]);
+          !block) {
+        return std::unexpected(block.error());
+      }
+      continue;
+    }
     const std::string base = "blk." + std::to_string(l) + ".";
     auto norm = NeedWeight(model, base + "attn_norm.weight", DType::F32);
     if (!norm) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*norm)->device, *h.xn,
-                       1, hidden, cfg.norm_eps)) {
+    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*norm)->device,
+                       *h.xn, 1, hidden, cfg.norm_eps)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    if (cfg.IsFullAttentionLayer(l)) {
-      auto wq = NeedWeightAny(model, base + "attn_q.weight");
-      auto wk = NeedWeightAny(model, base + "attn_k.weight");
-      auto wv = NeedWeightAny(model, base + "attn_v.weight");
-      auto wo = NeedWeightAny(model, base + "attn_output.weight");
-      auto q_norm = NeedWeight(model, base + "attn_q_norm.weight", DType::F32);
-      auto k_norm = NeedWeight(model, base + "attn_k_norm.weight", DType::F32);
-      if (!wq || !wk || !wv || !wo || !q_norm || !k_norm) {
-        return std::unexpected(StatusCode::MalformedFile);
-      }
-      auto gemm_q = GemmFor(backend, h.gemms, (*wq)->manifest.dtype);
-      auto gemm_k = GemmFor(backend, h.gemms, (*wk)->manifest.dtype);
-      auto gemm_v = GemmFor(backend, h.gemms, (*wv)->manifest.dtype);
-      auto gemm_o = GemmFor(backend, h.gemms, (*wo)->manifest.dtype);
-      if (!gemm_q || !gemm_k || !gemm_v || !gemm_o) {
-        return std::unexpected(StatusCode::UnsupportedFeature);
-      }
-      if (!ProjectDevice(backend, *(*gemm_q), *h.xn, *(*wq)->device, *h.fused, 1,
-                         heads * head_dim * 2, hidden) ||
-          !QGateSplitDevice(backend, *h.qgate_split_kernel, *h.fused, *h.q,
-                            *h.gate, heads, head_dim) ||
-          !ProjectDevice(backend, *(*gemm_k), *h.xn, *(*wk)->device, *h.kf, 1,
-                         kv_dim, hidden) ||
-          !ProjectDevice(backend, *(*gemm_v), *h.xn, *(*wv)->device, *h.vf, 1,
-                         kv_dim, hidden) ||
-          !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.q, *(*q_norm)->device,
-                         *h.q, heads, head_dim, cfg.norm_eps) ||
-          !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.kf, *(*k_norm)->device,
-                         *h.kf, kv_heads, head_dim, cfg.norm_eps) ||
-          !MropeDevice(backend, *h.mrope_kernel, *h.q, *h.pos, 1, heads,
-                       head_dim, rope_dim, sec_t, sec_h, sec_w,
-                       cfg.attention.rope_theta) ||
-          !MropeDevice(backend, *h.mrope_kernel, *h.kf, *h.pos, 1, kv_heads,
-                       head_dim, rope_dim, sec_t, sec_h, sec_w,
-                       cfg.attention.rope_theta)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-      HybridDecodeCache::FullKv& kv = h.full[l];
-      if (auto appended = AppendKv(backend, kv, *h.kf, *h.vf, kv_dim * 4);
-          !appended) {
-        return std::unexpected(appended.error());
-      }
-      if (!detail::AttentionDevice(backend, *h.attention_kernel, *h.q, *kv.k, *kv.v,
-                          *h.attn, kv.rows, heads, kv_heads, head_dim, p) ||
-          !SigmoidGateDevice(backend, *h.sigmoid_gate_kernel, *h.attn, *h.gate,
-                             *h.attn, heads * head_dim) ||
-          !ProjectDevice(backend, *(*gemm_o), *h.attn, *(*wo)->device, *h.proj,
-                         1, hidden, heads * head_dim) ||
-          !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, hidden)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-    } else {
-      auto w_qkv = NeedWeightAny(model, base + "attn_qkv.weight");
-      auto w_gate = NeedWeightAny(model, base + "attn_gate.weight");
-      auto w_conv = NeedWeight(model, base + "ssm_conv1d.weight", DType::F32);
-      auto w_alpha = NeedWeightAny(model, base + "ssm_alpha.weight");
-      auto w_beta = NeedWeightAny(model, base + "ssm_beta.weight");
-      auto w_a = NeedWeight(model, base + "ssm_a", DType::F32);
-      auto w_dt = NeedWeight(model, base + "ssm_dt.bias", DType::F32);
-      auto w_norm = NeedWeight(model, base + "ssm_norm.weight", DType::F32);
-      auto w_out = NeedWeightAny(model, base + "ssm_out.weight");
-      if (!w_qkv || !w_gate || !w_conv || !w_alpha || !w_beta || !w_a || !w_dt ||
-          !w_norm || !w_out) {
-        return std::unexpected(StatusCode::MalformedFile);
-      }
-      auto gemm_qkv = GemmFor(backend, h.gemms, (*w_qkv)->manifest.dtype);
-      auto gemm_gate = GemmFor(backend, h.gemms, (*w_gate)->manifest.dtype);
-      auto gemm_alpha = GemmFor(backend, h.gemms, (*w_alpha)->manifest.dtype);
-      auto gemm_beta = GemmFor(backend, h.gemms, (*w_beta)->manifest.dtype);
-      auto gemm_out = GemmFor(backend, h.gemms, (*w_out)->manifest.dtype);
-      if (!gemm_qkv || !gemm_gate || !gemm_alpha || !gemm_beta || !gemm_out) {
-        return std::unexpected(StatusCode::UnsupportedFeature);
-      }
-      if (!ProjectDevice(backend, *(*gemm_qkv), *h.xn, *(*w_qkv)->device,
-                         *h.qkv, 1, g.conv_dim, hidden) ||
-          !ProjectDevice(backend, *(*gemm_gate), *h.xn, *(*w_gate)->device,
-                         *h.z, 1, g.value_dim, hidden) ||
-          !ProjectDevice(backend, *(*gemm_beta), *h.xn, *(*w_beta)->device,
-                         *h.beta_raw, 1, g.num_v_heads, hidden) ||
-          !ProjectDevice(backend, *(*gemm_alpha), *h.xn, *(*w_alpha)->device,
-                         *h.alpha_raw, 1, g.num_v_heads, hidden) ||
-          !detail::SsmGateDevice(backend, *h.ssm_gate_kernel, *(*w_a)->device,
-                                 *(*w_dt)->device, *h.alpha_raw, *h.beta_raw,
-                                 *h.alpha, *h.beta, g.num_v_heads)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-      // The causal conv runs on the host: download the fused qkv, convolve
-      // with the cached history, then upload the mixed result.
-      std::vector<float> qkv(g.conv_dim);
-      auto qkv_down = backend.CopyD2H(
-          *h.qkv, reinterpret_cast<std::byte*>(qkv.data()), qkv.size() * 4);
-      if (!qkv_down) {
-        return std::unexpected(qkv_down.error());
-      }
-      auto conv_w = detail::DownloadF32Cached(
-          backend, h.host_weights, base + "ssm_conv1d.weight",
-          *(*w_conv)->device);
-      if (!conv_w) {
-        return std::unexpected(conv_w.error());
-      }
-      std::vector<float> xr(g.conv_dim * g.width);
-      for (std::size_t c = 0; c < g.conv_dim; ++c) {
-        xr[c * g.width] = qkv[c];
-        for (std::size_t i = 1; i < g.width; ++i) {
-          xr[c * g.width + i] =
-              h.conv_hist[l][c * (g.width - 1) + (i - 1)];
-        }
-      }
-      std::vector<float> mixed(g.conv_dim);
-      auto conv = Conv1dStepRef(std::span<const float>(xr),
-                                std::span<const float>(**conv_w),
-                                std::span<float>(mixed), g.conv_dim, g.width);
-      if (!conv) {
-        return std::unexpected(conv.error());
-      }
-      for (float& value : mixed) {
-        value = value / (1.0f + std::exp(-value));
-      }
-      // Slide the history: newest first.
-      for (std::size_t c = 0; c < g.conv_dim; ++c) {
-        for (std::size_t i = g.width - 1; i > 1; --i) {
-          h.conv_hist[l][c * (g.width - 1) + (i - 1)] =
-              h.conv_hist[l][c * (g.width - 1) + (i - 2)];
-        }
-        if (g.width > 1) {
-          h.conv_hist[l][c * (g.width - 1)] = qkv[c];
-        }
-      }
-      if (!UploadF32(backend, *h.conv_mixed, mixed) ||
-          !backend.CopyD2D(*h.conv_mixed, 0, *h.q_l, 0, g.key_dim * 4) ||
-          !backend.CopyD2D(*h.conv_mixed, g.key_dim * 4, *h.k_l, 0,
-                           g.key_dim * 4) ||
-          !backend.CopyD2D(*h.conv_mixed, 2 * g.key_dim * 4, *h.v_l, 0,
-                           g.value_dim * 4) ||
-          !L2NormDevice(backend, *h.l2norm_kernel, *h.q_l, *h.q_l,
-                        g.num_k_heads, g.head_k_dim, 1e-6f) ||
-          !L2NormDevice(backend, *h.l2norm_kernel, *h.k_l, *h.k_l,
-                        g.num_k_heads, g.head_k_dim, 1e-6f) ||
-          !detail::RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *h.q_l,
-                                     *h.q_exp, g.num_v_heads, g.head_k_dim,
-                                     g.factor) ||
-          !detail::RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *h.k_l,
-                                     *h.k_exp, g.num_v_heads, g.head_k_dim,
-                                     g.factor) ||
-          !DeltaStepHeadsDevice(backend, *h.delta_step_heads_kernel,
-                                *h.linear[l].state, *h.k_exp, *h.v_l, *h.q_exp,
-                                *h.core, *h.alpha, *h.beta, g.num_v_heads,
-                                g.head_k_dim, g.head_v_dim) ||
-          !RmsNormGatedDevice(backend, *h.rmsnorm_gated_kernel, *h.core,
-                              *(*w_norm)->device, *h.z, *h.out, g.num_v_heads,
-                              g.head_v_dim, cfg.norm_eps) ||
-          !ProjectDevice(backend, *(*gemm_out), *h.out, *(*w_out)->device,
-                         *h.proj, 1, hidden, g.value_dim) ||
-          !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, hidden)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-    }
-    // Shared gated MLP.
-    auto mlp_norm =
-        NeedWeight(model, base + "post_attention_norm.weight", DType::F32);
-    auto fg = NeedWeightAny(model, base + "ffn_gate.weight");
-    auto fu = NeedWeightAny(model, base + "ffn_up.weight");
-    auto fd = NeedWeightAny(model, base + "ffn_down.weight");
-    if (!mlp_norm || !fg || !fu || !fd) {
+    auto w_qkv = NeedWeightAny(model, base + "attn_qkv.weight");
+    auto w_gate = NeedWeightAny(model, base + "attn_gate.weight");
+    auto w_conv = NeedWeight(model, base + "ssm_conv1d.weight", DType::F32);
+    auto w_alpha = NeedWeightAny(model, base + "ssm_alpha.weight");
+    auto w_beta = NeedWeightAny(model, base + "ssm_beta.weight");
+    auto w_a = NeedWeight(model, base + "ssm_a", DType::F32);
+    auto w_dt = NeedWeight(model, base + "ssm_dt.bias", DType::F32);
+    auto w_norm = NeedWeight(model, base + "ssm_norm.weight", DType::F32);
+    auto w_out = NeedWeightAny(model, base + "ssm_out.weight");
+    if (!w_qkv || !w_gate || !w_conv || !w_alpha || !w_beta || !w_a || !w_dt ||
+        !w_norm || !w_out) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    auto gemm_fgate = GemmFor(backend, h.gemms, (*fg)->manifest.dtype);
-    auto gemm_fup = GemmFor(backend, h.gemms, (*fu)->manifest.dtype);
-    auto gemm_fdown = GemmFor(backend, h.gemms, (*fd)->manifest.dtype);
-    if (!gemm_fgate || !gemm_fup || !gemm_fdown) {
+    auto gemm_qkv = GemmFor(backend, h.gemms, (*w_qkv)->manifest.dtype);
+    auto gemm_gate = GemmFor(backend, h.gemms, (*w_gate)->manifest.dtype);
+    auto gemm_alpha = GemmFor(backend, h.gemms, (*w_alpha)->manifest.dtype);
+    auto gemm_beta = GemmFor(backend, h.gemms, (*w_beta)->manifest.dtype);
+    auto gemm_out = GemmFor(backend, h.gemms, (*w_out)->manifest.dtype);
+    if (!gemm_qkv || !gemm_gate || !gemm_alpha || !gemm_beta || !gemm_out) {
       return std::unexpected(StatusCode::UnsupportedFeature);
     }
-    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*mlp_norm)->device,
-                       *h.xn, 1, hidden, cfg.norm_eps) ||
-        !ProjectDevice(backend, *(*gemm_fgate), *h.xn, *(*fg)->device, *h.fgate,
-                       1, cfg.ffn_dim, hidden) ||
-        !ProjectDevice(backend, *(*gemm_fup), *h.xn, *(*fu)->device, *h.fup, 1,
-                       cfg.ffn_dim, hidden) ||
-        !SiluMulDevice(backend, *h.silu_mul_kernel, *h.fgate, *h.fup, *h.fmlp,
-                       cfg.ffn_dim) ||
-        !ProjectDevice(backend, *(*gemm_fdown), *h.fmlp, *(*fd)->device,
-                       *h.proj, 1, hidden, cfg.ffn_dim) ||
+    if (!ProjectDevice(backend, *(*gemm_qkv), *h.xn, *(*w_qkv)->device, *h.qkv,
+                       1, g.conv_dim, hidden) ||
+        !ProjectDevice(backend, *(*gemm_gate), *h.xn, *(*w_gate)->device, *h.z,
+                       1, g.value_dim, hidden) ||
+        !ProjectDevice(backend, *(*gemm_beta), *h.xn, *(*w_beta)->device,
+                       *h.beta_raw, 1, g.num_v_heads, hidden) ||
+        !ProjectDevice(backend, *(*gemm_alpha), *h.xn, *(*w_alpha)->device,
+                       *h.alpha_raw, 1, g.num_v_heads, hidden) ||
+        !SsmGateDevice(backend, *h.ssm_gate_kernel, *(*w_a)->device,
+                       *(*w_dt)->device, *h.alpha_raw, *h.beta_raw, *h.alpha,
+                       *h.beta, g.num_v_heads)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    // The causal conv runs on the host: download the fused qkv, convolve
+    // with the cached history, then upload the mixed result.
+    std::vector<float> qkv(g.conv_dim);
+    auto qkv_down = backend.CopyD2H(*h.qkv,
+                                    reinterpret_cast<std::byte*>(qkv.data()),
+                                    qkv.size() * 4);
+    if (!qkv_down) {
+      return std::unexpected(qkv_down.error());
+    }
+    auto conv_w = DownloadF32Cached(backend, h.host_weights,
+                                    base + "ssm_conv1d.weight",
+                                    *(*w_conv)->device);
+    if (!conv_w) {
+      return std::unexpected(conv_w.error());
+    }
+    std::vector<float> xr(g.conv_dim * g.width);
+    for (std::size_t c = 0; c < g.conv_dim; ++c) {
+      xr[c * g.width] = qkv[c];
+      for (std::size_t i = 1; i < g.width; ++i) {
+        xr[c * g.width + i] = h.conv_hist[l][c * (g.width - 1) + (i - 1)];
+      }
+    }
+    std::vector<float> mixed(g.conv_dim);
+    auto conv = Conv1dStepRef(std::span<const float>(xr),
+                              std::span<const float>(**conv_w),
+                              std::span<float>(mixed), g.conv_dim, g.width);
+    if (!conv) {
+      return std::unexpected(conv.error());
+    }
+    for (float& value : mixed) {
+      value = value / (1.0f + std::exp(-value));
+    }
+    for (std::size_t c = 0; c < g.conv_dim; ++c) {
+      for (std::size_t i = g.width - 1; i > 1; --i) {
+        h.conv_hist[l][c * (g.width - 1) + (i - 1)] =
+            h.conv_hist[l][c * (g.width - 1) + (i - 2)];
+      }
+      if (g.width > 1) {
+        h.conv_hist[l][c * (g.width - 1)] = qkv[c];
+      }
+    }
+    if (!UploadF32(backend, *h.conv_mixed, mixed) ||
+        !backend.CopyD2D(*h.conv_mixed, 0, *h.q_l, 0, g.key_dim * 4) ||
+        !backend.CopyD2D(*h.conv_mixed, g.key_dim * 4, *h.k_l, 0,
+                         g.key_dim * 4) ||
+        !backend.CopyD2D(*h.conv_mixed, 2 * g.key_dim * 4, *h.v_l, 0,
+                         g.value_dim * 4) ||
+        !L2NormDevice(backend, *h.l2norm_kernel, *h.q_l, *h.q_l, g.num_k_heads,
+                      g.head_k_dim, 1e-6f) ||
+        !L2NormDevice(backend, *h.l2norm_kernel, *h.k_l, *h.k_l, g.num_k_heads,
+                      g.head_k_dim, 1e-6f) ||
+        !RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *h.q_l, *h.q_exp,
+                           g.num_v_heads, g.head_k_dim, g.factor) ||
+        !RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *h.k_l, *h.k_exp,
+                           g.num_v_heads, g.head_k_dim, g.factor) ||
+        !DeltaStepHeadsDevice(backend, *h.delta_step_heads_kernel,
+                              *h.linear[l].state, *h.k_exp, *h.v_l, *h.q_exp,
+                              *h.core, *h.alpha, *h.beta, g.num_v_heads,
+                              g.head_k_dim, g.head_v_dim) ||
+        !RmsNormGatedDevice(backend, *h.rmsnorm_gated_kernel, *h.core,
+                            *(*w_norm)->device, *h.z, *h.out, g.num_v_heads,
+                            g.head_v_dim, cfg.norm_eps) ||
+        !ProjectDevice(backend, *(*gemm_out), *h.out, *(*w_out)->device,
+                       *h.proj, 1, hidden, g.value_dim) ||
         !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, hidden)) {
       return std::unexpected(StatusCode::DeviceError);
     }
+    if (auto ffn = RunFfn(backend, model, cfg, h, l); !ffn) {
+      return std::unexpected(ffn.error());
+    }
+  }
+  if (hidden_out != nullptr) {
+    auto snapshot = detail::DownloadF32(backend, *h.x);
+    if (!snapshot) {
+      return std::unexpected(snapshot.error());
+    }
+    *hidden_out = std::move(*snapshot);
   }
   auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
   auto output = NeedWeightAny(model, "output.weight");

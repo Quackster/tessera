@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 167/167 on both builds.
+`ctest` passes 168/168 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -387,13 +387,21 @@ through RADV GFX1201, rocm through the system ROCm).
   27B gated-delta decode drops from about 8.5 s to about 1 s per
   token. The host-only `hybrid_ops.hpp` helper is removed.
 
+- 2026-10-07: MTP head (168/168 `ctest` on both builds; the MTP test
+  is env-gated). Current head. `decode_mtp.cpp` runs the Qwen3.5
+  multi-token-prediction head: RMSNorm the token embedding and the
+  backbone hidden, concat, `nextn.eh_proj` to one hidden vector,
+  one full-attention block, the shared head norm and the shared
+  output weight. `DecodeStep` can emit the final hidden state; the
+  CLI `--mtp <id>` prints a draft. Unverifiable against a public
+  reference output, but the layout matches vLLM's qwen3_5_mtp
+  (credited). The 27B drafts deterministically.
+
 ## Next (in order)
 
-1. **MTP for the 27B target** (arch `qwen35`): the block.64 nextn
-   tensors (eh_proj, enorm/hnorm, shared_head_norm) are loaded but not
-   decoded. Wire the multi-token-prediction head so the draft block can
-   run. The main hybrid decode (full attention + recurrent) generates on
-   both backends today.
+1. **MTP verification**: the MTP head drafts. Still missing: wire the
+   draft into a verifier so MTP speculative decoding actually runs
+   (batched scoring of the draft plus the main token).
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.

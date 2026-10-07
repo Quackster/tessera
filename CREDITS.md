@@ -40,3 +40,9 @@ project, the version, the license, and where it is used.
   `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|
   \s*[\r\n]+|\s+(?!\S)|\s+`. Reimplemented in src/core/tokenizer.cpp;
   no code copied.
+- vLLM Qwen3.5 MTP implementation (Apache-2.0,
+  vllm/model_executor/models/qwen3_5_mtp.py): the MTP head layout
+  (RMSNorm the token embedding and the backbone hidden, concat,
+  nextn.eh_proj to one hidden vector, one full-attention block,
+  shared head norm and the shared output weight). Design reference
+  for src/core/decode_mtp.cpp; no code copied.

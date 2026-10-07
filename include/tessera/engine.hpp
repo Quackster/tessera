@@ -71,6 +71,12 @@ class Engine {
       Model& model, const GenerateOptions& options,
       const std::function<bool(std::uint32_t)>& on_token);
 
+  // One multi-token-prediction draft for the token after `token`: run a
+  // decode step to get the backbone hidden state, then the MTP head.
+  // UnsupportedFeature when the model has no MTP block.
+  [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraft(
+      Model& model, std::uint32_t token);
+
   // The engine's compute backend.
   [[nodiscard]] Backend& Owner();
   // nullptr when no strategy is attached.
