@@ -213,6 +213,8 @@ Repository-specific constraints on top of the hard rules:
   self-contained piece of work) is complete and the full test suite passes,
   make a git commit for it right away — do not let finished milestones pile up
   uncommitted.
+- A milestone commit must include source code changes. Do not make a commit
+  of only markdown (`.md`) files, unless told to commit them explicitly.
 
 ## Building and Testing
 

@@ -23,9 +23,12 @@ The boilerplate is complete and passes on both backends:
   and is verified by a read-back test on both devices.
 - DFlash2 strategy skeleton. It validates the draft checkpoint layout.
 - CLI: `tessera-cli run --model <path> [--draft <dir>]`.
-- Single GoogleTest target. `ctest` passes 58/58 on both builds.
-  The vulkan build was verified on an AMD Radeon RX 7900 XTX (RADV
-  NAVI31). The rocm build was verified on the system ROCm.
+- Generic GEMM kernel with GGUF Q4_K dequantization (fp32
+  accumulation). A host reference check verifies it on both devices
+  with per backend tolerance.
+- Single GoogleTest target. `ctest` passes 76/76 on both builds.
+  Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
+  through RADV GFX1201, rocm through the system ROCm).
 
 ## Done
 
@@ -45,27 +48,33 @@ The boilerplate is complete and passes on both backends:
   the ROCm toolchain (`enable_language(HIP)`), launched through
   `hipLaunchKernelExC`. The "fill" kernel is verified by read-back on
   both devices.
+- 2026-10-07: generic GEMM kernel (76/76 `ctest` on both builds).
+  Three launch binding bugs are fixed. Vulkan now exposes one
+  descriptor binding per buffer slot (the shaders declare one block
+  per binding). Both backends set argument pointers only after the
+  target vector stops growing (the old code stored `&vec.back()`
+  across a reallocation, so multi buffer launches read freed memory).
+  The ROCm device helpers carry `__host__ __device__` (first ROCm
+  build). The fix was verified on RADV and also reproduces on
+  llvmpipe, so it is a backend bug, not a driver bug.
 
 ## Next (in order)
 
-1. **Generic GEMM kernel** with GGUF Q4_K dequantization (fp32
-   accumulation) and a host reference check. Per backend tolerance
-   constants.
-2. **Attention (GQA) and RoPE kernels** driven by the model definition.
-3. **Weight upload**: manifest to device buffers via the backend.
+1. **Attention (GQA) and RoPE kernels** driven by the model definition.
+2. **Weight upload**: manifest to device buffers via the backend.
    Complete `Model::Load`. Today it only validates and parses the
    manifest.
-4. **Decode loop**: single token generation in the core (backend
+3. **Decode loop**: single token generation in the core (backend
    agnostic). End to end smoke on `Qwen3.8-27B-UD-Q4_K_M`.
-5. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
+4. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
    the fixed schema, decision pending). fp8 and mxfp4 GEMM kernels.
    MTP-FP8 draft weights.
-6. **DFlash2**: local dynamic convolution (grouped causal convolutions),
+5. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
-7. **Baseline pinning**: run the non speculative path on both backends.
+6. **Baseline pinning**: run the non speculative path on both backends.
    Record per backend tolerance. Assert in tests (fixed seeds).
-8. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+7. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. Models are data. No per model branches.
 
 ## Notes and decisions

@@ -3,6 +3,7 @@
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.
 #include "kernels_spirv.hpp"
 
+#include <array>
 #include <cstring>
 #include <vector>
 
@@ -67,15 +68,19 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
-  VkDescriptorSetLayoutBinding binding{};
-  binding.binding = 0;
-  binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  binding.descriptorCount = kMaxBoundBuffers;
-  binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  // One binding per buffer slot, so kernel i's buffer lands on binding i:
+  // GLSL shaders declare each buffer block as its own binding.
+  std::array<VkDescriptorSetLayoutBinding, kMaxBoundBuffers> layout_bindings{};
+  for (std::size_t i = 0; i < kMaxBoundBuffers; ++i) {
+    layout_bindings[i].binding = static_cast<std::uint32_t>(i);
+    layout_bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    layout_bindings[i].descriptorCount = 1;
+    layout_bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
   VkDescriptorSetLayoutCreateInfo set_layout_info{};
   set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 1;
-  set_layout_info.pBindings = &binding;
+  set_layout_info.bindingCount = kMaxBoundBuffers;
+  set_layout_info.pBindings = layout_bindings.data();
   result = vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                       &set_layout_);
   if (result != VK_SUCCESS) {
@@ -266,20 +271,26 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
              "); the descriptor pool is exhausted");
     return std::unexpected(FromVkResult(result));
   }
-  // One write per bound buffer; unused array elements stay null.
+  // One write per bound buffer: buffer i goes to binding i. The write's
+  // pBufferInfo must outlive the update call, so it is set after the
+  // buffer_infos vector has finished growing (no reallocation in between).
   std::vector<VkDescriptorBufferInfo> buffer_infos;
-  std::vector<VkWriteDescriptorSet> writes;
+  buffer_infos.reserve(kMaxBoundBuffers);
   for (std::size_t i = 0; i < bindings.size(); ++i) {
     buffer_infos.push_back(
         VkDescriptorBufferInfo{bindings[i].buffer, 0, bindings[i].size});
+  }
+  std::vector<VkWriteDescriptorSet> writes;
+  writes.reserve(kMaxBoundBuffers);
+  for (std::size_t i = 0; i < bindings.size(); ++i) {
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write.dstSet = set;
-    write.dstBinding = 0;
-    write.dstArrayElement = static_cast<std::uint32_t>(i);
+    write.dstBinding = static_cast<std::uint32_t>(i);
+    write.dstArrayElement = 0;
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.pBufferInfo = &buffer_infos.back();
+    write.pBufferInfo = &buffer_infos[i];
     writes.push_back(write);
   }
   if (!writes.empty()) {

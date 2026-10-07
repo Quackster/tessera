@@ -39,7 +39,7 @@ __global__ void FillKernel(int* out, unsigned long long value,
 
 // IEEE binary16 (little-endian) -> fp32, exact (device port of the
 // core Fp16ToFloat in src/core/numerics/quant.cpp).
-float Fp16ToFloatDev(std::uint16_t half) {
+__host__ __device__ float Fp16ToFloatDev(std::uint16_t half) {
   const std::uint32_t sign = half >> 15;
   const std::uint32_t exp = (half >> 10) & 0x1F;
   const std::uint32_t mant = half & 0x3FF;
@@ -60,8 +60,10 @@ float Fp16ToFloatDev(std::uint16_t half) {
 // The 6-bit scale/min pair of sub-block j from the 12-byte packing
 // (device port of the core GetScaleMin; the vulkan kernel uses the
 // same formula).
-void GetScaleMinDev(std::size_t j, const unsigned char* scales,
-                    std::uint8_t* scale, std::uint8_t* min) {
+__host__ __device__ void GetScaleMinDev(std::size_t j,
+                                        const unsigned char* scales,
+                                        std::uint8_t* scale,
+                                        std::uint8_t* min) {
   if (j < 4) {
     *scale = scales[j] & 63;
     *min = scales[j + 4] & 63;
@@ -297,14 +299,20 @@ class RocmBackend final : public Backend {
     std::memset(scalar_values, 0, sizeof(scalar_values));
     std::memcpy(scalar_values, launch.scalars.data(),
                 launch.scalars.size() * sizeof(std::uint64_t));
+    // Arg pointers must outlive the launch call, so they are set after
+    // buffer_pointers has finished growing (no reallocation in between).
     std::vector<void*> buffer_pointers;
-    std::vector<void*> arg_pointers;
+    buffer_pointers.reserve(kMaxBoundBuffers);
     for (const auto* buffer : launch.buffers) {
       if (buffer == nullptr) {
         return std::unexpected(StatusCode::InvalidArgument);
       }
       buffer_pointers.push_back(buffer->Handle());
-      arg_pointers.push_back(&buffer_pointers.back());
+    }
+    std::vector<void*> arg_pointers;
+    arg_pointers.reserve(kMaxBoundBuffers + kMaxScalars);
+    for (std::size_t i = 0; i < buffer_pointers.size(); ++i) {
+      arg_pointers.push_back(&buffer_pointers[i]);
     }
     for (std::size_t i = 0; i < launch.scalars.size(); ++i) {
       arg_pointers.push_back(&scalar_values[i]);
