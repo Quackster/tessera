@@ -7,6 +7,7 @@
 #include "core/numerics/conv.hpp"
 #include "models/qwen3_5/architecture.hpp"
 #include "models/qwen3_5/internal.hpp"
+#include "models/qwen3_5/state.hpp"
 
 namespace tessera::models::qwen3_5 {
 
@@ -16,8 +17,6 @@ namespace detail = ::tessera::core::detail;
 
 using core::Conv1dStepRef;
 using core::DecodeCache;
-using core::HybridBatchScratch;
-using core::HybridDecodeCache;
 using detail::AddDevice;
 using detail::AppendKv;
 using detail::AttentionDevice;
@@ -45,12 +44,12 @@ using detail::UploadF32;
 std::expected<void, StatusCode> AllocBatch(Backend& backend,
                                            const TransformerConfig& cfg,
                                            const LinearGeometry& g,
-                                           HybridDecodeCache& h,
+                                           Qwen35State& h,
                                            std::size_t rows) {
   if (h.batch && h.batch->capacity >= rows) {
     return {};
   }
-  auto b = std::make_unique<HybridBatchScratch>();
+  auto b = std::make_unique<Qwen35BatchScratch>();
   b->capacity = rows;
   auto alloc = [&backend](std::unique_ptr<Buffer>& slot,
                           std::size_t elements) -> bool {
@@ -107,7 +106,7 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
 std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
                                             const Model& model,
                                             const TransformerConfig& cfg,
-                                            HybridDecodeCache& h,
+                                            Qwen35State& h,
                                             std::size_t layer,
                                             std::size_t rows) {
   const std::string base = "blk." + std::to_string(layer) + ".";
@@ -125,7 +124,7 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
   if (!gemm_fgate || !gemm_fup || !gemm_fdown) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  HybridBatchScratch& b = *h.batch;
+  Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*mlp_norm)->device,
                      *b.xn, rows, cfg.hidden_dim, cfg.norm_eps) ||
       !ProjectDevice(backend, *(*gemm_fgate), *b.xn, *(*fg)->device, *b.fgate,
@@ -146,8 +145,8 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
 // Batched full-attention block over `rows` rows ending in h.batch->x.
 std::expected<void, StatusCode> RunFullBlockBatch(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
-    HybridDecodeCache& h, std::size_t layer, std::uint64_t pos,
-    HybridDecodeCache::FullKv& kv, std::size_t rows) {
+    Qwen35State& h, std::size_t layer, std::uint64_t pos,
+    Qwen35State::FullKv& kv, std::size_t rows) {
   const std::size_t hidden = cfg.hidden_dim;
   const std::size_t heads = cfg.attention.heads;
   const std::size_t kv_heads = cfg.attention.kv_heads;
@@ -175,7 +174,7 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   if (!gemm_q || !gemm_k || !gemm_v || !gemm_o) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  HybridBatchScratch& b = *h.batch;
+  Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*norm)->device, *b.xn,
                      rows, hidden, cfg.norm_eps) ||
       !ProjectDevice(backend, *(*gemm_q), *b.xn, *(*wq)->device, *b.fused,
@@ -240,7 +239,7 @@ std::expected<void, StatusCode> RunFullBlockBatch(
 // conv and the gated-delta scan run token by token with the shared state.
 std::expected<void, StatusCode> RunLinearBlockBatch(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
-    HybridDecodeCache& h, std::size_t layer, const LinearGeometry& g,
+    Qwen35State& h, std::size_t layer, const LinearGeometry& g,
     std::size_t rows) {
   const std::size_t hidden = cfg.hidden_dim;
   const std::string base = "blk." + std::to_string(layer) + ".";
@@ -266,7 +265,7 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
   if (!gemm_qkv || !gemm_gate || !gemm_alpha || !gemm_beta || !gemm_out) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  HybridBatchScratch& b = *h.batch;
+  Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*norm)->device, *b.xn,
                      rows, hidden, cfg.norm_eps) ||
       !ProjectDevice(backend, *(*gemm_qkv), *b.xn, *(*w_qkv)->device, *b.qkv,
@@ -417,7 +416,7 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
   if (!ready) {
     return std::unexpected(ready.error());
   }
-  HybridDecodeCache& h = *cache.hybrid;
+  Qwen35State& h = State(cache);
   auto alloc = AllocBatch(backend, cfg, g, h, rows);
   if (!alloc) {
     return std::unexpected(alloc.error());
@@ -554,10 +553,7 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
   const LinearGeometry& g = *geometry;
   const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
   const std::size_t hist_len = g.conv_dim * (g.width - 1);
-  if (!cache.hybrid) {
-    cache.hybrid = std::make_unique<core::HybridDecodeCache>();
-  }
-  HybridDecodeCache& h = *cache.hybrid;
+  Qwen35State& h = State(cache);
   const std::size_t prefix = h.position;
   std::vector<float> flat;
   std::vector<float> last_hidden;

@@ -9,6 +9,7 @@
 #include "core/numerics/conv.hpp"
 #include "models/qwen3_5/architecture.hpp"
 #include "models/qwen3_5/internal.hpp"
+#include "models/qwen3_5/state.hpp"
 
 namespace tessera::models::qwen3_5 {
 
@@ -18,7 +19,6 @@ namespace detail = ::tessera::core::detail;
 
 using core::Conv1dStepRef;
 using core::DecodeCache;
-using core::HybridDecodeCache;
 using detail::AddDevice;
 using detail::AppendKv;
 using detail::AttentionDevice;
@@ -43,7 +43,7 @@ using detail::UploadF32;
 
 std::expected<void, StatusCode> InitScratch(Backend& backend,
                                             const TransformerConfig& cfg,
-                                            HybridDecodeCache& h,
+                                            Qwen35State& h,
                                             const LinearGeometry& g) {
   const std::size_t q_dim = cfg.attention.heads * cfg.attention.head_dim;
   const std::size_t kv_dim = cfg.attention.kv_heads * cfg.attention.head_dim;
@@ -109,7 +109,7 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
 
 std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
                                        const TransformerConfig& cfg,
-                                       HybridDecodeCache& h,
+                                       Qwen35State& h,
                                        std::size_t layer) {
   const std::string base = "blk." + std::to_string(layer) + ".";
   auto mlp_norm =
@@ -144,8 +144,8 @@ std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
 
 std::expected<void, StatusCode> RunFullBlock(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
-    HybridDecodeCache& h, std::size_t layer, std::uint64_t pos,
-    HybridDecodeCache::FullKv& kv) {
+    Qwen35State& h, std::size_t layer, std::uint64_t pos,
+    Qwen35State::FullKv& kv) {
   const std::size_t hidden = cfg.hidden_dim;
   const std::size_t heads = cfg.attention.heads;
   const std::size_t kv_heads = cfg.attention.kv_heads;
@@ -228,10 +228,7 @@ std::expected<void, StatusCode> RunFullBlock(
 std::expected<void, StatusCode> EnsureHybridReady(
     Backend& backend, const TransformerConfig& cfg, DecodeCache& cache,
     const LinearGeometry& g) {
-  if (!cache.hybrid) {
-    cache.hybrid = std::make_unique<HybridDecodeCache>();
-  }
-  HybridDecodeCache& h = *cache.hybrid;
+  Qwen35State& h = State(cache);
   if (!h.ready) {
     auto load = [&backend](std::unique_ptr<Kernel>& slot,
                            std::string_view name) -> bool {
@@ -330,7 +327,7 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
   if (!ready) {
     return std::unexpected(ready.error());
   }
-  HybridDecodeCache& h = *cache.hybrid;
+  Qwen35State& h = State(cache);
   const std::size_t hidden = cfg.hidden_dim;
   auto embed = NeedWeightAny(model, "token_embd.weight");
   if (!embed) {
@@ -547,7 +544,7 @@ std::expected<std::vector<float>, StatusCode> Qwen35Architecture::Logits(
     return std::unexpected(config.error());
   }
   const TransformerConfig& cfg = *config;
-  HybridDecodeCache& h = *cache.hybrid;
+  Qwen35State& h = State(cache);
   const std::size_t hidden = cfg.hidden_dim;
   auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
   auto output = NeedWeightAny(model, "output.weight");

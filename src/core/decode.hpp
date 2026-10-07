@@ -15,6 +15,13 @@
 
 namespace tessera::core {
 
+// Base for the architecture-specific decode state. Each architecture
+// module defines its own subclass (in src/models/<arch>/) and stores it in
+// DecodeCache::arch; src/core never names the fields.
+struct ArchState {
+  virtual ~ArchState() = default;
+};
+
 // Per-step state for single-token vanilla decoding: the host key/value
 // cache per layer plus the loaded kernels. The cache grows one row per
 // step; kernels load once and are reused.
@@ -32,8 +39,9 @@ struct DecodeCache {
   // Storage type of the full-attention KV cache (default fp32). Set
   // before the first step.
   KvCacheType kv_type = KvCacheType::F32;
-  // Hybrid state, created on the first hybrid step (null for vanilla).
-  std::unique_ptr<struct HybridDecodeCache> hybrid;
+  // Architecture-specific state (built by the model's Architecture
+  // module); null until the first step, and null for the generic path.
+  std::unique_ptr<ArchState> arch;
   // Device-resident vanilla state, created on the first vanilla step.
   std::unique_ptr<struct DeviceDecodeState> device;
 };
@@ -76,83 +84,6 @@ struct DeviceDecodeState {
   std::unique_ptr<Buffer> mlp;
   std::unique_ptr<Buffer> logits;
   std::vector<Kv> kv;
-  bool ready = false;
-};
-
-// Scratch for the multi-token (batched) hybrid forward used by
-// speculative verification. Buffers hold `capacity` rows. The
-// recurrent-state history keeps one state per processed token so a
-// verification can roll back to the accepted prefix.
-struct HybridBatchScratch {
-  std::size_t capacity = 0;
-  std::unique_ptr<Buffer> x, xn, proj, logits, pos;
-  std::unique_ptr<Buffer> fused, q, gate, kf, vf, attn;
-  std::unique_ptr<Buffer> fgate, fup, fmlp;
-  std::unique_ptr<Buffer> qkv, z, alpha_raw, beta_raw, alpha, beta, out;
-  // Per linear layer: capacity device-state snapshots (capacity x state)
-  // and the matching host conv histories.
-  std::vector<std::unique_ptr<Buffer>> state_hist;
-  std::vector<std::vector<float>> conv_hist_hist;
-};
-
-// Per-step device-resident state for a hybrid model: the loaded
-// kernels, scratch device buffers, and per-layer state (full-attention
-// KV caches and linear-attention conv/recurrent state) on the device.
-struct HybridDecodeCache {
-  std::unique_ptr<Kernel> rmsnorm_kernel;
-  std::unique_ptr<Kernel> add_kernel;
-  std::unique_ptr<Kernel> silu_mul_kernel;
-  std::unique_ptr<Kernel> sigmoid_gate_kernel;
-  std::unique_ptr<Kernel> qgate_split_kernel;
-  std::unique_ptr<Kernel> mrope_kernel;
-  std::unique_ptr<Kernel> attention_kernel;
-  std::unique_ptr<Kernel> conv1d_step_kernel;
-  std::unique_ptr<Kernel> repeat_heads_kernel;
-  std::unique_ptr<Kernel> l2norm_kernel;
-  std::unique_ptr<Kernel> ssm_gate_kernel;
-  std::unique_ptr<Kernel> delta_step_heads_kernel;
-  std::unique_ptr<Kernel> rmsnorm_gated_kernel;
-  std::unique_ptr<Kernel> cast_kernel;
-  std::unique_ptr<Kernel> quant_kernel;
-  std::unique_ptr<Buffer> kv_scratch;
-  std::unique_ptr<Buffer> scale_scratch;
-  std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
-  // Shared scratch buffers (sized from the config).
-  std::unique_ptr<Buffer> x, xn, proj, logits, pos;
-  std::unique_ptr<Buffer> fused, q, gate, kf, vf, attn;
-  std::unique_ptr<Buffer> fgate, fup, fmlp;
-  std::unique_ptr<Buffer> qkv, z, alpha_raw, beta_raw, alpha, beta;
-  std::unique_ptr<Buffer> conv_mixed;
-  std::unique_ptr<Buffer> q_l, k_l;
-  std::unique_ptr<Buffer> q_exp, k_exp, v_l, core, out;
-  // MTP head scratch (fused embedding+hidden, hidden norms).
-  std::unique_ptr<Buffer> mtp_fused, mtp_h;
-  // Per linear layer, the conv input history on the host (oldest first).
-  std::vector<std::vector<float>> conv_hist;
-  struct FullKv {
-    std::unique_ptr<Buffer> k;
-    std::unique_ptr<Buffer> v;
-    // One fp32 scale per row when the type is Q8.
-    std::unique_ptr<Buffer> k_scale;
-    std::unique_ptr<Buffer> v_scale;
-    std::size_t rows = 0;
-    // Allocated row capacity; grows geometrically (see DeviceDecodeState).
-    std::size_t capacity = 0;
-    KvCacheType type = KvCacheType::F32;
-  };
-  struct LinearState {
-    std::unique_ptr<Buffer> conv_hist;
-    std::unique_ptr<Buffer> state;
-  };
-  std::vector<FullKv> full;
-  std::vector<LinearState> linear;
-  // Batched-forward scratch, created on the first batched step.
-  std::unique_ptr<HybridBatchScratch> batch;
-  FullKv mtp_kv;
-  // Host-side cache of constant weights (conv kernels) and the sequence
-  // position (full-layer KV rows equal the position).
-  std::unordered_map<std::string, std::vector<float>> host_weights;
-  std::size_t position = 0;  // full-layer KV rows equal the position
   bool ready = false;
 };
 

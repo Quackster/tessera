@@ -5,6 +5,7 @@
 #include <expected>
 
 #include "core/decode.hpp"
+#include "models/qwen3_5/state.hpp"
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
 
@@ -57,13 +58,13 @@ inline std::expected<LinearGeometry, StatusCode> DeriveGeometry(
 // add) on h.x in place. The attention output must already be added to h.x.
 [[nodiscard]] std::expected<void, StatusCode> RunFfn(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
-    core::HybridDecodeCache& h, std::size_t layer);
+    Qwen35State& h, std::size_t layer);
 
 // Runs one full-attention block (attn_norm, gated attention, gated MLP) on
 // h.x in place, using `kv` for the key/value cache at position `pos`.
 [[nodiscard]] std::expected<void, StatusCode> RunFullBlock(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
-    core::HybridDecodeCache& h, std::size_t layer, std::uint64_t pos,
-    core::HybridDecodeCache::FullKv& kv);
+    Qwen35State& h, std::size_t layer, std::uint64_t pos,
+    Qwen35State::FullKv& kv);
 
 }  // namespace tessera::models::qwen3_5

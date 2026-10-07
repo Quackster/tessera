@@ -88,10 +88,11 @@ inline std::expected<std::vector<float>, StatusCode> DownloadF32(
   return out;
 }
 
-// Append one key/value row to a preallocated KV cache. Works for both KV
-// cache types (DeviceDecodeState::Kv and HybridDecodeCache::FullKv) so the
-// append logic has one implementation. The buffer grows geometrically, so
-// a decode step copies one row instead of reallocating the whole cache.
+// Append one key/value row to a preallocated KV cache. The KV type is a
+// template parameter, so the append logic has one implementation for the
+// generic device state and for any architecture module state. The buffer
+// grows geometrically, so a decode step copies one row instead of
+// reallocating the whole cache.
 constexpr std::size_t kInitialKvRows = 4;
 
 // Cast an fp32 buffer (n elements) to a packed fp16 buffer (n*2 bytes).

@@ -899,25 +899,28 @@ through RADV GFX1201, rocm through the system ROCm).
   fallback (null module) keeps the device path. The synthetic hybrid
   fixtures now declare `general.architecture` qwen35.
 
+- 2026-10-07: hybrid decode state moved into the Qwen3.5 module (235/235
+  `ctest` on both builds). `core::DecodeCache` holds an opaque `ArchState`
+  (subclassed by `Qwen35State` in src/models/qwen3_5/state.hpp); the MTP
+  key/value rollback goes through new `Architecture::DraftRows` and
+  `DraftTruncate`. `src/core` no longer mentions the hybrid state, and no
+  core file names a model: dispatch, state creation and the draft cache
+  all go through `model.Arch()`. The generic transformer path and the
+  GGUF config parse stay in core (format-generic, not architecture
+  specific).
+
 ## Next (in order)
 
-0. **Architecture modules (from AGENTS.md)**: the interface, registry and
-   the `qwen3_5` trunk plus MTP head are done (see the Done entry).
-   Remaining: give the vanilla transformer a module too, and move the
-   hybrid decode state (`HybridDecodeCache`/`HybridBatchScratch` in
-   `src/core/decode.hpp`) into the module, so `src/core/` holds no
-   architecture-specific decode code. A new architecture is then a module
-   plus one registry line, with zero edits under `src/core/`.
-1. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
+0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
    grouped dynamic convolution, sliding attention, candidate selector and
    the verification loop, output equal to greedy. Remaining: acceptance
    tuning (context beyond the last token) and batching.
-2. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Architecture specific behavior
    moves behind the `Architecture` module interface (see item 0).
-3. **GEMM throughput**: the model runs far below memory bandwidth
+2. **GEMM throughput**: the model runs far below memory bandwidth
    (about 20 GB/s of 16 GB weights per 0.76 s/step), so the GEMM kernels
    are bound by the per-element byte-wise weight reads, not by the
    multiply-accumulate. Two changes: (a) read and dequantize a weight
@@ -927,7 +930,7 @@ through RADV GFX1201, rocm through the system ROCm).
    gemm_q4k/q5k/q6k/q3k/q8_0/iq4xs/iq4nl/fp8 on both backends. The
    attention_q8/attention_q4 kernels still recompute the dot product per
    output dimension.
-4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
+3. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
    `/slots`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -936,18 +939,18 @@ through RADV GFX1201, rocm through the system ROCm).
    queue, keep-alive, `/v1/responses`, render/derender/batch,
    `/tokenizer_info`, `/load` and LoRA, and the 501
    embedding/rerank/audio/pooling/classify/score surfaces.
-5. **Runtime options**: context size, draft-block and the GPU index
+4. **Runtime options**: context size, draft-block and the GPU index
    (`--gpu`) are CLI flags now, and the KV cache can be fp16 (`--kv-f16`)
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-6. **Multimodal (mmproj)**: config, weights, encoder+merger, image
+5. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, image-embedding injection, the CLI wiring and the
    `<|image_pad|>` placeholder default are done
    (`Engine::GenerateMultimodal`). Still to do: deepstack feature
    injection and the image prefill speed (attention kernel).
 
-7. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
+6. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism
    (shard attention heads and MLP rows across GPUs with an all-reduce per
    layer; vLLM tensor parallelism, Megatron-LM TP) or layer/pipeline

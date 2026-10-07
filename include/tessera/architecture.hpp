@@ -96,6 +96,14 @@ class Architecture {
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
       std::vector<float>* mtp_hidden_out) const = 0;
+
+  // Rows currently committed in the draft key/value cache (0 when there is
+  // none). Draft chaining appends a row per draft; after a partial accept
+  // the caller shrinks it back with DraftTruncate.
+  [[nodiscard]] virtual std::size_t DraftRows(
+      const core::DecodeCache& cache) const = 0;
+  virtual void DraftTruncate(core::DecodeCache& cache,
+                             std::size_t rows) const = 0;
 };
 
 // Build the architecture module for `arch`, or nullptr when no module is

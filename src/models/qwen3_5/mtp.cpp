@@ -7,10 +7,10 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "models/qwen3_5/internal.hpp"
+#include "models/qwen3_5/state.hpp"
 
 namespace tessera::models::qwen3_5 {
 
-using core::HybridDecodeCache;
 using core::detail::DownloadF32;
 using core::detail::GatherEmbedding;
 using core::detail::GemmFor;
@@ -36,13 +36,13 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
     if (!cfg.hybrid) {
       return std::unexpected(StatusCode::UnsupportedFeature);
     }
-    if (!cache.hybrid || !cache.hybrid->ready) {
+    if (cache.arch == nullptr || !static_cast<Qwen35State*>(cache.arch.get())->ready) {
       return std::unexpected(StatusCode::DeviceError);
     }
     if (token >= cfg.vocab_size || hidden.size() != cfg.hidden_dim) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
-    HybridDecodeCache& h = *cache.hybrid;
+    Qwen35State& h = State(cache);
     const std::size_t hidden_dim = cfg.hidden_dim;
     const std::size_t layer = cfg.layers;
     const std::string base = "blk." + std::to_string(layer) + ".";
@@ -138,6 +138,21 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
       }
     }
   return best;
+}
+
+std::size_t Qwen35Architecture::DraftRows(
+    const core::DecodeCache& cache) const {
+  if (cache.arch == nullptr) {
+    return 0;
+  }
+  return static_cast<const Qwen35State*>(cache.arch.get())->mtp_kv.rows;
+}
+
+void Qwen35Architecture::DraftTruncate(core::DecodeCache& cache,
+                                       std::size_t rows) const {
+  if (cache.arch != nullptr) {
+    static_cast<Qwen35State*>(cache.arch.get())->mtp_kv.rows = rows;
+  }
 }
 
 std::unique_ptr<Architecture> MakeQwen35Architecture() {

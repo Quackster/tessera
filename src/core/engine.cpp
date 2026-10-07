@@ -215,6 +215,7 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
   current = std::move(*logits);
   std::vector<std::uint32_t> produced;
   produced.reserve(options.max_tokens);
+  const Architecture* arch = model.Arch();
   std::uint64_t pos = prompt.size();
   std::uint32_t next = core::detail::ArgMax(current);
   // Number of MTP tokens to draft before one batched verification forward.
@@ -238,7 +239,7 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     ++pos;
     // Draft up to `block` tokens by chaining the MTP head (each draft fuses
     // the target hidden with the previous draft token).
-    const std::size_t mtp_base = cache.hybrid ? cache.hybrid->mtp_kv.rows : 0;
+    const std::size_t mtp_base = arch != nullptr ? arch->DraftRows(cache) : 0;
     std::vector<std::uint32_t> drafts;
     std::vector<float> chain = hidden;
     std::uint32_t tok = next;
@@ -262,8 +263,8 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     }
     if (mtp_missing) {
       // No MTP head: fall back to the target's greedy token.
-      if (cache.hybrid) {
-        cache.hybrid->mtp_kv.rows = mtp_base;
+      if (arch != nullptr) {
+        arch->DraftTruncate(cache, mtp_base);
       }
       next = core::detail::ArgMax(current);
       continue;
@@ -275,8 +276,8 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     if (!verify) {
       return std::unexpected(verify.error());
     }
-    if (cache.hybrid) {
-      cache.hybrid->mtp_kv.rows = mtp_base + verify->accepted;
+    if (arch != nullptr) {
+      arch->DraftTruncate(cache, mtp_base + verify->accepted);
     }
     for (std::size_t i = 0; i < verify->accepted; ++i) {
       produced.push_back(drafts[i]);
