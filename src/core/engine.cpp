@@ -1,5 +1,6 @@
 #include "tessera/engine.hpp"
 
+#include <chrono>
 #include <random>
 #include <string>
 #include <vector>
@@ -77,11 +78,23 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
   if (image_embeddings.size() != image_tokens * config->hidden_dim) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
+  const auto started = std::chrono::steady_clock::now();
+  const auto elapsed_ms = [&started]() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - started)
+        .count();
+  };
   core::DecodeCache cache;
   cache.kv_type = options.kv_type;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
+  }
+  if (options.progress_every > 0) {
+    diagnostics_.Info("engine", std::string("multimodal prefill: ") +
+                                    std::to_string(prompt.size()) +
+                                    " token(s), " +
+                                    std::to_string(image_tokens) + " image");
   }
   auto embedding_buffer =
       backend_->AllocateBuffer(config->hidden_dim * 4, MemoryKind::Device);
@@ -120,6 +133,14 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
         return std::unexpected(forward.error());
       }
     }
+    if (options.progress_every > 0 &&
+        (i + 1) % options.progress_every == 0) {
+      diagnostics_.Info("engine",
+                        std::string("multimodal prefill: ") +
+                            std::to_string(i + 1) + "/" +
+                            std::to_string(prompt.size()) + " (" +
+                            std::to_string(elapsed_ms()) + " ms)");
+    }
   }
   std::vector<std::uint32_t> produced;
   produced.reserve(options.max_tokens);
@@ -142,6 +163,15 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
       return std::unexpected(logits.error());
     }
     next = pick(*logits);
+  }
+  if (!produced.empty()) {
+    const long long ms = elapsed_ms();
+    diagnostics_.Info(
+        "engine",
+        std::string("generated ") + std::to_string(produced.size()) +
+            " token(s) in " + std::to_string(ms) + " ms (" +
+            std::to_string(ms / static_cast<long long>(produced.size())) +
+            " ms/token)");
   }
   return produced;
 }
@@ -280,6 +310,12 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   if (options.max_tokens == 0) {
     return 0;
   }
+  const auto started = std::chrono::steady_clock::now();
+  const auto elapsed_ms = [&started]() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - started)
+        .count();
+  };
   if (options.sample) {
     const SamplingOptions& p = options.sampling;
     if (!(p.temperature >= 0.0f) || !(p.top_p > 0.0f && p.top_p <= 1.0f) ||
@@ -298,6 +334,11 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   }
   // Prefill: only the last prompt token needs logits, so every earlier
   // token runs the block forward without the vocab-sized output head.
+  if (options.progress_every > 0) {
+    diagnostics_.Info("engine", std::string("prefill: ") +
+                                    std::to_string(prompt.size()) +
+                                    " prompt token(s)");
+  }
   for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
     auto forward = core::DecodeForward(*backend_, model, cache, prompt[i]);
     if (!forward) {
@@ -305,6 +346,13 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
           "engine", std::string("prompt step ") + std::to_string(i) +
                         " failed: " + std::string(ToString(forward.error())));
       return std::unexpected(forward.error());
+    }
+    if (options.progress_every > 0 &&
+        (i + 1) % options.progress_every == 0) {
+      diagnostics_.Info("engine",
+                        std::string("prefill: ") + std::to_string(i + 1) + "/" +
+                            std::to_string(prompt.size()) + " (" +
+                            std::to_string(elapsed_ms()) + " ms)");
     }
   }
   auto first_logits = core::DecodeLogits(*backend_, model, cache, prompt.back());
@@ -341,6 +389,14 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       return std::unexpected(logits.error());
     }
     next = pick(*logits);
+  }
+  if (produced > 0) {
+    const long long ms = elapsed_ms();
+    diagnostics_.Info(
+        "engine", std::string("generated ") + std::to_string(produced) +
+                      " token(s) in " + std::to_string(ms) + " ms (" +
+                      std::to_string(ms / static_cast<long long>(produced)) +
+                      " ms/token)");
   }
   return produced;
 }

@@ -57,6 +57,8 @@ struct GenerateOptions {
   // Draft tokens per speculative step for the DFlash2 draft; 0 uses the
   // draft checkpoint's configured block size.
   std::size_t draft_tokens = 0;
+  // Log progress every this many prefill steps (0 disables progress logs).
+  std::size_t progress_every = 64;
   // Storage type of the full-attention KV cache (default fp32).
   KvCacheType kv_type = KvCacheType::F32;
 };

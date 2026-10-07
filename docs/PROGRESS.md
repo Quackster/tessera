@@ -812,6 +812,14 @@ through RADV GFX1201, rocm through the system ROCm).
   the ~576 image tokens is token-by-token (host-glue, ~1 s each), so a
   full image run takes minutes; batched prefill would fix it.
 
+- 2026-10-07: CLI progress logging (229/229 `ctest` on both builds).
+  Current head. `GenerateOptions::progress_every` (default 64) makes the
+  engine log prefill progress every N tokens and a final
+  `generated N token(s) in X ms (Y ms/token)` line. The CLI logs the KV
+  cache type, the sampling settings, the vision projector load, the
+  image load/encode, and the encoded token count; `--quiet` hides all
+  of it.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to

@@ -46,6 +46,7 @@ void PrintUsage() {
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
                "  --image-token <id> placeholder token id for image rows\n"
+               "  --quiet           print only the generated tokens\n"
                "  --sample          sample instead of greedy decode\n"
                "  --temperature <f> sampling temperature (default 0.6)\n"
                "  --top-p <f>       nucleus probability (default 0.95)\n"
@@ -95,6 +96,7 @@ int main(int argc, char** argv) {
   std::string mmproj_path;
   std::string image_path;
   std::uint32_t image_token = 0;
+  bool quiet = false;
   std::string host = "127.0.0.1";
   std::vector<std::string> api_keys;
   std::vector<std::string> allow_origins;
@@ -125,6 +127,8 @@ int main(int argc, char** argv) {
       image_path = argv[++i];
     } else if (arg == "--image-token" && i + 1 < argc) {
       image_token = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+    } else if (arg == "--quiet") {
+      quiet = true;
     } else if (arg == "--api-key" && i + 1 < argc) {
       api_keys.emplace_back(argv[++i]);
     } else if (arg == "--allow-origin" && i + 1 < argc) {
@@ -284,6 +288,32 @@ int main(int argc, char** argv) {
     gen.seed = seed;
     gen.draft_tokens = draft_block;
     gen.kv_type = kv_type;
+    gen.progress_every = quiet ? 0 : 64;
+    if (!quiet) {
+      log.Info("cli", "kv cache: " +
+                          std::string(kv_type == tessera::KvCacheType::F16
+                                          ? "fp16"
+                                          : kv_type == tessera::KvCacheType::Q8
+                                                ? "int8"
+                                                : kv_type ==
+                                                          tessera::KvCacheType::Q4
+                                                      ? "4-bit"
+                                                      : "fp32"));
+      if (sample) {
+        log.Info("cli", "sampling: temperature=" +
+                            std::to_string(sampling.temperature) +
+                            " top_p=" + std::to_string(sampling.top_p) +
+                            " top_k=" + std::to_string(sampling.top_k) +
+                            " min_p=" + std::to_string(sampling.min_p) +
+                            " presence_penalty=" +
+                            std::to_string(sampling.presence_penalty) +
+                            " repetition_penalty=" +
+                            std::to_string(sampling.repetition_penalty) +
+                            " seed=" + std::to_string(seed));
+      } else {
+        log.Info("cli", "sampling: greedy");
+      }
+    }
     if (!prompt_text.empty()) {
       const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
       if (tokenizer == nullptr) {
@@ -304,12 +334,23 @@ int main(int argc, char** argv) {
         log.Warn("cli", "--image needs --mmproj");
         return kExitError;
       }
+      if (!quiet) {
+        log.Info("cli", "loading vision projector: " + mmproj_path);
+      }
       auto vision = tessera::VisionModel::Load(engine.Owner(), mmproj_path);
       if (!vision) {
         log.Warn("cli", std::string("mmproj load failed (") +
                             std::string(tessera::ToString(vision.error())) +
                             ")");
         return kExitError;
+      }
+      if (!quiet) {
+        log.Info("cli", "vision projector loaded: " +
+                            std::to_string(vision->Config().block_count) +
+                            " blocks, " +
+                            std::to_string(vision->Config().projection_dim) +
+                            " projection dim");
+        log.Info("cli", "loading image: " + image_path);
       }
       auto image = tessera::LoadPpm(image_path);
       if (!image) {
@@ -319,6 +360,10 @@ int main(int argc, char** argv) {
       }
       auto resized = tessera::ResizeBilinear(*image, vision->Config().image_size,
                                              vision->Config().image_size);
+      if (!quiet) {
+        log.Info("cli", "image loaded: " + std::to_string(image->width) + "x" +
+                            std::to_string(image->height) + ", encoding");
+      }
       auto embeddings = vision->Encode(engine.Owner(), resized.pixels,
                                        resized.height, resized.width);
       if (!embeddings) {
@@ -328,6 +373,9 @@ int main(int argc, char** argv) {
         return kExitError;
       }
       const std::size_t count = embeddings->size() / vision->Config().projection_dim;
+      if (!quiet) {
+        log.Info("cli", "image encoded: " + std::to_string(count) + " token(s)");
+      }
       std::vector<std::uint32_t> prompt(count, image_token);
       prompt.insert(prompt.end(), gen.prompt_tokens.begin(),
                     gen.prompt_tokens.end());
