@@ -474,8 +474,18 @@ std::expected<void, StatusCode> HybridForward(
       }
     }
     std::vector<float> mixed(g.conv_dim);
+    // The checkpoint conv weight is PyTorch nn.Conv1d order (tap 0 is the
+    // oldest sample); the step reference uses tap 0 as the current sample,
+    // so reverse the taps.
+    std::vector<float> rev_w((*conv_w)->size());
+    for (std::size_t c = 0; c < g.conv_dim; ++c) {
+      for (std::size_t t = 0; t < g.width; ++t) {
+        rev_w[c * g.width + t] =
+            (**conv_w)[c * g.width + (g.width - 1 - t)];
+      }
+    }
     auto conv = Conv1dStepRef(std::span<const float>(xr),
-                              std::span<const float>(**conv_w),
+                              std::span<const float>(rev_w),
                               std::span<float>(mixed), g.conv_dim, g.width);
     if (!conv) {
       return std::unexpected(conv.error());

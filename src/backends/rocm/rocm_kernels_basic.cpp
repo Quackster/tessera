@@ -542,7 +542,7 @@ __global__ void SsmGateKernel(const float* a_log, const float* dt,
   }
   const float raw = alpha_raw[h] + dt[h];
   const float softplus = raw > 20.0f ? raw : log1pf(expf(raw));
-  alpha[h] = expf(-expf(a_log[h]) * softplus);
+  alpha[h] = expf(a_log[h] * softplus);
   beta[h] = 1.0f / (1.0f + expf(-beta_raw[h]));
 }
 

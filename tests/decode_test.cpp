@@ -364,7 +364,7 @@ TEST(HybridDecodeTest, GatedBaselineIsPinned) {
 TEST(HybridDecodeTest, LinearBaselineIsPinned) {
   const auto got =
       GreedyTokens(WriteLinearHybridFixture("linear.gguf").string(), 8);
-  const std::vector<std::uint32_t> want = {5, 5, 31, 0, 30, 4, 19, 19};
+  const std::vector<std::uint32_t> want = {8, 18, 30, 18, 6, 11, 29, 14};
   EXPECT_EQ(got, want);
 }
 
@@ -426,7 +426,7 @@ TEST(HybridDecodeTest, SpeculationMatchesGreedy) {
   EXPECT_EQ(SpeculativeTokens(gated, 8, 31), want_gated);
   EXPECT_EQ(SpeculativeTokens(gated, 8, 1), want_gated);
   const std::string linear = WriteLinearHybridFixture("linear.gguf").string();
-  const std::vector<std::uint32_t> want_linear = {5, 5, 31, 0, 30, 4, 19, 19};
+  const std::vector<std::uint32_t> want_linear = {8, 18, 30, 18, 6, 11, 29, 14};
   EXPECT_EQ(SpeculativeTokens(linear, 8, 31), want_linear);
   EXPECT_EQ(SpeculativeTokens(linear, 8, 5), want_linear);
 }

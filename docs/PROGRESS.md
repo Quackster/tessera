@@ -845,6 +845,13 @@ through RADV GFX1201, rocm through the system ROCm).
    linear-attention block (conv1d history, gated-delta scan, or the SSM
    gates) or the full-attention QK-norm/mRoPE. The existing tiny fixtures
    only pin determinism, not correctness.
+   Progress: `llama-eval-callback` on the same GGUF gives the reference
+   graph; two bugs are fixed against it -- the SSM decay had an extra
+   `exp` (the checkpoint `ssm_a` is already `-A`, so decay is
+   `exp(ssm_a * softplus(a+dt))`) and the conv taps were reversed (the
+   reference `SSM_CONV` uses `[oldest..current]`, PyTorch order). The 27B
+   output is still incoherent, so more bugs remain; the pinned linear
+   fixture moved to `{8, 18, 30, 18, 6, 11, 29, 14}`.
 
 1. **Speculative decoding performance**: MTP speculation runs end to
    end (`Engine::GenerateSpeculative`, CLI `--speculate`) and is output

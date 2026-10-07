@@ -211,7 +211,7 @@ std::expected<void, StatusCode> SsmGateRef(
   for (std::size_t h = 0; h < heads; ++h) {
     const float raw = alpha_raw[h] + dt[h];
     const float softplus = raw > 20.0f ? raw : std::log1p(std::exp(raw));
-    alpha[h] = std::exp(-std::exp(a_log[h]) * softplus);
+    alpha[h] = std::exp(a_log[h] * softplus);
     beta[h] = 1.0f / (1.0f + std::exp(-beta_raw[h]));
   }
   return {};

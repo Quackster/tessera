@@ -23,6 +23,6 @@ void main() {
   }
   float raw = alpha_raw[h] + dt[h];
   float softplus = raw > 20.0 ? raw : log(1.0 + exp(raw));
-  alpha[h] = exp(-exp(a_log[h]) * softplus);
+  alpha[h] = exp(a_log[h] * softplus);
   beta[h] = 1.0 / (1.0 + exp(-beta_raw[h]));
 }
