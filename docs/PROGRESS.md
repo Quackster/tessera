@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 172/172 on both builds.
+`ctest` passes 173/173 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -423,6 +423,13 @@ through RADV GFX1201, rocm through the system ROCm).
   keys, so DFlash2 draft layers (causal sliding attention, window
   2048) run on vulkan (GLSL) and rocm (HIP). Host reference, contract
   and device-vs-reference tests updated.
+
+- 2026-10-07: dflash_conv delta row stride (173/173 `ctest` on both
+  builds). Current head. dflash_conv now takes a delta_row_stride
+  scalar so it consumes one side of the DFlash2 kernel_projection
+  output [rows, 2, taps, num_groups] directly, matching the
+  reference Triton kernel's delta_stride_row. Host reference, contract
+  and a strided device-vs-reference test updated.
 
 ## Next (in order)
 

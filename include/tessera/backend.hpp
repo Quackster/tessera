@@ -211,8 +211,11 @@ class Kernel {
 // "dflash_conv": buffers are X (fp32, rows x channels), Delta (fp32,
 // rows x taps x num_groups), Base (fp32, taps x channels) and the
 // output Y (fp32, rows x channels); scalars are rows, channels, taps,
-// group_size and block_size (num_groups = channels / group_size). The
-// DFlash2 grouped dynamic convolution resets every block_size rows. The
+// group_size, block_size and delta_row_stride (num_groups =
+// channels / group_size; delta_row_stride is at least taps x
+// num_groups and lets one side of the kernel_projection output be used
+// directly). The DFlash2 grouped dynamic convolution resets every
+// block_size rows. The
 // dispatch is ceil(rows * channels / 256) workgroups of 256.
 // "conv1d_step": buffer 0 is X (fp32, channels x width, newest sample
 // first), buffer 1 the weights W (fp32, channels x width), buffer 2 the
@@ -414,14 +417,16 @@ class Kernel {
     }
   }
   if (kernel.Id() == "dflash_conv") {
-    if (launch.buffers.size() != 4 || launch.scalars.size() != 5) {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 6) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t channels = launch.scalars[1];
     const std::uint64_t group_size = launch.scalars[3];
-    if (launch.scalars[0] == 0 || channels == 0 || launch.scalars[2] == 0 ||
+    const std::uint64_t taps = launch.scalars[2];
+    if (launch.scalars[0] == 0 || channels == 0 || taps == 0 ||
         group_size == 0 || launch.scalars[4] == 0 ||
-        channels % group_size != 0) {
+        channels % group_size != 0 ||
+        launch.scalars[5] < taps * (channels / group_size)) {
       return StatusCode::InvalidArgument;
     }
   }

@@ -3051,7 +3051,8 @@ TEST(BackendTest, DflashConvDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*x_buf).get(), (*d_buf).get(), (*b_buf).get(),
                     (*y_buf).get()};
-  launch.scalars = {kRows, kChannels, kTaps, kGroup, kBlock};
+  launch.scalars = {kRows, kChannels, kTaps, kGroup, kBlock,
+                    kTaps * num_groups};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(x.size() * 4);
@@ -3061,7 +3062,7 @@ TEST(BackendTest, DflashConvDeviceMatchesRef) {
   ASSERT_TRUE(core::DflashConvRef(
                   std::span<const float>(x), std::span<const float>(delta),
                   std::span<const float>(base), std::span<float>(ref), kRows,
-                  kChannels, kTaps, kGroup, kBlock)
+                  kChannels, kTaps, kGroup, kBlock, kTaps * num_groups)
                   .has_value());
   const auto* got = reinterpret_cast<const float*>(readback.data());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
@@ -3205,6 +3206,65 @@ TEST(BackendTest, AttentionWindowDeviceMatchesRef) {
                                  std::span<const float>(v),
                                  std::span<float>(ref), kM, kN, kHeads,
                                  kKvHeads, kDim, kQBase, kWindow)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: dflash_conv consumes one side of the kernel_projection output
+// [rows, 2, taps, groups] directly via the delta row stride.
+TEST(BackendTest, DflashConvStridedDeltaMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(89);
+  constexpr std::size_t kRows = 6;
+  constexpr std::size_t kChannels = 8;
+  constexpr std::size_t kTaps = 3;
+  constexpr std::size_t kGroup = 4;
+  constexpr std::size_t kBlock = 3;
+  const std::size_t num_groups = kChannels / kGroup;
+  const std::size_t stride = 2 * kTaps * num_groups;
+  std::vector<float> x(kRows * kChannels), base(kTaps * kChannels);
+  std::vector<float> delta(kRows * stride);
+  for (auto& v : x) v = DrawValue(rng);
+  for (auto& v : base) v = DrawValue(rng);
+  for (auto& v : delta) v = DrawValue(rng);
+  auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto d_buf = backend->AllocateBuffer(delta.size() * 4, MemoryKind::Device);
+  auto b_buf = backend->AllocateBuffer(base.size() * 4, MemoryKind::Device);
+  auto y_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf && d_buf && b_buf && y_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(upload(d_buf, delta).has_value());
+  ASSERT_TRUE(upload(b_buf, base).has_value());
+  auto kernel = backend->LoadKernel("dflash_conv", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows * kChannels + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*x_buf).get(), (*d_buf).get(), (*b_buf).get(),
+                    (*y_buf).get()};
+  launch.scalars = {kRows, kChannels, kTaps, kGroup, kBlock, stride};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(x.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**y_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(x.size());
+  ASSERT_TRUE(core::DflashConvRef(
+                  std::span<const float>(x), std::span<const float>(delta),
+                  std::span<const float>(base), std::span<float>(ref), kRows,
+                  kChannels, kTaps, kGroup, kBlock, stride)
                   .has_value());
   const auto* got = reinterpret_cast<const float*>(readback.data());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
