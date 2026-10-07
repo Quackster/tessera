@@ -35,16 +35,48 @@ struct DeviceTensor {
   std::unique_ptr<Buffer> device;
 };
 
+// Recurrent linear-attention dimensions of a hybrid model definition.
+// They size the fused qkv/gate projections, the causal conv1d and the
+// recurrent state; generic kernels take them as launch data, never as
+// per-model branches.
+struct SsmParams {
+  std::size_t conv_kernel = 0;    // causal conv1d width over the mix
+  std::size_t state_size = 0;     // recurrent state dim per head
+  std::size_t group_count = 0;    // key heads sharing a value group
+  std::size_t time_step_rank = 0;  // value heads (gate rank)
+  std::size_t inner_size = 0;     // fused qkv/gate projection width
+};
+
 // Transformer hyper-parameters from the model definition. The decode
 // loop sizes every launch from these; no code branches on the
 // architecture.
 struct TransformerConfig {
   AttentionParams attention;
-  std::size_t layers = 0;
+  std::size_t layers = 0;  // trunk blocks (excludes MTP draft blocks)
   std::size_t hidden_dim = 0;
   std::size_t ffn_dim = 0;
   std::size_t vocab_size = 0;
   double norm_eps = 1e-5;
+  // True for hybrid attention/SSM definitions (recurrent linear layers
+  // interleaved with full attention). The vanilla decode path rejects
+  // these as UnsupportedFeature until the recurrent kernels land.
+  bool hybrid = false;
+  // SSM dimensions, valid only when hybrid is true.
+  SsmParams ssm;
+  // Trunk layer l is full attention iff (l + 1) % interval == 0.
+  // Zero means every layer is full attention (vanilla).
+  std::size_t full_attention_interval = 0;
+  // True when trunk layer l runs full attention (never recurrent for
+  // vanilla configs, where the interval is zero).
+  //
+  // Usage:
+  //   if (config.IsFullAttentionLayer(l)) { /* GQA path */ }
+  [[nodiscard]] bool IsFullAttentionLayer(std::size_t layer) const {
+    if (!hybrid || full_attention_interval == 0) {
+      return true;
+    }
+    return (layer + 1) % full_attention_interval == 0;
+  }
 };
 
 // A loaded model: format + options + parsed tensor manifest + the
@@ -74,9 +106,11 @@ class Model {
   // Attention parameters from the model definition, for sizing kernel
   // launches (heads, kv groups, head dim, RoPE range and base). GGUF
   // reads <arch>.attention.head_count, head_count_kv, embedding_length
-  // and <arch>.rope.dimension_count, rope.freq_base. MalformedFile
-  // when the definition lacks them; UnsupportedFeature for MXFP4
-  // (config.json parsing is a later milestone).
+  // and <arch>.rope.dimension_count, rope.freq_base. Hybrid definitions
+  // carry <arch>.attention.key_length/value_length instead; the head
+  // dim comes from those and embedding divisibility is not required.
+  // MalformedFile when the definition lacks them; UnsupportedFeature
+  // for MXFP4 (config.json parsing is a later milestone).
   //
   // Usage:
   //   auto params = model.Attention();
@@ -85,8 +119,10 @@ class Model {
   // Full transformer config for the decode loop. GGUF reads block_count,
   // embedding_length, feed_forward_length and the attention keys above
   // plus <arch>.attention.layer_norm_rms_epsilon; the vocabulary comes
-  // from the output weight shape. MalformedFile when the definition
-  // lacks them; UnsupportedFeature for MXFP4.
+  // from the output weight shape. Hybrid definitions also provide the
+  // ssm.* keys and full_attention_interval; layers counts trunk blocks
+  // (block_count minus nextn_predict_layers). MalformedFile when the
+  // definition lacks them; UnsupportedFeature for MXFP4.
   //
   // Usage:
   //   auto config = model.Config();

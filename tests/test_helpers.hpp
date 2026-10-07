@@ -221,6 +221,41 @@ inline std::filesystem::path FreshTempDir(const std::string& name) {
   return dir;
 }
 
+// A tiny hybrid-shaped GGUF (interval 2, one MTP block, vocab 8).
+// Skipping the interval key leaves the ssm set partial for tests.
+inline std::filesystem::path WriteHybridFixture(const std::string& name,
+                                                bool complete) {
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, complete ? 19 : 18);
+  builder.KvString("general.name", "tiny-hybrid");
+  builder.KvString("general.architecture", "test-hybrid");
+  builder.KvU32("test-hybrid.block_count", 4);
+  builder.KvU32("test-hybrid.embedding_length", 256);
+  builder.KvU32("test-hybrid.feed_forward_length", 512);
+  builder.KvF32("test-hybrid.attention.layer_norm_rms_epsilon", 1e-5f);
+  builder.KvU32("test-hybrid.attention.head_count", 4);
+  builder.KvU32("test-hybrid.attention.head_count_kv", 2);
+  builder.KvU32("test-hybrid.attention.key_length", 64);
+  builder.KvU32("test-hybrid.attention.value_length", 64);
+  builder.KvU32("test-hybrid.rope.dimension_count", 32);
+  builder.KvF32("test-hybrid.rope.freq_base", 10000.0f);
+  builder.KvU32("test-hybrid.ssm.conv_kernel", 2);
+  builder.KvU32("test-hybrid.ssm.state_size", 8);
+  builder.KvU32("test-hybrid.ssm.group_count", 2);
+  builder.KvU32("test-hybrid.ssm.time_step_rank", 4);
+  builder.KvU32("test-hybrid.ssm.inner_size", 32);
+  if (complete) {
+    builder.KvU32("test-hybrid.full_attention_interval", 2);
+  }
+  builder.KvU32("test-hybrid.nextn_predict_layers", 1);
+  builder.Tensor("output.weight", 2, {256, 8}, 0, 0);
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 8192);
+  auto dir = FreshTempDir("tessera_tests_hybrid_model");
+  auto path = dir / name;
+  WriteBytes(path, builder.bytes);
+  return path;
+}
+
 // A valid safetensors container: 8-byte LE header length + JSON bytes.
 inline std::vector<std::byte> MakeSafetensorsContainer(
     const std::string& json, bool override_len = false,

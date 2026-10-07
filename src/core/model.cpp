@@ -48,8 +48,8 @@ std::optional<double> AsDouble(const core::GgufValue& value) {
   return std::nullopt;
 }
 
-// Attention parameters from GGUF metadata; nullopt when the file
-// carries no attention keys, MalformedFile when they are incomplete.
+// Attention parameters from GGUF metadata; nullopt without keys.
+// Explicit key/value lengths set head dim (hybrid); else embed/heads.
 std::expected<std::optional<AttentionParams>, StatusCode>
 ParseAttention(const core::GgufFile& gguf, std::string_view architecture) {
   if (architecture.empty()) {
@@ -75,10 +75,31 @@ ParseAttention(const core::GgufFile& gguf, std::string_view architecture) {
   const auto r = AsU64(*rope_dim);
   const auto t = AsDouble(*theta);
   if (!h || !k || !e || !r || !t || *h == 0 || *k == 0 || *e == 0 ||
-      *r == 0 || !(*t > 0.0) || (*h % *k) != 0 || (*e % *h) != 0) {
+      *r == 0 || !(*t > 0.0) || (*h % *k) != 0) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  const std::uint64_t head_dim = *e / *h;
+  std::uint64_t head_dim = 0;
+  const auto* key_len = gguf.Find(prefix + ".attention.key_length");
+  const auto* value_len = gguf.Find(prefix + ".attention.value_length");
+  if (key_len != nullptr || value_len != nullptr) {
+    if (key_len == nullptr || value_len == nullptr) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    const auto kl = AsU64(*key_len);
+    const auto vl = AsU64(*value_len);
+    if (!kl || !vl || *kl == 0 || *vl == 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    if (*kl != *vl) {
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
+    head_dim = *kl;
+  } else {
+    if ((*e % *h) != 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    head_dim = *e / *h;
+  }
   if (*r > head_dim || (*r % 2) != 0) {
     return std::unexpected(StatusCode::MalformedFile);
   }
@@ -91,8 +112,52 @@ ParseAttention(const core::GgufFile& gguf, std::string_view architecture) {
   return std::optional<AttentionParams>{params};
 }
 
-// Transformer config from GGUF metadata; nullopt when the file carries
-// no layer keys, MalformedFile when they are incomplete.
+// Hybrid recurrent definition (ssm.* plus full_attention_interval).
+// Nullopt without any key, MalformedFile when partial or zero.
+struct HybridDef {
+  SsmParams ssm;
+  std::uint64_t interval = 0;
+};
+
+std::expected<std::optional<HybridDef>, StatusCode> ParseHybrid(
+    const core::GgufFile& gguf, std::string_view architecture) {
+  const std::string prefix = std::string(architecture);
+  const auto* conv = gguf.Find(prefix + ".ssm.conv_kernel");
+  const auto* state = gguf.Find(prefix + ".ssm.state_size");
+  const auto* groups = gguf.Find(prefix + ".ssm.group_count");
+  const auto* rank = gguf.Find(prefix + ".ssm.time_step_rank");
+  const auto* inner = gguf.Find(prefix + ".ssm.inner_size");
+  const auto* interval = gguf.Find(prefix + ".full_attention_interval");
+  if (conv == nullptr && state == nullptr && groups == nullptr &&
+      rank == nullptr && inner == nullptr && interval == nullptr) {
+    return std::optional<HybridDef>{};
+  }
+  if (conv == nullptr || state == nullptr || groups == nullptr ||
+      rank == nullptr || inner == nullptr || interval == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto c = AsU64(*conv);
+  const auto s = AsU64(*state);
+  const auto g = AsU64(*groups);
+  const auto r = AsU64(*rank);
+  const auto n = AsU64(*inner);
+  const auto v = AsU64(*interval);
+  if (!c || !s || !g || !r || !n || !v || *c == 0 || *s == 0 || *g == 0 ||
+      *r == 0 || *n == 0 || *v == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  HybridDef def;
+  def.ssm.conv_kernel = static_cast<std::size_t>(*c);
+  def.ssm.state_size = static_cast<std::size_t>(*s);
+  def.ssm.group_count = static_cast<std::size_t>(*g);
+  def.ssm.time_step_rank = static_cast<std::size_t>(*r);
+  def.ssm.inner_size = static_cast<std::size_t>(*n);
+  def.interval = *v;
+  return std::optional<HybridDef>{def};
+}
+
+// Transformer config from GGUF metadata; nullopt without layer keys.
+// Hybrid layers counts trunk blocks (block_count minus nextn blocks).
 std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
     const core::GgufFile& gguf, std::string_view architecture) {
   if (architecture.empty()) {
@@ -126,6 +191,29 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
       *hidden == 0 || !(*eps > 0.0)) {
     return std::unexpected(StatusCode::MalformedFile);
   }
+  auto hybrid = ParseHybrid(gguf, architecture);
+  if (!hybrid) {
+    return std::unexpected(hybrid.error());
+  }
+  std::uint64_t trunk = *layers;
+  if (*hybrid) {
+    std::uint64_t nextn = 0;
+    if (const auto* nextn_key = gguf.Find(prefix + ".nextn_predict_layers");
+        nextn_key != nullptr) {
+      const auto parsed = AsU64(*nextn_key);
+      if (!parsed) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      nextn = *parsed;
+    }
+    if (nextn > *layers) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    trunk = *layers - nextn;
+    if (trunk == 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+  }
   std::size_t vocab = 0;
   for (const auto& tensor : gguf.tensors) {
     if (tensor.name == "output.weight") {
@@ -141,11 +229,17 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
   }
   TransformerConfig config;
   config.attention = **attention;
-  config.layers = static_cast<std::size_t>(*layers);
+  config.layers = static_cast<std::size_t>(trunk);
   config.hidden_dim = static_cast<std::size_t>(*hidden);
   config.ffn_dim = static_cast<std::size_t>(*ffn);
   config.vocab_size = vocab;
   config.norm_eps = *eps;
+  if (*hybrid) {
+    config.hybrid = true;
+    config.ssm = (*hybrid)->ssm;
+    config.full_attention_interval =
+        static_cast<std::size_t>((*hybrid)->interval);
+  }
   return std::optional<TransformerConfig>{config};
 }
 

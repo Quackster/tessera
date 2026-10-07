@@ -25,12 +25,8 @@ struct DecodeCache {
   std::unique_ptr<Kernel> attention_kernel;
 };
 
-// One decoder step for a vanilla transformer (llama.cpp GGUF tensor
-// naming): embed the token, run every block (QKV projections on the
-// device, RoPE, causal attention over the cache, gated MLP), project
-// to logits and return the argmax token. Projections must be Q4_K and
-// norms/embeddings F32, else UnsupportedFeature; a missing tensor is
-// MalformedFile. Deterministic: greedy sampling, fixed op order.
+// One vanilla decoder step: embed, block forward, greedy argmax.
+// Q4_K projections and F32 vectors only; hybrid configs unsupported.
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> DecodeStep(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token);

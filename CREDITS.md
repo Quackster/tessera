@@ -10,3 +10,10 @@ project, the version, the license, and where it is used.
   (iq3s_grid), and the ggml type ids 20, 21, 23. Ported (not
   compiled) to src/core/numerics/quant.cpp, the vulkan .comp
   kernels, and the rocm kernels in src/backends/rocm.
+- llama.cpp src/models/qwen35.cpp (MIT License, same checkout):
+  hybrid layer layout (recurrent gated-delta-net layers interleaved
+  with full attention every full_attention_interval blocks, MTP
+  blocks excluded from the main pass), fused Q-plus-gate and fused
+  qkv tensor shapes, and the ssm.* metadata keys. Referenced for
+  the hybrid config in include/tessera/model.hpp and
+  src/core/model.cpp; no code copied.

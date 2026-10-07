@@ -6,7 +6,10 @@ Working Principles).
 
 ## Current status
 
-The boilerplate is complete and passes on both backends:
+The boilerplate is complete and passes on both backends.
+`ctest` passes 115/115 on both builds.
+Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
+through RADV GFX1201, rocm through the system ROCm).
 
 - Project layout and CMake. The backend is selected at configure time
   (`vulkan` or `rocm`).
@@ -14,44 +17,45 @@ The boilerplate is complete and passes on both backends:
   `SpeculativeStrategy`, `Diagnostics`.
 - GGUF v2/v3 parser. It parses the header and the tensor manifest.
   It checks all bounds.
-- Safetensors layout checks for MXFP4 model directories.
+- Safetensors layout checks for MXFP4 model directories. A bounded
+  schema-strict JSON reader parses the tensor map with no third party
+  dependency. MXFP4 blobs pair with their E8M0 scales by name. MTP FP8
+  weights map natively.
 - Vulkan and ROCm backends: device init, buffer alloc/free, H2D/D2H
-  copy, synchronize.
+  copy, synchronize. `CopyD2HAt` reads byte slices for embedding rows.
 - Kernel launch plumbing on both backends. `LaunchKernel` binds buffers
   and 64-bit scalars in parameter order and waits on a fence (vulkan) or
   the hip runtime (rocm). The built-in "fill" kernel runs end to end
   and is verified by a read-back test on both devices.
-- DFlash2 strategy skeleton. It validates the draft checkpoint layout.
-- CLI: `tessera-cli run --model <path> [--draft <dir>]`.
-- Generic GEMM kernel with GGUF Q4_K dequantization (fp32
-  accumulation). A host reference check verifies it on both devices
-  with per backend tolerance.
+- Generic GEMM kernels with dequantization and fp32 accumulation.
+  Q4_K, Q3_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and IQ3_S are verified on both
+  devices against host references with per backend tolerance. Exact
+  codec unit tests cover the dequant math. FP8 (per-row scaled E4M3)
+  and MXFP4 (32-element E8M0 blocks) kernels are verified the same way.
+  The OCP E4M3 top bin needs care (only mantissa-all-ones is NaN,
+  max 448).
 - Attention (GQA) and RoPE kernels driven by the model definition.
   `Model::Attention` reads heads, kv groups, head dim and the RoPE
   range and base from GGUF metadata. The generic "rope" and
   "attention" built-ins take all dims as launch scalars and are
   verified against host references on both devices.
-- Single GoogleTest target. `ctest` passes 111/111 on both builds.
-  Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
-  through RADV GFX1201, rocm through the system ROCm).
-- K-quant and IQ GEMM paths (Q3_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS,
-  IQ3_S): dequant ports verified against llama.cpp, generic kernels
-  on both backends, exact codec unit tests. The 27B file still
-  needs fused QKV splitting and the SSM recurrence.
-- MXFP4 tensor map: the safetensors header parser reads the fixed
-  schema with a bounded hand-rolled reader. MXFP4 blobs pair with
-  their E8M0 scales by name; MTP FP8 weights map natively. Model
-  load builds the manifest and uploads every tensor.
-- FP8 and MXFP4 GEMM kernels on both backends, checked against fp32
-  host references with per backend tolerance.
-- Single-token decode loop in the core (backend agnostic): embed,
-  block forward (device GEMM/RoPE/attention, host norms), greedy
-  sample. Runs on vanilla-layout GGUF models. The 27B target is a
-  hybrid SSM model and stays unsupported (see the hybrid note).
 - Weight upload: `Model::Load` allocates one device buffer per
   manifest tensor and copies the file bytes through the backend.
   `Model::Weights` exposes them next to the manifest. Unsized
   layouts stay in the manifest but fail the load as unsupported.
+- Single-token decode loop in the core (backend agnostic): embed,
+  block forward (device GEMM/RoPE/attention, host norms), greedy
+  sample. It runs on vanilla-layout GGUF models. Hybrid definitions
+  load fully (the 27B target loads with 866 tensors on both backends)
+  but `DecodeStep` rejects them as unsupported until the recurrent
+  kernels land. Norms and SiLU run on the host until their device
+  kernels land.
+- DFlash2 strategy skeleton. It validates the draft checkpoint layout.
+- CLI: `tessera-cli run --model <path> [--draft <dir>]`. It loads the
+  model, uploads weights, and prints a tensor summary. It does not run
+  decode steps yet.
+- Single GoogleTest target. Device dependent tests skip cleanly when
+  no device is present. Numerical checks use per backend tolerance.
 
 ## Done
 
@@ -95,6 +99,15 @@ The boilerplate is complete and passes on both backends:
   data start. `Model::Load` reads the file once, uploads every
   tensor, and keeps the buffers in `Model::Weights` with a
   `FindWeight` lookup. The CLI prints the device byte count.
+- 2026-10-07: decode loop (91/91 `ctest` on both builds).
+  `TransformerConfig` comes from GGUF metadata and `DecodeStep`
+  runs one greedy step (device projections/RoPE/attention, host
+  norms/SiLU/argmax, host KV cache). A 1-layer vanilla fixture
+  decodes deterministically on both backends. A fixed descriptor
+  pool leak surfaced (the pool missed FREE_DESCRIPTOR_SET_BIT).
+  `CopyD2HAt` reads embedding rows; the GGUF array cap is now 1M
+  (248k-token vocabularies). `tests/backend_test.cpp` grows past
+  the 600 cap again (one offset test; exemption stands).
 - 2026-10-07: MXFP4 path (102/102 `ctest` on both builds). A bounded
   schema-strict JSON reader parses the safetensors map (no third
   party dependency, by decision). U8 blobs become F4E2M1 against
@@ -115,29 +128,35 @@ The boilerplate is complete and passes on both backends:
   ROCm Q3_K kernel. The rocm backend split into focused translation
   units (rule 4); shared device helpers are inline in the private
   kernel header. Borrowed math is credited in CREDITS.md.
-- 2026-10-07: decode loop (91/91 `ctest` on both builds).
-  `TransformerConfig` comes from GGUF metadata and `DecodeStep`
-  runs one greedy step (device projections/RoPE/attention, host
-  norms/SiLU/argmax, host KV cache). A 1-layer vanilla fixture
-  decodes deterministically on both backends. A fixed descriptor
-  pool leak surfaced (the pool missed FREE_DESCRIPTOR_SET_BIT).
-  `CopyD2HAt` reads embedding rows; the GGUF array cap is now 1M
-  (248k-token vocabularies). `tests/backend_test.cpp` grows past
-  the 600 cap again (one offset test; exemption stands).
+- 2026-10-07: hybrid definition and load (115/115 `ctest` on both
+  builds). Current head. `TransformerConfig` carries a hybrid flag,
+  `SsmParams` and the full-attention interval with an
+  `IsFullAttentionLayer` mapper. GGUF parsing reads explicit
+  key/value lengths (no embedding divisibility needed), the ssm.*
+  keys, and counts trunk blocks (block_count minus
+  nextn_predict_layers). The 27B target loads on both backends (866
+  tensors); `DecodeStep` rejects hybrid configs as
+  UnsupportedFeature. Layer kinds follow the llama.cpp interval rule,
+  credited in CREDITS.md.
 
 ## Next (in order)
 
-1. **Hybrid SSM decode** for the 27B target (arch `qwen35`): fused
-   QKV splitting, selective-scan and conv1d kernels (see
-   llama.cpp qwen35.cpp). Quant paths are done; the loader still
-   reports the first tensor no kernel consumes today.
+1. **Hybrid SSM decode** for the 27B target (arch `qwen35`):
+   definition and load are done (explicit head dim, SSM params, layer
+   kinds, trunk count; the file loads with 866 tensors on both
+   backends). Still missing: fused Q-plus-gate splitting with QK norms
+   and mRoPE on full layers, the linear path (causal conv1d, recurrent
+   scan, gated norm), and MTP handling. `DecodeStep` rejects hybrid
+   configs as unsupported today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
 3. **Baseline pinning**: run the non speculative path on both backends.
    Record per backend tolerance. Assert in tests (fixed seeds).
 4. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
-   definition needs them. Models are data. No per model branches.
+   definition needs them. The decode loop runs projections,
+   RoPE and attention on the device. Norms and SiLU still run on
+   the host. Models are data. No per model branches.
 5. **Serving API**: OpenAI-style `/v1/chat/completions` plus an
    Anthropic-style `/v1/messages` endpoint, served over HTTP from the
    engine. Streaming and non-streaming responses. The same limits

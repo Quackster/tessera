@@ -16,6 +16,7 @@ using tessera::ModelFormat;
 using tessera::TensorEntry;
 using tessera::ModelOptions;
 using tessera::StatusCode;
+using tessera::TransformerConfig;
 using tessera::testing::DrawValue;
 using tessera::testing::FreshTempDir;
 using tessera::testing::GgufBuilder;
@@ -23,6 +24,7 @@ using tessera::testing::MakeSafetensorsContainer;
 using tessera::testing::MakeValidGguf;
 using tessera::testing::QuantizeRows;
 using tessera::testing::WriteBytes;
+using tessera::testing::WriteHybridFixture;
 using tessera::testing::WritePlaceholderConfig;
 using tessera::testing::WritePlaceholderWeights;
 
@@ -266,13 +268,22 @@ TEST(EngineTest, RealModelLoadPathWhenProvided) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
   auto model = engine->LoadModel(ModelOptions{raw, 1024});
-  // The first-class target is a hybrid SSM model (fused QKV, state
-  // space tensors, Q3_K and unmapped 2026 quant types): the load
-  // reports the first layout it cannot size instead of decoding it.
-  // Full hybrid decode is a later milestone, tracked in
-  // docs/PROGRESS.md.
-  ASSERT_FALSE(model.has_value());
-  EXPECT_EQ(model.error(), StatusCode::UnsupportedFeature);
+  // The first-class target is a hybrid attention/SSM model: the load
+  // succeeds and decode reports UnsupportedFeature until the
+  // recurrent kernels land (see docs/PROGRESS.md).
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto config = (*model)->Config();
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_TRUE(config->hybrid);
+  EXPECT_EQ(config->layers, 64u);
+  EXPECT_EQ(config->attention.head_dim, 256u);
+  EXPECT_EQ(config->vocab_size, 248320u);
+  EXPECT_EQ(config->ssm.inner_size, 6144u);
+  EXPECT_EQ(config->full_attention_interval, 4u);
+  tessera::core::DecodeCache cache;
+  auto step = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
+  ASSERT_FALSE(step.has_value());
+  EXPECT_EQ(step.error(), StatusCode::UnsupportedFeature);
 }
 
 TEST(EngineTest, LoadMxFp4BlobAndScalePair) {
@@ -390,7 +401,81 @@ TEST(EngineTest, LoadGgufModelAttentionBadValues) {
   EXPECT_EQ(model.error(), StatusCode::MalformedFile);
 }
 
+TEST(EngineTest, LoadGgufModelAttentionExplicitHeadDim) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 9);
+  builder.KvString("general.name", "test-model");
+  builder.KvString("general.architecture", "test-hybrid");
+  builder.KvU32("test-hybrid.attention.head_count", 24);
+  builder.KvU32("test-hybrid.attention.head_count_kv", 4);
+  builder.KvU32("test-hybrid.embedding_length", 5120);
+  builder.KvU32("test-hybrid.attention.key_length", 256);
+  builder.KvU32("test-hybrid.attention.value_length", 256);
+  builder.KvU32("test-hybrid.rope.dimension_count", 64);
+  builder.KvF32("test-hybrid.rope.freq_base", 10000000.0f);
+  builder.Tensor("w_a", 1, {4}, 0, 0);
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 16);
+  auto dir = FreshTempDir("tessera_tests_explicit_headdim");
+  auto path = dir / "headdim.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto params = (*model)->Attention();
+  ASSERT_TRUE(params.has_value()) << tessera::ToString(params.error());
+  EXPECT_EQ(params->heads, 24u);
+  EXPECT_EQ(params->kv_heads, 4u);
+  EXPECT_EQ(params->head_dim, 256u);
+}
+
+TEST(EngineTest, LoadGgufModelHybridConfig) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteHybridFixture("hybrid.gguf", true);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto config = (*model)->Config();
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_TRUE(config->hybrid);
+  EXPECT_EQ(config->layers, 3u);
+  EXPECT_EQ(config->attention.head_dim, 64u);
+  EXPECT_EQ(config->ssm.conv_kernel, 2u);
+  EXPECT_EQ(config->ssm.state_size, 8u);
+  EXPECT_EQ(config->ssm.group_count, 2u);
+  EXPECT_EQ(config->ssm.time_step_rank, 4u);
+  EXPECT_EQ(config->ssm.inner_size, 32u);
+  EXPECT_EQ(config->full_attention_interval, 2u);
+  EXPECT_FALSE(config->IsFullAttentionLayer(0));
+  EXPECT_TRUE(config->IsFullAttentionLayer(1));
+  EXPECT_FALSE(config->IsFullAttentionLayer(2));
+  TransformerConfig vanilla;
+  EXPECT_TRUE(vanilla.IsFullAttentionLayer(5));
+}
+
+TEST(EngineTest, LoadGgufModelHybridIncompleteKeys) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteHybridFixture("hybrid_bad.gguf", false);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_FALSE(model.has_value());
+  EXPECT_EQ(model.error(), StatusCode::MalformedFile);
+}
+
+TEST(EngineTest, HybridDecodeReturnsUnsupported) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteHybridFixture("hybrid_decode.gguf", true);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  tessera::core::DecodeCache cache;
+  auto step = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
+  ASSERT_FALSE(step.has_value());
+  EXPECT_EQ(step.error(), StatusCode::UnsupportedFeature);
+}
+
 TEST(EngineTest, LoadModelAttentionMxFp4Unsupported) {
+
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
   auto dir = FreshTempDir("tessera_tests_attention_mxfp4");

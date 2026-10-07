@@ -180,6 +180,11 @@ std::expected<std::uint32_t, StatusCode> DecodeStep(
     return std::unexpected(config.error());
   }
   const TransformerConfig& cfg = *config;
+  // Hybrid attention/SSM blocks need the recurrent kernels; the
+  // vanilla walk below cannot run them, so fail fast and loud.
+  if (cfg.hybrid) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
   const std::size_t heads = cfg.attention.heads;
   const std::size_t kv_heads = cfg.attention.kv_heads;
   const std::size_t head_dim = cfg.attention.head_dim;

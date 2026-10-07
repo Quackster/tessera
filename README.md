@@ -16,12 +16,13 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. |
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. |
 | DFlash2 | Skeleton | Validates checkpoint layout. Draft logic is in work. |
-| CLI | Partial | Validates load path. Prints tensor summary. No decode loop yet. |
+| CLI | Partial | Loads model and uploads weights. Prints tensor summary. No token generation yet. Core DecodeStep covers vanilla GGUF. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, IQ and FP8/MXFP4 dequant. Host reference check. Per backend tolerance. |
 | Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
-| Decode loop | Done | Single token loop on vanilla GGUF. Hybrid SSM models report unsupported. |
-| MXFP4 path | Todo | Full tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights. |
+| Decode loop | Done | Single token loop on vanilla GGUF. Hybrid configs load but decode reports unsupported. |
+| Hybrid SSM | Partial | Definition and load done. 27B file loads. Recurrent kernels in work. |
+| MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
 | DFlash2 decode | Todo | Grouped causal convolutions. Low rank selector. Verify loop. |
 | Baseline pinning | Todo | Runs reference path on both backends. Records tolerance. |
 | MoE, MLP, norms | Todo | Kernels as model definition needs them. No per model branches. |
@@ -53,8 +54,8 @@ See `AGENTS.md` for architecture rules and for hard rules.
 
 | Format | State | Detail |
 | --- | --- | --- |
-| GGUF | Done | Parses v2 and v3. Supports Q4_K and IQ3 splits. Checks bounds. |
-| MXFP4 safetensors | Partial | Checks layout. Full map parsing is in work. |
+| GGUF | Done | Parses v2 and v3. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS and IQ3_S. Checks bounds. |
+| MXFP4 safetensors | Partial | Parses map and uploads weights. GEMM verified. No decode config yet. |
 | DFlash2 FP8 draft | Skeleton | Validates layout only. Decode logic is in work. |
 
 Model weights live outside the repo. Each variant uses one flat directory. Model paths are runtime configuration. Code and tests never hard code model paths.
@@ -73,7 +74,7 @@ CLI example:
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --draft ~/models/Qwen3.8-27B-DFlash2-FP8
 ```
 
-The CLI loads the model manifest. It attaches the draft strategy when `--draft` is set. It prints tensor count and total elements. Full weight upload and token generation are still in work.
+The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count and total elements. Token generation from the CLI is still in work.
 
 ## Build and test
 
