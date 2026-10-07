@@ -1,0 +1,55 @@
+#version 450
+
+// One thread per output element; dispatch ceil(m * n / 256).
+layout(local_size_x = 256) in;
+
+// "gemm_fp8_block" contract: buffer 0 is A (fp32, m x k), buffer 1 the
+// FP8 E4M3 weights W (n x k bytes), buffer 2 the block scales S (fp32,
+// (n/128) x (k/128)), buffer 3 the output C (fp32, m x n). Scalars are
+// 64-bit, so field k lives at pc.v[2k]: m v[0], n v[2], k v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) buffer W { uint w[]; };
+layout(set = 0, binding = 2) buffer S { float s[]; };
+layout(set = 0, binding = 3) buffer C { float c[]; };
+
+// OCP FP8 E4M3 byte to fp32 (port of the core Fp8E4M3ToFloat).
+float fp8_at(uint b) {
+  uint s7 = b >> 7;
+  uint e = (b >> 3) & 15;
+  uint m = b & 7;
+  float value;
+  if (e == 0) {
+    value = float(m) * exp2(-10.0);
+  } else if (e == 15) {
+    value = m == 7 ? 0.0 / 0.0 : (1.0 + float(m) / 8.0) * 256.0;
+  } else {
+    value = (1.0 + float(m) / 8.0) * exp2(float(e) - 8.0);
+  }
+  return s7 > 0 ? -value : value;
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  if (idx >= m * n) {
+    return;
+  }
+  uint row_a = idx / n;
+  uint row_w = idx % n;
+  uint k_blocks = k >> 7;
+  uint s_row = (row_w >> 7) * k_blocks;
+  float acc = 0.0;
+  for (uint t = 0; t < k; ++t) {
+    float wgt = s[s_row + (t >> 7)] * fp8_at((w[(row_w * k + t) >> 2] >>
+                                              (((row_w * k + t) & 3) << 3)) &
+                                             0xFF);
+    acc += a[row_a * k + t] * wgt;
+  }
+  c[idx] = acc;
+}

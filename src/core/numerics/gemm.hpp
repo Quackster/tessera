@@ -89,6 +89,20 @@ namespace tessera::core {
     std::span<const float> s, std::span<float> c, std::size_t m,
     std::size_t n, std::size_t k);
 
+// Host reference for the "gemm_fp8_block" built-in: like gemm_fp8 but
+// with one fp32 scale per 128 x 128 block of W (the DFlash2 draft
+// quantization). `a` is m x k fp32, `w` is n x k FP8 E4M3 bytes, `s`
+// holds (n/128) x (k/128) fp32 block scales row-major, `c` is m x n
+// fp32. m, n, k must be nonzero and n and k multiples of 128; a size
+// mismatch is InvalidArgument.
+//
+// Usage:
+//   auto status = GemmFp8BlockRef(a, w, s, c, m, n, k);
+[[nodiscard]] std::expected<void, StatusCode> GemmFp8BlockRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<const float> s, std::span<float> c, std::size_t m,
+    std::size_t n, std::size_t k);
+
 // Host reference for the "gemm_mxfp4" built-in: C = A x W'^T with
 // fp32 sequential accumulation, where W' dequantizes the MXFP4
 // microscale layout (F4E2M1 nibbles in `w`, one E8M0 byte per 32

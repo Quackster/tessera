@@ -65,6 +65,11 @@ __global__ void AttentionKernel(const float* q, const float* k,
                                 unsigned long long head_dim,
                                 unsigned long long q_base,
                                 unsigned long long window);
+__global__ void GemmFp8BlockKernel(const float* a, const unsigned char* w,
+                                   const float* s, float* c,
+                                   unsigned long long m,
+                                   unsigned long long n,
+                                   unsigned long long k);
 __global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
                                float* c, unsigned long long m,
                                unsigned long long n,

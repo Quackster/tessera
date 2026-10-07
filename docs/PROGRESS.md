@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 184/184 on both builds.
+`ctest` passes 185/185 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -510,6 +510,14 @@ through RADV GFX1201, rocm through the system ROCm).
   the tensor sizer already handled BF16, so bf16 weights (the DFlash2
   draft projections) now select a kernel. bf16 weights are read
   two-per-word and shifted into fp32 (exact).
+
+- 2026-10-07: block-scaled fp8 GEMM (185/185 `ctest` on both builds).
+  Current head. Generic "gemm_fp8_block" computes C = A x W^T with
+  FP8 E4M3 weights and one fp32 scale per 128 x 128 block (the DFlash2
+  draft quantization `weight_scale_inv`), on vulkan (GLSL) and rocm
+  (HIP) with a host reference and a device-vs-reference test. Together
+  with gemm_f32 and gemm_bf16 this covers every DFlash2 draft weight
+  dtype.
 
 ## Next (in order)
 

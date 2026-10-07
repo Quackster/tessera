@@ -34,6 +34,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"attention", kAttentionSpirV, sizeof(kAttentionSpirV)},
     {"rope", kRopeSpirV, sizeof(kRopeSpirV)},
     {"gemm_fp8", kGemmFp8SpirV, sizeof(kGemmFp8SpirV)},
+    {"gemm_fp8_block", kGemmFp8BlockSpirV, sizeof(kGemmFp8BlockSpirV)},
     {"gemm_f32", kGemmF32SpirV, sizeof(kGemmF32SpirV)},
     {"gemm_bf16", kGemmBf16SpirV, sizeof(kGemmBf16SpirV)},
     {"gemm_mxfp4", kGemmMxfp4SpirV, sizeof(kGemmMxfp4SpirV)},

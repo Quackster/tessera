@@ -246,6 +246,38 @@ std::expected<void, StatusCode> GemmFp8Ref(
   return {};
 }
 
+// DFlash2 block quantization: one scale per 128 x 128 weight block.
+constexpr std::size_t kFp8Block = 128;
+
+std::expected<void, StatusCode> GemmFp8BlockRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<const float> s, std::span<float> c, std::size_t m,
+    std::size_t n, std::size_t k) {
+  if (m == 0 || n == 0 || k == 0 || n % kFp8Block != 0 ||
+      k % kFp8Block != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t k_blocks = k / kFp8Block;
+  if (a.size() != m * k || w.size() != n * k ||
+      s.size() != (n / kFp8Block) * k_blocks || c.size() != m * n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < m; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      const float* s_row = &s[(j / kFp8Block) * k_blocks];
+      float acc = 0.0f;
+      for (std::size_t t = 0; t < k; ++t) {
+        const float wgt = s_row[t / kFp8Block] *
+                          Fp8E4M3ToFloat(static_cast<std::uint8_t>(
+                              w[j * k + t]));
+        acc = std::fma(a[i * k + t], wgt, acc);
+      }
+      c[i * n + j] = acc;
+    }
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> GemmMxFp4Ref(
     std::span<const float> a, std::span<const std::byte> w,
     std::span<const std::byte> s, std::span<float> c, std::size_t m,

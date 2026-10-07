@@ -3437,3 +3437,68 @@ TEST(BackendTest, GemmBf16DeviceMatchesRef) {
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
+
+// Device: the block-scaled fp8 GEMM (one scale per 128x128 block) matches
+// the reference. Bytes 0x7F/0xFF (E4M3 NaN) are avoided.
+TEST(BackendTest, GemmFp8BlockDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(92);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 128;
+  constexpr std::size_t kK = 128;
+  std::vector<float> a(kM * kK, 0.0f);
+  for (auto& v : a) v = DrawValue(rng);
+  std::vector<std::byte> w(kN * kK);
+  std::uniform_int_distribution<int> byte(0, 255);
+  for (auto& v : w) {
+    int b = byte(rng);
+    if (b == 0x7F || b == 0xFF) b = 0x7E;
+    v = static_cast<std::byte>(b);
+  }
+  std::vector<float> s(1, DrawValue(rng));
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto s_buf = backend->AllocateBuffer(s.size() * 4, MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && w_buf && s_buf && c_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **a_buf, std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(a.data()),
+                               a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(w))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(
+                  **s_buf, std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(s.data()),
+                               s.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("gemm_fp8_block", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*s_buf).get(),
+                    (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**c_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kM * kN);
+  ASSERT_TRUE(core::GemmFp8BlockRef(std::span<const float>(a),
+                                    std::span<const std::byte>(w),
+                                    std::span<const float>(s),
+                                    std::span<float>(ref), kM, kN, kK)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}

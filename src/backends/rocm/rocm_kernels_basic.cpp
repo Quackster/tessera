@@ -224,6 +224,32 @@ __global__ void GemmFp8Kernel(const float* a, const unsigned char* w,
   c[idx] = acc;
 }
 
+// Built-in "gemm_fp8_block": one fp32 scale per 128 x 128 weight block
+// (the DFlash2 draft quantization).
+__global__ void GemmFp8BlockKernel(const float* a, const unsigned char* w,
+                                   const float* s, float* c,
+                                   unsigned long long m,
+                                   unsigned long long n,
+                                   unsigned long long k) {
+  unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const unsigned long long k_blocks = k / 128ULL;
+  const float* s_row = &s[(row_w / 128ULL) * k_blocks];
+  float acc = 0.0f;
+  for (unsigned long long t = 0; t < k; ++t) {
+    const float wgt =
+        s_row[t / 128ULL] *
+        Fp8E4M3ToFloatDev(w[row_w * k + t]);
+    acc = fmaf(a[row_a * k + t], wgt, acc);
+  }
+  c[idx] = acc;
+}
+
 // Built-in "gemm_mxfp4": C = A x W'^T with fp32 sequential
 // accumulation; W' dequantizes MXFP4 nibbles (low nibble first) with
 // one E8M0 scale byte per 32 elements. k is a multiple of 32.

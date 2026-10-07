@@ -39,6 +39,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"attention", reinterpret_cast<void*>(&AttentionKernel)},
     {"rope", reinterpret_cast<void*>(&RopeKernel)},
     {"gemm_fp8", reinterpret_cast<void*>(&GemmFp8Kernel)},
+    {"gemm_fp8_block", reinterpret_cast<void*>(&GemmFp8BlockKernel)},
     {"gemm_f32", reinterpret_cast<void*>(&GemmF32Kernel)},
     {"gemm_bf16", reinterpret_cast<void*>(&GemmBf16Kernel)},
     {"gemm_mxfp4", reinterpret_cast<void*>(&GemmMxFp4Kernel)},
