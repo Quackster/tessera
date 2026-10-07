@@ -1,5 +1,6 @@
 #include "core/numerics/quant.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -117,6 +118,32 @@ std::uint16_t Fp16FromFloat(float value) {
   const std::uint32_t half =
       (static_cast<std::uint32_t>(exponent + 15) << 10) | (mantissa >> 13);
   return static_cast<std::uint16_t>(sign | half);
+}
+
+std::expected<void, StatusCode> QuantizeQ8Ref(std::span<const float> in,
+                                              std::span<std::byte> out,
+                                              std::span<float> scale,
+                                              std::size_t rows,
+                                              std::size_t cols) {
+  if (rows == 0 || cols == 0 || cols % 4 != 0 || in.size() != rows * cols ||
+      out.size() != rows * cols || scale.size() != rows) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    float amax = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      amax = std::max(amax, std::abs(in[r * cols + c]));
+    }
+    const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+    scale[r] = s;
+    for (std::size_t c = 0; c < cols; ++c) {
+      const float x = in[r * cols + c] / s;
+      long q = std::lround(x);  // half away from zero
+      q = std::clamp<long>(q, -127, 127);
+      out[r * cols + c] = static_cast<std::byte>(static_cast<std::int8_t>(q));
+    }
+  }
+  return {};
 }
 
 std::expected<void, StatusCode> CastF32F16Ref(std::span<const float> in,

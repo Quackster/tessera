@@ -626,6 +626,100 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
   y[i] = acc;
 }
 
+// Built-in "quantize_q8": one thread per row; symmetric int8 with a
+// per-row absmax scale, packed four bytes per word.
+__global__ void QuantizeQ8Kernel(const float* in, unsigned int* packed,
+                                 float* scale, unsigned long long rows,
+                                 unsigned long long cols) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  const unsigned long long base = r * cols;
+  float amax = 0.0f;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    amax = fmaxf(amax, fabsf(in[base + c]));
+  }
+  const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+  scale[r] = s;
+  const unsigned long long words = cols / 4;
+  for (unsigned long long w = 0; w < words; ++w) {
+    unsigned int word = 0u;
+    for (unsigned int b = 0u; b < 4u; ++b) {
+      const float x = in[base + w * 4 + b] / s;
+      int q = static_cast<int>(x >= 0.0f ? floorf(x + 0.5f) : ceilf(x - 0.5f));
+      q = q < -127 ? -127 : (q > 127 ? 127 : q);
+      word |= (static_cast<unsigned int>(q) & 0xFFu) << (b * 8u);
+    }
+    packed[r * words + w] = word;
+  }
+}
+
+// Built-in "attention_q8": GQA with symmetric int8 keys/values.
+__global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
+                                  const unsigned char* v, const float* ks,
+                                  const float* vs, float* out,
+                                  unsigned long long m, unsigned long long n,
+                                  unsigned long long heads,
+                                  unsigned long long kv_heads,
+                                  unsigned long long head_dim,
+                                  unsigned long long q_base,
+                                  unsigned long long window) {
+  const unsigned long long t =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= m * heads * head_dim) {
+    return;
+  }
+  const unsigned long long i = t / (heads * head_dim);
+  const unsigned long long rem = t % (heads * head_dim);
+  const unsigned long long h = rem / head_dim;
+  const unsigned long long e = rem % head_dim;
+  const unsigned long long kv = h / (heads / kv_heads);
+  const unsigned long long pos = q_base + i;
+  const unsigned long long last = pos >= n ? n - 1 : pos;
+  unsigned long long start =
+      (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+  if (start > last) {
+    start = last;
+  }
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  const unsigned long long q_base_idx = (i * heads + h) * head_dim;
+  const auto kat = [&](unsigned long long idx, float s) {
+    return static_cast<float>(static_cast<signed char>(k[idx])) * s;
+  };
+  const auto vat = [&](unsigned long long idx, float s) {
+    return static_cast<float>(static_cast<signed char>(v[idx])) * s;
+  };
+  float row_max = 0.0f;
+  bool first = true;
+  for (unsigned long long j = start; j <= last; ++j) {
+    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
+    float dot = 0.0f;
+    for (unsigned long long d = 0; d < head_dim; ++d) {
+      dot = fmaf(q[q_base_idx + d], kat(k_base + d, ks[j]), dot);
+    }
+    dot *= scale;
+    if (first || dot > row_max) {
+      row_max = dot;
+      first = false;
+    }
+  }
+  float acc = 0.0f;
+  float denom = 0.0f;
+  for (unsigned long long j = start; j <= last; ++j) {
+    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
+    float dot = 0.0f;
+    for (unsigned long long d = 0; d < head_dim; ++d) {
+      dot = fmaf(q[q_base_idx + d], kat(k_base + d, ks[j]), dot);
+    }
+    const float w = expf(dot * scale - row_max);
+    denom += w;
+    acc = fmaf(w, vat(k_base + e, vs[j]), acc);
+  }
+  out[t] = acc / denom;
+}
+
 // Built-in "cast_f32_f16": two fp32 -> one packed fp16 word.
 __global__ void CastF32F16Kernel(const float* in, unsigned int* out,
                                  unsigned long long n) {

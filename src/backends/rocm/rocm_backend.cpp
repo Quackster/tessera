@@ -65,6 +65,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"selector_edge_score", reinterpret_cast<void*>(&SelectorEdgeScoreKernel)},
     {"concat_features", reinterpret_cast<void*>(&ConcatFeaturesKernel)},
     {"cast_f32_f16", reinterpret_cast<void*>(&CastF32F16Kernel)},
+    {"quantize_q8", reinterpret_cast<void*>(&QuantizeQ8Kernel)},
+    {"attention_q8", reinterpret_cast<void*>(&AttentionQ8Kernel)},
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},

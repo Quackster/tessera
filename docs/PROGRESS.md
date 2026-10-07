@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 210/210 on both builds.
+`ctest` passes 212/212 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -706,6 +706,13 @@ through RADV GFX1201, rocm through the system ROCm).
   word (vulkan + rocm, host reference, device test). `Fp16FromFloat`
   encodes fp32 to fp16. With the fp16 attention flag this covers both
   halves of the fp16 KV cache; cache/storage wiring is next.
+
+- 2026-10-07: q8 KV kernels (212/212 `ctest` on both builds). Current
+  head. Generic "quantize_q8" symmetrically quantizes fp32 rows to
+  packed int8 with a per-row absmax scale; "attention_q8" runs GQA
+  over int8 keys/values with per-key-row scales. Host references and
+  device-vs-reference tests. These are the kernels for the q8 KV cache
+(storage/wiring next), alongside the fp16 cache.
 
 ## Next (in order)
 

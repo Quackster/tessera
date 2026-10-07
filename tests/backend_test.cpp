@@ -4655,3 +4655,110 @@ TEST(BackendTest, CastF32F16MatchesRef) {
                   .has_value());
   EXPECT_EQ(got, ref);
 }
+
+// Device: symmetric int8 quantization matches the host reference.
+TEST(BackendTest, QuantizeQ8MatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(105);
+  constexpr std::size_t kRows = 2, kCols = 8;
+  std::vector<float> in(kRows * kCols);
+  for (auto& v : in) v = DrawValue(rng);
+  auto in_buf = backend->AllocateBuffer(in.size() * 4, MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(in.size(), MemoryKind::Device);
+  auto scale_buf = backend->AllocateBuffer(kRows * 4, MemoryKind::Device);
+  ASSERT_TRUE(in_buf && out_buf && scale_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **in_buf, std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(in.data()),
+                                in.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("quantize_q8", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*in_buf).get(), (*out_buf).get(), (*scale_buf).get()};
+  launch.scalars = {kRows, kCols};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> got(in.size()), ref(in.size());
+  std::vector<float> got_scale(kRows), ref_scale(kRows);
+  backend->CopyD2H(**out_buf, got.data(), got.size());
+  backend->CopyD2H(**scale_buf, reinterpret_cast<std::byte*>(got_scale.data()),
+                   got_scale.size() * 4);
+  ASSERT_TRUE(core::QuantizeQ8Ref(std::span<const float>(in),
+                                  std::span<std::byte>(ref),
+                                  std::span<float>(ref_scale), kRows, kCols)
+                  .has_value());
+  EXPECT_EQ(got, ref);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    EXPECT_FLOAT_EQ(got_scale[r], ref_scale[r]);
+  }
+}
+
+// Device: int8 keys/values attention matches the host reference.
+TEST(BackendTest, AttentionQ8DeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(106);
+  constexpr std::size_t kM = 2, kN = 4, kHeads = 4, kKvHeads = 2, kDim = 16;
+  constexpr std::uint64_t kQBase = 3;
+  std::vector<float> q(kM * kHeads * kDim);
+  std::vector<float> k(kN * kKvHeads * kDim), v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  const std::size_t kv_dim = kKvHeads * kDim;
+  std::vector<std::byte> k8(k.size()), v8(v.size());
+  std::vector<float> ks(kN), vs(kN);
+  ASSERT_TRUE(core::QuantizeQ8Ref(std::span<const float>(k),
+                                  std::span<std::byte>(k8),
+                                  std::span<float>(ks), kN, kv_dim)
+                  .has_value());
+  ASSERT_TRUE(core::QuantizeQ8Ref(std::span<const float>(v),
+                                  std::span<std::byte>(v8),
+                                  std::span<float>(vs), kN, kv_dim)
+                  .has_value());
+  auto up = [&backend](const void* data, std::size_t bytes) {
+    auto b = backend->AllocateBuffer(bytes, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(data), bytes));
+    return std::move(*b);
+  };
+  auto q_buf = up(q.data(), q.size() * 4);
+  auto k_buf = up(k8.data(), k8.size());
+  auto v_buf = up(v8.data(), v8.size());
+  auto ks_buf = up(ks.data(), ks.size() * 4);
+  auto vs_buf = up(vs.data(), vs.size() * 4);
+  auto out_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(out_buf.has_value());
+  auto kernel = backend->LoadKernel("attention_q8", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), ks_buf.get(),
+                    vs_buf.get(), out_buf->get()};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(q.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(q.size());
+  ASSERT_TRUE(core::AttentionQ8Ref(
+                  std::span<const float>(q), std::span<const std::byte>(k8),
+                  std::span<const std::byte>(v8), std::span<const float>(ks),
+                  std::span<const float>(vs), std::span<float>(ref), kM, kN,
+                  kHeads, kKvHeads, kDim, kQBase, 0)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}

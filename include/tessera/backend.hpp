@@ -213,6 +213,14 @@ class Kernel {
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
 // for both is ceil(n / 256) workgroups of 256.
+// "quantize_q8": buffer 0 is In (fp32, rows x cols), buffer 1 the packed
+// int8 output (rows x cols bytes), buffer 2 one fp32 scale per row;
+// scalars are rows and cols (cols a multiple of 4). The dispatch is one
+// thread per row.
+// "attention_q8": like attention but keys and values are symmetric int8
+// (buffer 1 K, buffer 2 V), with one fp32 scale per key row (buffer 3 for
+// K, buffer 4 for V) and the fp32 output (buffer 5); scalars are m, n,
+// heads, kv_heads, head_dim, q_base and window.
 // "cast_f32_f16": buffer 0 is In (fp32, n elements), buffer 1 the
 // output (fp16, n elements, two per uint); scalar n (must be even). The
 // dispatch is ceil(n/2 / 256).
@@ -450,6 +458,26 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "quantize_q8") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 2) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
+        launch.scalars[1] % 4 != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "attention_q8") {
+    if (launch.buffers.size() != 6 || launch.scalars.size() != 7) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t heads = launch.scalars[2];
+    const std::uint64_t kv_heads = launch.scalars[3];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
+        kv_heads == 0 || launch.scalars[4] == 0 || heads % kv_heads != 0) {
       return StatusCode::InvalidArgument;
     }
   }
