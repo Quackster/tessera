@@ -1,0 +1,12 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortLambdasOnASingleLine: Inline
+FixNamespaceComments: false
+IncludeBlocks: Regroup
+MaxEmptyLinesToKeep: 1
+NamespaceIndentation: None
+SortIncludes: true
+Standard: c++20

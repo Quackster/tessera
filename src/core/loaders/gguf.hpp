@@ -1,0 +1,61 @@
+#pragma once
+
+#include <cstdint>
+#include <expected>
+#include <filesystem>
+#include <span>
+#include <string>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+#include "tessera/types.hpp"
+
+namespace tessera::core {
+
+// Scalar metadata values the GGUF parser supports. 8/16-bit values are
+// widened to 32-bit. Array values are dropped with a warning (see
+// ParseGguf).
+using GgufValue = std::variant<bool, std::int32_t, std::uint32_t,
+                              std::int64_t, std::uint64_t, float, double,
+                              std::string>;
+
+// Parsed GGUF file: header fields + metadata + tensor manifest.
+struct GgufFile {
+  std::uint32_t version = 0;
+  std::unordered_map<std::string, GgufValue> metadata;
+  std::vector<TensorEntry> tensors;
+  // Byte offsets of each tensor relative to the start of the tensor
+  // data (the aligned region after the tensor infos); parallel to
+  // `tensors`.
+  std::vector<std::uint64_t> tensor_offsets;
+  // Keys of array metadata values dropped by the parser (not supported).
+  std::vector<std::string> dropped_array_keys;
+
+  // Look up a metadata value by key; nullptr when absent.
+  [[nodiscard]] const GgufValue* Find(std::string_view key) const;
+};
+
+// Parse a GGUF v2/v3 image from memory (little-endian; v2 and v3 share
+// the byte layout, v3 additionally defines a big-endian encoding that
+// this reader does not accept).
+//
+// Rejects malformed input with MalformedFile: bad magic, truncated
+// sections, out-of-bounds lengths, more than 4 dims, a bool value other
+// than 0/1, an alignment that is not a power of two, a tensor offset
+// that is not a multiple of the file alignment, a non-monotonic offset
+// chain, or tensor data beyond the end of the file. Unsupported
+// versions and unknown (but well-formed) tensor types return
+// UnsupportedFeature.
+//
+// Usage:
+//   auto bytes = ReadFile(path);
+//   auto file = ParseGguf(bytes);
+[[nodiscard]] std::expected<GgufFile, StatusCode> ParseGguf(
+    std::span<const std::byte> data);
+
+// Parse a .gguf file from disk (ReadFile + ParseGguf).
+[[nodiscard]] std::expected<GgufFile, StatusCode> ParseGgufFile(
+    const std::filesystem::path& path);
+
+}  // namespace tessera::core

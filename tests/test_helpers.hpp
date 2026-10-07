@@ -1,0 +1,246 @@
+#pragma once
+
+// Shared helpers for the tessera test suite (single test binary; see
+// AGENTS.md "Building and Testing").
+
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <initializer_list>
+#include <string>
+#include <vector>
+
+namespace tessera::testing {
+
+// Builds a GGUF image in memory (little-endian, v2/v3 spec layout:
+// u64 string lengths without NUL, 13-type value table, variable dims,
+// u32 ggml type).
+struct GgufBuilder {
+  std::vector<std::byte> bytes;
+
+  void PushU8(std::uint8_t value) {
+    bytes.push_back(static_cast<std::byte>(value));
+  }
+
+  void PushU16(std::uint16_t value) {
+    for (int i = 0; i < 2; ++i) {
+      bytes.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xFF));
+    }
+  }
+
+  void PushU32(std::uint32_t value) {
+    for (int i = 0; i < 4; ++i) {
+      bytes.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xFF));
+    }
+  }
+
+  void PushU64(std::uint64_t value) {
+    for (int i = 0; i < 8; ++i) {
+      bytes.push_back(static_cast<std::byte>((value >> (8 * i)) & 0xFF));
+    }
+  }
+
+  void PushF32(float value) {
+    std::uint32_t bits;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    PushU32(bits);
+  }
+
+  void PushF64(double value) {
+    std::uint64_t bits;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    PushU64(bits);
+  }
+
+  // A GGUF string: u64 byte length + the bytes (no NUL, per the spec).
+  void PushString(const char* text) {
+    const auto len = std::strlen(text);
+    PushU64(static_cast<std::uint64_t>(len));
+    for (std::size_t i = 0; i < len; ++i) {
+      bytes.push_back(static_cast<std::byte>(text[i]));
+    }
+  }
+
+  void Header(std::uint32_t magic, std::uint32_t version,
+              std::uint64_t tensor_count, std::uint64_t kv_count) {
+    PushU32(magic);
+    PushU32(version);
+    PushU64(tensor_count);
+    PushU64(kv_count);
+  }
+
+  // Metadata key + value; the types follow the spec value table.
+  void KvU8(const char* key, std::uint8_t value) {
+    PushString(key);
+    PushU32(0);
+    PushU8(value);
+  }
+
+  void KvI8(const char* key, std::int8_t value) {
+    PushString(key);
+    PushU32(1);
+    PushU8(static_cast<std::uint8_t>(value));
+  }
+
+  void KvU16(const char* key, std::uint16_t value) {
+    PushString(key);
+    PushU32(2);
+    PushU16(value);
+  }
+
+  void KvI16(const char* key, std::int16_t value) {
+    PushString(key);
+    PushU32(3);
+    PushU16(static_cast<std::uint16_t>(value));
+  }
+
+  void KvU32(const char* key, std::uint32_t value) {
+    PushString(key);
+    PushU32(4);
+    PushU32(value);
+  }
+
+  void KvI32(const char* key, std::int32_t value) {
+    PushString(key);
+    PushU32(5);
+    PushU32(static_cast<std::uint32_t>(value));
+  }
+
+  void KvF32(const char* key, float value) {
+    PushString(key);
+    PushU32(6);
+    PushF32(value);
+  }
+
+  void KvBool(const char* key, bool value) {
+    PushString(key);
+    PushU32(7);
+    PushU8(value ? 1 : 0);
+  }
+
+  // A bool byte the spec rejects (only 0 and 1 are valid).
+  void KvBoolRaw(const char* key, std::uint8_t raw) {
+    PushString(key);
+    PushU32(7);
+    PushU8(raw);
+  }
+
+  void KvString(const char* key, const char* value) {
+    PushString(key);
+    PushU32(8);
+    PushString(value);
+  }
+
+  void KvU64(const char* key, std::uint64_t value) {
+    PushString(key);
+    PushU32(10);
+    PushU64(value);
+  }
+
+  void KvI64(const char* key, std::int64_t value) {
+    PushString(key);
+    PushU32(11);
+    PushU64(static_cast<std::uint64_t>(value));
+  }
+
+  void KvF64(const char* key, double value) {
+    PushString(key);
+    PushU32(12);
+    PushF64(value);
+  }
+
+  // Tensor entry: name, rank, rank dims (u64), ggml type, offset.
+  void Tensor(const char* name, std::uint32_t rank,
+              std::initializer_list<std::uint64_t> dims, std::uint32_t ggml_type,
+              std::uint64_t offset) {
+    PushString(name);
+    PushU32(rank);
+    auto dim_it = dims.begin();
+    for (std::uint32_t d = 0; d < rank; ++d) {
+      PushU64(dim_it != dims.end() ? *dim_it++ : 1);
+    }
+    PushU32(ggml_type);
+    PushU64(offset);
+  }
+
+  // Append zero bytes as the (fake) tensor payload region.
+  void PadPayload(std::size_t count) {
+    bytes.insert(bytes.end(), count, std::byte{0});
+  }
+
+  // Grow the image with zero bytes to an absolute size.
+  void PadTo(std::size_t size) {
+    if (bytes.size() < size) {
+      bytes.insert(bytes.end(), size - bytes.size(), std::byte{0});
+    }
+  }
+};
+
+// Build a minimal valid GGUF v3 file: one string kv, one f32 tensor.
+inline std::vector<std::byte> MakeValidGguf() {
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 1);
+  builder.KvString("general.name", "test-model");
+  builder.Tensor("w_a", 1, {4}, 0, 0);  // F32, 1x4
+  // The payload region starts at align32(info_end); pad past it.
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 16);
+  return builder.bytes;
+}
+
+// Write raw bytes to a path, creating/truncating it.
+inline void WriteBytes(const std::filesystem::path& path,
+                       const std::vector<std::byte>& data) {
+  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  if (!data.empty()) {
+    stream.write(reinterpret_cast<const char*>(data.data()),
+                 static_cast<std::streamsize>(data.size()));
+  }
+}
+
+inline void WriteString(const std::filesystem::path& path,
+                        const std::string& text) {
+  std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+  stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+
+// A stable (wall-clock independent) temp directory for test fixtures.
+inline std::filesystem::path FreshTempDir(const std::string& name) {
+  auto dir = std::filesystem::temp_directory_path() / name;
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directories(dir, ec);
+  return dir;
+}
+
+// A valid safetensors container: 8-byte LE header length + JSON bytes.
+inline std::vector<std::byte> MakeSafetensorsContainer(
+    const std::string& json, bool override_len = false,
+    std::uint64_t len_override = 0) {
+  std::vector<std::byte> out;
+  const std::uint64_t len =
+      override_len ? len_override : static_cast<std::uint64_t>(json.size());
+  for (int i = 0; i < 8; ++i) {
+    out.push_back(static_cast<std::byte>((len >> (8 * i)) & 0xFF));
+  }
+  for (char c : json) {
+    out.push_back(static_cast<std::byte>(c));
+  }
+  return out;
+}
+
+// A config.json placeholder good enough for layout checks.
+inline void WritePlaceholderConfig(const std::filesystem::path& dir) {
+  WriteString(dir / "config.json", R"({"architectures":["TesseraTest"]})");
+}
+
+inline void WritePlaceholderWeights(const std::filesystem::path& dir,
+                                   const std::string& file_name =
+                                       "model.safetensors") {
+  WriteBytes(dir / file_name, MakeSafetensorsContainer(
+                                 R"({"model":{"w":{"dtype":"F32"}}})"));
+}
+
+}  // namespace tessera::testing

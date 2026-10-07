@@ -1,0 +1,23 @@
+#version 450
+
+// Workgroup size is fixed at compile time on vulkan (LocalSize); the
+// caller dispatches ceil(count / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// Built-in "fill": scalar 0 (pc.v[0]) is the value, scalar 1 (pc.v[2])
+// is the element count; scalars are 64-bit, so field k lives at v[2k].
+// Buffers bind at set 0, binding 0.
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer Data {
+  int data[];
+};
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i < pc.v[2]) {
+    data[i] = int(pc.v[0]);
+  }
+}
