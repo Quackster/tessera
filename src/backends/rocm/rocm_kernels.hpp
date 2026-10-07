@@ -114,5 +114,8 @@ __global__ void MropeKernel(float* data, const unsigned long long* pos,
                             unsigned long long theta_bits,
                             unsigned long long sec_t, unsigned long long sec_h,
                             unsigned long long sec_w);
+__global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
+                                 unsigned long long heads,
+                                 unsigned long long head_dim);
 
 }  // namespace tessera::backends::rocm

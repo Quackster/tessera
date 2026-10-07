@@ -46,6 +46,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"conv1d", kConv1dSpirV, sizeof(kConv1dSpirV)},
     {"delta_step", kDeltaStepSpirV, sizeof(kDeltaStepSpirV)},
     {"mrope", kMropeSpirV, sizeof(kMropeSpirV)},
+    {"qgate_split", kQgateSplitSpirV, sizeof(kQgateSplitSpirV)},
 };
 
 int LookupBuiltIn(std::string_view name) {

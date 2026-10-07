@@ -327,4 +327,22 @@ __global__ void MropeKernel(float* data, const unsigned long long* pos,
   base[j] = x1 * c - x2 * s;
   base[j + pairs] = x1 * s + x2 * c;
 }
+
+// Built-in "qgate_split": split a fused gated-attention projection
+// into queries and gates (per head query then gate). One thread per
+// (head, element).
+__global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
+                                 unsigned long long heads,
+                                 unsigned long long head_dim) {
+  const unsigned long long t =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= heads * head_dim) {
+    return;
+  }
+  const unsigned long long head = t / head_dim;
+  const unsigned long long e = t % head_dim;
+  const unsigned long long src = head * 2 * head_dim;
+  q[t] = fused[src + e];
+  gate[t] = fused[src + head_dim + e];
+}
 }  // namespace tessera::backends::rocm

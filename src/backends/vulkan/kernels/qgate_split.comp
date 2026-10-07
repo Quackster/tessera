@@ -1,0 +1,38 @@
+#version 450
+
+// One thread per (head, element); the dispatch is
+// ceil(heads * head_dim / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "qgate_split" contract: buffer 0 is the fused gated-attention
+// projection (per head query then gate), buffer 1 the queries, buffer
+// 2 the gates. Scalars: heads v[0], head_dim v[2].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer Fused {
+  float fused[];
+};
+
+layout(set = 0, binding = 1) buffer Q {
+  float q[];
+};
+
+layout(set = 0, binding = 2) buffer G {
+  float g[];
+};
+
+void main() {
+  uint t = gl_GlobalInvocationID.x;
+  uint heads = pc.v[0];
+  uint head_dim = pc.v[2];
+  if (t >= heads * head_dim) {
+    return;
+  }
+  uint head = t / head_dim;
+  uint e = t % head_dim;
+  uint src = head * 2 * head_dim;
+  q[t] = fused[src + e];
+  g[t] = fused[src + head_dim + e];
+}

@@ -27,3 +27,9 @@ project, the version, the license, and where it is used.
   MRotaryEmbedding docs): three-section pair layout with a global
   frequency index, text rows equivalent to 1D RoPE. Design reference
   for the mrope built-in; no code copied.
+- Hugging Face transformers Qwen3-Next modeling (Apache-2.0,
+  src/transformers/models/qwen3_next/modeling_qwen3_next.py): the
+  gated-attention q_proj layout (view to [heads, 2*head_dim], chunk
+  per head into query then gate) and the sigmoid gate on the SDPA
+  output. Design reference for the qgate_split built-in; no code
+  copied.

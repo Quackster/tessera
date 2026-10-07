@@ -2109,3 +2109,94 @@ TEST(BackendTest, MropeRejectsBadArgs) {
   ASSERT_FALSE(bad_sections.has_value());
   EXPECT_EQ(bad_sections.error(), StatusCode::InvalidArgument);
 }
+
+// Device: the fused gated-attention split matches the host reference
+// (3 heads of head dim 8, distinct values per segment).
+TEST(BackendTest, QGateSplitDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(47);
+  constexpr std::size_t kHeads = 3;
+  constexpr std::size_t kHeadDim = 8;
+  std::vector<float> fused(kHeads * 2 * kHeadDim);
+  for (auto& v : fused) {
+    v = DrawValue(rng);
+  }
+  auto fused_buf =
+      backend->AllocateBuffer(fused.size() * 4, MemoryKind::Device);
+  auto q_buf =
+      backend->AllocateBuffer(kHeads * kHeadDim * 4, MemoryKind::Device);
+  auto gate_buf =
+      backend->AllocateBuffer(kHeads * kHeadDim * 4, MemoryKind::Device);
+  ASSERT_TRUE(fused_buf.has_value() && q_buf.has_value() &&
+              gate_buf.has_value());
+  auto upload = backend->CopyH2D(**fused_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(fused.data()), fused.size() * 4));
+  ASSERT_TRUE(upload.has_value()) << tessera::ToString(upload.error());
+
+  auto kernel = backend->LoadKernel("qgate_split", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kHeads * kHeadDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*fused_buf).get(), (*q_buf).get(), (*gate_buf).get()};
+  launch.scalars = {kHeads, kHeadDim};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<float> ref_q(kHeads * kHeadDim);
+  std::vector<float> ref_gate(kHeads * kHeadDim);
+  auto ref_status = core::QGateSplitRef(
+      std::span<const float>(fused), std::span<float>(ref_q),
+      std::span<float>(ref_gate), kHeads, kHeadDim);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  std::vector<std::byte> readback_q(kHeads * kHeadDim * 4);
+  std::vector<std::byte> readback_gate(kHeads * kHeadDim * 4);
+  ASSERT_TRUE(backend->CopyD2H(**q_buf, readback_q.data(), readback_q.size())
+                  .has_value());
+  ASSERT_TRUE(backend->CopyD2H(**gate_buf, readback_gate.data(),
+                               readback_gate.size())
+                  .has_value());
+  const auto* device_q = reinterpret_cast<const float*>(readback_q.data());
+  const auto* device_gate =
+      reinterpret_cast<const float*>(readback_gate.data());
+  for (std::size_t i = 0; i < ref_q.size(); ++i) {
+    EXPECT_FLOAT_EQ(device_q[i], ref_q[i]);
+    EXPECT_FLOAT_EQ(device_gate[i], ref_gate[i]);
+  }
+}
+
+// Host and contract: the qgate-split reference and the launch contract
+// reject malformed shapes at the boundary (zero dims, size gaps).
+TEST(BackendTest, QGateSplitRejectsBadArgs) {
+  std::vector<float> fused(2 * 2 * 4, 0.5f);
+  std::vector<float> q(2 * 4);
+  std::vector<float> gate(2 * 4);
+  auto bad = core::QGateSplitRef(std::span<const float>(fused),
+                                 std::span<float>(q), std::span<float>(gate),
+                                 0, 4);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_q(2, 0.5f);
+  bad = core::QGateSplitRef(std::span<const float>(fused),
+                            std::span<float>(short_q), std::span<float>(gate),
+                            2, 4);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto split = backend->LoadKernel("qgate_split", {});
+  ASSERT_TRUE(split.has_value()) << tessera::ToString(split.error());
+  tessera::KernelLaunch launch;
+  // Qgate split wants 3 buffers and 2 scalars; zero head dim rejected.
+  const std::vector<const tessera::Buffer*> three_buffers{
+      nullptr, nullptr, nullptr};
+  launch.buffers = three_buffers;
+  launch.scalars = {2, 0};
+  auto bad_contract = backend->LaunchKernel(**split, launch);
+  ASSERT_FALSE(bad_contract.has_value());
+  EXPECT_EQ(bad_contract.error(), StatusCode::InvalidArgument);
+}

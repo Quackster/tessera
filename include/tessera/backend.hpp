@@ -189,6 +189,11 @@ class Kernel {
 // position times theta^(-2j/rope_dim); pairs past the sections reuse
 // the width id. The dispatch is
 // ceil(rows * heads * (rope_dim / 2) / 256) workgroups of 256.
+// "qgate_split": buffer 0 is the fused gated-attention projection
+// (fp32, heads*2*head_dim, per head query then gate), buffer 1 the
+// queries Q (fp32, heads*head_dim), buffer 2 the gates G (fp32,
+// heads*head_dim); scalars are heads and head_dim. The dispatch is
+// ceil(heads * head_dim / 256) workgroups of 256.
 [[nodiscard]] inline StatusCode CheckBuiltInArgs(const Kernel& kernel,
                                                  const KernelLaunch& launch) {
   if (kernel.Id() == "fill" &&
@@ -314,6 +319,14 @@ class Kernel {
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || head_dim == 0 ||
         rope_dim == 0 || rope_dim > head_dim || (head_dim % 2) != 0 ||
         (rope_dim % 2) != 0 || sections > rope_dim / 2) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "qgate_split") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 2) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

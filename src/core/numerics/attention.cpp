@@ -138,8 +138,7 @@ std::expected<void, StatusCode> MropeRef(
 std::expected<void, StatusCode> DeltaStepRef(
     std::span<float> s, std::span<const float> k, std::span<const float> v,
     std::span<const float> q, std::span<float> o, std::size_t dk,
-    std::size_t dv, float alpha, float beta) {
-  if (dk == 0 || dv == 0) {
+    std::size_t dv, float alpha, float beta) {  if (dk == 0 || dv == 0) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
   if (s.size() != dk * dv || k.size() != dk || v.size() != dv ||
@@ -159,6 +158,29 @@ std::expected<void, StatusCode> DeltaStepRef(
       out = std::fma(updated, q[j], out);
     }
     o[d] = out;
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> QGateSplitRef(
+    std::span<const float> fused, std::span<float> q, std::span<float> gate,
+    std::size_t heads, std::size_t head_dim) {
+  if (heads == 0 || head_dim == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t per_head = heads * head_dim;
+  if (fused.size() != per_head * 2 || q.size() != per_head ||
+      gate.size() != per_head) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t h = 0; h < heads; ++h) {
+    const float* src = fused.data() + h * 2 * head_dim;
+    float* q_row = q.data() + h * head_dim;
+    float* gate_row = gate.data() + h * head_dim;
+    for (std::size_t e = 0; e < head_dim; ++e) {
+      q_row[e] = src[e];
+      gate_row[e] = src[head_dim + e];
+    }
   }
   return {};
 }

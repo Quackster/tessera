@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 129/129 on both builds.
+`ctest` passes 131/131 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -57,6 +57,10 @@ through RADV GFX1201, rocm through the system ROCm).
   global frequency schedule. Text-only rows reduce to plain RoPE
   (asserted on device). Verified against the host reference on both
   devices.
+- Generic fused gated-attention split: one fused projection holds
+  query then gate per head; the split yields the queries and the gates
+  for the sigmoid output gate. Verified against the host reference on
+  both devices.
 - Weight upload: `Model::Load` allocates one device buffer per
   manifest tensor and copies the file bytes through the backend.
   `Model::Weights` exposes them next to the manifest. Unsized
@@ -186,20 +190,29 @@ through RADV GFX1201, rocm through the system ROCm).
   shader read the wrong word of the u64 position triples, and CMake
   keeps stale SPIR-V until `cmake -B` re-runs (see notes).
 - 2026-10-07: rope sections in config (129/129 `ctest` on both
-  builds). Current head. The GGUF parser retains arrays up to 16
+  builds). The GGUF parser retains arrays up to 16
   elements in `small_arrays`; longer ones stay dropped. The model
   config carries the mRoPE section counts (3 entries, or 4 with a
   zero pad) and hybrid definitions require them. The 27B target
   reports [11, 11, 10] on both backends.
+- 2026-10-07: gated-attention split kernel (131/131 `ctest` on both
+  builds). Current head. Generic "qgate_split" (one thread per head
+  element) splits the fused Q-plus-gate projection into queries and
+  gates on vulkan (GLSL) and rocm (HIP). Layout taken from the public
+  Qwen3-Next reference: q_proj output views as [heads, 2*head_dim] and
+  chunks per head into query then gate; credited in CREDITS.md. Host
+  reference next to the attention refs; contract in
+  `include/tessera/backend.hpp`.
 
 ## Next (in order)
 
 1. **Hybrid SSM decode** for the 27B target (arch `qwen35`):
-   definition, load, sections, and norm/gate/conv/scan/mrope kernels
-   are done (the file loads with 866 tensors on both backends).
-   Still missing: fused Q-plus-gate splitting, wiring the scan into
-   the decode loop, and MTP handling. `DecodeStep` rejects hybrid
-   configs as unsupported today.
+   definition, load, sections, and norm/gate/conv/scan/mrope/split
+   kernels are done (the file loads with 866 tensors on both
+   backends). Still missing: wiring the full-attention and recurrent
+   paths into the decode loop, the Q8_0 GEMM the linear layers use,
+   and MTP handling. `DecodeStep` rejects hybrid configs as
+   unsupported today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
