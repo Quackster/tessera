@@ -19,11 +19,14 @@ read, fix, and extend it without asking.
 - Complexity budget: small functions, cohesive modules. No hidden globals —
   state flows through explicitly constructed and owned objects (Engine, Model,
   Backend); there is no process-wide singleton, keep it that way.
-- The two pillars this project is judged on:
+- The pillars this project is judged on:
   1. Extensibility: new LLM architectures arrive as data, not as core code
      changes.
   2. Portability: the core stays independent of both Vulkan and ROCm so the
      backends can be refactored, swapped, or extended without touching it.
+  3. Performance: every line of code serves inference speed. Choose the
+     faster implementation even when it takes more code. Hot paths avoid
+     needless copies, allocations, and abstraction overhead.
 
 ## Architecture Rules
 
