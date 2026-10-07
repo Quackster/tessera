@@ -20,6 +20,7 @@
 #include "spec/dflash2_layer.hpp"
 #include "spec/dflash2_stack.hpp"
 #include "spec/dflash2_selector.hpp"
+#include "spec/dflash2_fuse.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -4133,6 +4134,54 @@ TEST(BackendTest, DraftSelectorMatchesRef) {
                   kHidden, kRank, kVocab, kTopK)
                   .has_value());
   const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the DFlash2 target-hidden fusion (concat n aux hidden tensors,
+// then the fc projection) matches the host reference.
+TEST(BackendTest, DraftFuseMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(99);
+  constexpr std::size_t kN = 2, kRows = 2, kFeatures = 2, kHidden = 3;
+  std::vector<float> aux(kN * kRows * kFeatures), fc(kHidden * kN * kFeatures);
+  for (auto& v : aux) v = DrawValue(rng);
+  for (auto& v : fc) v = DrawValue(rng);
+  auto up = [&backend](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  auto aux_b = up(aux), fc_b = up(fc);
+  auto scratch_b = backend->AllocateBuffer(kRows * kN * kFeatures * 4,
+                                            MemoryKind::Device);
+  auto out_b = backend->AllocateBuffer(kRows * kHidden * 4, MemoryKind::Device);
+  ASSERT_TRUE(scratch_b && out_b);
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto concat = backend->LoadKernel("concat_features", {});
+  ASSERT_TRUE(gemm.has_value() && concat.has_value());
+  auto device = tessera::spec::DraftFuseDevice(*backend, **gemm, **concat,
+                                               **scratch_b, *aux_b, *fc_b,
+                                               **out_b, kN, kRows, kFeatures,
+                                               kHidden);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<float> got(kRows * kHidden);
+  backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref(kRows * kHidden);
+  ASSERT_TRUE(tessera::spec::DraftFuseRef(
+                  std::span<const float>(aux), std::span<const float>(fc),
+                  std::span<float>(ref), kN, kRows, kFeatures, kHidden)
+                  .has_value());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   float max_abs = 0.0f;
   for (std::size_t i = 0; i < ref.size(); ++i) {

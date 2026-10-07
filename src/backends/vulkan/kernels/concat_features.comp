@@ -1,0 +1,30 @@
+#version 450
+
+// One thread per output element; dispatch ceil(rows * n * features / 256).
+layout(local_size_x = 256) in;
+
+// "concat_features" contract: buffer 0 is In (fp32, n x rows x features),
+// buffer 1 the output Out (fp32, rows x n*features). Scalars are 64-bit,
+// so field k lives at pc.v[2k]: n v[0], rows v[2], features v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer In { float in_data[]; };
+layout(set = 0, binding = 1) buffer Out { float out_data[]; };
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint n = pc.v[0];
+  uint rows = pc.v[2];
+  uint features = pc.v[4];
+  if (idx >= rows * n * features) {
+    return;
+  }
+  uint width = n * features;
+  uint r = idx / width;
+  uint rem = idx % width;
+  uint i = rem / features;
+  uint j = rem % features;
+  out_data[idx] = in_data[(i * rows + r) * features + j];
+}

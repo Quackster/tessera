@@ -148,6 +148,10 @@ __global__ void RepeatHeadsKernel(const float* in, float* out,
                                   unsigned long long num_v_heads,
                                   unsigned long long head_k_dim,
                                   unsigned long long factor);
+__global__ void ConcatFeaturesKernel(const float* in, float* out,
+                                     unsigned long long n,
+                                     unsigned long long rows,
+                                     unsigned long long features);
 __global__ void SelectorEdgeScoreKernel(const float* predecessor_codebook,
                                         const float* successor_codebook,
                                         const float* hidden,

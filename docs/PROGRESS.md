@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 194/194 on both builds.
+`ctest` passes 195/195 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -580,6 +580,13 @@ through RADV GFX1201, rocm through the system ROCm).
   (selector_edge_score). Host reference and a device-vs-reference
   test. The target-hidden fusion (`fc`) is a plain GEMM over the
   concatenated aux hidden, so it needs no new code.
+
+- 2026-10-07: concat_features and the DFlash2 target fusion (195/195
+  `ctest` on both builds). Current head. Generic "concat_features"
+  stacks n tensors of rows x features along the feature axis (host
+  reference, vulkan + rocm kernels, device test). `src/spec/
+  dflash2_fuse.*` composes it with the `fc` projection, the DFlash2
+  target-hidden fusion, with a host reference and device test.
 
 ## Next (in order)
 

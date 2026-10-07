@@ -213,6 +213,10 @@ class Kernel {
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
 // for both is ceil(n / 256) workgroups of 256.
+// "concat_features": buffer 0 is In (fp32, n x rows x features),
+// buffer 1 the output Out (fp32, rows x n*features); scalars are n, rows
+// and features. This stacks feature vectors along the feature axis. The
+// dispatch is ceil(rows * n * features / 256).
 // "selector_edge_score": buffers are PredecessorCodebook (fp32,
 // vocab x rank), SuccessorCodebook (fp32, vocab x rank), Hidden (fp32,
 // batch x seq x rank), CandidateIds (int32, batch x seq x top_k),
@@ -444,6 +448,16 @@ class Kernel {
     }
     if (launch.scalars[0] == 0) {
       return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "concat_features") {
+    if (launch.buffers.size() != 2 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    for (std::uint64_t value : launch.scalars) {
+      if (value == 0) {
+        return StatusCode::InvalidArgument;
+      }
     }
   }
   if (kernel.Id() == "selector_edge_score") {

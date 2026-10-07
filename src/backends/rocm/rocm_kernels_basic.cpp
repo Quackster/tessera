@@ -617,6 +617,25 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
   y[i] = acc;
 }
 
+// Built-in "concat_features": stack n tensors of rows x features along
+// the feature axis.
+__global__ void ConcatFeaturesKernel(const float* in, float* out,
+                                     unsigned long long n,
+                                     unsigned long long rows,
+                                     unsigned long long features) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= rows * n * features) {
+    return;
+  }
+  const unsigned long long width = n * features;
+  const unsigned long long r = idx / width;
+  const unsigned long long rem = idx % width;
+  const unsigned long long i = rem / features;
+  const unsigned long long j = rem % features;
+  out[idx] = in[(i * rows + r) * features + j];
+}
+
 // Built-in "selector_edge_score": DFlash2 candidate-selector transition
 // score. One thread per output element.
 __global__ void SelectorEdgeScoreKernel(
