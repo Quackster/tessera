@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 145/145 on both builds.
+`ctest` passes 160/160 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -61,6 +61,9 @@ through RADV GFX1201, rocm through the system ROCm).
   query then gate per head; the split yields the queries and the gates
   for the sigmoid output gate. Verified against the host reference on
   both devices.
+- Generic elementwise `add` (residual) and `silu_mul` (gated MLP)
+  kernels with host references; the first building blocks for a
+  device-resident decode loop.
 - Generic L2 normalization and gated RMS normalization for the linear
   attention path: L2 normalizes delta queries and keys before the
   scan; the gated form normalizes the scan output and scales it by a
@@ -315,6 +318,13 @@ through RADV GFX1201, rocm through the system ROCm).
   vectors and SSM scalars once (`DownloadF32Cached`) instead of
   re-downloading them every step; the decode determinism tests cover
   the cached path. Output is unchanged.
+
+- 2026-10-07: device elementwise kernels (160/160 `ctest` on both
+  builds). Current head. Generic add (residual) and silu_mul
+  (gated MLP) built-ins on vulkan (GLSL) and rocm (HIP) with host
+  references in src/core/numerics/norm.*, contracts and
+  device-vs-reference tests. First step toward a device-resident
+  decode loop (the current loop is host-orchestrated and slow).
 
 ## Next (in order)
 
