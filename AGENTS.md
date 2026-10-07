@@ -144,10 +144,10 @@ These are hard rules, set by the project owner:
     new `.md` files anywhere) unless the user explicitly asks or an approved
     plan calls for them.
 
-11. **Comments are max 2 lines** — a comment (single `//` line or a `/* */`
-    block) may span at most 2 consecutive lines. Prefer one short line; say
+11. **Comments are max 4 lines** — a comment (single `//` line or a `/* */`
+    block) may span at most 4 consecutive lines. Prefer fewer short lines; say
     what is non-obvious, never restate the code. Exception: public-API doc
-    comments in headers (rule 12) are exempt from the 2-line cap; inline
+    comments in headers (rule 12) are exempt from the 4-line cap; inline
     comments inside function bodies are not.
 
 12. **Doc comments on every public API** — every public type and function in
