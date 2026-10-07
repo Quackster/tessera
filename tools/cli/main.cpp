@@ -23,12 +23,13 @@ void PrintUsage() {
   std::fprintf(stderr,
                "usage: tessera-cli run --model <path> [--draft <dir>]\n"
                "       [--context <n>] [--draft-block <n>]\n"
-               "       [--prompt <id>] [--tokens <n>]\n"
+               "       [--prompt <id>] [--prompt-text <str>] [--tokens <n>]\n"
                "  --model <path>    a .gguf file or an MXFP4 model directory\n"
                "  --draft <dir>     DFlash2 draft checkpoint directory\n"
                "  --context <n>     maximum context length (default %zu)\n"
                "  --draft-block <n> draft block tokens (default %zu)\n"
                "  --prompt <id>     first token id for generation (default 0)\n"
+               "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
                "  --tokens <n>      run n greedy decode steps and print them\n",
                kDefaultContext, kDefaultDraftBlock);
 }
@@ -42,6 +43,7 @@ int main(int argc, char** argv) {
   }
   std::string model_path;
   std::string draft_path;
+  std::string prompt_text;
   std::uint32_t prompt = 0;
   std::size_t tokens = 0;
   std::size_t context = kDefaultContext;
@@ -52,6 +54,8 @@ int main(int argc, char** argv) {
       model_path = argv[++i];
     } else if (arg == "--draft" && i + 1 < argc) {
       draft_path = argv[++i];
+    } else if (arg == "--prompt-text" && i + 1 < argc) {
+      prompt_text = argv[++i];
     } else if (arg == "--context" && i + 1 < argc) {
       context = std::stoul(argv[++i]);
     } else if (arg == "--draft-block" && i + 1 < argc) {
@@ -135,8 +139,24 @@ int main(int argc, char** argv) {
                         std::to_string(tensors[i].shape.Numel()) + "]");
   }
   if (tokens > 0) {
-    auto generated =
-        engine.Generate(loaded, tessera::GenerateOptions{tokens, prompt});
+    tessera::GenerateOptions gen;
+    gen.max_tokens = tokens;
+    gen.first_token = prompt;
+    if (!prompt_text.empty()) {
+      const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
+      if (tokenizer == nullptr) {
+        log.Warn("cli", "this model has no tokenizer; use --prompt <id>");
+        return kExitError;
+      }
+      auto ids = tokenizer->Encode(prompt_text);
+      if (!ids) {
+        log.Warn("cli", std::string("prompt encode failed (") +
+                            std::string(tessera::ToString(ids.error())) + ")");
+        return kExitError;
+      }
+      gen.prompt_tokens = *ids;
+    }
+    auto generated = engine.Generate(loaded, gen);
     if (!generated) {
       log.Warn("cli", std::string("generation failed (") +
                           std::string(tessera::ToString(generated.error())) +

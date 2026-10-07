@@ -17,6 +17,7 @@ add_library(tessera STATIC
     src/core/engine.cpp
     src/core/model.cpp
     src/core/files.cpp
+    src/core/tokenizer.cpp
     src/core/buffer.cpp
     src/core/loaders/gguf.cpp
     src/core/loaders/safetensors.cpp
@@ -163,6 +164,7 @@ add_executable(tessera-tests
     tests/safetensors_test.cpp
     tests/engine_test.cpp
     tests/decode_test.cpp
+    tests/tokenizer_test.cpp
     tests/backend_test.cpp
     tests/spec_test.cpp
 )

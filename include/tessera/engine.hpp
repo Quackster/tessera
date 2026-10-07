@@ -25,8 +25,11 @@ struct EngineOptions {
 struct GenerateOptions {
   // Greedy decode steps to run; 0 produces no tokens.
   std::size_t max_tokens = 0;
-  // The first token fed to the decoder (a prompt token id).
+  // The first token fed to the decoder when prompt_tokens is empty.
   std::uint32_t first_token = 0;
+  // Prompt tokens fed before generation; when non-empty they take the
+  // place of first_token and the last one seeds generation.
+  std::vector<std::uint32_t> prompt_tokens;
 };
 
 // Top-level facade: owns the backend and the loaded models.

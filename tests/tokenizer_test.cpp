@@ -1,0 +1,96 @@
+#include <gtest/gtest.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "test_helpers.hpp"
+#include "tessera/engine.hpp"
+#include "tessera/model.hpp"
+#include "tessera/tokenizer.hpp"
+#include "tessera/types.hpp"
+
+using tessera::Engine;
+using tessera::ModelOptions;
+using tessera::StatusCode;
+using tessera::Tokenizer;
+using tessera::testing::MakeEngineOrSkip;
+
+// A tiny ASCII tokenizer: each letter is one byte-level token.
+TEST(TokenizerTest, TinyAsciiRoundTrip) {
+  Tokenizer tok({"a", "b", "c"}, {1, 1, 1}, {});
+  auto ids = tok.Encode("abc");
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  const std::vector<std::uint32_t> want = {0, 1, 2};
+  EXPECT_EQ(*ids, want);
+  auto text = tok.Decode(*ids);
+  ASSERT_TRUE(text.has_value()) << tessera::ToString(text.error());
+  EXPECT_EQ(*text, "abc");
+}
+
+// A merge rule collapses "a" "b" into the "ab" token.
+TEST(TokenizerTest, MergeApplies) {
+  Tokenizer tok({"a", "b", "ab"}, {1, 1, 1}, {"a b"});
+  auto ids = tok.Encode("ab");
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  const std::vector<std::uint32_t> want = {2};
+  EXPECT_EQ(*ids, want);
+}
+
+// Digits split per character (the Qwen pre-tokenizer), letters group.
+TEST(TokenizerTest, DigitsSplitPerChar) {
+  Tokenizer tok({"a", "0", "1"}, {1, 1, 1}, {});
+  auto ids = tok.Encode("a01");
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  const std::vector<std::uint32_t> want = {0, 1, 2};
+  EXPECT_EQ(*ids, want);
+}
+
+// Decode rejects an out-of-range id.
+TEST(TokenizerTest, DecodeRejectsBadId) {
+  Tokenizer tok({"a"}, {1}, {});
+  const std::vector<std::uint32_t> ids = {5};
+  auto text = tok.Decode(ids);
+  ASSERT_FALSE(text.has_value());
+  EXPECT_EQ(text.error(), StatusCode::InvalidArgument);
+}
+
+// Encode against the reference tokenizer ids (path via TESSERA_TEST_GGUF;
+// never hard-coded). Decode round-trips the same text.
+TEST(TokenizerTest, RealTokenizerMatchesReference) {
+  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{path, 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const Tokenizer* tok = (*model)->GetTokenizer();
+  ASSERT_NE(tok, nullptr);
+  struct Case {
+    const char* text;
+    std::vector<std::uint32_t> ids;
+  };
+  const std::vector<Case> cases = {
+      {"Hello", {9419}},
+      {"Hello, world!", {9419, 11, 1814, 0}},
+      {"1 2 3", {16, 220, 17, 220, 18}},
+      {"123", {16, 17, 18}},
+      {"don't", {14572, 914}},
+      {"def f(x):\n    return x + 1\n",
+       {727, 281, 2007, 1590, 198, 262, 460, 830, 478, 220, 16, 198}},
+      {"  leading", {220, 6187}},
+      {"日本語のテスト", {247359, 15303, 181801}},
+  };
+  for (const Case& c : cases) {
+    auto got = tok->Encode(c.text);
+    ASSERT_TRUE(got.has_value()) << tessera::ToString(got.error());
+    EXPECT_EQ(*got, c.ids) << "text: " << c.text;
+    auto back = tok->Decode(*got);
+    ASSERT_TRUE(back.has_value()) << tessera::ToString(back.error());
+    EXPECT_EQ(*back, c.text) << "text: " << c.text;
+  }
+}

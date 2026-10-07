@@ -34,9 +34,10 @@ struct GgufFile {
   std::uint64_t tensor_data_start = 0;
   // Keys of array metadata values dropped by the parser (not supported).
   std::vector<std::string> dropped_array_keys;
-  // Small array metadata values kept by the parser (at most a few
-  // elements, e.g. rope section counts). Large arrays stay dropped;
-  // see dropped_array_keys.
+  // Array metadata retained by the parser: short arrays plus the
+  // tokenizer definition arrays (tokens, token_type, merges) whatever
+  // their size. Other large arrays stay dropped; see
+  // dropped_array_keys.
   std::unordered_map<std::string, std::vector<GgufValue>> small_arrays;
 
   // Look up a metadata value by key; nullptr when absent.

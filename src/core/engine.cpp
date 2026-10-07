@@ -78,9 +78,27 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(
     Model& model, const GenerateOptions& options) {
   std::vector<std::uint32_t> produced;
   produced.reserve(options.max_tokens);
+  if (options.max_tokens == 0) {
+    return produced;
+  }
   core::DecodeCache cache;
-  std::uint32_t next = options.first_token;
-  for (std::size_t step = 0; step < options.max_tokens; ++step) {
+  std::vector<std::uint32_t> prompt = options.prompt_tokens;
+  if (prompt.empty()) {
+    prompt.push_back(options.first_token);
+  }
+  std::uint32_t next = prompt.back();
+  for (std::size_t i = 0; i < prompt.size(); ++i) {
+    auto decoded = core::DecodeStep(*backend_, model, cache, prompt[i]);
+    if (!decoded) {
+      diagnostics_.Warn(
+          "engine", std::string("prompt step ") + std::to_string(i) +
+                        " failed: " + std::string(ToString(decoded.error())));
+      return std::unexpected(decoded.error());
+    }
+    next = *decoded;
+  }
+  produced.push_back(next);
+  for (std::size_t step = 1; step < options.max_tokens; ++step) {
     auto decoded = core::DecodeStep(*backend_, model, cache, next);
     if (!decoded) {
       diagnostics_.Warn(

@@ -25,6 +25,14 @@ constexpr std::uint64_t kMaxRetainedArrayElements = 16;
 // Skipped arrays are walked bounds-checked, so large counts are cheap;
 // real vocabularies reach 248k entries.
 constexpr std::uint64_t kMaxGgufArrayCount = 1ull << 20;
+
+// Array keys retained in full regardless of size: the tokenizer
+// definition the tokenizer loader needs.
+bool IsRetainedArrayKey(std::string_view key) {
+  return key == "tokenizer.ggml.tokens" ||
+         key == "tokenizer.ggml.token_type" ||
+         key == "tokenizer.ggml.merges";
+}
 constexpr std::uint32_t kMaxGgufRank = 4;
 constexpr std::uint64_t kMaxGgufDim = 1ull << 24;
 // Spec default for the general.alignment metadata key.
@@ -284,7 +292,7 @@ std::expected<GgufFile, StatusCode> ParseGguf(
       if (cursor.failed || count > kMaxGgufArrayCount) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      if (count > kMaxRetainedArrayElements) {
+      if (count > kMaxRetainedArrayElements && !IsRetainedArrayKey(key)) {
         bool ok = true;
         for (std::uint64_t e = 0; e < count && ok; ++e) {
           ok = cursor.SkipScalar(elem_type);

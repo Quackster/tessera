@@ -192,6 +192,59 @@ ParseRopeSections(const core::GgufFile& gguf, std::string_view architecture,
   return std::optional<std::vector<std::uint64_t>>{sections};
 }
 
+// Build the byte-level BPE tokenizer from the retained tokenizer arrays;
+// nullopt when the file declares no supported tokenizer (not gpt2, or no
+// token array). MalformedFile when the arrays are inconsistent.
+std::expected<std::optional<Tokenizer>, StatusCode> ParseTokenizer(
+    const core::GgufFile& gguf) {
+  const auto* model = gguf.Find("tokenizer.ggml.model");
+  const auto* model_str = model == nullptr ? nullptr : std::get_if<std::string>(model);
+  if (model_str == nullptr || *model_str != "gpt2") {
+    return std::optional<Tokenizer>{};
+  }
+  const auto tokens_it = gguf.small_arrays.find("tokenizer.ggml.tokens");
+  if (tokens_it == gguf.small_arrays.end()) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  std::vector<std::string> vocab;
+  vocab.reserve(tokens_it->second.size());
+  for (const auto& value : tokens_it->second) {
+    const auto* text = std::get_if<std::string>(&value);
+    if (text == nullptr) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    vocab.push_back(*text);
+  }
+  std::vector<std::int32_t> types(vocab.size(), 1);
+  const auto types_it = gguf.small_arrays.find("tokenizer.ggml.token_type");
+  if (types_it != gguf.small_arrays.end()) {
+    if (types_it->second.size() != vocab.size()) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    for (std::size_t i = 0; i < vocab.size(); ++i) {
+      const auto value = AsU64(types_it->second[i]);
+      if (!value) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      types[i] = static_cast<std::int32_t>(*value);
+    }
+  }
+  std::vector<std::string> merges;
+  const auto merges_it = gguf.small_arrays.find("tokenizer.ggml.merges");
+  if (merges_it != gguf.small_arrays.end()) {
+    merges.reserve(merges_it->second.size());
+    for (const auto& value : merges_it->second) {
+      const auto* text = std::get_if<std::string>(&value);
+      if (text == nullptr) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      merges.push_back(*text);
+    }
+  }
+  return std::optional<Tokenizer>{
+      std::in_place, std::move(vocab), std::move(types), std::move(merges)};
+}
+
 // Transformer config from GGUF metadata; nullopt without layer keys.
 // Hybrid layers counts trunk blocks (block_count minus nextn blocks).
 std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
@@ -296,12 +349,13 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
              std::vector<TensorEntry> tensors, std::string name,
              std::string architecture, std::optional<AttentionParams> attention,
              std::optional<TransformerConfig> config,
-             std::vector<DeviceTensor> weights)
+             std::vector<DeviceTensor> weights,
+             std::optional<Tokenizer> tokenizer)
     : backend_(backend), options_(std::move(options)), format_(format),
       tensors_(std::move(tensors)), name_(std::move(name)),
       architecture_(std::move(architecture)),
       attention_(std::move(attention)), config_(std::move(config)),
-      weights_(std::move(weights)) {}
+      weights_(std::move(weights)), tokenizer_(std::move(tokenizer)) {}
 
 // Upload every manifest tensor to a device buffer. `bytes` is the
 // whole file; offsets come from the parsed manifest.
@@ -383,10 +437,14 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!weights) {
       return std::unexpected(weights.error());
     }
+    auto tokenizer = ParseTokenizer(*gguf);
+    if (!tokenizer) {
+      return std::unexpected(tokenizer.error());
+    }
     return std::unique_ptr<Model>(new Model(
         backend, options, ModelFormat::Gguf, std::move(gguf->tensors),
         std::move(name), std::move(architecture), std::move(*attention),
-        std::move(*config), std::move(*weights)));
+        std::move(*config), std::move(*weights), std::move(*tokenizer)));
   }
   if (std::filesystem::is_directory(path, ec) && !ec) {
     auto layout = core::InspectMxFp4Directory(path);
@@ -419,7 +477,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     return std::unique_ptr<Model>(
         new Model(backend, options, ModelFormat::MxFp4, std::move(tensors),
                   std::string{}, std::string{}, std::nullopt, std::nullopt,
-                  std::move(*weights)));
+                  std::move(*weights), std::nullopt));
   }
   return std::unexpected(StatusCode::InvalidArgument);
 }
@@ -475,6 +533,10 @@ std::expected<TransformerConfig, StatusCode> Model::Config() const {
     return std::unexpected(StatusCode::MalformedFile);
   }
   return *config_;
+}
+
+const Tokenizer* Model::GetTokenizer() const {
+  return tokenizer_ ? &*tokenizer_ : nullptr;
 }
 
 }  // namespace tessera

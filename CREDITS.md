@@ -34,3 +34,9 @@ project, the version, the license, and where it is used.
   per head into query then gate) and the sigmoid gate on the SDPA
   output. Design reference for the qgate_split built-in; no code
   copied.
+- GPT-2 byte-level BPE tokenizer (OpenAI, MIT) and the Qwen
+  pre-tokenization pattern (HF tokenizer config, Apache-2.0): the
+  bytes-to-unicode map, merge-by-rank BPE, and the split regex
+  `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|
+  \s*[\r\n]+|\s+(?!\S)|\s+`. Reimplemented in src/core/tokenizer.cpp;
+  no code copied.

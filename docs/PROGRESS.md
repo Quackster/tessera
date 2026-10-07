@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 140/140 on both builds.
+`ctest` passes 145/145 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -16,8 +16,8 @@ through RADV GFX1201, rocm through the system ROCm).
 - Public API: `Engine`, `Model`, `Backend`/`Buffer`,
   `SpeculativeStrategy`, `Diagnostics`.
 - GGUF v2/v3 parser. It parses the header and the tensor manifest.
-  It checks all bounds. Small metadata arrays stay retained.
-  Bulk arrays stay dropped.
+  It checks all bounds. Small metadata arrays stay retained. Bulk
+  arrays stay dropped, except the tokenizer definition arrays.
 - Safetensors layout checks for MXFP4 model directories. A bounded
   schema-strict JSON reader parses the tensor map with no third party
   dependency. MXFP4 blobs pair with their E8M0 scales by name. MTP FP8
@@ -82,10 +82,18 @@ through RADV GFX1201, rocm through the system ROCm).
 - Public generation API: `Engine::Generate(model, options)` runs greedy
   single-token decode on the non-speculative (reference) path and
   returns the produced token ids. The CLI drives it.
+- Byte-level BPE tokenizer (`tessera::Tokenizer`) built from the GGUF
+  tokenizer definition (vocab, merges, types). It applies the Qwen
+  pre-tokenization split, matches the reference tokenizer on ASCII,
+  Latin and CJK text, and round-trips decode. `Model::GetTokenizer`
+  exposes it. Not applied: NFC normalization, special-token matching,
+  combining marks and emoji.
 - CLI: `tessera-cli run --model <path> [--draft <dir>] [--context <n>]
-  [--draft-block <n>] [--prompt <id>] [--tokens <n>]`. It loads the
-  model, uploads weights, prints a tensor summary, and with `--tokens`
-  runs greedy decode through `Engine::Generate` and prints the ids.
+  [--draft-block <n>] [--prompt <id>] [--prompt-text <str>]
+  [--tokens <n>]`. It loads the model, uploads weights, prints a tensor
+  summary, and with `--tokens` runs greedy decode through
+  `Engine::Generate` and prints the ids. `--prompt-text` tokenizes text
+  with the model's tokenizer.
 - Single GoogleTest target. Device dependent tests skip cleanly when
   no device is present. Numerical checks use per backend tolerance.
 
@@ -254,11 +262,21 @@ through RADV GFX1201, rocm through the system ROCm).
   change. The 27B baseline stays covered by the env-gated real-model
   test.
 - 2026-10-07: public generation API + runtime options (140/140 `ctest`
-  on both builds). Current head. `Engine::Generate` runs greedy decode
+  on both builds). `Engine::Generate` runs greedy decode
   on the non-speculative path and returns the token ids. The CLI gains
   `--context` and `--draft-block` (no more hard-coded sizes) and drives
   generation through the public API, so it no longer includes core
   internals.
+- 2026-10-07: byte-level BPE tokenizer (145/145 `ctest` on both
+  builds). Current head. The GGUF parser retains the tokenizer
+  definition arrays; `tessera::Tokenizer` builds from the vocab, merge
+  rules and types, and applies the Qwen pre-tokenization split. It
+  matches the reference tokenizer exactly on ASCII, Latin, CJK and
+  code samples (real-model test), and decode round-trips. `Model::
+  GetTokenizer` exposes it; the CLI adds `--prompt-text` and
+  `Engine::Generate` takes prompt tokens. Fixed the `\s+(?!\S)`
+  backtracking the reference relies on. Not applied: NFC, special-
+  token matching, combining marks and emoji.
 
 ## Next (in order)
 

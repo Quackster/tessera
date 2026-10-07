@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "tessera/backend.hpp"
+#include "tessera/tokenizer.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
@@ -136,13 +137,20 @@ class Model {
   //   auto config = model.Config();
   //   if (config) for (std::size_t l = 0; l < config->layers; ++l) ...
   [[nodiscard]] std::expected<TransformerConfig, StatusCode> Config() const;
+  // The model's tokenizer (GGUF only); nullptr when the file carries no
+  // recognized tokenizer definition.
+  //
+  // Usage:
+  //   if (auto* tok = model.Tokenizer()) tok->Encode("hi");
+  [[nodiscard]] const Tokenizer* GetTokenizer() const;
 
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,
         std::vector<TensorEntry> tensors, std::string name,
         std::string architecture, std::optional<AttentionParams> attention,
         std::optional<TransformerConfig> config,
-        std::vector<DeviceTensor> weights);
+        std::vector<DeviceTensor> weights,
+        std::optional<Tokenizer> tokenizer);
   Backend& backend_;
   ModelOptions options_;
   ModelFormat format_;
@@ -152,6 +160,7 @@ class Model {
   std::optional<AttentionParams> attention_;
   std::optional<TransformerConfig> config_;
   std::vector<DeviceTensor> weights_;
+  std::optional<Tokenizer> tokenizer_;
 };
 
 }  // namespace tessera
