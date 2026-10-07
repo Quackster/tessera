@@ -16,6 +16,7 @@
 #include "core/numerics/vision.hpp"
 #include "core/vision_block.hpp"
 #include "core/vision_stack.hpp"
+#include "core/vision_merger.hpp"
 #include "core/numerics/selector.hpp"
 #include "spec/dflash2_conv.hpp"
 #include "spec/dflash2_mlp.hpp"
@@ -5235,6 +5236,64 @@ TEST(BackendTest, VisionStackMatchesRef) {
                   ref_blocks, std::span<const float>(plnw),
                   std::span<const float>(plnb), std::span<float>(ref), kTokens,
                   kEmbed, kPatchDim, kHeads, kHeadDim, kFfn, kEps)
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the Qwen3VL vision merger (spatial merge + mm.0 + GELU + mm.2)
+// matches the host reference.
+TEST(BackendTest, VisionMergerMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(115);
+  constexpr std::size_t kGh = 4, kGw = 4, kEmbed = 4, kMerge = 2, kProj = 6;
+  const std::size_t m2 = kMerge * kMerge;
+  const std::size_t merged = m2 * kEmbed;
+  const std::size_t tokens = kGh * kGw;
+  const std::size_t out_tokens = (kGh / kMerge) * (kGw / kMerge);
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = DrawValue(rng);
+    return v;
+  };
+  std::vector<float> x = rnd(tokens * kEmbed), w0 = rnd(merged * merged);
+  std::vector<float> b0 = rnd(merged), w2 = rnd(kProj * merged), b2 = rnd(kProj);
+  auto up = [&backend](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  auto x_b = up(x), w0_b = up(w0), b0_b = up(b0), w2_b = up(w2), b2_b = up(b2);
+  auto out_b = backend->AllocateBuffer(out_tokens * kProj * 4,
+                                       MemoryKind::Device);
+  ASSERT_TRUE(out_b.has_value());
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto gelu = backend->LoadKernel("gelu", {});
+  auto ba = backend->LoadKernel("bias_add", {});
+  auto sm = backend->LoadKernel("spatial_merge", {});
+  ASSERT_TRUE(gemm && gelu && ba && sm);
+  auto device = tessera::core::VisionMergerDevice(
+      *backend, **gemm, **gelu, **ba, **sm, *x_b, *w0_b, *b0_b, *w2_b, *b2_b,
+      **out_b, kGh, kGw, kEmbed, kMerge, kProj);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<float> got(out_tokens * kProj);
+  backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref(out_tokens * kProj);
+  ASSERT_TRUE(tessera::core::VisionMergerRef(
+                  std::span<const float>(x), std::span<const float>(w0),
+                  std::span<const float>(b0), std::span<const float>(w2),
+                  std::span<const float>(b2), std::span<float>(ref), kGh, kGw,
+                  kEmbed, kMerge, kProj)
                   .has_value());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   float max_abs = 0.0f;

@@ -35,4 +35,37 @@ std::expected<void, StatusCode> PatchifyRef(
   return {};
 }
 
+std::expected<void, StatusCode> SpaceMergeRef(std::span<const float> x,
+                                              std::span<float> out,
+                                              std::size_t grid_h,
+                                              std::size_t grid_w,
+                                              std::size_t embed,
+                                              std::size_t merge) {
+  if (grid_h == 0 || grid_w == 0 || embed == 0 || merge == 0 ||
+      grid_h % merge != 0 || grid_w % merge != 0 ||
+      x.size() != grid_h * grid_w * embed) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t out_w = grid_w / merge;
+  const std::size_t out_tokens = (grid_h / merge) * out_w;
+  const std::size_t m2 = merge * merge;
+  if (out.size() != out_tokens * m2 * embed) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t b = 0; b < out_tokens; ++b) {
+    const std::size_t gbh = b / out_w;
+    const std::size_t gbw = b % out_w;
+    for (std::size_t mh = 0; mh < merge; ++mh) {
+      for (std::size_t mw = 0; mw < merge; ++mw) {
+        const std::size_t q = mh * merge + mw;
+        const std::size_t in_row = (gbh * merge + mh) * grid_w + (gbw * merge + mw);
+        for (std::size_t c = 0; c < embed; ++c) {
+          out[b * m2 * embed + q * embed + c] = x[in_row * embed + c];
+        }
+      }
+    }
+  }
+  return {};
+}
+
 }  // namespace tessera::core

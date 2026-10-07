@@ -214,6 +214,9 @@ class Kernel {
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
 // for both is ceil(n / 256) workgroups of 256.
+// "spatial_merge": buffer 0 In (tokens x embed, grid_h x grid_w), buffer 1
+// Out ((grid_h/merge)*(grid_w/merge) x merge*merge*embed); scalars embed,
+// grid_w, grid_h and merge. The dispatch is ceil(out_elems / 256).
 // "image_patchify": buffer 0 In (image [h, w, 3] fp32), buffer 1 Mean
 // (3), buffer 2 Std (3), buffer 3 Out (patches x 3*patch*patch); scalars
 // h, w and patch. The dispatch is ceil(out_elems / 256).
@@ -475,6 +478,19 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "spatial_merge") {
+    if (launch.buffers.size() != 2 || launch.scalars.size() != 4) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t embed = launch.scalars[0];
+    const std::uint64_t grid_w = launch.scalars[1];
+    const std::uint64_t grid_h = launch.scalars[2];
+    const std::uint64_t merge = launch.scalars[3];
+    if (embed == 0 || grid_w == 0 || grid_h == 0 || merge == 0 ||
+        grid_w % merge != 0 || grid_h % merge != 0) {
       return StatusCode::InvalidArgument;
     }
   }

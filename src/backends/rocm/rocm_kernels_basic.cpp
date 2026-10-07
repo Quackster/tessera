@@ -724,6 +724,35 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
   out[t] = acc / denom;
 }
 
+// Built-in "spatial_merge": group merge x merge patches, concatenating
+// their embeddings.
+__global__ void SpatialMergeKernel(const float* x, float* y,
+                                   unsigned long long embed,
+                                   unsigned long long grid_w,
+                                   unsigned long long grid_h,
+                                   unsigned long long merge) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const unsigned long long m2 = merge * merge;
+  const unsigned long long out_w = grid_w / merge;
+  const unsigned long long out_tokens = (grid_h / merge) * out_w;
+  if (idx >= out_tokens * m2 * embed) {
+    return;
+  }
+  const unsigned long long per_out = m2 * embed;
+  const unsigned long long b = idx / per_out;
+  const unsigned long long rem = idx % per_out;
+  const unsigned long long q = rem / embed;
+  const unsigned long long c = rem % embed;
+  const unsigned long long mh = q / merge;
+  const unsigned long long mw = q % merge;
+  const unsigned long long gbh = b / out_w;
+  const unsigned long long gbw = b % out_w;
+  const unsigned long long in_row =
+      (gbh * merge + mh) * grid_w + (gbw * merge + mw);
+  y[idx] = x[in_row * embed + c];
+}
+
 // Built-in "bias_add": row-broadcast bias add.
 __global__ void BiasAddKernel(const float* x, const float* b, float* y,
                               unsigned long long rows,

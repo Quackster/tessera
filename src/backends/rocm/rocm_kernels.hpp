@@ -184,6 +184,11 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
                                   unsigned long long head_dim,
                                   unsigned long long q_base,
                                   unsigned long long window);
+__global__ void SpatialMergeKernel(const float* x, float* y,
+                                   unsigned long long embed,
+                                   unsigned long long grid_w,
+                                   unsigned long long grid_h,
+                                   unsigned long long merge);
 __global__ void BiasAddKernel(const float* x, const float* b, float* y,
                               unsigned long long rows,
                               unsigned long long cols);

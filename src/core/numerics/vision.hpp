@@ -19,4 +19,15 @@ namespace tessera::core {
     std::span<const float> std, std::span<float> out, std::size_t h,
     std::size_t w, std::size_t patch);
 
+// Host reference for the "spatial_merge" built-in: group a grid_h x
+// grid_w grid of `embed`-wide tokens into (grid_h/merge) x
+// (grid_w/merge) blocks, concatenating each block's merge x merge
+// embeddings. `x` is (grid_h*grid_w) x embed; `out` is
+// ((grid_h/merge)*(grid_w/merge)) x (merge*merge*embed), block-major with
+// the element at (mh*merge+mw)*embed + c. Sizes must be nonzero and
+// divisible; else InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> SpaceMergeRef(
+    std::span<const float> x, std::span<float> out, std::size_t grid_h,
+    std::size_t grid_w, std::size_t embed, std::size_t merge);
+
 }  // namespace tessera::core

@@ -72,6 +72,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"layernorm", reinterpret_cast<void*>(&LayerNormKernel)},
     {"gelu", reinterpret_cast<void*>(&GeluKernel)},
     {"bias_add", reinterpret_cast<void*>(&BiasAddKernel)},
+    {"spatial_merge", reinterpret_cast<void*>(&SpatialMergeKernel)},
     {"image_patchify", reinterpret_cast<void*>(&ImagePatchifyKernel)},
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},

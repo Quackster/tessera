@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 224/224 on both builds.
+`ctest` passes 225/225 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -769,6 +769,12 @@ through RADV GFX1201, rocm through the system ROCm).
   patch embedding (bias) + position embedding, the transformer blocks,
   and the final LayerNorm. Adds a shared `LayerNormDevice`/`BiasAddDevice`
   helper. Host reference and a device-vs-reference test (two blocks).
+
+- 2026-10-07: vision merger (225/225 `ctest` on both builds). Current
+  head. `src/core/vision_merger.*` runs the Qwen3VL merger: 2x2 spatial
+  merge (`spatial_merge` kernel) then mm.0 + bias -> GELU -> mm.2 +
+  bias into the language hidden space. Host reference and a
+  device-vs-reference test.
 
 ## Next (in order)
 

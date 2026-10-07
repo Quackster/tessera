@@ -63,6 +63,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gelu", kGeluSpirV, sizeof(kGeluSpirV)},
     {"bias_add", kBiasAddSpirV, sizeof(kBiasAddSpirV)},
     {"image_patchify", kImagePatchifySpirV, sizeof(kImagePatchifySpirV)},
+    {"spatial_merge", kSpatialMergeSpirV, sizeof(kSpatialMergeSpirV)},
     {"delta_step", kDeltaStepSpirV, sizeof(kDeltaStepSpirV)},
     {"mrope", kMropeSpirV, sizeof(kMropeSpirV)},
     {"qgate_split", kQgateSplitSpirV, sizeof(kQgateSplitSpirV)},

@@ -1,0 +1,40 @@
+#version 450
+
+// One thread per output element; dispatch ceil(out_elems / 256).
+layout(local_size_x = 256) in;
+
+// "spatial_merge" contract: buffer 0 In (tokens x embed, grid_h x grid_w
+// row-major), buffer 1 Out ((grid_h/merge)*(grid_w/merge) x
+// merge*merge*embed). Scalars: embed v[0], grid_w v[2], grid_h v[4],
+// merge v[6]. Within a block the element is at (mh*merge+mw)*embed + c.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer In { float x[]; };
+layout(set = 0, binding = 1) buffer Out { float y[]; };
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint embed = pc.v[0];
+  uint grid_w = pc.v[2];
+  uint grid_h = pc.v[4];
+  uint merge = pc.v[6];
+  uint m2 = merge * merge;
+  uint out_w = grid_w / merge;
+  uint out_tokens = (grid_h / merge) * out_w;
+  if (idx >= out_tokens * m2 * embed) {
+    return;
+  }
+  uint per_out = m2 * embed;
+  uint b = idx / per_out;
+  uint rem = idx % per_out;
+  uint q = rem / embed;
+  uint c = rem % embed;
+  uint mh = q / merge;
+  uint mw = q % merge;
+  uint gbh = b / out_w;
+  uint gbw = b % out_w;
+  uint in_row = (gbh * merge + mh) * grid_w + (gbw * merge + mw);
+  y[idx] = x[in_row * embed + c];
+}
