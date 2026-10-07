@@ -332,11 +332,18 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyD2H(const Buffer& src, std::byte* dst,
                                          std::size_t bytes) override {
-    if (bytes > src.Size()) {
+    return CopyD2HAt(src, 0, dst, bytes);
+  }
+
+  std::expected<void, StatusCode> CopyD2HAt(
+      const Buffer& src, std::size_t offset, std::byte* dst,
+      std::size_t bytes) override {
+    if (offset > src.Size() || bytes > src.Size() - offset) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
+    const auto* base = static_cast<const std::byte*>(src.Handle()) + offset;
     auto error =
-        hipMemcpy(dst, src.Handle(), bytes, hipMemcpyDeviceToHost);
+        hipMemcpy(dst, base, bytes, hipMemcpyDeviceToHost);
     if (error != hipSuccess) {
       LogError(std::string("hipMemcpy D2H of ") + std::to_string(bytes) +
                " bytes failed (" + HipErrorName(error) + ")");

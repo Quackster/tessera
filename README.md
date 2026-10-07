@@ -20,7 +20,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | GEMM | Done | Generic GEMM with Q4_K dequant. Host reference check. Per backend tolerance. |
 | Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
-| Decode loop | Todo | Single token generation in core. Smoke test on GGUF model. |
+| Decode loop | Done | Single token loop on vanilla GGUF. Hybrid SSM models report unsupported. |
 | MXFP4 path | Todo | Full tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights. |
 | DFlash2 decode | Todo | Grouped causal convolutions. Low rank selector. Verify loop. |
 | Baseline pinning | Todo | Runs reference path on both backends. Records tolerance. |

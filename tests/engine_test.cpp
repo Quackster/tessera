@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <random>
+#include <vector>
+
+#include "core/decode.hpp"
 #include "test_helpers.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
@@ -10,9 +15,11 @@ using tessera::EngineOptions;
 using tessera::ModelFormat;
 using tessera::ModelOptions;
 using tessera::StatusCode;
+using tessera::testing::DrawValue;
 using tessera::testing::FreshTempDir;
 using tessera::testing::GgufBuilder;
 using tessera::testing::MakeValidGguf;
+using tessera::testing::QuantizeRows;
 using tessera::testing::WriteBytes;
 using tessera::testing::WritePlaceholderConfig;
 using tessera::testing::WritePlaceholderWeights;
@@ -33,6 +40,95 @@ std::filesystem::path WriteGgufFixture(const std::string& name) {
   auto dir = FreshTempDir("tessera_tests_engine");
   auto path = dir / name;
   WriteBytes(path, MakeValidGguf());
+  return path;
+}
+
+// A 1-layer vanilla transformer GGUF: hidden 256, 4 heads over 2 kv
+// groups of dim 64, ffn 512, vocab 32. Projections are Q4_K, vectors
+// F32, tensor names follow the llama.cpp convention.
+std::filesystem::path WriteTinyModelFixture(const std::string& name) {
+  std::mt19937 rng(7);
+  struct Spec {
+    const char* tensor;
+    std::uint32_t type;
+    std::vector<std::uint64_t> dims;
+    std::size_t rows;  // Q4_K row count (0 for F32)
+    std::size_t cols;  // Q4_K row length (0 for F32)
+  };
+  const std::vector<Spec> specs = {
+      {"token_embd.weight", 0, {256, 32}, 0, 0},
+      {"blk.0.attn_norm.weight", 0, {256}, 0, 0},
+      {"blk.0.attn_q.weight", 12, {256, 256}, 256, 256},
+      {"blk.0.attn_k.weight", 12, {256, 128}, 128, 256},
+      {"blk.0.attn_v.weight", 12, {256, 128}, 128, 256},
+      {"blk.0.attn_output.weight", 12, {256, 256}, 256, 256},
+      {"blk.0.ffn_norm.weight", 0, {256}, 0, 0},
+      {"blk.0.ffn_gate.weight", 12, {256, 512}, 512, 256},
+      {"blk.0.ffn_up.weight", 12, {256, 512}, 512, 256},
+      {"blk.0.ffn_down.weight", 12, {512, 256}, 256, 512},
+      {"output_norm.weight", 0, {256}, 0, 0},
+      {"output.weight", 12, {256, 32}, 32, 256},
+  };
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, specs.size(), 10);
+  builder.KvString("general.name", "tiny-vanilla");
+  builder.KvString("general.architecture", "test-vanilla");
+  builder.KvU32("test-vanilla.block_count", 1);
+  builder.KvU32("test-vanilla.embedding_length", 256);
+  builder.KvU32("test-vanilla.feed_forward_length", 512);
+  builder.KvU32("test-vanilla.attention.head_count", 4);
+  builder.KvU32("test-vanilla.attention.head_count_kv", 2);
+  builder.KvU32("test-vanilla.rope.dimension_count", 64);
+  builder.KvF32("test-vanilla.rope.freq_base", 10000.0f);
+  builder.KvF32("test-vanilla.attention.layer_norm_rms_epsilon", 1e-5f);
+  std::uint64_t offset = 0;
+  for (const auto& spec : specs) {
+    const std::uint64_t placed = offset;
+    std::size_t bytes = 0;
+    if (spec.type == 0) {
+      std::size_t numel = 1;
+      for (auto d : spec.dims) {
+        numel *= static_cast<std::size_t>(d);
+      }
+      bytes = numel * 4;
+    } else {
+      bytes = spec.rows * (spec.cols / 256) * 144;
+    }
+    offset = (offset + bytes + 31) & ~31u;
+    if (spec.dims.size() == 1) {
+      builder.Tensor(spec.tensor, 1, {spec.dims[0]}, spec.type, placed);
+    } else {
+      builder.Tensor(spec.tensor, 2, {spec.dims[0], spec.dims[1]}, spec.type,
+                     placed);
+    }
+  }
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  for (const auto& spec : specs) {
+    if (spec.type == 0) {
+      std::size_t numel = 1;
+      for (auto d : spec.dims) {
+        numel *= static_cast<std::size_t>(d);
+      }
+      const bool is_norm =
+          std::string(spec.tensor).find("norm") != std::string::npos;
+      for (std::size_t i = 0; i < numel; ++i) {
+        builder.PushF32(is_norm ? 1.0f : DrawValue(rng));
+      }
+    } else {
+      std::vector<float> values(spec.rows * spec.cols);
+      for (auto& v : values) {
+        v = DrawValue(rng);
+      }
+      auto block = QuantizeRows(values, spec.rows, spec.cols);
+      for (auto b : block) {
+        builder.bytes.push_back(b);
+      }
+    }
+    builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  }
+  auto dir = FreshTempDir("tessera_tests_tiny_model");
+  auto path = dir / name;
+  WriteBytes(path, builder.bytes);
   return path;
 }
 
@@ -128,6 +224,51 @@ TEST(EngineTest, LoadGgufModelRejectsUnsizedLayout) {
   auto path = dir / "weights_q2k.gguf";
   WriteBytes(path, builder.bytes);
   auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_FALSE(model.has_value());
+  EXPECT_EQ(model.error(), StatusCode::UnsupportedFeature);
+}
+
+TEST(EngineTest, TinyModelDecodesDeterministically) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("tiny.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto config = (*model)->Config();
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_EQ(config->layers, 1u);
+  EXPECT_EQ(config->vocab_size, 32u);
+  tessera::core::DecodeCache cache;
+  auto first =
+      tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
+  ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
+  EXPECT_LT(*first, 32u);
+  // A second step runs against the grown cache.
+  auto second =
+      tessera::core::DecodeStep(engine->Owner(), **model, cache, *first);
+  ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
+  EXPECT_LT(*second, 32u);
+  // A fresh cache replays the first step exactly.
+  tessera::core::DecodeCache replay;
+  auto again =
+      tessera::core::DecodeStep(engine->Owner(), **model, replay, 0);
+  ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
+  EXPECT_EQ(*again, *first);
+}
+
+TEST(EngineTest, RealModelLoadPathWhenProvided) {
+  const char* raw = std::getenv("TESSERA_TEST_GGUF");
+  if (raw == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{raw, 1024});
+  // The first-class target is a hybrid SSM model (fused QKV, state
+  // space tensors, Q3_K and unmapped 2026 quant types): the load
+  // reports the first layout it cannot size instead of decoding it.
+  // Full hybrid decode is a later milestone, tracked in
+  // docs/PROGRESS.md.
   ASSERT_FALSE(model.has_value());
   EXPECT_EQ(model.error(), StatusCode::UnsupportedFeature);
 }

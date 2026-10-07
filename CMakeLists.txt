@@ -12,6 +12,7 @@ set(TESSERA_BACKEND "vulkan" CACHE STRING "Compute backend: vulkan or rocm")
 set_property(CACHE TESSERA_BACKEND PROPERTY STRINGS vulkan rocm)
 
 add_library(tessera STATIC
+    src/core/decode.cpp
     src/core/engine.cpp
     src/core/model.cpp
     src/core/files.cpp

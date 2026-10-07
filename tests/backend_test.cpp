@@ -92,6 +92,34 @@ TEST(BackendTest, BufferRoundTrip) {
   EXPECT_TRUE(read_mapped);
 }
 
+TEST(BackendTest, CopyD2HAtReadsSlice) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kSize = 64;
+  auto device = backend->AllocateBuffer(kSize, MemoryKind::Device);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  std::vector<std::byte> pattern(kSize);
+  for (std::size_t i = 0; i < kSize; ++i) {
+    pattern[i] = static_cast<std::byte>(i);
+  }
+  auto upload = backend->CopyH2D(**device, std::span<const std::byte>(pattern));
+  ASSERT_TRUE(upload.has_value()) << tessera::ToString(upload.error());
+  std::vector<std::byte> slice(16);
+  auto download =
+      backend->CopyD2HAt(**device, 16, slice.data(), slice.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  for (std::size_t i = 0; i < slice.size(); ++i) {
+    EXPECT_EQ(slice[i], static_cast<std::byte>(16 + i)) << "byte " << i;
+  }
+  // Past-the-end reads are rejected at the boundary.
+  auto over = backend->CopyD2HAt(**device, 64, slice.data(), 1);
+  ASSERT_FALSE(over.has_value());
+  EXPECT_EQ(over.error(), StatusCode::InvalidArgument);
+  auto spanning = backend->CopyD2HAt(**device, 56, slice.data(), 16);
+  ASSERT_FALSE(spanning.has_value());
+  EXPECT_EQ(spanning.error(), StatusCode::InvalidArgument);
+}
+
 TEST(BackendTest, AllocateZeroBytes) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);

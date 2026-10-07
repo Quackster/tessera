@@ -19,7 +19,9 @@ constexpr std::uint64_t kMaxGgufKvCount = 1ull << 16;
 // names at 64 bytes.
 constexpr std::uint64_t kMaxGgufStringLen = 65535;
 constexpr std::uint64_t kMaxGgufTensorNameLen = 64;
-constexpr std::uint64_t kMaxGgufArrayCount = 1ull << 16;
+// Array metadata is skipped without retention (bounds-checked walk),
+// so large counts are cheap; real vocabularies reach 248k entries.
+constexpr std::uint64_t kMaxGgufArrayCount = 1ull << 20;
 constexpr std::uint32_t kMaxGgufRank = 4;
 constexpr std::uint64_t kMaxGgufDim = 1ull << 24;
 // Spec default for the general.alignment metadata key.

@@ -91,16 +91,76 @@ ParseAttention(const core::GgufFile& gguf, std::string_view architecture) {
   return std::optional<AttentionParams>{params};
 }
 
+// Transformer config from GGUF metadata; nullopt when the file carries
+// no layer keys, MalformedFile when they are incomplete.
+std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
+    const core::GgufFile& gguf, std::string_view architecture) {
+  if (architecture.empty()) {
+    return std::optional<TransformerConfig>{};
+  }
+  const std::string prefix = std::string(architecture);
+  const auto* layers_key = gguf.Find(prefix + ".block_count");
+  const auto* ffn_key = gguf.Find(prefix + ".feed_forward_length");
+  const auto* eps_key =
+      gguf.Find(prefix + ".attention.layer_norm_rms_epsilon");
+  if (layers_key == nullptr && ffn_key == nullptr && eps_key == nullptr) {
+    return std::optional<TransformerConfig>{};
+  }
+  auto attention = ParseAttention(gguf, architecture);
+  if (!attention) {
+    return std::unexpected(attention.error());
+  }
+  if (!*attention) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto* embed_key = gguf.Find(prefix + ".embedding_length");
+  if (layers_key == nullptr || ffn_key == nullptr || eps_key == nullptr ||
+      embed_key == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto layers = AsU64(*layers_key);
+  const auto ffn = AsU64(*ffn_key);
+  const auto eps = AsDouble(*eps_key);
+  const auto hidden = AsU64(*embed_key);
+  if (!layers || !ffn || !eps || !hidden || *layers == 0 || *ffn == 0 ||
+      *hidden == 0 || !(*eps > 0.0)) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  std::size_t vocab = 0;
+  for (const auto& tensor : gguf.tensors) {
+    if (tensor.name == "output.weight") {
+      const std::size_t numel = tensor.shape.Numel();
+      if (numel % *hidden != 0) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      vocab = numel / static_cast<std::size_t>(*hidden);
+    }
+  }
+  if (vocab == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  TransformerConfig config;
+  config.attention = **attention;
+  config.layers = static_cast<std::size_t>(*layers);
+  config.hidden_dim = static_cast<std::size_t>(*hidden);
+  config.ffn_dim = static_cast<std::size_t>(*ffn);
+  config.vocab_size = vocab;
+  config.norm_eps = *eps;
+  return std::optional<TransformerConfig>{config};
+}
+
 }  // namespace
 
 Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
              std::vector<TensorEntry> tensors, std::string name,
              std::string architecture, std::optional<AttentionParams> attention,
+             std::optional<TransformerConfig> config,
              std::vector<DeviceTensor> weights)
     : backend_(backend), options_(std::move(options)), format_(format),
       tensors_(std::move(tensors)), name_(std::move(name)),
       architecture_(std::move(architecture)),
-      attention_(std::move(attention)), weights_(std::move(weights)) {}
+      attention_(std::move(attention)), config_(std::move(config)),
+      weights_(std::move(weights)) {}
 
 // Upload every manifest tensor to a device buffer. `bytes` is the
 // whole file; offsets come from the parsed manifest.
@@ -172,6 +232,10 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!attention) {
       return std::unexpected(attention.error());
     }
+    auto config = ParseConfig(*gguf, architecture);
+    if (!config) {
+      return std::unexpected(config.error());
+    }
     auto weights =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
                       gguf->tensor_data_start, std::span<const std::byte>(*bytes));
@@ -181,7 +245,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     return std::unique_ptr<Model>(new Model(
         backend, options, ModelFormat::Gguf, std::move(gguf->tensors),
         std::move(name), std::move(architecture), std::move(*attention),
-        std::move(*weights)));
+        std::move(*config), std::move(*weights)));
   }
   if (std::filesystem::is_directory(path, ec) && !ec) {
     // MXFP4 layout check; the tensor map is parsed in milestone 6, so the
@@ -192,7 +256,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     }
     return std::unique_ptr<Model>(
         new Model(backend, options, ModelFormat::MxFp4, {}, std::string{},
-                  std::string{}, std::nullopt, {}));
+                  std::string{}, std::nullopt, std::nullopt, {}));
   }
   return std::unexpected(StatusCode::InvalidArgument);
 }
@@ -238,6 +302,16 @@ std::expected<AttentionParams, StatusCode> Model::Attention() const {
     return std::unexpected(StatusCode::MalformedFile);
   }
   return *attention_;
+}
+
+std::expected<TransformerConfig, StatusCode> Model::Config() const {
+  if (format_ != ModelFormat::Gguf) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  if (!config_) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  return *config_;
 }
 
 }  // namespace tessera

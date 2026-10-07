@@ -35,6 +35,18 @@ struct DeviceTensor {
   std::unique_ptr<Buffer> device;
 };
 
+// Transformer hyper-parameters from the model definition. The decode
+// loop sizes every launch from these; no code branches on the
+// architecture.
+struct TransformerConfig {
+  AttentionParams attention;
+  std::size_t layers = 0;
+  std::size_t hidden_dim = 0;
+  std::size_t ffn_dim = 0;
+  std::size_t vocab_size = 0;
+  double norm_eps = 1e-5;
+};
+
 // A loaded model: format + options + parsed tensor manifest + the
 // uploaded weight buffers (one per manifest tensor, GGUF only).
 //
@@ -70,11 +82,22 @@ class Model {
   //   auto params = model.Attention();
   //   if (params) launch.scalars = {m, n, params->heads, ...};
   [[nodiscard]] std::expected<AttentionParams, StatusCode> Attention() const;
+  // Full transformer config for the decode loop. GGUF reads block_count,
+  // embedding_length, feed_forward_length and the attention keys above
+  // plus <arch>.attention.layer_norm_rms_epsilon; the vocabulary comes
+  // from the output weight shape. MalformedFile when the definition
+  // lacks them; UnsupportedFeature for MXFP4.
+  //
+  // Usage:
+  //   auto config = model.Config();
+  //   if (config) for (std::size_t l = 0; l < config->layers; ++l) ...
+  [[nodiscard]] std::expected<TransformerConfig, StatusCode> Config() const;
 
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,
         std::vector<TensorEntry> tensors, std::string name,
         std::string architecture, std::optional<AttentionParams> attention,
+        std::optional<TransformerConfig> config,
         std::vector<DeviceTensor> weights);
   Backend& backend_;
   ModelOptions options_;
@@ -83,6 +106,7 @@ class Model {
   std::string name_;
   std::string architecture_;
   std::optional<AttentionParams> attention_;
+  std::optional<TransformerConfig> config_;
   std::vector<DeviceTensor> weights_;
 };
 

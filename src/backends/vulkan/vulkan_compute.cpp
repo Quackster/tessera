@@ -113,6 +113,9 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
   pool_size.descriptorCount = kMaxBoundBuffers * kMaxDescriptorSets;
   VkDescriptorPoolCreateInfo pool_create{};
   pool_create.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  // Launches are synchronous, so each launch frees its set back to
+  // the pool; individual free needs this flag.
+  pool_create.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
   pool_create.maxSets = kMaxDescriptorSets;
   pool_create.poolSizeCount = 1;
   pool_create.pPoolSizes = &pool_size;

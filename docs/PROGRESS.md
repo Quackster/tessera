@@ -31,9 +31,13 @@ The boilerplate is complete and passes on both backends:
   range and base from GGUF metadata. The generic "rope" and
   "attention" built-ins take all dims as launch scalars and are
   verified against host references on both devices.
-- Single GoogleTest target. `ctest` passes 88/88 on both builds.
+- Single GoogleTest target. `ctest` passes 91/91 on both builds.
   Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
   through RADV GFX1201, rocm through the system ROCm).
+- Single-token decode loop in the core (backend agnostic): embed,
+  block forward (device GEMM/RoPE/attention, host norms), greedy
+  sample. Runs on vanilla-layout GGUF models. The 27B target is a
+  hybrid SSM model and stays unsupported (see the hybrid note).
 - Weight upload: `Model::Load` allocates one device buffer per
   manifest tensor and copies the file bytes through the backend.
   `Model::Weights` exposes them next to the manifest. Unsized
@@ -81,14 +85,26 @@ The boilerplate is complete and passes on both backends:
   data start. `Model::Load` reads the file once, uploads every
   tensor, and keeps the buffers in `Model::Weights` with a
   `FindWeight` lookup. The CLI prints the device byte count.
+- 2026-10-07: decode loop (91/91 `ctest` on both builds).
+  `TransformerConfig` comes from GGUF metadata and `DecodeStep`
+  runs one greedy step (device projections/RoPE/attention, host
+  norms/SiLU/argmax, host KV cache). A 1-layer vanilla fixture
+  decodes deterministically on both backends. A fixed descriptor
+  pool leak surfaced (the pool missed FREE_DESCRIPTOR_SET_BIT).
+  `CopyD2HAt` reads embedding rows; the GGUF array cap is now 1M
+  (248k-token vocabularies). `tests/backend_test.cpp` grows past
+  the 600 cap again (one offset test; exemption stands).
 
 ## Next (in order)
 
-1. **Decode loop**: single token generation in the core (backend
-   agnostic). End to end smoke on `Qwen3.8-27B-UD-Q4_K_M`.
-2. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
+1. **MXFP4 path**: full safetensors tensor map parsing (JSON reader for
    the fixed schema, decision pending). fp8 and mxfp4 GEMM kernels.
    MTP-FP8 draft weights.
+2. **Hybrid SSM decode** for the 27B target (arch `qwen35`): fused
+   QKV splitting, selective-scan and conv1d kernels, Q3_K and
+   2026-type layouts (ids 20, 21, 23), Q5_K/Q6_K GEMM paths. The
+   file probes as 866 tensors (248320 vocab, 65 blocks, hidden
+   5120); the loader reports the first unmapped layout today.
 3. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.

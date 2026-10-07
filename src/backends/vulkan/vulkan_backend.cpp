@@ -312,14 +312,20 @@ class VulkanBackend final : public Backend {
     if (!record) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    auto copy = SubmitCopy(*staging, *record, src.size());
+    auto copy = SubmitCopy(*staging, *record, 0, 0, src.size());
     ReleaseStaging(*staging);
     return copy;
   }
 
   std::expected<void, StatusCode> CopyD2H(const Buffer& src, std::byte* dst,
                                          std::size_t bytes) override {
-    if (bytes > src.Size()) {
+    return CopyD2HAt(src, 0, dst, bytes);
+  }
+
+  std::expected<void, StatusCode> CopyD2HAt(
+      const Buffer& src, std::size_t offset, std::byte* dst,
+      std::size_t bytes) override {
+    if (offset > src.Size() || bytes > src.Size() - offset) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
     auto staging = AllocateStaging(bytes);
@@ -330,7 +336,7 @@ class VulkanBackend final : public Backend {
     if (!record) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    auto copy = SubmitCopy(*record, *staging, bytes);
+    auto copy = SubmitCopy(*record, *staging, offset, 0, bytes);
     if (copy) {
       std::memcpy(dst, staging->mapped, bytes);
     }
@@ -506,7 +512,8 @@ class VulkanBackend final : public Backend {
 
   // One transfer: command buffer + fence, then wait for completion.
   std::expected<void, StatusCode> SubmitCopy(
-      const VkBuffer source, const VkBuffer destination, std::size_t bytes) {
+      const VkBuffer source, const VkBuffer destination,
+      std::size_t src_offset, std::size_t dst_offset, std::size_t bytes) {
     VkCommandBufferAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     alloc_info.commandPool = state_.pool;
@@ -527,8 +534,8 @@ class VulkanBackend final : public Backend {
     }
     // The 1.4+ C API takes a region table, not offsets.
     VkBufferCopy region{};
-    region.srcOffset = 0;
-    region.dstOffset = 0;
+    region.srcOffset = src_offset;
+    region.dstOffset = dst_offset;
     region.size = bytes;
     vkCmdCopyBuffer(command, source, destination, 1, &region);
     result = vkEndCommandBuffer(command);
@@ -573,13 +580,19 @@ class VulkanBackend final : public Backend {
   // Overloads so the two record types can be passed uniformly.
   std::expected<void, StatusCode> SubmitCopy(const Staging& source,
                                             const MemoryRecord& destination,
+                                            std::size_t src_offset,
+                                            std::size_t dst_offset,
                                             std::size_t bytes) {
-    return SubmitCopy(source.buffer, destination.buffer, bytes);
+    return SubmitCopy(source.buffer, destination.buffer, src_offset,
+                      dst_offset, bytes);
   }
   std::expected<void, StatusCode> SubmitCopy(const MemoryRecord& source,
                                             const Staging& destination,
+                                            std::size_t src_offset,
+                                            std::size_t dst_offset,
                                             std::size_t bytes) {
-    return SubmitCopy(source.buffer, destination.buffer, bytes);
+    return SubmitCopy(source.buffer, destination.buffer, src_offset,
+                      dst_offset, bytes);
   }
 
   VulkanState state_;

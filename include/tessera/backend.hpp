@@ -237,6 +237,12 @@ class Backend {
   // Copy `bytes` from `src` into host memory (bounds-checked).
   virtual std::expected<void, StatusCode> CopyD2H(
       const Buffer& src, std::byte* dst, std::size_t bytes) = 0;
+  // Copy `bytes` from `src` at `offset` into host memory
+  // (bounds-checked). Reads a slice without staging the whole buffer
+  // (embedding rows, single cache lines).
+  virtual std::expected<void, StatusCode> CopyD2HAt(
+      const Buffer& src, std::size_t offset, std::byte* dst,
+      std::size_t bytes) = 0;
 
   // Load a compiled kernel. Vulkan: `code` is a SPIR-V module and `name`
   // its entry point; an empty code resolves a built-in (today "fill" and
