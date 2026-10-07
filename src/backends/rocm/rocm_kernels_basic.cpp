@@ -68,6 +68,12 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
                                 unsigned long long window,
                                 unsigned long long kv_f16,
                                 unsigned long long causal) {
+  // One workgroup per (query row, head); the query/key dot product is
+  // computed once per key, so the cost is O(n * head_dim) per query/head.
+  constexpr unsigned long long kTile = 256;
+  __shared__ float q_s[256];
+  __shared__ float sc[256];
+  __shared__ float wt[256];
   const std::uint16_t* kh = reinterpret_cast<const std::uint16_t*>(k);
   const std::uint16_t* vh = reinterpret_cast<const std::uint16_t*>(v);
   const auto kat = [&](unsigned long long idx) {
@@ -76,15 +82,13 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
   const auto vat = [&](unsigned long long idx) {
     return kv_f16 ? Fp16ToFloatDev(vh[idx]) : v[idx];
   };
-  const unsigned long long t =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= m * heads * head_dim) {
+  const unsigned long long g = blockIdx.x;
+  if (g >= m * heads) {
     return;
   }
-  const unsigned long long i = t / (heads * head_dim);
-  const unsigned long long rem = t % (heads * head_dim);
-  const unsigned long long h = rem / head_dim;
-  const unsigned long long e = rem % head_dim;
+  const unsigned long long e = threadIdx.x;
+  const unsigned long long i = g / heads;
+  const unsigned long long h = g % heads;
   const unsigned long long kv = h / (heads / kv_heads);
   const unsigned long long pos = q_base + i;
   const unsigned long long last =
@@ -97,34 +101,64 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     }
   }
   const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-  const unsigned long long q_base_idx = (i * heads + h) * head_dim;
-  float row_max = 0.0f;
-  bool first = true;
-  for (unsigned long long j = start; j <= last; ++j) {
-    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
-    float dot = 0.0f;
-    for (unsigned long long d = 0; d < head_dim; ++d) {
-      dot = fmaf(q[q_base_idx + d], kat(k_base + d), dot);
-    }
-    dot *= scale;
-    if (first || dot > row_max) {
-      row_max = dot;
-      first = false;
-    }
+  const unsigned long long qb = (i * heads + h) * head_dim;
+  if (e < head_dim) {
+    q_s[e] = q[qb + e];
   }
+  __syncthreads();
+  float run_max = -1e30f;
+  float run_sum = 0.0f;
   float acc = 0.0f;
-  float denom = 0.0f;
-  for (unsigned long long j = start; j <= last; ++j) {
-    const unsigned long long k_base = (j * kv_heads + kv) * head_dim;
-    float dot = 0.0f;
-    for (unsigned long long d = 0; d < head_dim; ++d) {
-      dot = fmaf(q[q_base_idx + d], kat(k_base + d), dot);
+  unsigned long long tile = start;
+  while (true) {
+    const unsigned long long tile_last =
+        (tile + kTile - 1 < last) ? tile + kTile - 1 : last;
+    float s = -1e30f;
+    if (tile + e <= last) {
+      const unsigned long long j = tile + e;
+      const unsigned long long kb = (j * kv_heads + kv) * head_dim;
+      float dot = 0.0f;
+      for (unsigned long long d = 0; d < head_dim; ++d) {
+        dot = fmaf(q_s[d], kat(kb + d), dot);
+      }
+      s = dot * scale;
     }
-    const float w = expf(dot * scale - row_max);
-    denom += w;
-    acc = fmaf(w, vat(k_base + e), acc);
+    sc[e] = s;
+    __syncthreads();
+    float tmax = -1e30f;
+    for (unsigned long long t = 0; t < kTile; ++t) {
+      tmax = fmaxf(tmax, sc[t]);
+    }
+    const float m_new = fmaxf(run_max, tmax);
+    const float corr = expf(run_max - m_new);
+    float l = 0.0f;
+    for (unsigned long long t = 0; t < kTile; ++t) {
+      const float w = expf(sc[t] - m_new);
+      wt[t] = w;
+      l += w;
+    }
+    __syncthreads();
+    float a = 0.0f;
+    for (unsigned long long t = 0; t < kTile; ++t) {
+      const unsigned long long j = tile + t;
+      if (j > last) {
+        break;
+      }
+      const unsigned long long vb = (j * kv_heads + kv) * head_dim;
+      a = fmaf(wt[t], vat(vb + e), a);
+    }
+    acc = fmaf(corr, acc, a);
+    run_sum = fmaf(corr, run_sum, l);
+    run_max = m_new;
+    __syncthreads();
+    if (tile_last >= last) {
+      break;
+    }
+    tile += kTile;
   }
-  out[t] = acc / denom;
+  if (e < head_dim) {
+    out[qb + e] = acc / run_sum;
+  }
 }
 
 // OCP FP8 E4M3 byte to fp32 (device port of the core Fp8E4M3ToFloat).

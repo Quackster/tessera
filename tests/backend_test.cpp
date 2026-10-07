@@ -1523,7 +1523,7 @@ TEST(BackendTest, AttentionDeviceMatchesRef) {
   auto kernel = backend->LoadKernel("attention", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
@@ -3011,7 +3011,7 @@ TEST(BackendTest, AttentionBatchedMatchesRef) {
   auto kernel = backend->LoadKernel("attention", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*o_buf).get()};
@@ -3213,7 +3213,7 @@ TEST(BackendTest, AttentionWindowDeviceMatchesRef) {
   auto kernel = backend->LoadKernel("attention", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
@@ -4610,7 +4610,7 @@ TEST(BackendTest, AttentionF16DeviceMatchesRef) {
   auto kernel = backend->LoadKernel("attention", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
@@ -5049,7 +5049,7 @@ TEST(BackendTest, AttentionNonCausalDeviceMatchesRef) {
   auto kernel = backend->LoadKernel("attention", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), out_buf->get()};
   launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, 0, 0, 0, 0};

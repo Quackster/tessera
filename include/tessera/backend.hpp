@@ -151,7 +151,8 @@ class Kernel {
 // m, n, heads, kv_heads, head_dim, q_base. Query row i sits at
 // position q_base + i and attends keys 0..pos (clamped to n - 1) with
 // scale 1/sqrt(head_dim); head h reads kv head h / (heads/kv_heads).
-// The dispatch is ceil(m * heads * head_dim / 256) workgroups of 256.
+// head_dim must be at most 256. The dispatch is m * heads workgroups of
+// 256 (one workgroup per query row and head).
 // "gemm_f32": buffer 0 is A (fp32, m x k), buffer 1 the fp32
 // weights W (n x k), buffer 2 the output C (fp32, m x n); scalars are
 // m, n, k. The dispatch is ceil(m * n / 256) workgroups of 256.

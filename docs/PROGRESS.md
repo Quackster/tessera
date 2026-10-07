@@ -873,6 +873,15 @@ through RADV GFX1201, rocm through the system ROCm).
   literal string. The CLI defaults `--image-token` to the model's
   `<|image_pad|>` id so image prompts work without passing it.
 
+- 2026-10-07: O(n*d) attention kernel (235/235 `ctest` on both builds).
+  The attention kernel recomputed the query/key dot product once per
+  output dimension (O(n * head_dim^2) per query). It now runs one
+  workgroup per (query row, head) with a tiled online softmax: the query
+  is staged in shared memory, each thread scores one key per tile, and
+  the tile weights feed the value accumulation, so the cost is
+  O(n * head_dim) per query/head. head_dim is capped at 256. Both
+  backends; the attention_q8/attention_q4 variants keep the old shape.
+
 ## Next (in order)
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):
@@ -884,11 +893,12 @@ through RADV GFX1201, rocm through the system ROCm).
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Models are data. No per
    model branches.
-2. **Attention kernel cost**: the attention, attention_q8 and attention_q4
-   kernels recompute the query/key dot product for every output dimension
-   (O(n * head_dim^2) per query). Long context and the image prefill are
-   dominated by this. Next: one workgroup per (query, head) with the scores
-   in shared memory (softmax, then the weighted sum), on both backends.
+2. **GEMM row reuse**: the batched prefill is now dominated by the GEMM
+   kernels, which dequantize each weight block once per output row (m
+   times for an m-token batch). Restructure so a block is dequantized
+   once and applied to all rows, then re-measure the prefill. The
+   attention_q8/attention_q4 kernels still recompute the dot product per
+   output dimension.
 3. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,

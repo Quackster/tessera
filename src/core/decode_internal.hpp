@@ -521,9 +521,12 @@ inline std::expected<void, StatusCode> AttentionDevice(
     std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base,
     std::uint64_t window = 0, std::size_t rows = 1, bool kv_f16 = false,
     bool causal = true) {
+  if (head_dim == 0 || head_dim > 256) {
+    // The tiled kernel holds the per-head query in 256 shared floats.
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>(
-      (rows * heads * head_dim + 255) / 256);
+  launch.grid_x = static_cast<std::uint32_t>(rows * heads);
   launch.block_x = 256;
   launch.buffers = {&q, &k, &v, &out};
   launch.scalars = {rows,

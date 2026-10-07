@@ -30,7 +30,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in one batched forward. Runtime options: `--context`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`) or 4-bit (`--kv-q4`) KV cache. |
 | Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Host reference check. Per backend tolerance. |
-| Attention and RoPE | Done | GQA path driven by model data. RoPE kernel verified by read back on both backends. |
+| Attention and RoPE | Done | GQA path driven by model data; tiled O(n*d) attention (one workgroup per query/head, online softmax). RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. The 27B hybrid path generates coherent text. |
 | Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. |
