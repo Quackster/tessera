@@ -47,6 +47,7 @@ void PrintUsage() {
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
                "  --image-token <id> placeholder token id for image rows\n"
                "  --quiet           print only the generated tokens\n"
+               "  --log-tokens      log the input and output text (tokenizer)\n"
                "  --sample          sample instead of greedy decode\n"
                "  --temperature <f> sampling temperature (default 0.6)\n"
                "  --top-p <f>       nucleus probability (default 0.95)\n"
@@ -97,6 +98,7 @@ int main(int argc, char** argv) {
   std::string image_path;
   std::uint32_t image_token = 0;
   bool quiet = false;
+  bool log_tokens = false;
   std::string host = "127.0.0.1";
   std::vector<std::string> api_keys;
   std::vector<std::string> allow_origins;
@@ -129,6 +131,8 @@ int main(int argc, char** argv) {
       image_token = static_cast<std::uint32_t>(std::stoul(argv[++i]));
     } else if (arg == "--quiet") {
       quiet = true;
+    } else if (arg == "--log-tokens") {
+      log_tokens = true;
     } else if (arg == "--api-key" && i + 1 < argc) {
       api_keys.emplace_back(argv[++i]);
     } else if (arg == "--allow-origin" && i + 1 < argc) {
@@ -395,13 +399,28 @@ int main(int argc, char** argv) {
                           ")");
       return kExitError;
     }
-    std::string produced;
-    for (std::uint32_t id : *generated) {
-      produced += std::to_string(id) + " ";
+    if (log_tokens) {
+      const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
+      if (tokenizer == nullptr) {
+        log.Warn("cli", "--log-tokens needs a tokenizer on the model");
+      } else {
+        const std::vector<std::uint32_t> input =
+            gen.prompt_tokens.empty()
+                ? std::vector<std::uint32_t>{gen.first_token}
+                : gen.prompt_tokens;
+        auto input_text = tokenizer->Decode(input);
+        auto output_text = tokenizer->Decode(*generated);
+        if (input_text) {
+          log.Info("cli", "input text: " + *input_text);
+        }
+        if (output_text) {
+          log.Info("cli", "output text: " + *output_text);
+        }
+      }
+    } else {
+      log.Info("cli", std::string(speculate ? "speculative " : "generated ") +
+                          std::to_string(generated->size()) + " token(s)");
     }
-    log.Info("cli", std::string(speculate ? "speculative tokens: "
-                                         : "generated tokens: ") +
-                        produced);
   }
   return kExitOk;
 }

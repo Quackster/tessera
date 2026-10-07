@@ -820,6 +820,11 @@ through RADV GFX1201, rocm through the system ROCm).
   image load/encode, and the encoded token count; `--quiet` hides all
   of it.
 
+- 2026-10-07: CLI --log-tokens (229/229 `ctest` on both builds).
+  Current head. `tessera-cli --log-tokens` decodes the input and output
+  token ids to text with the model tokenizer and logs them; the default
+  logs only `generated N token(s)` (the engine still logs the timing).
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
