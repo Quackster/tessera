@@ -237,4 +237,23 @@ __global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
   }
   o[i] = a[i] / (1.0f + expf(-g[i]));
 }
+// Built-in "conv1d": causal depthwise convolution over channels x
+// length fp32. One thread per output element, sequential accumulation.
+__global__ void Conv1dKernel(const float* x, const float* w, float* y,
+                             unsigned long long channels,
+                             unsigned long long length,
+                             unsigned long long width) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= channels * length) {
+    return;
+  }
+  const unsigned long long c = i / length;
+  const unsigned long long t = i % length;
+  float acc = 0.0f;
+  for (unsigned long long k = 0; k < width && k <= t; ++k) {
+    acc = fmaf(w[c * width + k], x[c * length + t - k], acc);
+  }
+  y[i] = acc;
+}
 }  // namespace tessera::backends::rocm

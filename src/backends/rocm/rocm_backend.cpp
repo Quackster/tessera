@@ -48,6 +48,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_iq3s", reinterpret_cast<void*>(&GemmIq3SKernel)},
     {"rmsnorm", reinterpret_cast<void*>(&RmsnormKernel)},
     {"sigmoid_gate", reinterpret_cast<void*>(&SigmoidGateKernel)},
+    {"conv1d", reinterpret_cast<void*>(&Conv1dKernel)},
 };
 
 int LookupBuiltIn(std::string_view name) {

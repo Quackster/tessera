@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 119/119 on both builds.
+`ctest` passes 121/121 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -43,6 +43,9 @@ through RADV GFX1201, rocm through the system ROCm).
   accumulation. Row-wise norms back QK-Norm; the gate scales SDPA
   outputs for gated attention. Both built-ins take all dims as launch
   scalars and are verified against host references on both devices.
+- Generic causal depthwise conv1d with fp32 sequential accumulation.
+  Linear-attention blocks run the qkv mix through this before the
+  recurrent scan. Verified against the host reference on both devices.
 - Weight upload: `Model::Load` allocates one device buffer per
   manifest tensor and copies the file bytes through the backend.
   `Model::Weights` exposes them next to the manifest. Unsized
@@ -143,7 +146,7 @@ through RADV GFX1201, rocm through the system ROCm).
   UnsupportedFeature. Layer kinds follow the llama.cpp interval rule,
   credited in CREDITS.md.
 - 2026-10-07: norm and gate kernels (119/119 `ctest` on both builds).
-  Current head. Generic "rmsnorm" (one thread per row) and
+  Generic "rmsnorm" (one thread per row) and
   "sigmoid_gate" (one thread per element) built-ins on vulkan (GLSL)
   and rocm (HIP) with host references in `src/core/numerics/norm.*`.
   Contracts live in `include/tessera/backend.hpp` next to the other
@@ -152,14 +155,20 @@ through RADV GFX1201, rocm through the system ROCm).
   stands). The math follows public papers (Gated DeltaNet, gated
   attention, Qwen3-Next blog), credited in CREDITS.md; no llama.cpp
   source was read, per the new AGENTS.md rule.
+- 2026-10-07: conv1d kernel (121/121 `ctest` on both builds).
+  Current head. Generic causal depthwise "conv1d" (one thread per
+  output element) on vulkan (GLSL) and rocm (HIP) with a host
+  reference in the new `src/core/numerics/conv.*` pair. Contract in
+  `include/tessera/backend.hpp`; device-vs-reference and bad-arg
+  tests use the per backend attention tolerance.
 
 ## Next (in order)
 
 1. **Hybrid SSM decode** for the 27B target (arch `qwen35`):
-   definition, load, and norm/gate kernels are done (the file loads
-   with 866 tensors on both backends). Still missing: fused Q-plus-gate
-   splitting with mRoPE on full layers, the linear path (causal conv1d,
-   recurrent scan, gated norm), and MTP handling. `DecodeStep` rejects
+   definition, load, and norm/gate/conv kernels are done (the file
+   loads with 866 tensors on both backends). Still missing: fused
+   Q-plus-gate splitting with mRoPE on full layers, the recurrent
+   scan with gated norm, and MTP handling. `DecodeStep` rejects
    hybrid configs as unsupported today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.

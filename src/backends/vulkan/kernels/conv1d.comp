@@ -1,0 +1,40 @@
+#version 450
+
+// One thread per output element; the dispatch is
+// ceil(channels * length / 256) workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "conv1d" contract: buffers X (channels x length), W (channels x
+// width), Y (out). Scalars: channels v[0], length v[2], width v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer X {
+  float x[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  float w[];
+};
+
+layout(set = 0, binding = 2) buffer Y {
+  float y[];
+};
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint channels = pc.v[0];
+  uint length = pc.v[2];
+  if (i >= channels * length) {
+    return;
+  }
+  uint width = pc.v[4];
+  uint c = i / length;
+  uint t = i % length;
+  float acc = 0.0;
+  for (uint k = 0; k < width && k <= t; ++k) {
+    acc += w[c * width + k] * x[c * length + t - k];
+  }
+  y[i] = acc;
+}

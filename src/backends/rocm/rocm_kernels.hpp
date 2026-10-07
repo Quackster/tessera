@@ -98,5 +98,9 @@ __global__ void RmsnormKernel(const float* x, const float* w, float* y,
                               unsigned long long eps_bits);
 __global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
                                   unsigned long long n);
+__global__ void Conv1dKernel(const float* x, const float* w, float* y,
+                             unsigned long long channels,
+                             unsigned long long length,
+                             unsigned long long width);
 
 }  // namespace tessera::backends::rocm

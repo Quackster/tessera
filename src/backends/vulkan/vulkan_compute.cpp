@@ -43,6 +43,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_iq3s", kGemmIq3SSpirV, sizeof(kGemmIq3SSpirV)},
     {"rmsnorm", kRmsnormSpirV, sizeof(kRmsnormSpirV)},
     {"sigmoid_gate", kSigmoidGateSpirV, sizeof(kSigmoidGateSpirV)},
+    {"conv1d", kConv1dSpirV, sizeof(kConv1dSpirV)},
 };
 
 int LookupBuiltIn(std::string_view name) {

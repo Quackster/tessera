@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "core/numerics/attention.hpp"
+#include "core/numerics/conv.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -1699,4 +1700,104 @@ TEST(BackendTest, NormRejectsBadContract) {
   auto zero_len = backend->LaunchKernel(**gate, launch);
   ASSERT_FALSE(zero_len.has_value());
   EXPECT_EQ(zero_len.error(), StatusCode::InvalidArgument);
+}
+
+// Device: causal depthwise conv1d matches the host reference
+// (8 channels, 16 steps, width 4, so early steps see a short tail).
+TEST(BackendTest, Conv1dDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(43);
+  constexpr std::size_t kChannels = 8;
+  constexpr std::size_t kLength = 16;
+  constexpr std::size_t kWidth = 4;
+  std::vector<float> x(kChannels * kLength);
+  std::vector<float> w(kChannels * kWidth);
+  for (auto& v : x) {
+    v = DrawValue(rng);
+  }
+  for (auto& v : w) {
+    v = DrawValue(rng);
+  }
+  auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size() * 4, MemoryKind::Device);
+  auto y_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf.has_value() && w_buf.has_value() && y_buf.has_value());
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(upload(w_buf, w).has_value());
+
+  auto kernel = backend->LoadKernel("conv1d", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kChannels * kLength + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*x_buf).get(), (*w_buf).get(), (*y_buf).get()};
+  launch.scalars = {kChannels, kLength, kWidth};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(x.size() * 4);
+  auto download =
+      backend->CopyD2H(**y_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(x.size());
+  auto ref_status = core::ConvRef(std::span<const float>(x),
+                                  std::span<const float>(w),
+                                  std::span<float>(ref), kChannels, kLength,
+                                  kWidth);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(device_out[i] - ref[i]);
+    const float r =
+        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, r);
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Host and contract: the conv1d reference and the launch contract
+// reject malformed shapes at the boundary (zero dims, size gaps).
+TEST(BackendTest, ConvRejectsBadArgs) {
+  std::vector<float> x(8 * 16, 0.5f);
+  std::vector<float> w(8 * 4, 0.5f);
+  std::vector<float> y(8 * 16);
+  auto bad = core::ConvRef(std::span<const float>(x), std::span<const float>(w),
+                           std::span<float>(y), 8, 16, 0);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_w(8 * 2, 0.5f);
+  bad = core::ConvRef(std::span<const float>(x), std::span<const float>(short_w),
+                      std::span<float>(y), 8, 16, 4);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto conv = backend->LoadKernel("conv1d", {});
+  ASSERT_TRUE(conv.has_value()) << tessera::ToString(conv.error());
+  tessera::KernelLaunch launch;
+  // Conv1d wants 3 buffers and 3 scalars; zero width is rejected.
+  const std::vector<const tessera::Buffer*> three_buffers{
+      nullptr, nullptr, nullptr};
+  launch.buffers = three_buffers;
+  launch.scalars = {8, 16, 0};
+  auto zero_width = backend->LaunchKernel(**conv, launch);
+  ASSERT_FALSE(zero_width.has_value());
+  EXPECT_EQ(zero_width.error(), StatusCode::InvalidArgument);
 }

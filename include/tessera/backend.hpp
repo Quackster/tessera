@@ -169,6 +169,11 @@ class Kernel {
 // "sigmoid_gate": buffers are A and G (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = A * sigmoid(G) elementwise. The
 // dispatch is ceil(n / 256) workgroups of 256.
+// "conv1d": buffer 0 is X (fp32, channels x length), buffer 1 the
+// weights W (fp32, channels x width), buffer 2 the output Y (fp32,
+// channels x length); scalars are channels, length, width. Y is the
+// causal depthwise convolution with sequential accumulation. The
+// dispatch is ceil(channels * length / 256) workgroups of 256.
 [[nodiscard]] inline StatusCode CheckBuiltInArgs(const Kernel& kernel,
                                                  const KernelLaunch& launch) {
   if (kernel.Id() == "fill" &&
@@ -263,6 +268,15 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "conv1d") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
+        launch.scalars[2] == 0) {
       return StatusCode::InvalidArgument;
     }
   }
