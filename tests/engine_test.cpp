@@ -735,3 +735,31 @@ TEST(EngineTest, VisionConfigWhenProvided) {
   EXPECT_EQ(config->spatial_merge_size, 2u);
   EXPECT_EQ(config->projector_type, "qwen3vl_merger");
 }
+
+// The real mmproj loads and encodes a synthetic image to finite embeddings
+// when its path is provided (set TESSERA_TEST_MMPROJ).
+TEST(EngineTest, VisionEncodeWhenProvided) {
+  const char* path = std::getenv("TESSERA_TEST_MMPROJ");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_MMPROJ not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = tessera::VisionModel::Load(engine->Owner(), path);
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const tessera::VisionConfig& cfg = model->Config();
+  std::vector<float> image(cfg.image_size * cfg.image_size * 3);
+  for (std::size_t i = 0; i < image.size(); ++i) {
+    image[i] = 0.5f * (1.0f + std::sin(static_cast<float>(i) * 0.001f));
+  }
+  auto embeddings = model->Encode(engine->Owner(), image, cfg.image_size,
+                                  cfg.image_size);
+  ASSERT_TRUE(embeddings.has_value()) << tessera::ToString(embeddings.error());
+  const std::size_t out_tokens =
+      (cfg.image_size / cfg.patch_size / cfg.spatial_merge_size) *
+      (cfg.image_size / cfg.patch_size / cfg.spatial_merge_size);
+  EXPECT_EQ(embeddings->size(), out_tokens * cfg.projection_dim);
+  for (const float value : *embeddings) {
+    EXPECT_TRUE(std::isfinite(value));
+  }
+}

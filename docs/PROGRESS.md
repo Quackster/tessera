@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 225/225 on both builds.
+`ctest` passes 226/226 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -775,6 +775,14 @@ through RADV GFX1201, rocm through the system ROCm).
   merge (`spatial_merge` kernel) then mm.0 + bias -> GELU -> mm.2 +
   bias into the language hidden space. Host reference and a
   device-vs-reference test.
+
+- 2026-10-07: vision model load + encode (226/226 `ctest` on both
+  builds; the real-file test is env-gated). Current head.
+  `tessera::VisionModel` loads the mmproj (bf16 tensors converted to
+  fp32, F32 norms kept), binds the patch/position/post-norm/block/
+  merger weights, and `Encode` runs patchify -> stack -> merger to
+  image embeddings. The real Qwen3.8 mmproj loads and encodes a
+  synthetic image to finite embeddings.
 
 ## Next (in order)
 

@@ -3,8 +3,11 @@
 #include <cstddef>
 #include <expected>
 #include <filesystem>
+#include <memory>
 #include <string>
+#include <vector>
 
+#include "tessera/backend.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
@@ -32,10 +35,34 @@ struct VisionConfig {
 // vision encoder (`general.architecture` "clip",
 // `clip.has_vision_encoder` true). FileNotFound when missing,
 // MalformedFile for a wrong architecture or a missing/invalid field.
-//
-// Usage:
-//   auto config = LoadVisionConfig("~/models/.../mmproj-BF16.gguf");
 [[nodiscard]] std::expected<VisionConfig, StatusCode> LoadVisionConfig(
     const std::filesystem::path& path);
+
+// The loaded vision projector weights (fp32 on the device) plus the
+// kernels the encoder needs. `Encode` preprocesses an [h, w, 3] fp32 image
+// (values in [0, 1]), runs the CLIP encoder and the merger, and returns the
+// image embeddings (out_tokens x projection_dim) as a host vector.
+class VisionModel {
+ public:
+  VisionModel();
+  ~VisionModel();
+  VisionModel(VisionModel&&) noexcept;
+  VisionModel& operator=(VisionModel&&) noexcept;
+  VisionModel(const VisionModel&) = delete;
+  VisionModel& operator=(const VisionModel&) = delete;
+
+  [[nodiscard]] static std::expected<VisionModel, StatusCode> Load(
+      Backend& backend, const std::filesystem::path& path);
+
+  [[nodiscard]] const VisionConfig& Config() const;
+
+  [[nodiscard]] std::expected<std::vector<float>, StatusCode> Encode(
+      Backend& backend, std::span<const float> image, std::size_t h,
+      std::size_t w);
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace tessera
