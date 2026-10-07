@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 137/137 on both builds.
+`ctest` passes 139/139 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -232,7 +232,7 @@ through RADV GFX1201, rocm through the system ROCm).
   hybrid fixture decodes deterministically on both backends. The CLI
   gains `--prompt` and `--tokens` and runs greedy decode.
 - 2026-10-07: recurrent linear-attention decode (137/137 `ctest` on
-  both builds). Current head. `src/core/decode_hybrid.cpp` now runs
+  both builds). `src/core/decode_hybrid.cpp` now runs
   the gated-delta block: fused qkv/gate projections, causal conv1d
   over a per-layer conv history, L2-normalized q/k with head repeat,
   a per-value-head delta scan with a carried recurrent state, and the
@@ -242,6 +242,13 @@ through RADV GFX1201, rocm through the system ROCm).
   `{k, n, m}` scalar order while every other GEMM used `{m, n, k}`;
   all quant GEMMs now share one order. The 27B target generates on
   both backends (CLI `--tokens`); only MTP remains.
+- 2026-10-07: baseline pinning (139/139 `ctest` on both builds).
+  Current head. `tests/decode_test.cpp` pins the fixed-seed hybrid
+  fixtures to exact greedy token sequences (gated and linear). The
+  sequences are identical on vulkan and rocm (fp32 sequential
+  accumulation, same op order), so a drift flags a kernel or scheduler
+  change. The 27B baseline stays covered by the env-gated real-model
+  test.
 
 ## Next (in order)
 
@@ -253,22 +260,20 @@ through RADV GFX1201, rocm through the system ROCm).
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
-3. **Baseline pinning**: run the non speculative path on both backends.
-   Record per backend tolerance. Assert in tests (fixed seeds).
-4. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+3. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Models are data. No per
    model branches.
-5. **Serving API**: OpenAI-style `/v1/chat/completions` plus an
+4. **Serving API**: OpenAI-style `/v1/chat/completions` plus an
    Anthropic-style `/v1/messages` endpoint, served over HTTP from the
    engine. Streaming and non-streaming responses. The same limits
    apply to both shapes.
-6. **Runtime options**: every serving and engine knob as a CLI flag
+5. **Runtime options**: every serving and engine knob as a CLI flag
    and an engine option. Model path, draft path, mmproj path for
    vision input, KV cache quantization (q4, q8, fp16), maximum
    context size, batch caps. No hard-coded paths or sizes.
-7. **Multimodal (mmproj)**: load the vision projector next to the
+6. **Multimodal (mmproj)**: load the vision projector next to the
    model, encode images to embeddings, prepend them to the prompt
    sequence. Covers the mmproj file in the model directory.
 

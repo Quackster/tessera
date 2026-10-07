@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/decode.hpp"
 #include "test_helpers.hpp"
@@ -269,4 +271,50 @@ TEST(HybridDecodeTest, GatedFullAttentionDecodesDeterministically) {
 
 TEST(HybridDecodeTest, LinearAttentionDecodesDeterministically) {
   ExpectDeterministicDecode(WriteLinearHybridFixture("linear.gguf").string());
+}
+
+namespace {
+
+// Greedy tokens from token 0 for `n` steps (fixed-seed fixtures).
+std::vector<std::uint32_t> GreedyTokens(const std::string& path,
+                                        std::size_t n) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{path, 1024});
+  EXPECT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  std::vector<std::uint32_t> tokens;
+  if (!model.has_value()) {
+    return tokens;
+  }
+  tessera::core::DecodeCache cache;
+  std::uint32_t next = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    auto step = tessera::core::DecodeStep(engine->Owner(), **model, cache, next);
+    EXPECT_TRUE(step.has_value()) << tessera::ToString(step.error());
+    if (!step.has_value()) {
+      break;
+    }
+    next = *step;
+    tokens.push_back(next);
+  }
+  return tokens;
+}
+
+}  // namespace
+
+// Baseline pinning: the fixed-seed fixtures decode to these exact greedy
+// tokens on both backends (fp32 sequential accumulation, identical op
+// order). A drift here means a kernel or scheduler change.
+TEST(HybridDecodeTest, GatedBaselineIsPinned) {
+  const auto got = GreedyTokens(WriteGatedHybridFixture("gated.gguf").string(),
+                                8);
+  const std::vector<std::uint32_t> want = {1, 0, 26, 18, 17, 3, 3, 3};
+  EXPECT_EQ(got, want);
+}
+
+TEST(HybridDecodeTest, LinearBaselineIsPinned) {
+  const auto got =
+      GreedyTokens(WriteLinearHybridFixture("linear.gguf").string(), 8);
+  const std::vector<std::uint32_t> want = {5, 5, 31, 0, 30, 4, 19, 19};
+  EXPECT_EQ(got, want);
 }

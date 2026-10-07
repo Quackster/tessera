@@ -24,7 +24,7 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head in work. |
 | MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
 | DFlash2 decode | Todo | Grouped causal convolutions. Low rank selector. Verify loop. |
-| Baseline pinning | Todo | Runs reference path on both backends. Records tolerance. |
+| Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
 | MoE, MLP, norms | Partial | RMSNorm and sigmoid-gate kernels done. MLP, MoE and embedding kernels in work. No per model branches. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
