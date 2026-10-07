@@ -3840,6 +3840,9 @@ TEST(BackendTest, DraftLayerMatchesRef) {
   const std::vector<float> gw = rnd(kFfn * kHidden);
   const std::vector<float> uw = rnd(kFfn * kHidden);
   const std::vector<float> dw = rnd(kHidden * kFfn);
+  const std::vector<float> hnorm = rnd(kHidden);
+  constexpr std::size_t kCtx = 2;
+  const std::vector<float> chidden = rnd(kCtx * kHidden);
   auto upload = [&backend](const std::vector<float>& data) {
     auto buf = backend->AllocateBuffer(data.size() * 4, MemoryKind::Device);
     EXPECT_TRUE(buf.has_value());
@@ -3853,6 +3856,8 @@ TEST(BackendTest, DraftLayerMatchesRef) {
   auto ow_b = upload(ow), qn_b = upload(qn), kn_b = upload(kn);
   auto pnorm_b = upload(pnorm), mcp_b = upload(mcp), mcb_b = upload(mcb);
   auto gw_b = upload(gw), uw_b = upload(uw), dw_b = upload(dw);
+  auto hnorm_b = upload(hnorm);
+  auto chidden_b = upload(chidden);
   auto h_b = upload(hidden), r_b = upload(resid);
   auto out_b = backend->AllocateBuffer(hidden.size() * 4, MemoryKind::Device);
   auto rout_b = backend->AllocateBuffer(hidden.size() * 4, MemoryKind::Device);
@@ -3873,6 +3878,7 @@ TEST(BackendTest, DraftLayerMatchesRef) {
   wb.gate_w = &*gw_b;
   wb.up_w = &*uw_b;
   wb.down_w = &*dw_b;
+  wb.hidden_norm = &*hnorm_b;
   auto rms = backend->LoadKernel("rmsnorm", {});
   auto gemm = backend->LoadKernel("gemm_f32", {});
   auto conv = backend->LoadKernel("dflash_conv", {});
@@ -3897,36 +3903,43 @@ TEST(BackendTest, DraftLayerMatchesRef) {
   wr.gate_w = std::span<const float>(gw);
   wr.up_w = std::span<const float>(uw);
   wr.down_w = std::span<const float>(dw);
+  wr.hidden_norm = std::span<const float>(hnorm);
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   for (int use_residual = 0; use_residual < 2; ++use_residual) {
-    const tessera::Buffer* residual = use_residual ? &*r_b : nullptr;
-    auto device = tessera::spec::DraftLayerDevice(
-        *backend, **rms, **gemm, **conv, **rope, **attn, **silu, **add, *h_b,
-        residual, wb, **out_b, **rout_b, kRows, kHidden, kHeads, kKvHeads,
-        kHeadDim, kFfn, kTaps, kGroup, kBlock, kWindow, 0, kTheta, kEps);
-    ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
-    backend->Synchronize();
-    std::vector<float> out_got(hidden.size()), rout_got(hidden.size());
-    backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(out_got.data()),
-                     out_got.size() * 4);
-    backend->CopyD2H(**rout_b, reinterpret_cast<std::byte*>(rout_got.data()),
-                     rout_got.size() * 4);
-    std::vector<float> ref(hidden.size()), rref(hidden.size());
-    ASSERT_TRUE(tessera::spec::DraftLayerRef(
-                    std::span<const float>(hidden),
-                    use_residual ? std::span<const float>(resid)
-                                 : std::span<const float>(),
-                    wr, std::span<float>(ref), std::span<float>(rref), kRows,
-                    kHidden, kHeads, kKvHeads, kHeadDim, kFfn, kTaps, kGroup,
-                    kBlock, kWindow, 0, kTheta, kEps)
-                    .has_value());
-    float dout = 0.0f, dres = 0.0f;
-    for (std::size_t i = 0; i < ref.size(); ++i) {
-      dout = std::max(dout, std::abs(ref[i] - out_got[i]));
-      dres = std::max(dres, std::abs(rref[i] - rout_got[i]));
+    for (const std::size_t ctx : {std::size_t{0}, kCtx}) {
+      const tessera::Buffer* residual = use_residual ? &*r_b : nullptr;
+      const tessera::Buffer* context = ctx > 0 ? &*chidden_b : nullptr;
+      auto device = tessera::spec::DraftLayerDevice(
+          *backend, **rms, **gemm, **conv, **rope, **attn, **silu, **add, *h_b,
+          residual, wb, **out_b, **rout_b, kRows, kHidden, kHeads, kKvHeads,
+          kHeadDim, kFfn, kTaps, kGroup, kBlock, kWindow, 0, kTheta, kEps,
+          context, ctx);
+      ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+      backend->Synchronize();
+      std::vector<float> out_got(hidden.size()), rout_got(hidden.size());
+      backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(out_got.data()),
+                       out_got.size() * 4);
+      backend->CopyD2H(**rout_b, reinterpret_cast<std::byte*>(rout_got.data()),
+                       rout_got.size() * 4);
+      std::vector<float> ref(hidden.size()), rref(hidden.size());
+      ASSERT_TRUE(tessera::spec::DraftLayerRef(
+                      std::span<const float>(hidden),
+                      use_residual ? std::span<const float>(resid)
+                                   : std::span<const float>(),
+                      wr, std::span<float>(ref), std::span<float>(rref), kRows,
+                      kHidden, kHeads, kKvHeads, kHeadDim, kFfn, kTaps, kGroup,
+                      kBlock, kWindow, 0, kTheta, kEps,
+                      ctx > 0 ? std::span<const float>(chidden)
+                              : std::span<const float>())
+                      .has_value());
+      float dout = 0.0f, dres = 0.0f;
+      for (std::size_t i = 0; i < ref.size(); ++i) {
+        dout = std::max(dout, std::abs(ref[i] - out_got[i]));
+        dres = std::max(dres, std::abs(rref[i] - rout_got[i]));
+      }
+      EXPECT_LE(dout, tol.abs) << "residual=" << use_residual << " ctx=" << ctx;
+      EXPECT_LE(dres, tol.abs) << "residual=" << use_residual << " ctx=" << ctx;
     }
-    EXPECT_LE(dout, tol.abs) << "residual=" << use_residual;
-    EXPECT_LE(dres, tol.abs) << "residual=" << use_residual;
   }
 }
 

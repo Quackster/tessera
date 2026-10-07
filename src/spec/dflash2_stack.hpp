@@ -22,7 +22,8 @@ namespace tessera::spec {
     std::size_t rows, std::size_t hidden_dim, std::size_t heads,
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
-    std::size_t window, std::uint64_t pos_base, double theta, float eps);
+    std::size_t window, std::uint64_t pos_base, double theta, float eps,
+    std::span<const float> context_hidden = {});
 
 // Device version. `layers` are the per-layer weight buffers in order; the
 // per-call layer scratch is allocated inside each layer call.
@@ -34,6 +35,7 @@ namespace tessera::spec {
     Buffer& out, std::size_t rows, std::size_t hidden_dim, std::size_t heads,
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
-    std::size_t window, std::uint64_t pos_base, double theta, float eps);
+    std::size_t window, std::uint64_t pos_base, double theta, float eps,
+    const Buffer* context_hidden = nullptr, std::size_t ctx = 0);
 
 }  // namespace tessera::spec

@@ -613,6 +613,14 @@ through RADV GFX1201, rocm through the system ROCm).
   (RoPE and causality/window). With no context the behaviour is
   unchanged. Host reference and a device-vs-reference test.
 
+- 2026-10-07: DFlash2 context through the draft layer and stack (199/199
+  `ctest` on both builds). Current head. A draft layer gains a shared
+  hidden_norm and an optional context hidden input: when present it
+  forms the layer's context K/V (DraftContextKv) and the attention
+  attends over it; the stack passes the fused context hidden to each
+  layer. The layer test now covers the residual x context combinations
+  on both backends.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to

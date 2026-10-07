@@ -31,6 +31,8 @@ struct DraftLayerWeights {
   std::span<const float> gate_w;
   std::span<const float> up_w;
   std::span<const float> down_w;
+  // Shared target-hidden norm for the context K/V (empty when no context).
+  std::span<const float> hidden_norm;
 };
 
 // Host reference. `hidden` is rows x hidden_dim; `residual` is the same
@@ -44,7 +46,8 @@ struct DraftLayerWeights {
     std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
     std::size_t ffn, std::size_t taps, std::size_t group_size,
     std::size_t block_size, std::size_t window, std::uint64_t pos_base,
-    double theta, float eps);
+    double theta, float eps,
+    std::span<const float> context_hidden = {});
 
 // The device weight buffers (fp32) of one layer.
 struct DraftLayerBuffers {
@@ -63,6 +66,7 @@ struct DraftLayerBuffers {
   const Buffer* gate_w = nullptr;
   const Buffer* up_w = nullptr;
   const Buffer* down_w = nullptr;
+  const Buffer* hidden_norm = nullptr;
 };
 
 // Device version. `residual` is null on the first layer. Scratch buffers
@@ -76,6 +80,7 @@ struct DraftLayerBuffers {
     std::size_t rows, std::size_t hidden_dim, std::size_t heads,
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
-    std::size_t window, std::uint64_t pos_base, double theta, float eps);
+    std::size_t window, std::uint64_t pos_base, double theta, float eps,
+    const Buffer* context_hidden = nullptr, std::size_t ctx = 0);
 
 }  // namespace tessera::spec
