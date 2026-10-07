@@ -200,6 +200,9 @@ Repository-specific constraints on top of the hard rules:
   after each finished milestone, update the Area, State, and Detail rows
   so the table matches `docs/PROGRESS.md`.
 - Search with `rg` before assuming a behavior is missing.
+- Research model architecture online: use papers, model cards, and
+  public specs for algorithm details. Do not read the local llama.cpp
+  checkout when designing or porting model logic.
 - Do not encode model names into tests: a "qwen3" test is a test of the
   generic attention path fed with qwen3-shaped parameters.
 - When a numerical regression appears, check whether the reference baseline
