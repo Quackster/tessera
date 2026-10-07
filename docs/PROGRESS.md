@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 218/218 on both builds.
+`ctest` passes 220/220 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -736,6 +736,13 @@ through RADV GFX1201, rocm through the system ROCm).
   projector type. The real Qwen3.8 mmproj parses; a non-CLIP GGUF is
   MalformedFile. This is the first multimodal step; the encoder and
   merger forward follow.
+
+- 2026-10-07: LayerNorm and GELU kernels (220/220 `ctest` on both
+  builds). Current head. Generic "layernorm" (row-wise, weight and
+  bias, biased variance) and "gelu" (elementwise tanh approximation)
+  on vulkan and rocm with host references and device-vs-reference
+  tests. The CLIP vision encoder needs both (it uses LayerNorm and
+  GELU, not RMSNorm/SiLU).
 
 ## Next (in order)
 

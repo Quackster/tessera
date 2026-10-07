@@ -183,6 +183,10 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
                                   unsigned long long head_dim,
                                   unsigned long long q_base,
                                   unsigned long long window);
+__global__ void LayerNormKernel(const float* x, const float* w, const float* b,
+                                float* y, unsigned long long rows,
+                                unsigned long long cols, float eps);
+__global__ void GeluKernel(const float* x, float* y, unsigned long long n);
 __global__ void QuantizeQ4Kernel(const float* in, unsigned int* packed,
                                  float* scale, unsigned long long rows,
                                  unsigned long long cols);

@@ -1,0 +1,22 @@
+#version 450
+
+// One thread per element; dispatch ceil(n / 256).
+layout(local_size_x = 256) in;
+
+// "gelu" contract: buffer 0 X (fp32, n), buffer 1 the output (fp32, n);
+// scalar n at pc.v[0]. Uses the tanh approximation.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) buffer Y { float y[]; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.v[0]) {
+    return;
+  }
+  float t = x[i];
+  y[i] = 0.5 * t * (1.0 + tanh(0.7978845608 * (t + 0.044715 * t * t * t)));
+}

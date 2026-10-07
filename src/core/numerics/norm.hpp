@@ -21,6 +21,22 @@ namespace tessera::core {
     std::span<const float> x, std::span<const float> w, std::span<float> y,
     std::size_t rows, std::size_t cols, float eps);
 
+// Host reference for the "layernorm" built-in: row-wise LayerNorm over
+// rows x cols fp32 (y = (x - mean) / sqrt(var + eps) * w + b, biased
+// variance, ascending accumulation, the order the kernels use). The
+// CLIP vision encoder uses it. Rows and cols must be nonzero, eps must
+// not be negative, and the spans must hold rows*cols (x, y) and cols
+// (w, b); else InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> LayerNormRef(
+    std::span<const float> x, std::span<const float> w,
+    std::span<const float> b, std::span<float> y, std::size_t rows,
+    std::size_t cols, float eps);
+
+// Host reference for the "gelu" built-in: elementwise tanh-approximation
+// GELU over n fp32. n must be nonzero; else InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> GeluRef(
+    std::span<const float> x, std::span<float> y, std::size_t n);
+
 // Host reference for the "sigmoid_gate" built-in: elementwise gated
 // scale over n fp32 (out = a * sigmoid(g)). Gated attention applies
 // this to the SDPA output with the fused gate projection. n must be

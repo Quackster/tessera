@@ -32,6 +32,51 @@ std::expected<void, StatusCode> RmsNormRef(std::span<const float> x,
   return {};
 }
 
+std::expected<void, StatusCode> LayerNormRef(std::span<const float> x,
+                                             std::span<const float> w,
+                                             std::span<const float> b,
+                                             std::span<float> y,
+                                             std::size_t rows,
+                                             std::size_t cols, float eps) {
+  if (rows == 0 || cols == 0 || eps < 0.0f || x.size() != rows * cols ||
+      w.size() != cols || b.size() != cols || y.size() != rows * cols) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    const float* xr = x.data() + r * cols;
+    float mean = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      mean += xr[c];
+    }
+    mean /= static_cast<float>(cols);
+    float var = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      const float d = xr[c] - mean;
+      var = std::fma(d, d, var);
+    }
+    var /= static_cast<float>(cols);
+    const float inv = 1.0f / std::sqrt(var + eps);
+    float* yr = y.data() + r * cols;
+    for (std::size_t c = 0; c < cols; ++c) {
+      yr[c] = (xr[c] - mean) * inv * w[c] + b[c];
+    }
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> GeluRef(std::span<const float> x,
+                                        std::span<float> y, std::size_t n) {
+  if (n == 0 || x.size() != n || y.size() != n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    const float t = x[i];
+    y[i] = 0.5f * t *
+           (1.0f + std::tanh(0.7978845608f * (t + 0.044715f * t * t * t)));
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> SigmoidGateRef(std::span<const float> a,
                                                std::span<const float> g,
                                                std::span<float> out,

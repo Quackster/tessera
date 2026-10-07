@@ -4871,3 +4871,94 @@ TEST(BackendTest, AttentionQ4DeviceMatchesRef) {
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
+
+// Device: LayerNorm matches the host reference.
+TEST(BackendTest, LayerNormDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(109);
+  constexpr std::size_t kRows = 3, kCols = 8;
+  std::vector<float> x(kRows * kCols), w(kCols), b(kCols);
+  for (auto& v : x) v = DrawValue(rng);
+  for (auto& v : w) v = DrawValue(rng);
+  for (auto& v : b) v = DrawValue(rng);
+  auto up = [&backend](const std::vector<float>& d) {
+    auto buf = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**buf, std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(d.data()),
+                               d.size() * 4));
+    return std::move(*buf);
+  };
+  auto x_b = up(x), w_b = up(w), b_b = up(b);
+  auto y_b = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(y_b.has_value());
+  auto kernel = backend->LoadKernel("layernorm", {});
+  ASSERT_TRUE(kernel.has_value());
+  const float eps = 1e-5f;
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &eps, sizeof(bits));
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {x_b.get(), w_b.get(), b_b.get(), y_b->get()};
+  launch.scalars = {kRows, kCols, bits};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(x.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**y_b, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(x.size());
+  ASSERT_TRUE(core::LayerNormRef(std::span<const float>(x),
+                                 std::span<const float>(w),
+                                 std::span<const float>(b),
+                                 std::span<float>(ref), kRows, kCols, eps)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: GELU matches the host reference.
+TEST(BackendTest, GeluDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(110);
+  constexpr std::size_t kN = 16;
+  std::vector<float> x(kN);
+  for (auto& v : x) v = DrawValue(rng);
+  auto x_b = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto y_b = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_b && y_b);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **x_b, std::span<const std::byte>(
+                             reinterpret_cast<const std::byte*>(x.data()),
+                             x.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("gelu", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*x_b).get(), (*y_b).get()};
+  launch.scalars = {kN};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<float> got(kN), ref(kN);
+  backend->CopyD2H(**y_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  ASSERT_TRUE(core::GeluRef(std::span<const float>(x), std::span<float>(ref),
+                            kN)
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}

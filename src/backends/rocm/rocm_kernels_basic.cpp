@@ -720,6 +720,45 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
   out[t] = acc / denom;
 }
 
+// Built-in "layernorm": one thread per row.
+__global__ void LayerNormKernel(const float* x, const float* w, const float* b,
+                                float* y, unsigned long long rows,
+                                unsigned long long cols, float eps) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  const unsigned long long base = r * cols;
+  float mean = 0.0f;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    mean += x[base + c];
+  }
+  mean /= static_cast<float>(cols);
+  float var = 0.0f;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    const float d = x[base + c] - mean;
+    var = fmaf(d, d, var);
+  }
+  var /= static_cast<float>(cols);
+  const float inv = rsqrtf(var + eps);
+  for (unsigned long long c = 0; c < cols; ++c) {
+    y[base + c] = (x[base + c] - mean) * inv * w[c] + b[c];
+  }
+}
+
+// Built-in "gelu": elementwise tanh approximation.
+__global__ void GeluKernel(const float* x, float* y, unsigned long long n) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  const float t = x[i];
+  y[i] = 0.5f * t *
+         (1.0f + tanhf(0.7978845608f * (t + 0.044715f * t * t * t)));
+}
+
 // Built-in "quantize_q4": one thread per row; symmetric 4-bit with a
 // per-row absmax scale, packed eight nibbles per word.
 __global__ void QuantizeQ4Kernel(const float* in, unsigned int* packed,

@@ -213,6 +213,11 @@ class Kernel {
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
 // for both is ceil(n / 256) workgroups of 256.
+// "layernorm": buffers X (fp32, rows x cols), weight (fp32, cols), bias
+// (fp32, cols) and the output (fp32, rows x cols); scalars rows, cols and
+// eps (fp32 bits). One thread per row.
+// "gelu": buffer 0 X (fp32, n), buffer 1 the output (fp32, n); scalar n.
+// Tanh approximation. The dispatch is ceil(n / 256).
 // "quantize_q8": buffer 0 is In (fp32, rows x cols), buffer 1 the packed
 // int8 output (rows x cols bytes), buffer 2 one fp32 scale per row;
 // scalars are rows and cols (cols a multiple of 4). The dispatch is one
@@ -463,6 +468,20 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "layernorm") {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "gelu") {
+    if (launch.buffers.size() != 2 || launch.scalars.size() != 1 ||
+        launch.scalars[0] == 0) {
       return StatusCode::InvalidArgument;
     }
   }
