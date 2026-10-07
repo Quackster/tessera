@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdlib>
 
 #include <memory>
@@ -7,6 +8,7 @@
 #include "test_helpers.hpp"
 #include "spec/dflash2_config.hpp"
 #include "spec/dflash2_weights.hpp"
+#include "spec/dflash2_drafter.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
@@ -223,5 +225,56 @@ TEST(SpecWeightsTest, LoadsRealDraftWhenProvided) {
     EXPECT_NE(layer.q_w, nullptr);
     EXPECT_NE(layer.down_w, nullptr);
     EXPECT_NE(layer.hidden_norm, nullptr);
+  }
+}
+
+// The real DFlash2 drafter loads and runs one draft block on the device
+// when the checkpoint directory is provided (set TESSERA_TEST_DFLASH2_DIR).
+// A small dummy head keeps the test light; the logits must be finite.
+TEST(SpecDrafterTest, RunsRealDraftWhenProvided) {
+  const char* dir = std::getenv("TESSERA_TEST_DFLASH2_DIR");
+  if (dir == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_DFLASH2_DIR not set";
+  }
+  std::unique_ptr<tessera::Engine> engine;
+  tessera::testing::MakeEngineOrSkip(engine);
+  auto config = LoadDFlash2Config(dir);
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  auto drafter = tessera::spec::DFlash2Drafter::Create(engine->Owner(), dir,
+                                                       *config);
+  ASSERT_TRUE(drafter.has_value()) << tessera::ToString(drafter.error());
+  const std::size_t rows = config->block_size;
+  const std::size_t ctx = 1;
+  const std::size_t n = config->target_layer_ids.size();
+  const std::size_t hidden = config->hidden_size;
+  const std::size_t vocab = 32;
+  auto& backend = engine->Owner();
+  auto make = [&](std::size_t count, float seed) {
+    std::vector<float> data(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      data[i] = std::sin(static_cast<float>(i) * seed) * 0.01f;
+    }
+    auto buffer = backend.AllocateBuffer(count * 4, tessera::MemoryKind::Device);
+    backend.CopyH2D(**buffer, std::span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(data.data()),
+                                  data.size() * 4));
+    return std::move(*buffer);
+  };
+  auto mask = make(rows * hidden, 0.1f);
+  auto aux = make(n * ctx * hidden, 0.2f);
+  auto outw = make(vocab * hidden, 0.3f);
+  auto logits = backend.AllocateBuffer(rows * vocab * 4, tessera::MemoryKind::Device);
+  ASSERT_TRUE(logits.has_value());
+  auto head = backend.LoadKernel("gemm_f32", {});
+  ASSERT_TRUE(head.has_value());
+  auto status = drafter->Run(backend, *mask, *aux, *outw, **head, **logits,
+                             rows, ctx, vocab);
+  ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
+  backend.Synchronize();
+  std::vector<float> got(rows * vocab);
+  backend.CopyD2H(**logits, reinterpret_cast<std::byte*>(got.data()),
+                  got.size() * 4);
+  for (const float value : got) {
+    EXPECT_TRUE(std::isfinite(value));
   }
 }

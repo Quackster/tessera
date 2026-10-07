@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 203/203 on both builds.
+`ctest` passes 204/204 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -649,6 +649,13 @@ through RADV GFX1201, rocm through the system ROCm).
   builds). Current head. `src/spec/dflash2_candidates.*` returns the
   top-K draft logits per row (ids and unary values, descending), the
   input the candidate selector re-ranks. Host test.
+
+- 2026-10-07: DFlash2 drafter runs the real draft (204/204 `ctest` on
+  both builds; the real-checkpoint test is env-gated). Current head.
+  `src/spec/dflash2_drafter.*` loads the draft weights with the block
+  kernels and runs one draft block (fc fusion, mask-query stack with
+  context, final norm, head projection). The real Qwen3.8-27B DFlash2
+  draft loads and produces finite logits on the device.
 
 ## Next (in order)
 
