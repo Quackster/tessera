@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 216/216 on both builds.
+`ctest` passes 218/218 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -728,6 +728,15 @@ through RADV GFX1201, rocm through the system ROCm).
   path is deterministic on the fixtures and runs on the 27B (a lossy
   mode, so the greedy tokens differ from fp32 by design).
 
+- 2026-10-07: vision (mmproj) config (218/218 `ctest` on both builds;
+  the real-file test is env-gated). Current head. `tessera::
+  LoadVisionConfig` parses the mmproj GGUF (CLIP vision encoder +
+  merger): image/patch size, embedding/ffn/block/head counts,
+  projection dim, spatial merge, layer-norm eps, image mean/std,
+  projector type. The real Qwen3.8 mmproj parses; a non-CLIP GGUF is
+  MalformedFile. This is the first multimodal step; the encoder and
+  merger forward follow.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
@@ -757,9 +766,10 @@ through RADV GFX1201, rocm through the system ROCm).
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-6. **Multimodal (mmproj)**: load the vision projector next to the
-   model, encode images to embeddings, prepend them to the prompt
-   sequence. Covers the mmproj file in the model directory.
+6. **Multimodal (mmproj)**: the vision config loads from the mmproj
+   GGUF. Still to do: the CLIP encoder + merger forward, image
+   preprocessing, and prepending the image embeddings to the prompt. The
+   mmproj file is loaded from the model directory.
 
 7. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism

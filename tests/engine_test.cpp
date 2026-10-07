@@ -11,6 +11,7 @@
 #include "test_helpers.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
+#include "tessera/vision.hpp"
 #include "tessera/types.hpp"
 
 using tessera::Engine;
@@ -707,4 +708,30 @@ TEST(EngineTest, DFlash2MatchesGreedyOnModel) {
   auto spec = engine->GenerateDraft(**model, options, draft);
   ASSERT_TRUE(spec.has_value()) << tessera::ToString(spec.error());
   EXPECT_EQ(*spec, *greedy);
+}
+
+// The vision config parser rejects a non-CLIP GGUF.
+TEST(EngineTest, VisionConfigRejectsNonClip) {
+  auto path = WriteGgufFixture("notclip.gguf");
+  auto config = tessera::LoadVisionConfig(path);
+  ASSERT_FALSE(config.has_value());
+  EXPECT_EQ(config.error(), StatusCode::MalformedFile);
+}
+
+// The real mmproj parses when its path is provided
+// (set TESSERA_TEST_MMPROJ).
+TEST(EngineTest, VisionConfigWhenProvided) {
+  const char* path = std::getenv("TESSERA_TEST_MMPROJ");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_MMPROJ not set";
+  }
+  auto config = tessera::LoadVisionConfig(path);
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_EQ(config->image_size, 768u);
+  EXPECT_EQ(config->patch_size, 16u);
+  EXPECT_EQ(config->block_count, 27u);
+  EXPECT_EQ(config->embedding_length, 1152u);
+  EXPECT_EQ(config->projection_dim, 5120u);
+  EXPECT_EQ(config->spatial_merge_size, 2u);
+  EXPECT_EQ(config->projector_type, "qwen3vl_merger");
 }

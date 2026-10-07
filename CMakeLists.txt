@@ -25,6 +25,7 @@ add_library(tessera STATIC
     src/core/loaders/safetensors.cpp
     src/core/json.cpp
     src/core/sampling.cpp
+    src/core/vision.cpp
     src/core/numerics/quant.cpp
     src/core/numerics/gemm.cpp
     src/core/numerics/attention.cpp
