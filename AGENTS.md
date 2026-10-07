@@ -51,23 +51,33 @@ read, fix, and extend it without asking.
 - Numerical tolerance differs slightly between backends: assert per-backend
   tolerance, never a single hard-coded epsilon.
 
-### Models are data, not branches
-- A new LLM architecture is added by providing a model definition
-  (config + weights) that drives a fixed set of generic kernels: GEMM,
-  attention (GQA/MQA), MLP, MoE, RMSNorm/LayerNorm, RoPE/position embeddings,
-  activations, embeddings.
-- No per-model-name branches in generic code: no `if (model == "qwen3")` in
-  kernels, attention, or memory management. Fixes live in the generic
-  kernel/scheduler layer that owns the failing behavior, never in
-  per-model special cases.
-- If a generic kernel lacks a capability a new architecture needs, extend the
-  generic kernel (with tests). A model-specific kernel is allowed only when
-  the capability is genuinely architecture-specific, and then it lives in the
-  model-definition layer.
-- The extensibility test (how new architectures are checked in): add the
-  architecture as config + weights, with zero new files under `src/core/`, and
-  a test running it on the configured backend. If that required editing core
-  code, the abstraction leaked — fix the leak.
+### Architectures are pluggable modules
+- Architecture specific behavior lives in one polymorphic module per
+  architecture. The module owns the config parse, the weight name map, the
+  layer assembly (which generic kernels run, in what order, on which shapes)
+  and any genuinely architecture specific kernel.
+- Layout: `src/models/<arch>/` (for example
+  `src/models/qwen3_5/{config.cpp,weights.cpp,layers.cpp}`) behind one
+  `Architecture` interface in `include/tessera/architecture.hpp`, selected at
+  model load time and constructed by a factory in
+  `src/models/registry.cpp`. `src/core/` keeps the backend agnostic engine,
+  scheduler and generic kernels, and never names a model.
+- Generic code calls the interface. It has no `if (model == "qwen3")` branches
+  in kernels, attention or memory management.
+- A new architecture is a new `src/models/<arch>/` module plus one
+  registration line in `src/models/registry.cpp`, with no edits under
+  `src/core/`. A fix that belongs to one architecture lives in that module; a
+  fix that belongs to a shared kernel lives in `src/core/numerics/` or
+  `src/backends/*/kernels/`.
+- A capability shared by several architectures is a generic kernel in
+  `src/core/numerics/` and `src/backends/*/kernels/`, added with tests. A
+  capability that only one architecture needs is a kernel in
+  `src/models/<arch>/kernels/`, behind the same backend interface.
+- The extensibility test: a new architecture is a module under
+  `src/models/<arch>/` (config, weights, assembly) plus a test that runs it on
+  the configured backend, with zero edits under `src/core/`. If the module
+  needs a new generic kernel, that kernel lands in `src/core/numerics/` with
+  tests, not inlined in the module.
 
 ### Speculative decoding
 - Draft/verification algorithms (DFlash2 today; DFlash, DSpark, others later)
