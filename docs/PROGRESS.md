@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 168/168 on both builds.
+`ctest` passes 169/169 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -396,6 +396,11 @@ through RADV GFX1201, rocm through the system ROCm).
   CLI `--mtp <id>` prints a draft. Unverifiable against a public
   reference output, but the layout matches vLLM's qwen3_5_mtp
   (credited). The 27B drafts deterministically.
+
+- 2026-10-07: batched attention verified (169/169 `ctest` on both
+  builds). Current head. The attention kernel already handles
+  several query rows (m > 1); a device-vs-reference test pins it,
+  a prerequisite for the speculative verifier.
 
 ## Next (in order)
 

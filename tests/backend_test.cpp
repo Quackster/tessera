@@ -2954,3 +2954,63 @@ TEST(BackendTest, Conv1dStepDeviceMatchesRef) {
     EXPECT_NEAR(got[i], ref[i], 1e-5f);
   }
 }
+
+// Device: attention with several query rows (m > 1) matches the reference.
+TEST(BackendTest, AttentionBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(86);
+  constexpr std::size_t kM = 3;
+  constexpr std::size_t kN = 6;
+  constexpr std::size_t kHeads = 4;
+  constexpr std::size_t kKvHeads = 2;
+  constexpr std::size_t kDim = 16;
+  constexpr std::uint64_t kQBase = 2;
+  std::vector<float> q(kM * kHeads * kDim), k(kN * kKvHeads * kDim);
+  std::vector<float> v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  auto q_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  auto k_buf = backend->AllocateBuffer(k.size() * 4, MemoryKind::Device);
+  auto v_buf = backend->AllocateBuffer(v.size() * 4, MemoryKind::Device);
+  auto o_buf =
+      backend->AllocateBuffer(kM * kHeads * kDim * 4, MemoryKind::Device);
+  ASSERT_TRUE(q_buf && k_buf && v_buf && o_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(q_buf, q).has_value());
+  ASSERT_TRUE(upload(k_buf, k).has_value());
+  ASSERT_TRUE(upload(v_buf, v).has_value());
+  auto kernel = backend->LoadKernel("attention", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
+                    (*o_buf).get()};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kHeads * kDim * 4);
+  ASSERT_TRUE(backend->CopyD2H(**o_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kM * kHeads * kDim);
+  ASSERT_TRUE(core::AttentionRef(std::span<const float>(q),
+                                 std::span<const float>(k),
+                                 std::span<const float>(v),
+                                 std::span<float>(ref), kM, kN, kHeads, kKvHeads,
+                                 kDim, kQBase)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
