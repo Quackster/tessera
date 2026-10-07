@@ -805,6 +805,13 @@ through RADV GFX1201, rocm through the system ROCm).
   vision encoder + image loader + injection now connect end to end at
   the engine level.
 
+- 2026-10-07: multimodal CLI (229/229 `ctest` on both builds). Current
+  head. `tessera-cli run --mmproj <dir> --image <ppm> --image-token <id>`
+  loads the vision projector, encodes the image, prepends its token
+  count as placeholders and calls `GenerateMultimodal`. The prefill of
+  the ~576 image tokens is token-by-token (host-glue, ~1 s each), so a
+  full image run takes minutes; batched prefill would fix it.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to

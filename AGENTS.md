@@ -241,6 +241,9 @@ runtime coverage goes into the single test target; add test functions to the
 `tests/*.cpp` sources compiled into it. New suites only fragment ctest output
 and bloat configure time.
 
+When testing the generic Qwen 3.8 model, test it both with MTP enabled and
+with MTP disabled. Both paths must be covered.
+
 ## Where Things Live
 
 Provisional layout, to be updated as the tree stabilizes:

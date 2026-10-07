@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "tessera/engine.hpp"
+#include "tessera/image.hpp"
+#include "tessera/vision.hpp"
 #include "tessera/serve.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
@@ -41,6 +43,9 @@ void PrintUsage() {
                "  --mtp <id>        print the MTP draft after this token id\n"
                "  --tokens <n>      run n greedy decode steps and print them\n"
                "  --speculate       verify MTP drafts instead of plain greedy\n"
+               "  --mmproj <path>   vision projector (mmproj) GGUF\n"
+               "  --image <path>    image (binary PPM) to prepend as tokens\n"
+               "  --image-token <id> placeholder token id for image rows\n"
                "  --sample          sample instead of greedy decode\n"
                "  --temperature <f> sampling temperature (default 0.6)\n"
                "  --top-p <f>       nucleus probability (default 0.95)\n"
@@ -87,6 +92,9 @@ int main(int argc, char** argv) {
   std::string model_path;
   std::string draft_path;
   std::string prompt_text;
+  std::string mmproj_path;
+  std::string image_path;
+  std::uint32_t image_token = 0;
   std::string host = "127.0.0.1";
   std::vector<std::string> api_keys;
   std::vector<std::string> allow_origins;
@@ -111,6 +119,12 @@ int main(int argc, char** argv) {
       draft_path = argv[++i];
     } else if (arg == "--prompt-text" && i + 1 < argc) {
       prompt_text = argv[++i];
+    } else if (arg == "--mmproj" && i + 1 < argc) {
+      mmproj_path = argv[++i];
+    } else if (arg == "--image" && i + 1 < argc) {
+      image_path = argv[++i];
+    } else if (arg == "--image-token" && i + 1 < argc) {
+      image_token = static_cast<std::uint32_t>(std::stoul(argv[++i]));
     } else if (arg == "--api-key" && i + 1 < argc) {
       api_keys.emplace_back(argv[++i]);
     } else if (arg == "--allow-origin" && i + 1 < argc) {
@@ -284,11 +298,49 @@ int main(int argc, char** argv) {
       }
       gen.prompt_tokens = *ids;
     }
-    auto generated =
-        draft_path.empty()
-            ? (speculate ? engine.GenerateSpeculative(loaded, gen)
-                         : engine.Generate(loaded, gen))
-            : engine.GenerateDraft(loaded, gen, draft_path);
+    std::expected<std::vector<std::uint32_t>, tessera::StatusCode> generated;
+    if (!image_path.empty()) {
+      if (mmproj_path.empty()) {
+        log.Warn("cli", "--image needs --mmproj");
+        return kExitError;
+      }
+      auto vision = tessera::VisionModel::Load(engine.Owner(), mmproj_path);
+      if (!vision) {
+        log.Warn("cli", std::string("mmproj load failed (") +
+                            std::string(tessera::ToString(vision.error())) +
+                            ")");
+        return kExitError;
+      }
+      auto image = tessera::LoadPpm(image_path);
+      if (!image) {
+        log.Warn("cli", std::string("image load failed (") +
+                            std::string(tessera::ToString(image.error())) + ")");
+        return kExitError;
+      }
+      auto resized = tessera::ResizeBilinear(*image, vision->Config().image_size,
+                                             vision->Config().image_size);
+      auto embeddings = vision->Encode(engine.Owner(), resized.pixels,
+                                       resized.height, resized.width);
+      if (!embeddings) {
+        log.Warn("cli", std::string("image encode failed (") +
+                            std::string(tessera::ToString(embeddings.error())) +
+                            ")");
+        return kExitError;
+      }
+      const std::size_t count = embeddings->size() / vision->Config().projection_dim;
+      std::vector<std::uint32_t> prompt(count, image_token);
+      prompt.insert(prompt.end(), gen.prompt_tokens.begin(),
+                    gen.prompt_tokens.end());
+      gen.prompt_tokens = prompt;
+      generated = engine.GenerateMultimodal(loaded, gen, *embeddings, count,
+                                            image_token);
+    } else {
+      generated =
+          draft_path.empty()
+              ? (speculate ? engine.GenerateSpeculative(loaded, gen)
+                           : engine.Generate(loaded, gen))
+              : engine.GenerateDraft(loaded, gen, draft_path);
+    }
     if (!generated) {
       log.Warn("cli", std::string("generation failed (") +
                           std::string(tessera::ToString(generated.error())) +
