@@ -668,6 +668,58 @@ TEST(BackendTest, GemmIq3SDeviceMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
+// Device: Q8_0 GEMM matches the host reference (2 x 8 outputs, one
+// 32-element block per row).
+TEST(BackendTest, GemmQ80DeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(61);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 32;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 34, 0);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+  auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+  ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+  auto kernel = backend->LoadKernel("gemm_q80", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kM * kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  auto download =
+      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ80Ref(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
 // Device: the K-quant and IQ GEMM contracts reject bad shapes.
 TEST(BackendTest, QuantGemmRejectsBadContract) {
   std::unique_ptr<Backend> backend;
@@ -678,6 +730,8 @@ TEST(BackendTest, QuantGemmRejectsBadContract) {
   ASSERT_TRUE(q6k.has_value()) << tessera::ToString(q6k.error());
   auto iq4nl = backend->LoadKernel("gemm_iq4nl", {});
   ASSERT_TRUE(iq4nl.has_value()) << tessera::ToString(iq4nl.error());
+  auto q80 = backend->LoadKernel("gemm_q80", {});
+  ASSERT_TRUE(q80.has_value()) << tessera::ToString(q80.error());
   const std::vector<const tessera::Buffer*> two_buffers{nullptr, nullptr};
   const std::vector<const tessera::Buffer*> three_buffers{
       nullptr, nullptr, nullptr};
@@ -696,6 +750,9 @@ TEST(BackendTest, QuantGemmRejectsBadContract) {
   auto bad_iq = backend->LaunchKernel(**iq4nl, launch);
   ASSERT_FALSE(bad_iq.has_value());
   EXPECT_EQ(bad_iq.error(), StatusCode::InvalidArgument);
+  auto bad_q80 = backend->LaunchKernel(**q80, launch);
+  ASSERT_FALSE(bad_q80.has_value());
+  EXPECT_EQ(bad_q80.error(), StatusCode::InvalidArgument);
 }
 
 // Device: the fp GEMM contracts reject bad shapes.
@@ -792,6 +849,16 @@ TEST(BackendTest, QuantDequantsExact) {
                        std::span<float>(outs3));
   EXPECT_FLOAT_EQ(outs3[0], 1.0f);
   EXPECT_FLOAT_EQ(outs3[7], 1.0f);
+  // Q8_0: d=1, q[0]=-128, q[1]=127.
+  std::vector<std::byte> q8(34, std::byte{0});
+  q8[1] = std::byte{0x3C};
+  q8[2] = std::byte{0x80};
+  q8[3] = std::byte{0x7F};
+  std::vector<float> out8(32);
+  core::DequantizeQ80(std::span<const std::byte>(q8),
+                      std::span<float>(out8));
+  EXPECT_FLOAT_EQ(out8[0], -128.0f);
+  EXPECT_FLOAT_EQ(out8[1], 127.0f);
 }
 
 // Host: the K-quant and IQ GEMM references reject malformed shapes.
@@ -834,6 +901,12 @@ TEST(BackendTest, QuantGemmRefsRejectBadArgs) {
   bad = core::GemmIq3SRef(std::span<const float>(a),
                           std::span<const std::byte>(ws3),
                           std::span<float>(short_c), 2, 4, 256);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<std::byte> w80(4 * 34, std::byte{0});
+  bad = core::GemmQ80Ref(std::span<const float>(a32),
+                         std::span<const std::byte>(w80),
+                         std::span<float>(c), 2, 4, 100);
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
 }

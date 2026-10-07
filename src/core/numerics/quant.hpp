@@ -201,4 +201,8 @@ void DequantizeIQ4XS(std::span<const std::byte> block, std::span<float> out);
 // grid quants, signs, scales). Ports dequantize_row_iq3_s.
 void DequantizeIQ3S(std::span<const std::byte> block, std::span<float> out);
 
+// Dequantize one Q8_0 block (34 bytes) into 32 fp32 values (d fp16 plus
+// 32 signed bytes). The GGUF Q8_0 layout.
+void DequantizeQ80(std::span<const std::byte> block, std::span<float> out);
+
 }  // namespace tessera::core

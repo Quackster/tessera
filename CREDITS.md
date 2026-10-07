@@ -9,7 +9,8 @@ project, the version, the license, and where it is used.
   functions), the IQ4 codebook (kvalues_iq4nl), the IQ3_S grid
   (iq3s_grid), and the ggml type ids 20, 21, 23. Ported (not
   compiled) to src/core/numerics/quant.cpp, the vulkan .comp
-  kernels, and the rocm kernels in src/backends/rocm.
+  kernels, and the rocm kernels in src/backends/rocm. Q8_0 follows
+  the public GGUF block layout (fp16 scale plus 32 signed bytes).
 - llama.cpp src/models/qwen35.cpp (MIT License, same checkout):
   hybrid layer layout (recurrent gated-delta-net layers interleaved
   with full attention every full_attention_interval blocks, MTP

@@ -518,4 +518,13 @@ void QuantizeQ4K(std::span<const float> values, std::byte* block) {
   std::memcpy(block + 16, qs, sizeof(qs));
 }
 
+void DequantizeQ80(std::span<const std::byte> block, std::span<float> out) {
+  // d[0..1] fp16, then 32 signed bytes[2..33].
+  const float d = Fp16ToFloat(ReadU16(block, 0));
+  for (std::size_t j = 0; j < 32; ++j) {
+    const auto q = static_cast<std::int8_t>(ReadByte(block, 2 + j));
+    out[j] = d * static_cast<float>(q);
+  }
+}
+
 }  // namespace tessera::core

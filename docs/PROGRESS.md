@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 131/131 on both builds.
+`ctest` passes 132/132 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -29,12 +29,12 @@ through RADV GFX1201, rocm through the system ROCm).
   the hip runtime (rocm). The built-in "fill" kernel runs end to end
   and is verified by a read-back test on both devices.
 - Generic GEMM kernels with dequantization and fp32 accumulation.
-  Q4_K, Q3_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and IQ3_S are verified on both
-  devices against host references with per backend tolerance. Exact
-  codec unit tests cover the dequant math. FP8 (per-row scaled E4M3)
-  and MXFP4 (32-element E8M0 blocks) kernels are verified the same way.
-  The OCP E4M3 top bin needs care (only mantissa-all-ones is NaN,
-  max 448).
+  Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS and IQ3_S are verified
+  on both devices against host references with per backend tolerance.
+  Exact codec unit tests cover the dequant math. FP8 (per-row scaled
+  E4M3) and MXFP4 (32-element E8M0 blocks) kernels are verified the
+  same way. The OCP E4M3 top bin needs care (only mantissa-all-ones is
+  NaN, max 448).
 - Attention (GQA) and RoPE kernels driven by the model definition.
   `Model::Attention` reads heads, kv groups, head dim and the RoPE
   range and base from GGUF metadata. The generic "rope" and
@@ -196,23 +196,28 @@ through RADV GFX1201, rocm through the system ROCm).
   zero pad) and hybrid definitions require them. The 27B target
   reports [11, 11, 10] on both backends.
 - 2026-10-07: gated-attention split kernel (131/131 `ctest` on both
-  builds). Current head. Generic "qgate_split" (one thread per head
+  builds). Generic "qgate_split" (one thread per head
   element) splits the fused Q-plus-gate projection into queries and
   gates on vulkan (GLSL) and rocm (HIP). Layout taken from the public
   Qwen3-Next reference: q_proj output views as [heads, 2*head_dim] and
   chunks per head into query then gate; credited in CREDITS.md. Host
   reference next to the attention refs; contract in
   `include/tessera/backend.hpp`.
+- 2026-10-07: Q8_0 GEMM kernel (132/132 `ctest` on both builds).
+  Current head. Generic "gemm_q80" (34-byte blocks: fp16 scale plus 32
+  signed bytes) on vulkan (GLSL) and rocm (HIP), with a host dequant
+  and GEMM reference in the quant/gemm pair. The hybrid linear layers
+  use Q8_0 for their gate projections, so this closes the last missing
+  GEMM format before decode wiring.
 
 ## Next (in order)
 
 1. **Hybrid SSM decode** for the 27B target (arch `qwen35`):
-   definition, load, sections, and norm/gate/conv/scan/mrope/split
-   kernels are done (the file loads with 866 tensors on both
-   backends). Still missing: wiring the full-attention and recurrent
-   paths into the decode loop, the Q8_0 GEMM the linear layers use,
-   and MTP handling. `DecodeStep` rejects hybrid configs as
-   unsupported today.
+   definition, load, sections, and all projection/norm/gate/conv/scan/
+   mrope/split kernels are done (the file loads with 866 tensors on
+   both backends). Still missing: wiring the full-attention and
+   recurrent paths into the decode loop, and MTP handling. `DecodeStep`
+   rejects hybrid configs as unsupported today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.

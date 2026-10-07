@@ -91,8 +91,11 @@ __global__ void GemmIq4XsKernel(const float* a, const unsigned char* w,
                                 float* c, unsigned long long m,
                                 unsigned long long n, unsigned long long k);
 __global__ void GemmIq3SKernel(const float* a, const unsigned char* w,
-                                 float* c, unsigned long long m,
-                                 unsigned long long n, unsigned long long k);
+                                float* c, unsigned long long m,
+                                unsigned long long n, unsigned long long k);
+__global__ void GemmQ80Kernel(const float* a, const unsigned char* w,
+                              float* c, unsigned long long m,
+                              unsigned long long n, unsigned long long k);
 __global__ void RmsnormKernel(const float* x, const float* w, float* y,
                               unsigned long long rows, unsigned long long cols,
                               unsigned long long eps_bits);

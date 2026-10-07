@@ -208,4 +208,33 @@ __global__ void GemmQ3KKernel(const float* a, const unsigned char* w,
   }
   c[idx] = acc;
 }
+
+// Built-in "gemm_q80": buffer 0 is the activation A (fp32, m x k),
+// buffer 1 the quantized weights W (Q8_0, n x k), buffer 2 the output
+// C (fp32, m x n); scalars are m, n, k. A Q8_0 block is 34 bytes:
+// d fp16 then 32 signed bytes. One thread per output element.
+__global__ void GemmQ80Kernel(const float* a, const unsigned char* w,
+                              float* c, unsigned long long m,
+                              unsigned long long n, unsigned long long k) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  const unsigned long long blocks = k / 32;
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char* base = w + row_w * (blocks * 34) + b * 34;
+    const std::uint16_t half = static_cast<std::uint16_t>(
+        base[0] | (static_cast<std::uint16_t>(base[1]) << 8));
+    const float d = Fp16ToFloatDev(half);
+    for (unsigned long long l = 0; l < 32; ++l) {
+      const auto q = static_cast<std::int8_t>(base[2 + l]);
+      acc = fmaf(a[row_a * k + b * 32 + l], d * static_cast<float>(q), acc);
+    }
+  }
+  c[idx] = acc;
+}
 }  // namespace tessera::backends::rocm

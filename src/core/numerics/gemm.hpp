@@ -47,6 +47,9 @@ namespace tessera::core {
 [[nodiscard]] std::expected<void, StatusCode> GemmIq3SRef(
     std::span<const float> a, std::span<const std::byte> w,
     std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmQ80Ref(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
 
 // Host reference for the "gemm_fp8" built-in: C = A x (diag(s) x W)^T
 // with fp32 sequential accumulation (deterministic, the same order

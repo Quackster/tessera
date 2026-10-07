@@ -157,10 +157,10 @@ class Kernel {
 // scalars are m, n, k with k a positive multiple of 32. The dispatch
 // is ceil(m * n / 256) workgroups of 256.
 // "gemm_q5k", "gemm_q6k", "gemm_q3k", "gemm_iq4nl", "gemm_iq4xs",
-// "gemm_iq3s": buffer 0 is A (fp32, m x k), buffer 1 the quantized
-// weights W, buffer 2 the output C (fp32, m x n); scalars are m, n,
-// k with k a positive multiple of 256 (32 for iq4nl). The dispatch
-// is ceil(m * n / 256) workgroups of 256.
+// "gemm_iq3s", "gemm_q80": buffer 0 is A (fp32, m x k), buffer 1 the
+// quantized weights W, buffer 2 the output C (fp32, m x n); scalars
+// are m, n, k with k a positive multiple of 256 (32 for iq4nl and
+// q80). The dispatch is ceil(m * n / 256) workgroups of 256.
 // "rmsnorm": buffer 0 is X (fp32, rows x cols), buffer 1 the weight W
 // (fp32, cols), buffer 2 the output Y (fp32, rows x cols); scalars
 // are rows, cols, and the fp32 epsilon bits. Y = X / sqrt(mean(X^2) +
@@ -266,6 +266,16 @@ class Kernel {
     }
   }
   if (kernel.Id() == "gemm_iq4nl") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t k = launch.scalars[2];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || k == 0 ||
+        k % 32 != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "gemm_q80") {
     if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
       return StatusCode::InvalidArgument;
     }
