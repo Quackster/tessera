@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 190/190 on both builds.
+`ctest` passes 191/191 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -547,6 +547,18 @@ through RADV GFX1201, rocm through the system ROCm).
   stage (convolve with an externally computed delta) to
   dflash2_conv. Host reference and a device-vs-reference test.
 
+- 2026-10-07: DFlash2 attention layer half (191/191 `ctest` on both
+  builds). Current head. `src/spec/dflash2_attention.*` runs the
+  attention half of a draft layer: input_layernorm RMSNorm, the
+  attention_conv prepare (projection + side-0 grouped conv), QKV
+  projections, per-head QK-RMSNorm, RoPE, grouped-query sliding
+  attention, the output projection and the attention_conv finish
+  (side-1 conv reusing the prepare projection). Fixes latent
+  single-row assumptions: `RopeDevice` and `AttentionDevice` took a
+  row count (the decode path passes 1) so multi-token blocks rotate
+  and attend every row. Host reference and a device-vs-reference
+  test.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
@@ -587,6 +599,11 @@ through RADV GFX1201, rocm through the system ROCm).
    pipeline parallelism). Both need several `Backend` instances, weight
    sharding in the loaders, and cross-device collectives or peer copies.
    Not started.
+
+8. **Sampling parameters**: generation is greedy today. Add sampling with
+   the Qwen 3.8 27B defaults: temperature 0.6, top_p 0.95, top_k 20,
+   min_p 0.0, presence_penalty 0.0 and repetition_penalty 1.0. Expose them
+   as generation options and CLI flags.
 
 ## Notes and decisions
 

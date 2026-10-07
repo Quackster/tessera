@@ -385,13 +385,13 @@ inline std::expected<void, StatusCode> AttentionDevice(
     Backend& backend, const Kernel& kernel, const Buffer& q, const Buffer& k,
     const Buffer& v, Buffer& out, std::size_t n, std::size_t heads,
     std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base,
-    std::uint64_t window = 0) {
+    std::uint64_t window = 0, std::size_t rows = 1) {
   KernelLaunch launch;
-  launch.grid_x =
-      static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
+  launch.grid_x = static_cast<std::uint32_t>(
+      (rows * heads * head_dim + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&q, &k, &v, &out};
-  launch.scalars = {1, n, heads, kv_heads, head_dim, q_base, window};
+  launch.scalars = {rows, n, heads, kv_heads, head_dim, q_base, window};
   return backend.LaunchKernel(kernel, launch);
 }
 
@@ -399,16 +399,16 @@ inline std::expected<void, StatusCode> AttentionDevice(
 inline std::expected<void, StatusCode> RopeDevice(
     Backend& backend, const Kernel& kernel, Buffer& io, std::size_t heads,
     std::size_t head_dim, std::size_t rope_dim, std::uint64_t pos_base,
-    double theta) {
+    double theta, std::size_t rows = 1) {
   const float theta_f = static_cast<float>(theta);
   std::uint32_t bits = 0;
   std::memcpy(&bits, &theta_f, sizeof(bits));
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>(
-      (heads * (rope_dim / 2) + 255) / 256);
+      (rows * heads * (rope_dim / 2) + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&io};
-  launch.scalars = {1, heads, head_dim, rope_dim, pos_base, bits};
+  launch.scalars = {rows, heads, head_dim, rope_dim, pos_base, bits};
   return backend.LaunchKernel(kernel, launch);
 }
 
