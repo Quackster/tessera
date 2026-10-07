@@ -527,3 +527,33 @@ TEST(HybridDecodeTest, MtpDraftWhenModelProvided) {
   ASSERT_TRUE(draft2.has_value()) << tessera::ToString(draft2.error());
   EXPECT_EQ(*draft2, *draft);
 }
+
+// The forward can copy the residual-stream hidden after selected layers
+// (the DFlash2 target hidden states). On the one-layer gated fixture the
+// captured layer-0 hidden equals the final hidden.
+TEST(HybridDecodeTest, ForwardCapturesLayerHidden) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value()) << tessera::ToString(cfg.error());
+  const std::size_t hidden = cfg->hidden_dim;
+  auto buffer = engine->Owner().AllocateBuffer(hidden * 4,
+                                               tessera::MemoryKind::Device);
+  ASSERT_TRUE(buffer.has_value());
+  std::vector<std::size_t> layers = {0};
+  std::vector<tessera::Buffer*> captures = {buffer->get()};
+  std::vector<float> hidden_out;
+  tessera::core::DecodeCache cache;
+  auto forward = tessera::core::HybridForward(
+      engine->Owner(), **model, cache, 0, &hidden_out, &layers, &captures);
+  ASSERT_TRUE(forward.has_value()) << tessera::ToString(forward.error());
+  engine->Owner().Synchronize();
+  std::vector<float> captured(hidden);
+  engine->Owner().CopyD2H(**buffer,
+                          reinterpret_cast<std::byte*>(captured.data()),
+                          captured.size() * 4);
+  EXPECT_EQ(captured, hidden_out);
+}

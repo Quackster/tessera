@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 204/204 on both builds.
+`ctest` passes 205/205 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -656,6 +656,13 @@ through RADV GFX1201, rocm through the system ROCm).
   kernels and runs one draft block (fc fusion, mask-query stack with
   context, final norm, head projection). The real Qwen3.8-27B DFlash2
   draft loads and produces finite logits on the device.
+
+- 2026-10-07: target hidden capture (205/205 `ctest` on both builds).
+  Current head. `HybridForward` takes an optional layer list and
+  capture buffers: after each listed layer it copies the
+  residual-stream hidden on the device. This is how the DFlash2 draft
+  gets the target hidden at `target_layer_ids`. On the one-layer
+  fixture the captured layer-0 hidden equals the final hidden.
 
 ## Next (in order)
 

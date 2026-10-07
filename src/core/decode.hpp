@@ -169,7 +169,9 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
 // the last, which is all that needs logits.
 [[nodiscard]] std::expected<void, StatusCode> HybridForward(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr,
+    const std::vector<std::size_t>* capture_layers = nullptr,
+    std::vector<Buffer*>* capture = nullptr);
 
 // The block forward of one device-resident vanilla step without the head.
 [[nodiscard]] std::expected<void, StatusCode> DecodeStepDeviceForward(

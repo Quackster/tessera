@@ -240,7 +240,8 @@ std::expected<void, StatusCode> RunFullBlock(
 
 std::expected<void, StatusCode> HybridForward(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out) {
+    std::uint32_t token, std::vector<float>* hidden_out,
+    const std::vector<std::size_t>* capture_layers, std::vector<Buffer*>* capture) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -319,11 +320,29 @@ std::expected<void, StatusCode> HybridForward(
                                    sizeof(triples)))) {
     return std::unexpected(StatusCode::DeviceError);
   }
+  // Optionally copy the residual-stream hidden after selected layers, for
+  // the DFlash2 draft's target hidden states.
+  const auto capture_layer = [&](std::size_t layer) -> StatusCode {
+    if (capture_layers == nullptr || capture == nullptr) {
+      return StatusCode::Ok;
+    }
+    for (std::size_t i = 0; i < capture_layers->size(); ++i) {
+      if ((*capture_layers)[i] == layer) {
+        if (!backend.CopyD2D(*h.x, 0, *(*capture)[i], 0, hidden * 4)) {
+          return StatusCode::DeviceError;
+        }
+      }
+    }
+    return StatusCode::Ok;
+  };
   for (std::size_t l = 0; l < cfg.layers; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
       if (auto block = RunFullBlock(backend, model, cfg, h, l, p, h.full[l]);
           !block) {
         return std::unexpected(block.error());
+      }
+      if (capture_layer(l) != StatusCode::Ok) {
+        return std::unexpected(StatusCode::DeviceError);
       }
       continue;
     }
@@ -439,6 +458,9 @@ std::expected<void, StatusCode> HybridForward(
     }
     if (auto ffn = RunFfn(backend, model, cfg, h, l); !ffn) {
       return std::unexpected(ffn.error());
+    }
+    if (capture_layer(l) != StatusCode::Ok) {
+      return std::unexpected(StatusCode::DeviceError);
     }
   }
   if (hidden_out != nullptr) {
