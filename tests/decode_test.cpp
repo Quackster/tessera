@@ -708,3 +708,28 @@ TEST(HybridDecodeTest, FeedEmbeddingMatchesToken) {
   ASSERT_TRUE(logits_b.has_value()) << tessera::ToString(logits_b.error());
   EXPECT_EQ(*logits_a, *logits_b);
 }
+
+// Multimodal generation feeds image embeddings at the placeholder tokens and
+// is deterministic.
+TEST(HybridDecodeTest, MultimodalGenerate) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value()) << tessera::ToString(cfg.error());
+  const std::size_t hidden = cfg->hidden_dim;
+  std::mt19937 rng(120);
+  std::vector<float> embeddings(2 * hidden);
+  for (auto& v : embeddings) v = tessera::testing::DrawValue(rng) * 0.1f;
+  tessera::GenerateOptions options;
+  options.max_tokens = 4;
+  options.prompt_tokens = {0, 0, 5, 7};
+  auto first = engine->GenerateMultimodal(**model, options, embeddings, 2, 0);
+  ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
+  EXPECT_EQ(first->size(), 4u);
+  auto again = engine->GenerateMultimodal(**model, options, embeddings, 2, 0);
+  ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
+  EXPECT_EQ(*first, *again);
+}

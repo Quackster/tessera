@@ -5,6 +5,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -103,6 +104,15 @@ class Engine {
   // UnsupportedFeature when the model has no MTP block.
   [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraft(
       Model& model, std::uint32_t token);
+
+  // Generation with image input. The prompt may contain `image_token_id`
+  // placeholders; the first `image_tokens` of them consume consecutive rows
+  // of `image_embeddings` (image_tokens x hidden, row-major) instead of the
+  // token embedding during prefill. The rest of generation is as Generate.
+  [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
+  GenerateMultimodal(Model& model, const GenerateOptions& options,
+                     std::span<const float> image_embeddings,
+                     std::size_t image_tokens, std::uint32_t image_token_id);
 
   // Greedy generation with the DFlash2 draft checkpoint at `draft_path`.
   // The output equals plain greedy decoding. UnsupportedFeature when the

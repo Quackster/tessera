@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 228/228 on both builds.
+`ctest` passes 229/229 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -797,6 +797,14 @@ through RADV GFX1201, rocm through the system ROCm).
   (`ResizeBilinear`). Host tests cover a tiny PPM and resize. This is
   the image input step before the vision encoder.
 
+- 2026-10-07: multimodal generation (229/229 `ctest` on both builds).
+  Current head. `Engine::GenerateMultimodal` feeds image embeddings at
+  the `image_token_id` placeholder positions during prefill (the first
+  `image_tokens` placeholders consume consecutive embedding rows) and
+  then generates. Test: deterministic on the gated fixture. The
+  vision encoder + image loader + injection now connect end to end at
+  the engine level.
+
 ## Next (in order)
 
 1. **Speculative decoding performance**: MTP speculation runs end to
@@ -826,10 +834,10 @@ through RADV GFX1201, rocm through the system ROCm).
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-6. **Multimodal (mmproj)**: the vision config loads from the mmproj
-   GGUF. Still to do: the CLIP encoder + merger forward, image
-   preprocessing, and prepending the image embeddings to the prompt. The
-   mmproj file is loaded from the model directory.
+6. **Multimodal (mmproj)**: config, weights, encoder+merger, image
+   load/resize, and image-embedding injection into generation are done
+   (`Engine::GenerateMultimodal`). Still to do: the CLI wiring, deepstack
+   feature injection, and the image placeholder tokenizer mapping.
 
 7. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism

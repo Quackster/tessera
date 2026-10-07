@@ -62,6 +62,90 @@ std::expected<std::unique_ptr<Model>, StatusCode> Engine::LoadModel(
   return model;
 }
 
+std::expected<std::vector<std::uint32_t>, StatusCode>
+Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
+                           std::span<const float> image_embeddings,
+                           std::size_t image_tokens,
+                           std::uint32_t image_token_id) {
+  if (options.max_tokens == 0) {
+    return std::vector<std::uint32_t>{};
+  }
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  if (image_embeddings.size() != image_tokens * config->hidden_dim) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  core::DecodeCache cache;
+  cache.kv_type = options.kv_type;
+  std::vector<std::uint32_t> prompt = options.prompt_tokens;
+  if (prompt.empty()) {
+    prompt.push_back(options.first_token);
+  }
+  auto embedding_buffer =
+      backend_->AllocateBuffer(config->hidden_dim * 4, MemoryKind::Device);
+  if (!embedding_buffer) {
+    return std::unexpected(StatusCode::OutOfMemory);
+  }
+  std::size_t used_images = 0;
+  std::vector<float> current;
+  for (std::size_t i = 0; i < prompt.size(); ++i) {
+    const Buffer* embedding = nullptr;
+    if (prompt[i] == image_token_id && used_images < image_tokens) {
+      const std::span<const float> row =
+          image_embeddings.subspan(used_images * config->hidden_dim,
+                                   config->hidden_dim);
+      if (!backend_->CopyH2D(**embedding_buffer,
+                             std::span<const std::byte>(
+                                 reinterpret_cast<const std::byte*>(row.data()),
+                                 row.size() * 4))) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      embedding = embedding_buffer->get();
+      ++used_images;
+    }
+    if (i + 1 == prompt.size()) {
+      auto logits =
+          core::DecodeLogits(*backend_, model, cache, prompt[i], nullptr,
+                             nullptr, nullptr, embedding);
+      if (!logits) {
+        return std::unexpected(logits.error());
+      }
+      current = std::move(*logits);
+    } else {
+      auto forward = core::DecodeForward(*backend_, model, cache, prompt[i],
+                                         nullptr, embedding);
+      if (!forward) {
+        return std::unexpected(forward.error());
+      }
+    }
+  }
+  std::vector<std::uint32_t> produced;
+  produced.reserve(options.max_tokens);
+  std::mt19937_64 rng(options.seed);
+  std::vector<std::uint32_t> history = prompt;
+  const auto pick = [&](std::span<const float> logits) {
+    return options.sample
+               ? core::SampleToken(logits, options.sampling, history, rng)
+               : core::detail::ArgMax(logits);
+  };
+  std::uint32_t next = pick(current);
+  while (produced.size() < options.max_tokens) {
+    produced.push_back(next);
+    if (produced.size() >= options.max_tokens) {
+      break;
+    }
+    history.push_back(next);
+    auto logits = core::DecodeLogits(*backend_, model, cache, next);
+    if (!logits) {
+      return std::unexpected(logits.error());
+    }
+    next = pick(*logits);
+  }
+  return produced;
+}
+
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::GenerateDraft(
     Model& model, const GenerateOptions& options,
     const std::string& draft_path) {
