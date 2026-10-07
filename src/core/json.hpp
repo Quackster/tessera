@@ -11,7 +11,7 @@
 // nesting depth and value sizes are capped so a malformed body cannot
 // exhaust memory. Not a general JSON library.
 
-namespace tessera::serve {
+namespace tessera::core {
 
 class Json {
  public:
@@ -58,4 +58,4 @@ class Json {
   std::map<std::string, Json> object_;
 };
 
-}  // namespace tessera::serve
+}  // namespace tessera::core

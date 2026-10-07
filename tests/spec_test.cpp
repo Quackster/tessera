@@ -1,9 +1,15 @@
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+
 #include "test_helpers.hpp"
+#include "spec/dflash2_config.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
 
+using tessera::spec::DFlash2Config;
+using tessera::spec::LoadDFlash2Config;
+using tessera::spec::ParseDFlash2Config;
 using tessera::CreateDFlash2Strategy;
 using tessera::StrategyOptions;
 using tessera::StatusCode;
@@ -70,4 +76,122 @@ TEST(SpecTest, AttachValidIsIdempotent) {
   ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
   auto second = strategy->Attach(StrategyOptions{dir.string(), 4});
   ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
+}
+
+namespace {
+
+// A minimal but complete DFlash2 draft config: hidden 5120, 5 layers of 32
+// heads over 8 kv heads of dim 128, conv group 16, 2 taps, selector top-4.
+constexpr const char* kDraftConfig = R"({
+  "hidden_size": 5120,
+  "num_hidden_layers": 5,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 17408,
+  "vocab_size": 248320,
+  "rms_norm_eps": 1e-06,
+  "sliding_window": 2048,
+  "rope_parameters": {"rope_theta": 10000000.0},
+  "layer_types": ["sliding_attention", "sliding_attention",
+                   "sliding_attention", "sliding_attention",
+                   "sliding_attention"],
+  "dflash_config": {
+    "block_size": 8,
+    "conv_group_size": 16,
+    "conv_kernel_size": 2,
+    "mask_token_id": 248070,
+    "selector_rank": 256,
+    "selector_top_k": 4,
+    "target_layer_ids": [5, 19, 33, 47, 61]
+  }
+})";
+
+}  // namespace
+
+TEST(SpecConfigTest, ParsesValidConfig) {
+  auto config = ParseDFlash2Config(kDraftConfig);
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_EQ(config->hidden_size, 5120u);
+  EXPECT_EQ(config->num_layers, 5u);
+  EXPECT_EQ(config->num_heads, 32u);
+  EXPECT_EQ(config->num_kv_heads, 8u);
+  EXPECT_EQ(config->head_dim, 128u);
+  EXPECT_EQ(config->vocab_size, 248320u);
+  EXPECT_EQ(config->sliding_window, 2048u);
+  EXPECT_EQ(config->block_size, 8u);
+  EXPECT_EQ(config->conv_group_size, 16u);
+  EXPECT_EQ(config->conv_kernel_size, 2u);
+  EXPECT_EQ(config->mask_token_id, 248070u);
+  EXPECT_EQ(config->selector_rank, 256u);
+  EXPECT_EQ(config->selector_top_k, 4u);
+  EXPECT_EQ(config->target_layer_ids, (std::vector<std::uint32_t>{5, 19, 33, 47, 61}));
+  EXPECT_EQ(config->layer_types.size(), 5u);
+  EXPECT_DOUBLE_EQ(config->rope_theta, 10000000.0);
+}
+
+TEST(SpecConfigTest, RejectsMalformedConfigs) {
+  // Missing a required top-level field.
+  auto missing = ParseDFlash2Config(R"({"num_hidden_layers": 5})");
+  ASSERT_FALSE(missing.has_value());
+  EXPECT_EQ(missing.error(), StatusCode::MalformedFile);
+
+  // Zero hidden size.
+  auto zero = ParseDFlash2Config(R"({
+    "hidden_size": 0, "num_hidden_layers": 5, "num_attention_heads": 32,
+    "num_key_value_heads": 8, "head_dim": 128, "intermediate_size": 17408,
+    "vocab_size": 248320, "rms_norm_eps": 1e-06, "sliding_window": 2048,
+    "rope_parameters": {"rope_theta": 1e7},
+    "layer_types": ["a", "a", "a", "a", "a"],
+    "dflash_config": {"block_size": 8, "conv_group_size": 16,
+      "conv_kernel_size": 2, "mask_token_id": 1, "selector_rank": 256,
+      "selector_top_k": 4, "target_layer_ids": [5]}})");
+  ASSERT_FALSE(zero.has_value());
+  EXPECT_EQ(zero.error(), StatusCode::MalformedFile);
+
+  // conv_group_size does not divide hidden_size.
+  std::string not_divisible = kDraftConfig;
+  not_divisible.replace(not_divisible.find("\"conv_group_size\": 16"),
+                        std::string("\"conv_group_size\": 16").size(),
+                        "\"conv_group_size\": 17");
+  auto bad_group = ParseDFlash2Config(not_divisible);
+  ASSERT_FALSE(bad_group.has_value());
+  EXPECT_EQ(bad_group.error(), StatusCode::MalformedFile);
+
+  // layer_types length does not match num_hidden_layers.
+  std::string bad_layers = kDraftConfig;
+  bad_layers.replace(bad_layers.find("\"num_hidden_layers\": 5"),
+                     std::string("\"num_hidden_layers\": 5").size(),
+                     "\"num_hidden_layers\": 4");
+  auto layers = ParseDFlash2Config(bad_layers);
+  ASSERT_FALSE(layers.has_value());
+  EXPECT_EQ(layers.error(), StatusCode::MalformedFile);
+
+  // A non-numeric target layer id.
+  std::string bad_ids = kDraftConfig;
+  bad_ids.replace(bad_ids.find("[5, 19, 33, 47, 61]"),
+                  std::string("[5, 19, 33, 47, 61]").size(),
+                  "[5, \"x\"]");
+  auto ids = ParseDFlash2Config(bad_ids);
+  ASSERT_FALSE(ids.has_value());
+  EXPECT_EQ(ids.error(), StatusCode::MalformedFile);
+}
+
+// The real DFlash2 draft config parses when the directory is provided
+// (set TESSERA_TEST_DFLASH2_DIR).
+TEST(SpecConfigTest, LoadsRealConfigWhenProvided) {
+  const char* dir = std::getenv("TESSERA_TEST_DFLASH2_DIR");
+  if (dir == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_DFLASH2_DIR not set";
+  }
+  auto config = LoadDFlash2Config(dir);
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_EQ(config->num_layers, 5u);
+  EXPECT_EQ(config->hidden_size, 5120u);
+  EXPECT_EQ(config->conv_group_size, 16u);
+  EXPECT_EQ(config->conv_kernel_size, 2u);
+  EXPECT_EQ(config->selector_rank, 256u);
+  EXPECT_EQ(config->selector_top_k, 16u);
+  EXPECT_EQ(config->target_layer_ids.size(), 5u);
+  EXPECT_EQ(config->layer_types.size(), 5u);
 }

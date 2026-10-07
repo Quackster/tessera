@@ -9,10 +9,10 @@
 #include <thread>
 
 #include "serve/http.hpp"
-#include "serve/json.hpp"
+#include "core/json.hpp"
 
 using tessera::serve::HttpRequest;
-using tessera::serve::Json;
+using tessera::core::Json;
 using tessera::serve::ResponseWriter;
 using tessera::serve::RunHttpServer;
 

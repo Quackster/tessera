@@ -23,19 +23,20 @@ add_library(tessera STATIC
     src/core/buffer.cpp
     src/core/loaders/gguf.cpp
     src/core/loaders/safetensors.cpp
+    src/core/json.cpp
     src/core/numerics/quant.cpp
     src/core/numerics/gemm.cpp
     src/core/numerics/attention.cpp
     src/core/numerics/norm.cpp
     src/core/numerics/conv.cpp
     src/core/numerics/selector.cpp
-    src/serve/json.cpp
     src/serve/http.cpp
     src/serve/server.cpp
     src/serve/jinja/value.cpp
     src/serve/jinja/jinja_parse.cpp
     src/serve/jinja/jinja_eval.cpp
     src/spec/dflash2.cpp
+    src/spec/dflash2_config.cpp
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
 target_compile_options(tessera PRIVATE -Wall -Wextra)

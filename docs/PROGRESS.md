@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 185/185 on both builds.
+`ctest` passes 188/188 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -518,6 +518,17 @@ through RADV GFX1201, rocm through the system ROCm).
   (HIP) with a host reference and a device-vs-reference test. Together
   with gemm_f32 and gemm_bf16 this covers every DFlash2 draft weight
   dtype.
+
+- 2026-10-07: DFlash2 draft config parsing (188/188 `ctest` on both
+  builds). Current head. The bounded JSON DOM moves from `src/serve`
+  to `src/core/json.*` (namespace `tessera::core`), so core can parse
+  model configs without depending on the serving layer. New
+  `src/spec/dflash2_config.*` parses the draft `config.json`: the
+  transformer geometry, `rope_theta`, and the `dflash_config` block
+  (block size, conv group/taps, mask token id, selector rank/top-K,
+  target layer ids, layer types), with validation. Tests cover a
+  valid config, malformed fields, and the real Qwen3.8-27B DFlash2
+  checkpoint (env-gated).
 
 ## Next (in order)
 

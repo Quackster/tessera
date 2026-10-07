@@ -7,14 +7,14 @@
 
 #include "serve/http.hpp"
 #include "serve/jinja/jinja.hpp"
-#include "serve/json.hpp"
+#include "core/json.hpp"
 
 namespace tessera {
 
 namespace {
 
 using serve::HttpRequest;
-using serve::Json;
+using core::Json;
 using serve::ResponseWriter;
 namespace jinja = tessera::serve::jinja;
 

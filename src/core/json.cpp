@@ -1,11 +1,11 @@
-#include "serve/json.hpp"
+#include "core/json.hpp"
 
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <string>
 
-namespace tessera::serve {
+namespace tessera::core {
 
 namespace {
 
@@ -404,4 +404,4 @@ std::unique_ptr<Json> Json::Parse(std::string_view text) {
   return value;
 }
 
-}  // namespace tessera::serve
+}  // namespace tessera::core
