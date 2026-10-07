@@ -23,6 +23,7 @@
 #include "spec/dflash2_fuse.hpp"
 #include "spec/dflash2_context.hpp"
 #include "spec/dflash2_block.hpp"
+#include "spec/dflash2_candidates.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -4523,4 +4524,31 @@ TEST(BackendTest, DequantizeBf16AndFp8Block) {
       EXPECT_FLOAT_EQ(fp8_out[r * kCols + c], expected);
     }
   }
+}
+
+// Host: the DFlash2 candidate extraction returns the top-K logits per row
+// in descending order.
+TEST(BackendTest, DraftCandidatesTopK) {
+  constexpr std::size_t kRows = 2, kVocab = 5, kTopK = 3;
+  const std::vector<float> logits = {0.1f, 0.9f, 0.4f, 0.7f, 0.2f,
+                                     0.8f, 0.3f, 0.6f, 0.5f, 0.0f};
+  std::vector<std::uint32_t> ids(kRows * kTopK);
+  std::vector<float> unary(kRows * kTopK);
+  ASSERT_TRUE(tessera::spec::DraftCandidates(
+                  std::span<const float>(logits), std::span<std::uint32_t>(ids),
+                  std::span<float>(unary), kRows, kVocab, kTopK)
+                  .has_value());
+  EXPECT_EQ(ids[0], 1u);
+  EXPECT_EQ(ids[1], 3u);
+  EXPECT_EQ(ids[2], 2u);
+  for (std::size_t i = 0; i < kTopK; ++i) {
+    EXPECT_FLOAT_EQ(unary[i], logits[ids[i]]);
+  }
+  EXPECT_FLOAT_EQ(unary[3], 0.8f);
+  EXPECT_EQ(ids[3], 0u);
+  auto bad = tessera::spec::DraftCandidates(
+      std::span<const float>(logits), std::span<std::uint32_t>(ids),
+      std::span<float>(unary), kRows, kVocab, kVocab + 1);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), tessera::StatusCode::InvalidArgument);
 }
