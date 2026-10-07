@@ -40,6 +40,7 @@ add_library(tessera STATIC
     src/core/numerics/concat.cpp
     src/core/numerics/vision.cpp
     src/serve/http.cpp
+    src/serve/chat_prompt.cpp
     src/serve/server.cpp
     src/serve/jinja/value.cpp
     src/serve/jinja/jinja_parse.cpp

@@ -48,6 +48,7 @@ void PrintUsage() {
                "  --image-token <id> placeholder token id for image rows\n"
                "  --quiet           print only the generated tokens\n"
                "  --log-tokens      log the input and output text (tokenizer)\n"
+               "  --no-chat         do not apply the chat template\n"
                "  --sample          sample instead of greedy decode\n"
                "  --temperature <f> sampling temperature (default 0.6)\n"
                "  --top-p <f>       nucleus probability (default 0.95)\n"
@@ -99,6 +100,7 @@ int main(int argc, char** argv) {
   std::uint32_t image_token = 0;
   bool quiet = false;
   bool log_tokens = false;
+  bool no_chat = false;
   std::string host = "127.0.0.1";
   std::vector<std::string> api_keys;
   std::vector<std::string> allow_origins;
@@ -133,6 +135,8 @@ int main(int argc, char** argv) {
       quiet = true;
     } else if (arg == "--log-tokens") {
       log_tokens = true;
+    } else if (arg == "--no-chat") {
+      no_chat = true;
     } else if (arg == "--api-key" && i + 1 < argc) {
       api_keys.emplace_back(argv[++i]);
     } else if (arg == "--allow-origin" && i + 1 < argc) {
@@ -324,7 +328,20 @@ int main(int argc, char** argv) {
         log.Warn("cli", "this model has no tokenizer; use --prompt <id>");
         return kExitError;
       }
-      auto ids = tokenizer->Encode(prompt_text);
+      std::string text = prompt_text;
+      auto chat = no_chat
+                      ? std::expected<std::string, tessera::StatusCode>(
+                            std::unexpect, tessera::StatusCode::UnsupportedFeature)
+                      : loaded.ChatPrompt(prompt_text);
+      if (chat.has_value()) {
+        text = *chat;
+        if (!quiet) {
+          log.Info("cli", "applied the model chat template to the prompt");
+        }
+      } else if (!quiet) {
+        log.Info("cli", "no chat template; using the raw prompt text");
+      }
+      auto ids = tokenizer->Encode(text);
       if (!ids) {
         log.Warn("cli", std::string("prompt encode failed (") +
                             std::string(tessera::ToString(ids.error())) + ")");
@@ -414,7 +431,17 @@ int main(int argc, char** argv) {
           log.Info("cli", "input text: " + *input_text);
         }
         if (output_text) {
-          log.Info("cli", "output text: " + *output_text);
+          // Split the Qwen thinking block (if any) from the response.
+          const std::string close_marker = "</think>";
+          const std::size_t close = output_text->find(close_marker);
+          if (close == std::string::npos) {
+            log.Info("cli", "output text: " + *output_text);
+          } else {
+            log.Info("cli", "thinking: " +
+                                output_text->substr(0, close));
+            log.Info("cli", "response: " +
+                                output_text->substr(close + close_marker.size()));
+          }
         }
       }
     } else {

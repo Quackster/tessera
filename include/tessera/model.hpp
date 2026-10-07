@@ -146,6 +146,12 @@ class Model {
   // The model's chat template (GGUF tokenizer.chat_template); empty when
   // the file carries none.
   [[nodiscard]] std::string_view ChatTemplate() const;
+  // Render a single user message through the model's chat template with
+  // the generation prompt appended, so a tokenizer can produce the ids the
+  // model was trained on. UnsupportedFeature when the model has no chat
+  // template.
+  [[nodiscard]] std::expected<std::string, StatusCode> ChatPrompt(
+      std::string_view user_text, bool enable_thinking = false) const;
 
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,

@@ -94,3 +94,16 @@ TEST(TokenizerTest, RealTokenizerMatchesReference) {
     EXPECT_EQ(*back, c.text) << "text: " << c.text;
   }
 }
+
+// A control token (type 3) is matched literally in the input and emits its
+// id; the text around it is encoded normally.
+TEST(TokenizerTest, SpecialTokenMatched) {
+  Tokenizer tok({"<|im_start|>", "h", "i"}, {3, 1, 1}, {});
+  auto ids = tok.Encode("<|im_start|>hi");
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  const std::vector<std::uint32_t> want = {0, 1, 2};
+  EXPECT_EQ(*ids, want);
+  auto text = tok.Decode(*ids);
+  ASSERT_TRUE(text.has_value()) << tessera::ToString(text.error());
+  EXPECT_EQ(*text, "<|im_start|>hi");
+}

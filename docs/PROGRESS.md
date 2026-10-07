@@ -827,6 +827,25 @@ through RADV GFX1201, rocm through the system ROCm).
 
 ## Next (in order)
 
+0. **URGENT: fix the garbage decoding.** Greedy generation on the real
+   Qwen 3.8 27B GGUF is incoherent, so the model never answers. Examples
+   (greedy): `--prompt-text "The capital of France is"` (with the chat
+   template, `<think>` block) produced `c =,. on on ...`; a raw
+   `--no-chat "The quick brown fox jumps over the lazy"` produced
+   `.,.,...`. The tokenizer is correct: `"The capital of France is"`
+   encodes to `760 6511 314 9338 369`, the Qwen ids, and the chat
+   template renders correctly (`<|im_start|>user...<|im_end|>
+   <|im_start|>assistant`). The fused Q+gate split matches the vLLM
+   reference `qwen3_next.py` (`qkv.split([q_size*2, kv_size, kv_size])`,
+   `q_gate.view(heads, -1)`, `chunk(2)` -> per head `[q, gate]`), so the
+   split is not it. Next: isolate the first wrong layer. The target blocks
+   are 3 linear (gated delta) then 1 full attention
+   (`full_attention_interval` 4); compare a full-attention-only and a
+   linear-only forward against a reference at real dimensions; suspect the
+   linear-attention block (conv1d history, gated-delta scan, or the SSM
+   gates) or the full-attention QK-norm/mRoPE. The existing tiny fixtures
+   only pin determinism, not correctness.
+
 1. **Speculative decoding performance**: MTP speculation runs end to
    end (`Engine::GenerateSpeculative`, CLI `--speculate`) and is output
    preserving, but scores one token per target forward. Next: batch the

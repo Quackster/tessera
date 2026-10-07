@@ -19,12 +19,13 @@ namespace tessera {
 // rank order. The Qwen pre-tokenization split is applied before merges.
 //
 // Preconditions: `vocab` is non-empty and `merges` holds "left right"
-// pairs of byte-level tokens. Text must be UTF-8. Control/special
-// tokens are not matched inside the input; Encode treats them as
-// ordinary text. The split classifies bytes (bytes >= 0x80 count as
-// letters) and does not apply NFC normalization; this matches the
-// reference for ASCII, Latin and CJK text but not for combining marks
-// or emoji.
+// pairs of byte-level tokens. Text must be UTF-8. Control (type 3) and
+// user-defined (type 4) tokens are special: Encode matches their literal
+// strings in the input and emits their id (longest match first),
+// encoding the text between them with byte-level BPE. The split
+// classifies bytes (bytes >= 0x80 count as letters) and does not apply
+// NFC normalization; this matches the reference for ASCII, Latin and CJK
+// text but not for combining marks or emoji.
 //
 // Usage:
 //   Tokenizer tok(vocab, types, merges);
@@ -53,6 +54,8 @@ class Tokenizer {
   std::vector<std::string> vocab_;
   std::vector<std::int32_t> token_types_;
   std::unordered_map<std::string, std::uint32_t> token_to_id_;
+  // Special tokens (control/user-defined), longest first.
+  std::vector<std::pair<std::string, std::uint32_t>> special_;
   // Merge rank keyed by "left\x01right".
   std::unordered_map<std::string, std::int32_t> merge_rank_;
 };

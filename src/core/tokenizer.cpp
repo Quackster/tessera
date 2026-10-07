@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cctype>
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -244,6 +245,17 @@ Tokenizer::Tokenizer(std::vector<std::string> vocab,
   for (std::size_t id = 0; id < vocab_.size(); ++id) {
     token_to_id_.emplace(vocab_[id], static_cast<std::uint32_t>(id));
   }
+  for (std::size_t id = 0; id < vocab_.size() && id < token_types_.size();
+       ++id) {
+    // GGUF token types: 3 = control, 4 = user-defined; both are special.
+    if (token_types_[id] == 3 || token_types_[id] == 4) {
+      special_.emplace_back(vocab_[id], static_cast<std::uint32_t>(id));
+    }
+  }
+  std::sort(special_.begin(), special_.end(),
+            [](const auto& a, const auto& b) {
+              return a.first.size() > b.first.size();
+            });
   std::int32_t rank = 0;
   for (const std::string& merge : merges) {
     const std::size_t space = merge.find(' ');
@@ -266,6 +278,20 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Tokenizer::Encode(
   std::vector<std::uint32_t> ids;
   std::size_t i = 0;
   while (i < text.size()) {
+    // Match a special token literally (longest first) before BPE.
+    bool matched = false;
+    for (const auto& [token, id] : special_) {
+      if (text.size() - i >= token.size() &&
+          text.compare(i, token.size(), token) == 0) {
+        ids.push_back(id);
+        i += token.size();
+        matched = true;
+        break;
+      }
+    }
+    if (matched) {
+      continue;
+    }
     const std::size_t len = PreTokenLength(text, i);
     std::vector<std::string> symbols;
     symbols.reserve(len);
