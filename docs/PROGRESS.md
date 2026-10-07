@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 160/160 on both builds.
+`ctest` passes 161/161 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -61,6 +61,8 @@ through RADV GFX1201, rocm through the system ROCm).
   query then gate per head; the split yields the queries and the gates
   for the sigmoid output gate. Verified against the host reference on
   both devices.
+- Device-to-device launch helpers (`ProjectDevice`, `RmsNormDevice`,
+  `AddDevice`, `SiluMulDevice`): chain kernels without host copies.
 - Generic elementwise `add` (residual) and `silu_mul` (gated MLP)
   kernels with host references; the first building blocks for a
   device-resident decode loop.
@@ -325,6 +327,12 @@ through RADV GFX1201, rocm through the system ROCm).
   references in src/core/numerics/norm.*, contracts and
   device-vs-reference tests. First step toward a device-resident
   decode loop (the current loop is host-orchestrated and slow).
+
+- 2026-10-07: device-to-device launch helpers (161/161 `ctest` on
+  both builds). Current head. `src/core/decode_internal.hpp` gains
+  ProjectDevice/RmsNormDevice/AddDevice/SiluMulDevice so a block
+  forward can keep activations on the device; a chained
+  gemm_q4k -> rmsnorm -> add device test matches the host refs.
 
 ## Next (in order)
 

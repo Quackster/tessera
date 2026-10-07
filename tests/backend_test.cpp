@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "core/decode_internal.hpp"
 #include "core/numerics/attention.hpp"
 #include "core/numerics/conv.hpp"
 #include "core/numerics/gemm.hpp"
@@ -2570,5 +2571,79 @@ TEST(BackendTest, SiluMulDeviceMatchesRef) {
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   for (std::size_t i = 0; i < kN; ++i) {
     EXPECT_NEAR(got[i], ref[i], tol.abs);
+  }
+}
+
+// Device: chained device-to-device kernels (gemm_q4k -> rmsnorm -> add)
+// with no host round-trips match the host references.
+TEST(BackendTest, DeviceChainMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(80);
+  constexpr std::size_t kM = 1;
+  constexpr std::size_t kN = 64;
+  constexpr std::size_t kK = 256;
+  constexpr float kEps = 1e-5f;
+  std::vector<float> a(kM * kK);
+  std::vector<float> w_raw(kN * kK);
+  std::vector<float> norm_w(kN, 1.0f);
+  std::vector<float> bias(kN);
+  for (auto& v : a) v = DrawValue(rng);
+  for (auto& v : w_raw) v = DrawValue(rng);
+  for (auto& v : bias) v = DrawValue(rng);
+  std::vector<std::byte> w = QuantizeRows(w_raw, kN, kK);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  auto nw_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto y_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto b_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto z_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && w_buf && c_buf && nw_buf && y_buf && b_buf && z_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(a_buf, a).has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(w))
+                  .has_value());
+  ASSERT_TRUE(upload(nw_buf, norm_w).has_value());
+  ASSERT_TRUE(upload(b_buf, bias).has_value());
+  auto gemm = backend->LoadKernel("gemm_q4k", {});
+  auto rmsnorm = backend->LoadKernel("rmsnorm", {});
+  auto add = backend->LoadKernel("add", {});
+  ASSERT_TRUE(gemm && rmsnorm && add);
+  ASSERT_TRUE(core::detail::ProjectDevice(*backend, **gemm, **a_buf, **w_buf,
+                                          **c_buf, kM, kN, kK)
+                  .has_value());
+  ASSERT_TRUE(core::detail::RmsNormDevice(*backend, **rmsnorm, **c_buf,
+                                          **nw_buf, **y_buf, kM, kN, kEps)
+                  .has_value());
+  ASSERT_TRUE(core::detail::AddDevice(*backend, **add, **y_buf, **b_buf,
+                                      **z_buf, kN)
+                  .has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**z_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> c_ref(kM * kN);
+  ASSERT_TRUE(core::GemmQ4KRef(std::span<const float>(a),
+                               std::span<const std::byte>(w),
+                               std::span<float>(c_ref), kM, kN, kK)
+                  .has_value());
+  std::vector<float> y_ref(kN);
+  ASSERT_TRUE(core::RmsNormRef(std::span<const float>(c_ref),
+                               std::span<const float>(norm_w),
+                               std::span<float>(y_ref), kM, kN, kEps)
+                  .has_value());
+  std::vector<float> z_ref(kN);
+  ASSERT_TRUE(core::AddRef(std::span<const float>(y_ref),
+                           std::span<const float>(bias),
+                           std::span<float>(z_ref), kN)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const GemmTolerance tol = ToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < kN; ++i) {
+    EXPECT_NEAR(got[i], z_ref[i], tol.abs);
   }
 }

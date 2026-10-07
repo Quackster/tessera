@@ -152,8 +152,7 @@ inline std::expected<void, StatusCode> GatherEmbedding(
 
 // y = A(1 x k) times dequant(W) on the device; `weights` is n x k in
 // the format the loaded `gemm` kernel expects.
-inline std::expected<std::vector<float>, StatusCode> Project(
-    Backend& backend, const Kernel& gemm, const std::vector<float>& x,
+inline std::expected<std::vector<float>, StatusCode> Project(    Backend& backend, const Kernel& gemm, const std::vector<float>& x,
     const Buffer& weights, std::size_t n) {
   const std::size_t k = x.size();
   auto x_buf = backend.AllocateBuffer(k * 4, MemoryKind::Device);
@@ -176,6 +175,65 @@ inline std::expected<std::vector<float>, StatusCode> Project(
   }
   backend.Synchronize();
   return DownloadF32(backend, **out_buf);
+}
+
+// Device-to-device launch helpers (no host copies): keep activations on
+// the device and chain kernels. The device-resident block forward uses
+// these instead of Project (which round-trips through the host).
+
+// C = A (m x k) times dequant(W) with A and C on the device; scalars
+// follow the shared (m, n, k) order.
+inline std::expected<void, StatusCode> ProjectDevice(
+    Backend& backend, const Kernel& gemm, const Buffer& a, const Buffer& w,
+    Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((m * n + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&a, &w, &c};
+  launch.scalars = {m, n, k};
+  return backend.LaunchKernel(gemm, launch);
+}
+
+// Y = rmsnorm(X, W) with X, W, Y on the device (rows x cols).
+inline std::expected<void, StatusCode> RmsNormDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& x, const Buffer& w,
+    Buffer& y, std::size_t rows, std::size_t cols, double eps) {
+  const float eps_f = static_cast<float>(eps);
+  std::uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(eps_f));
+  std::memcpy(&bits, &eps_f, sizeof(bits));
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&x, &w, &y};
+  launch.scalars = {rows, cols, bits};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// O = A + B (residual) on the device.
+inline std::expected<void, StatusCode> AddDevice(Backend& backend,
+                                                 const Kernel& kernel,
+                                                 const Buffer& a,
+                                                 const Buffer& b, Buffer& o,
+                                                 std::size_t n) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((n + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&a, &b, &o};
+  launch.scalars = {n};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// O = silu(G) * U (gated MLP) on the device.
+inline std::expected<void, StatusCode> SiluMulDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& gate,
+    const Buffer& up, Buffer& o, std::size_t n) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((n + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&gate, &up, &o};
+  launch.scalars = {n};
+  return backend.LaunchKernel(kernel, launch);
 }
 
 // Causal GQA attention over one query row; the key/value matrices
