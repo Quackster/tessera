@@ -157,6 +157,33 @@ __host__ __device__ float F4E2M1ToFloatDev(std::uint8_t nibble) {
   return sign != 0 ? -value : value;
 }
 
+// bf16 -> fp32 on the device: shift the 16 bits into the high half.
+__device__ float Bf16ToFloatDev(unsigned short bits) {
+  unsigned int wide = static_cast<unsigned int>(bits) << 16;
+  float value;
+  memcpy(&value, &wide, sizeof(value));
+  return value;
+}
+
+// Built-in "gemm_bf16": C = A x W^T with bf16 weights and fp32
+// sequential accumulation.
+__global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
+                               float* c, unsigned long long m,
+                               unsigned long long n, unsigned long long k) {
+  unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = idx / n;
+  const unsigned long long row_w = idx % n;
+  float acc = 0.0f;
+  for (unsigned long long t = 0; t < k; ++t) {
+    acc = fmaf(a[row_a * k + t], Bf16ToFloatDev(w[row_w * k + t]), acc);
+  }
+  c[idx] = acc;
+}
+
 // Built-in "gemm_f32": C = A x W^T with fp32 sequential accumulation.
 __global__ void GemmF32Kernel(const float* a, const float* w, float* c,
                               unsigned long long m, unsigned long long n,

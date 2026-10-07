@@ -1,0 +1,40 @@
+#version 450
+
+// One thread per output element; dispatch ceil(m * n / 256).
+layout(local_size_x = 256) in;
+
+// "gemm_bf16" contract (tessera API): buffer 0 is A (fp32, m x k),
+// buffer 1 the bf16 weights W (n x k, two per uint), buffer 2 the output
+// C (fp32, m x n). Scalars are 64-bit, so field k lives at pc.v[2k]:
+// m v[0], n v[2], k v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) buffer W { uint w[]; };
+layout(set = 0, binding = 2) buffer C { float c[]; };
+
+// bf16 -> fp32: shift the 16 bits into the high half of an fp32 word.
+float bf16_at(uint index) {
+  uint word = w[index >> 1];
+  uint bits = (word >> ((index & 1) << 4)) & 0xFFFF;
+  return uintBitsToFloat(bits << 16);
+}
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  if (idx >= m * n) {
+    return;
+  }
+  uint row_a = idx / n;
+  uint row_w = idx % n;
+  float acc = 0.0;
+  for (uint t = 0; t < k; ++t) {
+    acc += a[row_a * k + t] * bf16_at(row_w * k + t);
+  }
+  c[idx] = acc;
+}

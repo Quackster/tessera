@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 183/183 on both builds.
+`ctest` passes 184/184 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -501,6 +501,15 @@ through RADV GFX1201, rocm through the system ROCm).
   device-vs-reference test. `GemmKernelName` maps DType::F32 to it, so
   a projection whose weights are fp32 now selects a kernel instead of
   UnsupportedFeature.
+
+- 2026-10-07: bf16-weight GEMM (184/184 `ctest` on both builds).
+  Current head. Generic "gemm_bf16" computes C = A x W^T with bf16
+  weights and fp32 sequential accumulation, on vulkan (GLSL) and rocm
+  (HIP) with a host reference and a device-vs-reference test.
+  `GemmKernelName` maps DType::BF16 to it. The safetensors parser and
+  the tensor sizer already handled BF16, so bf16 weights (the DFlash2
+  draft projections) now select a kernel. bf16 weights are read
+  two-per-word and shifted into fp32 (exact).
 
 ## Next (in order)
 

@@ -64,6 +64,18 @@ namespace tessera::core {
     std::span<const float> a, std::span<const float> w, std::span<float> c,
     std::size_t m, std::size_t n, std::size_t k);
 
+// Host reference for the "gemm_bf16" built-in: C = A x W^T where W is
+// bf16 (bfloat16), with fp32 sequential accumulation (deterministic, the
+// same order the kernel uses). `a` is m x k fp32 row-major, `w` is n x k
+// bf16 (2 bytes each), `c` is m x n fp32. m, n, k must be nonzero; a
+// size mismatch is InvalidArgument.
+//
+// Usage:
+//   auto status = GemmBf16Ref(a, w, c, m, n, k);
+[[nodiscard]] std::expected<void, StatusCode> GemmBf16Ref(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+
 // Host reference for the "gemm_fp8" built-in: C = A x (diag(s) x W)^T
 // with fp32 sequential accumulation (deterministic, the same order
 // the kernels use). `a` is m x k fp32 row-major, `w` is n x k FP8

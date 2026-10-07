@@ -1,6 +1,8 @@
 #include "core/numerics/gemm.hpp"
 
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "core/numerics/quant.hpp"
@@ -8,6 +10,15 @@
 namespace tessera::core {
 
 namespace {
+
+// bf16 -> fp32: bf16 shares the fp32 exponent field, so shifting the 16
+// bits into the high half of an fp32 word is exact.
+float Bf16ToFloat(std::uint16_t bits) {
+  const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+  float value = 0.0f;
+  std::memcpy(&value, &wide, sizeof(value));
+  return value;
+}
 
 // One canonical dequantize-then-dot loop for every block-quantized
 // GEMM reference (a single implementation, not one copy per format).
@@ -175,6 +186,33 @@ std::expected<void, StatusCode> GemmF32Ref(
       float acc = 0.0f;
       for (std::size_t t = 0; t < k; ++t) {
         acc = std::fma(a[i * k + t], w[j * k + t], acc);
+      }
+      c[i * n + j] = acc;
+    }
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> GemmBf16Ref(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k) {
+  if (m == 0 || n == 0 || k == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (a.size() != m * k || w.size() != n * k * 2 || c.size() != m * n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < m; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      float acc = 0.0f;
+      for (std::size_t t = 0; t < k; ++t) {
+        const std::size_t offset = (j * k + t) * 2;
+        const std::uint16_t bits = static_cast<std::uint16_t>(
+            static_cast<std::uint8_t>(w[offset]) |
+            (static_cast<std::uint16_t>(
+                 static_cast<std::uint8_t>(w[offset + 1]))
+             << 8));
+        acc = std::fma(a[i * k + t], Bf16ToFloat(bits), acc);
       }
       c[i * n + j] = acc;
     }
