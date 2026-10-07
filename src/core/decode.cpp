@@ -1,4 +1,5 @@
 #include "core/decode.hpp"
+#include "core/decode_internal.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -8,95 +9,12 @@ namespace tessera::core {
 
 namespace {
 
-// A required weight: missing is MalformedFile, a wrong layout is
-// UnsupportedFeature (only Q4_K projections and F32 vectors run).
-std::expected<const DeviceTensor*, StatusCode> NeedWeight(
-    const Model& model, std::string_view name, DType dtype) {
-  for (const auto& weight : model.Weights()) {
-    if (weight.manifest.name == name) {
-      if (weight.manifest.dtype != dtype) {
-        return std::unexpected(StatusCode::UnsupportedFeature);
-      }
-      return &weight;
-    }
-  }
-  return std::unexpected(StatusCode::MalformedFile);
-}
-
-void RmsNormInto(const std::vector<float>& x, const float* w, double eps,
-                 std::vector<float>& out) {
-  float mean = 0.0f;
-  for (float v : x) {
-    mean += v * v;
-  }
-  mean /= static_cast<float>(x.size());
-  const float gain =
-      1.0f / std::sqrt(mean + static_cast<float>(eps));
-  for (std::size_t i = 0; i < x.size(); ++i) {
-    out[i] = x[i] * gain * w[i];
-  }
-}
-
-void SiluMulInto(const std::vector<float>& gate, const std::vector<float>& up,
-                 std::vector<float>& out) {
-  for (std::size_t i = 0; i < gate.size(); ++i) {
-    const float silu = gate[i] / (1.0f + std::exp(-gate[i]));
-    out[i] = silu * up[i];
-  }
-}
-
-// Small F32 vectors (norms) download to the host; elementwise ops run
-// there until their device kernels land.
-std::expected<std::vector<float>, StatusCode> DownloadF32(
-    Backend& backend, const Buffer& buf) {
-  std::vector<std::byte> raw(buf.Size());
-  auto down = backend.CopyD2H(buf, raw.data(), raw.size());
-  if (!down) {
-    return std::unexpected(down.error());
-  }
-  std::vector<float> out(buf.Size() / 4);
-  std::memcpy(out.data(), raw.data(), raw.size());
-  return out;
-}
-
-// y = A(1 x k) times dequant(W) on the device (W is Q4_K, n x k).
-std::expected<std::vector<float>, StatusCode> Project(
-    Backend& backend, const Kernel& gemm, const std::vector<float>& x,
-    const Buffer& weights, std::size_t n) {
-  const std::size_t k = x.size();
-  auto x_buf = backend.AllocateBuffer(k * 4, MemoryKind::Device);
-  if (!x_buf) {
-    return std::unexpected(x_buf.error());
-  }
-  auto out_buf = backend.AllocateBuffer(n * 4, MemoryKind::Device);
-  if (!out_buf) {
-    return std::unexpected(out_buf.error());
-  }
-  auto up = backend.CopyH2D(
-      **x_buf, std::span<const std::byte>(
-                   reinterpret_cast<const std::byte*>(x.data()), k * 4));
-  if (!up) {
-    return std::unexpected(up.error());
-  }
-  KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((n + 255) / 256);
-  launch.block_x = 256;
-  launch.buffers = {(*x_buf).get(), &weights, (*out_buf).get()};
-  launch.scalars = {k, n, 1};
-  auto ran = backend.LaunchKernel(gemm, launch);
-  if (!ran) {
-    return std::unexpected(ran.error());
-  }
-  backend.Synchronize();
-  std::vector<std::byte> raw(n * 4);
-  auto down = backend.CopyD2H(**out_buf, raw.data(), raw.size());
-  if (!down) {
-    return std::unexpected(down.error());
-  }
-  std::vector<float> out(n);
-  std::memcpy(out.data(), raw.data(), n * 4);
-  return out;
-}
+using detail::Attend;
+using detail::DownloadF32;
+using detail::NeedWeight;
+using detail::Project;
+using detail::RmsNormInto;
+using detail::SiluMulInto;
 
 // RoPE over an uploaded row buffer, in place on the device.
 std::expected<void, StatusCode> RopeRows(
@@ -120,54 +38,6 @@ std::expected<void, StatusCode> RopeRows(
   }
   backend.Synchronize();
   return {};
-}
-
-// Causal attention over one query row (device); the full key/value
-// matrices upload fresh every step.
-std::expected<std::vector<float>, StatusCode> Attend(
-    Backend& backend, const Kernel& attention, const std::vector<float>& q,
-    const std::vector<float>& k, const std::vector<float>& v,
-    std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
-    std::uint64_t q_base) {
-  const std::size_t kv_dim = kv_heads * head_dim;
-  const std::size_t n = k.size() / kv_dim;
-  auto q_buf = backend.AllocateBuffer(q.size() * 4, MemoryKind::Device);
-  auto k_buf = backend.AllocateBuffer(k.size() * 4, MemoryKind::Device);
-  auto v_buf = backend.AllocateBuffer(v.size() * 4, MemoryKind::Device);
-  auto out_buf =
-      backend.AllocateBuffer(heads * head_dim * 4, MemoryKind::Device);
-  if (!q_buf || !k_buf || !v_buf || !out_buf) {
-    return std::unexpected(StatusCode::OutOfMemory);
-  }
-  const auto upload = [&backend](auto& buf, const auto& data) {
-    return backend.CopyH2D(
-        **buf, std::span<const std::byte>(
-                   reinterpret_cast<const std::byte*>(data.data()),
-                   data.size() * 4));
-  };
-  if (!upload(q_buf, q) || !upload(k_buf, k) || !upload(v_buf, v)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  KernelLaunch launch;
-  launch.grid_x =
-      static_cast<std::uint32_t>((heads * head_dim + 255) / 256);
-  launch.block_x = 256;
-  launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
-                    (*out_buf).get()};
-  launch.scalars = {1, n, heads, kv_heads, head_dim, q_base};
-  auto ran = backend.LaunchKernel(attention, launch);
-  if (!ran) {
-    return std::unexpected(ran.error());
-  }
-  backend.Synchronize();
-  std::vector<std::byte> raw(heads * head_dim * 4);
-  auto down = backend.CopyD2H(**out_buf, raw.data(), raw.size());
-  if (!down) {
-    return std::unexpected(down.error());
-  }
-  std::vector<float> out(heads * head_dim);
-  std::memcpy(out.data(), raw.data(), raw.size());
-  return out;
 }
 
 }  // namespace
