@@ -302,6 +302,51 @@ std::vector<std::uint32_t> GreedyTokens(const std::string& path,
   return tokens;
 }
 
+// Greedy decode driven by speculative verification with a fixed draft
+// pair. The output must not depend on the draft.
+std::vector<std::uint32_t> SpeculativeTokens(const std::string& path,
+                                             std::size_t n,
+                                             std::uint32_t draft_token) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{path, 1024});
+  EXPECT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  std::vector<std::uint32_t> out;
+  if (!model.has_value()) {
+    return out;
+  }
+  tessera::core::DecodeCache cache;
+  auto current = tessera::core::DecodeLogits(engine->Owner(), **model, cache, 0);
+  EXPECT_TRUE(current.has_value()) << tessera::ToString(current.error());
+  if (!current.has_value()) {
+    return out;
+  }
+  while (out.size() < n) {
+    const std::vector<std::uint32_t> draft = {draft_token, draft_token};
+    auto verify = tessera::core::VerifyDraft(engine->Owner(), **model, cache,
+                                             draft, *current);
+    EXPECT_TRUE(verify.has_value()) << tessera::ToString(verify.error());
+    if (!verify.has_value()) {
+      break;
+    }
+    for (std::size_t i = 0; i < verify->accepted && out.size() < n; ++i) {
+      out.push_back(draft[i]);
+    }
+    if (out.size() >= n) {
+      break;
+    }
+    out.push_back(verify->next_token);
+    auto next = tessera::core::DecodeLogits(engine->Owner(), **model, cache,
+                                            verify->next_token);
+    EXPECT_TRUE(next.has_value()) << tessera::ToString(next.error());
+    if (!next.has_value()) {
+      break;
+    }
+    current = std::move(*next);
+  }
+  return out;
+}
+
 }  // namespace
 
 // Baseline pinning: the fixed-seed fixtures decode to these exact greedy
@@ -366,6 +411,22 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
       engine->Owner(), **model, std::span<const std::uint32_t>{});
   ASSERT_TRUE(empty.has_value());
   EXPECT_TRUE(empty->empty());
+}
+
+// Greedy speculative decoding must be output preserving: for any draft,
+// accepted tokens plus the bonus token equal the plain greedy sequence.
+// A fixed wrong draft exercises the all-rejected path; a draft that
+// starts with the correct token exercises acceptance. Covers the
+// full-attention and the stateful linear fixtures.
+TEST(HybridDecodeTest, SpeculationMatchesGreedy) {
+  const std::string gated = WriteGatedHybridFixture("gated.gguf").string();
+  const std::vector<std::uint32_t> want_gated = {1, 0, 26, 18, 17, 3, 3, 3};
+  EXPECT_EQ(SpeculativeTokens(gated, 8, 31), want_gated);
+  EXPECT_EQ(SpeculativeTokens(gated, 8, 1), want_gated);
+  const std::string linear = WriteLinearHybridFixture("linear.gguf").string();
+  const std::vector<std::uint32_t> want_linear = {5, 5, 31, 0, 30, 4, 19, 19};
+  EXPECT_EQ(SpeculativeTokens(linear, 8, 31), want_linear);
+  EXPECT_EQ(SpeculativeTokens(linear, 8, 5), want_linear);
 }
 
 // The MTP head drafts a token from the backbone hidden state (27B target;

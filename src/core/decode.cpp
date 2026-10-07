@@ -2,6 +2,8 @@
 
 #include <memory>
 
+#include "core/decode_internal.hpp"
+
 namespace tessera::core {
 
 std::expected<std::uint32_t, StatusCode> DecodeStep(
@@ -50,6 +52,33 @@ std::expected<std::vector<std::vector<float>>, StatusCode> ScoreTokens(
     rows.push_back(std::move(*logits));
   }
   return rows;
+}
+
+std::expected<DraftVerification, StatusCode> VerifyDraft(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::span<const std::uint32_t> draft,
+    std::span<const float> prefix_logits) {
+  if (prefix_logits.empty()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  DraftVerification result;
+  result.logits.assign(prefix_logits.begin(), prefix_logits.end());
+  // Feed a draft token only after it matches the target's greedy token, so
+  // the cache advances by exactly the accepted prefix and needs no
+  // rollback.
+  for (const std::uint32_t token : draft) {
+    if (detail::ArgMax(result.logits) != token) {
+      break;
+    }
+    auto logits = DecodeLogits(backend, model, cache, token);
+    if (!logits) {
+      return std::unexpected(logits.error());
+    }
+    result.logits = std::move(*logits);
+    ++result.accepted;
+  }
+  result.next_token = detail::ArgMax(result.logits);
+  return result;
 }
 
 }  // namespace tessera::core

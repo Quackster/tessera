@@ -175,4 +175,27 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
 ScoreTokens(Backend& backend, const Model& model,
             std::span<const std::uint32_t> tokens);
 
+// The outcome of verifying a greedy draft against the target model.
+// `accepted` leading draft tokens match the target's greedy distribution
+// and are already in the cache; `next_token` is the target's greedy token
+// after them (the bonus token); `logits` is the distribution after the
+// accepted prefix, ready to verify the next draft.
+struct DraftVerification {
+  std::size_t accepted = 0;
+  std::uint32_t next_token = 0;
+  std::vector<float> logits;
+};
+
+// Greedy speculative verification. Given the target's distribution at the
+// current prefix (`prefix_logits`) and a draft, feed each draft token only
+// while it equals the target's greedy token, then stop. The cache is left
+// at the accepted prefix, so no state is ever rolled back. The output
+// (accepted draft tokens followed by `next_token`) is identical to plain
+// greedy decoding for any draft. `prefix_logits` must be the logits from
+// the step that produced the current cache position; empty is invalid.
+[[nodiscard]] std::expected<DraftVerification, StatusCode> VerifyDraft(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::span<const std::uint32_t> draft,
+    std::span<const float> prefix_logits);
+
 }  // namespace tessera::core

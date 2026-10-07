@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 174/174 on both builds.
+`ctest` passes 175/175 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -440,15 +440,25 @@ through RADV GFX1201, rocm through the system ROCm).
   the primitive both speculative paths verify with. A test pins the
   ScoreTokens rows against the greedy baseline.
 
+- 2026-10-07: greedy speculative verification loop (175/175 `ctest` on
+  both builds). Current head. `VerifyDraft` feeds a draft token only
+  while it equals the target's greedy token, then stops, so the cache
+  is left at the accepted prefix and no state is rolled back. The
+  accepted tokens plus the bonus token equal plain greedy decoding for
+  any draft. Tests run the loop on the full-attention and stateful
+  linear fixtures with all-rejected and accepted drafts and pin the
+  output to the greedy baseline. Sequential today (one target forward
+  per accepted token); batched scoring is the next speed step.
+
 ## Next (in order)
 
-1. **MTP verification**: the MTP head drafts. The verifier vocabulary
-   (`DecodeLogits`/`ScoreTokens`) now exists. Still missing: the
-   draft/accept/reject loop and batched scoring of the draft tokens.
+1. **MTP verification**: the MTP head drafts and the greedy verifier
+   loop (`VerifyDraft`) exists. Still missing: wire `MtpDraftStep` into a
+   speculative generation loop (and the CLI) and batch the scoring.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
-   The verifier vocabulary and the draft kernels are in place; the draft
-   forward and the accept/reject loop remain.
+   The verifier loop and the draft kernels are in place; the DFlash2 draft
+   forward and its selector-driven candidate block remain.
 3. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
