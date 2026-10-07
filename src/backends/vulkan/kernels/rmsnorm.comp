@@ -1,0 +1,42 @@
+#version 450
+
+// One thread per row; the dispatch is ceil(rows / 256) workgroups
+// via grid_x.
+layout(local_size_x = 256) in;
+
+// "rmsnorm" contract: buffers X (rows x cols), W (cols), Y (out).
+// Scalars: rows v[0], cols v[2], epsilon fp32 bits v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer X {
+  float x[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  float w[];
+};
+
+layout(set = 0, binding = 2) buffer Y {
+  float y[];
+};
+
+void main() {
+  uint r = gl_GlobalInvocationID.x;
+  uint rows = pc.v[0];
+  if (r >= rows) {
+    return;
+  }
+  uint cols = pc.v[2];
+  float eps = uintBitsToFloat(pc.v[4]);
+  float mean = 0.0;
+  for (uint c = 0; c < cols; ++c) {
+    mean += x[r * cols + c] * x[r * cols + c];
+  }
+  mean /= float(cols);
+  float gain = inversesqrt(mean + eps);
+  for (uint c = 0; c < cols; ++c) {
+    y[r * cols + c] = x[r * cols + c] * gain * w[c];
+  }
+}

@@ -22,6 +22,7 @@ add_library(tessera STATIC
     src/core/numerics/quant.cpp
     src/core/numerics/gemm.cpp
     src/core/numerics/attention.cpp
+    src/core/numerics/norm.cpp
     src/spec/dflash2.cpp
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
@@ -42,9 +43,10 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     # name prefixes.
     set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8
         gemm_mxfp4 gemm_q5k gemm_q6k gemm_q3k gemm_iq4nl gemm_iq4xs
-        gemm_iq3s)
+        gemm_iq3s rmsnorm sigmoid_gate)
     set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8
-        GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S)
+        GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S
+        Rmsnorm SigmoidGate)
     set(TESSERA_KERNEL_HEADER
 "#pragma once
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.

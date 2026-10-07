@@ -12,6 +12,7 @@
 
 #include "core/numerics/attention.hpp"
 #include "core/numerics/gemm.hpp"
+#include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
 #include "test_helpers.hpp"
 #include "tessera/backend.hpp"
@@ -1499,4 +1500,203 @@ TEST(BackendTest, AttentionRejectsBadContract) {
   auto bad_groups = backend->LaunchKernel(**attention, launch);
   ASSERT_FALSE(bad_groups.has_value());
   EXPECT_EQ(bad_groups.error(), StatusCode::InvalidArgument);
+}
+
+// Device: row-wise RMS normalization matches the host reference
+// (4 rows of 64, epsilon 1e-6, unit weights plus a scaled row).
+TEST(BackendTest, RmsnormDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(41);
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kCols = 64;
+  constexpr float kEps = 1e-6f;
+  std::vector<float> x(kRows * kCols);
+  std::vector<float> w(kCols, 1.0f);
+  for (auto& v : x) {
+    v = DrawValue(rng);
+  }
+  w[0] = 0.5f;
+  auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size() * 4, MemoryKind::Device);
+  auto y_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf.has_value() && w_buf.has_value() && y_buf.has_value());
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(upload(w_buf, w).has_value());
+
+  std::uint32_t eps_bits = 0;
+  static_assert(sizeof(eps_bits) == sizeof(kEps));
+  std::memcpy(&eps_bits, &kEps, sizeof(eps_bits));
+  auto kernel = backend->LoadKernel("rmsnorm", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*x_buf).get(), (*w_buf).get(), (*y_buf).get()};
+  launch.scalars = {kRows, kCols, eps_bits};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(x.size() * 4);
+  auto download =
+      backend->CopyD2H(**y_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(x.size());
+  auto ref_status = core::RmsNormRef(std::span<const float>(x),
+                                     std::span<const float>(w),
+                                     std::span<float>(ref), kRows, kCols, kEps);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(device_out[i] - ref[i]);
+    const float r =
+        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, r);
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Device: sigmoid-gated scale matches the host reference (256
+// elements drawn from [-1, 1], gate included).
+TEST(BackendTest, SigmoidGateDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(42);
+  constexpr std::size_t kN = 256;
+  std::vector<float> a(kN);
+  std::vector<float> g(kN);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  for (auto& v : g) {
+    v = DrawValue(rng);
+  }
+  auto a_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto g_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto o_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && g_buf.has_value() && o_buf.has_value());
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(a_buf, a).has_value());
+  ASSERT_TRUE(upload(g_buf, g).has_value());
+
+  auto kernel = backend->LoadKernel("sigmoid_gate", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*g_buf).get(), (*o_buf).get()};
+  launch.scalars = {kN};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(kN * 4);
+  auto download =
+      backend->CopyD2H(**o_buf, readback.data(), readback.size());
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  std::vector<float> ref(kN);
+  auto ref_status = core::SigmoidGateRef(std::span<const float>(a),
+                                         std::span<const float>(g),
+                                         std::span<float>(ref), kN);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const auto* device_out = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(device_out[i] - ref[i]);
+    const float r =
+        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, r);
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Host: the norm references reject malformed shapes at the boundary
+// (zero dims, negative epsilon, size gaps).
+TEST(BackendTest, NormRefsRejectBadArgs) {
+  std::vector<float> x(4 * 8, 0.5f);
+  std::vector<float> w(8, 1.0f);
+  std::vector<float> y(4 * 8);
+  auto bad = core::RmsNormRef(std::span<const float>(x),
+                              std::span<const float>(w), std::span<float>(y),
+                              0, 8, 1e-6f);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  bad = core::RmsNormRef(std::span<const float>(x), std::span<const float>(w),
+                         std::span<float>(y), 4, 8, -1.0f);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_w(4, 1.0f);
+  bad = core::RmsNormRef(std::span<const float>(x),
+                         std::span<const float>(short_w), std::span<float>(y),
+                         4, 8, 1e-6f);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+
+  std::vector<float> a(8, 0.5f);
+  std::vector<float> g(8, 0.5f);
+  std::vector<float> o(8);
+  auto bad_gate = core::SigmoidGateRef(std::span<const float>(a),
+                                       std::span<const float>(g),
+                                       std::span<float>(o), 0);
+  ASSERT_FALSE(bad_gate.has_value());
+  EXPECT_EQ(bad_gate.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_a(4, 0.5f);
+  bad_gate = core::SigmoidGateRef(std::span<const float>(short_a),
+                                  std::span<const float>(g),
+                                  std::span<float>(o), 8);
+  ASSERT_FALSE(bad_gate.has_value());
+  EXPECT_EQ(bad_gate.error(), StatusCode::InvalidArgument);
+}
+
+// Device: the rmsnorm and sigmoid_gate contracts (backend.hpp) reject
+// bad shapes before anything reaches the device.
+TEST(BackendTest, NormRejectsBadContract) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto rmsnorm = backend->LoadKernel("rmsnorm", {});
+  ASSERT_TRUE(rmsnorm.has_value()) << tessera::ToString(rmsnorm.error());
+  auto gate = backend->LoadKernel("sigmoid_gate", {});
+  ASSERT_TRUE(gate.has_value()) << tessera::ToString(gate.error());
+
+  tessera::KernelLaunch launch;
+  // Rmsnorm wants 3 buffers and 3 scalars; zero rows are rejected.
+  const std::vector<const tessera::Buffer*> three_buffers{
+      nullptr, nullptr, nullptr};
+  launch.buffers = three_buffers;
+  launch.scalars = {0, 64, 0};
+  auto no_buffers = backend->LaunchKernel(**rmsnorm, launch);
+  ASSERT_FALSE(no_buffers.has_value());
+  EXPECT_EQ(no_buffers.error(), StatusCode::InvalidArgument);
+  // Sigmoid gate wants 3 buffers and 1 scalar; zero length rejected.
+  launch.scalars = {0};
+  auto zero_len = backend->LaunchKernel(**gate, launch);
+  ASSERT_FALSE(zero_len.has_value());
+  EXPECT_EQ(zero_len.error(), StatusCode::InvalidArgument);
 }

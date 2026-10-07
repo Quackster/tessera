@@ -161,6 +161,14 @@ class Kernel {
 // weights W, buffer 2 the output C (fp32, m x n); scalars are m, n,
 // k with k a positive multiple of 256 (32 for iq4nl). The dispatch
 // is ceil(m * n / 256) workgroups of 256.
+// "rmsnorm": buffer 0 is X (fp32, rows x cols), buffer 1 the weight W
+// (fp32, cols), buffer 2 the output Y (fp32, rows x cols); scalars
+// are rows, cols, and the fp32 epsilon bits. Y = X / sqrt(mean(X^2) +
+// eps) * W per row with sequential accumulation. The dispatch is
+// ceil(rows * cols / 256) workgroups of 256.
+// "sigmoid_gate": buffers are A and G (fp32, n each) and the output O
+// (fp32, n); scalar 0 is n. O = A * sigmoid(G) elementwise. The
+// dispatch is ceil(n / 256) workgroups of 256.
 [[nodiscard]] inline StatusCode CheckBuiltInArgs(const Kernel& kernel,
                                                  const KernelLaunch& launch) {
   if (kernel.Id() == "fill" &&
@@ -239,6 +247,22 @@ class Kernel {
     const std::uint64_t k = launch.scalars[2];
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || k == 0 ||
         k % 32 != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "rmsnorm") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "sigmoid_gate") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 1) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

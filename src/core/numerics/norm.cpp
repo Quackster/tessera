@@ -1,0 +1,51 @@
+#include "core/numerics/norm.hpp"
+
+#include <cmath>
+
+namespace tessera::core {
+
+std::expected<void, StatusCode> RmsNormRef(std::span<const float> x,
+                                           std::span<const float> w,
+                                           std::span<float> y,
+                                           std::size_t rows,
+                                           std::size_t cols, float eps) {
+  if (rows == 0 || cols == 0 || eps < 0.0f) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (x.size() != rows * cols || w.size() != cols ||
+      y.size() != rows * cols) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    const float* x_row = x.data() + r * cols;
+    float mean = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      mean = std::fma(x_row[c], x_row[c], mean);
+    }
+    mean /= static_cast<float>(cols);
+    const float gain = 1.0f / std::sqrt(mean + eps);
+    float* y_row = y.data() + r * cols;
+    for (std::size_t c = 0; c < cols; ++c) {
+      y_row[c] = x_row[c] * gain * w[c];
+    }
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> SigmoidGateRef(std::span<const float> a,
+                                               std::span<const float> g,
+                                               std::span<float> out,
+                                               std::size_t n) {
+  if (n == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (a.size() != n || g.size() != n || out.size() != n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = a[i] / (1.0f + std::exp(-g[i]));
+  }
+  return {};
+}
+
+}  // namespace tessera::core

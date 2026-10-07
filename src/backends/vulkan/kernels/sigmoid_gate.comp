@@ -1,0 +1,32 @@
+#version 450
+
+// One thread per element; the dispatch is ceil(n / 256) workgroups
+// via grid_x.
+layout(local_size_x = 256) in;
+
+// "sigmoid_gate" contract: buffers A, G (n each), O (out).
+// Scalar n is v[0]; out[i] = a[i] * sigmoid(g[i]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer G {
+  float g[];
+};
+
+layout(set = 0, binding = 2) buffer O {
+  float o[];
+};
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint n = pc.v[0];
+  if (i >= n) {
+    return;
+  }
+  o[i] = a[i] / (1.0 + exp(-g[i]));
+}

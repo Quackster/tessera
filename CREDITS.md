@@ -17,3 +17,9 @@ project, the version, the license, and where it is used.
   qkv tensor shapes, and the ssm.* metadata keys. Referenced for
   the hybrid config in include/tessera/model.hpp and
   src/core/model.cpp; no code copied.
+- Gated Delta Networks (arXiv 2412.06464, Yang et al.) and Gated
+  Attention for LLMs (NeurIPS 2025, Qiu et al.), plus the Qwen3-Next
+  architecture blog (qwen.ai): the gated delta recurrence, the SDPA
+  output sigmoid gate, and the 3:1 hybrid layout. Design references
+  for src/core/numerics/norm.* and the hybrid roadmap; no code
+  copied.

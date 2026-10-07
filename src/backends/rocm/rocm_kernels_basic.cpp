@@ -201,4 +201,40 @@ __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
   }
   c[idx] = acc;
 }
+// Built-in "rmsnorm": row-wise RMS norm over rows x cols fp32.
+// One thread per row with sequential accumulation.
+__global__ void RmsnormKernel(const float* x, const float* w, float* y,
+                              unsigned long long rows, unsigned long long cols,
+                              unsigned long long eps_bits) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  float eps = 0.0f;
+  static_assert(sizeof(eps) == 4);
+  std::uint32_t bits = static_cast<std::uint32_t>(eps_bits);
+  std::memcpy(&eps, &bits, 4);
+  float mean = 0.0f;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    mean = fmaf(x[r * cols + c], x[r * cols + c], mean);
+  }
+  mean /= static_cast<float>(cols);
+  const float gain = 1.0f / sqrtf(mean + eps);
+  for (unsigned long long c = 0; c < cols; ++c) {
+    y[r * cols + c] = x[r * cols + c] * gain * w[c];
+  }
+}
+
+// Built-in "sigmoid_gate": elementwise out = a * sigmoid(g) over n
+// fp32. One thread per element.
+__global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
+                                  unsigned long long n) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  o[i] = a[i] / (1.0f + expf(-g[i]));
+}
 }  // namespace tessera::backends::rocm

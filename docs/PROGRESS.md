@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 115/115 on both builds.
+`ctest` passes 119/119 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -39,6 +39,10 @@ through RADV GFX1201, rocm through the system ROCm).
   range and base from GGUF metadata. The generic "rope" and
   "attention" built-ins take all dims as launch scalars and are
   verified against host references on both devices.
+- Generic RMSNorm and sigmoid-gate kernels with fp32 sequential
+  accumulation. Row-wise norms back QK-Norm; the gate scales SDPA
+  outputs for gated attention. Both built-ins take all dims as launch
+  scalars and are verified against host references on both devices.
 - Weight upload: `Model::Load` allocates one device buffer per
   manifest tensor and copies the file bytes through the backend.
   `Model::Weights` exposes them next to the manifest. Unsized
@@ -129,7 +133,7 @@ through RADV GFX1201, rocm through the system ROCm).
   units (rule 4); shared device helpers are inline in the private
   kernel header. Borrowed math is credited in CREDITS.md.
 - 2026-10-07: hybrid definition and load (115/115 `ctest` on both
-  builds). Current head. `TransformerConfig` carries a hybrid flag,
+  builds). `TransformerConfig` carries a hybrid flag,
   `SsmParams` and the full-attention interval with an
   `IsFullAttentionLayer` mapper. GGUF parsing reads explicit
   key/value lengths (no embedding divisibility needed), the ssm.*
@@ -138,25 +142,35 @@ through RADV GFX1201, rocm through the system ROCm).
   tensors); `DecodeStep` rejects hybrid configs as
   UnsupportedFeature. Layer kinds follow the llama.cpp interval rule,
   credited in CREDITS.md.
+- 2026-10-07: norm and gate kernels (119/119 `ctest` on both builds).
+  Current head. Generic "rmsnorm" (one thread per row) and
+  "sigmoid_gate" (one thread per element) built-ins on vulkan (GLSL)
+  and rocm (HIP) with host references in `src/core/numerics/norm.*`.
+  Contracts live in `include/tessera/backend.hpp` next to the other
+  built-ins. Device-vs-reference tests use the per backend attention
+  tolerance. `tests/backend_test.cpp` grows further (exemption
+  stands). The math follows public papers (Gated DeltaNet, gated
+  attention, Qwen3-Next blog), credited in CREDITS.md; no llama.cpp
+  source was read, per the new AGENTS.md rule.
 
 ## Next (in order)
 
 1. **Hybrid SSM decode** for the 27B target (arch `qwen35`):
-   definition and load are done (explicit head dim, SSM params, layer
-   kinds, trunk count; the file loads with 866 tensors on both
-   backends). Still missing: fused Q-plus-gate splitting with QK norms
-   and mRoPE on full layers, the linear path (causal conv1d, recurrent
-   scan, gated norm), and MTP handling. `DecodeStep` rejects hybrid
-   configs as unsupported today.
+   definition, load, and norm/gate kernels are done (the file loads
+   with 866 tensors on both backends). Still missing: fused Q-plus-gate
+   splitting with mRoPE on full layers, the linear path (causal conv1d,
+   recurrent scan, gated norm), and MTP handling. `DecodeStep` rejects
+   hybrid configs as unsupported today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.
    Requires the full verifier vocabulary.
 3. **Baseline pinning**: run the non speculative path on both backends.
    Record per backend tolerance. Assert in tests (fixed seeds).
 4. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
-   definition needs them. The decode loop runs projections,
-   RoPE and attention on the device. Norms and SiLU still run on
-   the host. Models are data. No per model branches.
+   definition needs them. The generic RMSNorm kernel is done. The
+   decode loop runs projections, RoPE and attention on the device.
+   Norms and SiLU still run on the host. Models are data. No per
+   model branches.
 5. **Serving API**: OpenAI-style `/v1/chat/completions` plus an
    Anthropic-style `/v1/messages` endpoint, served over HTTP from the
    engine. Streaming and non-streaming responses. The same limits
