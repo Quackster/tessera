@@ -19,7 +19,10 @@ namespace tessera::spec {
 // (2*taps*num_groups) x hidden; the base kernel is 2 x taps x hidden;
 // q/o are (heads*head_dim) wide and k/v (kv_heads*head_dim); q_norm and
 // k_norm are head_dim; num_groups = hidden / group_size. `window` is the
-// sliding window (0 keeps all past keys).
+// sliding window (0 keeps all past keys). When `ctx` is nonzero the
+// queries attend over `context_k`/`context_v` (ctx x kv_heads*head_dim,
+// already RoPE-rotated) followed by the block's own keys, and the query
+// positions start at `pos_base + ctx`.
 //
 // Usage:
 //   auto status = DraftAttentionRef(x, ...out, rows, 5120, 32, 8, 128,
@@ -33,7 +36,9 @@ namespace tessera::spec {
     std::span<float> out, std::size_t rows, std::size_t hidden,
     std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
-    std::size_t window, std::uint64_t pos_base, double theta, float eps);
+    std::size_t window, std::uint64_t pos_base, double theta, float eps,
+    std::span<const float> context_k = {},
+    std::span<const float> context_v = {}, std::size_t ctx = 0);
 
 // Device version. `gemm` is gemm_f32, `conv` dflash_conv, `rmsnorm`,
 // `rope` and `attention` their built-ins. Scratch (fp32): xn (rows x
@@ -51,6 +56,8 @@ namespace tessera::spec {
     const Buffer& k_norm_w, Buffer& out, std::size_t rows, std::size_t hidden,
     std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
-    std::size_t window, std::uint64_t pos_base, double theta, float eps);
+    std::size_t window, std::uint64_t pos_base, double theta, float eps,
+    const Buffer* context_k = nullptr, const Buffer* context_v = nullptr,
+    std::size_t ctx = 0);
 
 }  // namespace tessera::spec

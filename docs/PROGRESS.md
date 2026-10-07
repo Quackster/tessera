@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 198/198 on both builds.
+`ctest` passes 199/199 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -605,6 +605,13 @@ through RADV GFX1201, rocm through the system ROCm).
   the layer k_proj/v_proj, K-norm and RoPE. Host reference and a
   device-vs-reference test. This is the input the context-aware draft
   attention will consume.
+
+- 2026-10-07: DFlash2 context attention (199/199 `ctest` on both builds).
+  Current head. `DraftAttentionRef`/`Device` take an optional context
+  K/V prefix: the queries attend over the context rows followed by the
+  block's own keys, and the query positions start at `pos_base + ctx`
+  (RoPE and causality/window). With no context the behaviour is
+  unchanged. Host reference and a device-vs-reference test.
 
 ## Next (in order)
 

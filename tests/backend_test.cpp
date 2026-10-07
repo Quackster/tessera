@@ -4252,3 +4252,86 @@ TEST(BackendTest, DraftContextKvMatchesRef) {
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
+
+// Device: the DFlash2 attention half with a context K/V prefix (queries
+// follow the context in position) matches the host reference.
+TEST(BackendTest, DraftAttentionContextMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(101);
+  constexpr std::size_t kRows = 2, kHidden = 4, kHeads = 2, kKvHeads = 1,
+                       kHeadDim = 2, kTaps = 2, kGroup = 2, kBlock = 2,
+                       kCtx = 2;
+  constexpr float kEps = 1e-6f;
+  constexpr double kTheta = 10000.0;
+  const std::size_t q_dim = kHeads * kHeadDim;
+  const std::size_t kv_dim = kKvHeads * kHeadDim;
+  const std::size_t proj_n = 2 * kTaps * (kHidden / kGroup);
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = DrawValue(rng);
+    return v;
+  };
+  std::vector<float> x = rnd(kRows * kHidden), inorm = rnd(kHidden);
+  std::vector<float> pw = rnd(proj_n * kHidden), base = rnd(2 * kTaps * kHidden);
+  std::vector<float> qw = rnd(q_dim * kHidden), kw = rnd(kv_dim * kHidden);
+  std::vector<float> vw = rnd(kv_dim * kHidden), ow = rnd(kHidden * q_dim);
+  std::vector<float> qn = rnd(kHeadDim), kn = rnd(kHeadDim);
+  std::vector<float> ck = rnd(kCtx * kv_dim), cv = rnd(kCtx * kv_dim);
+  auto up = [&backend](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  auto x_b = up(x), inorm_b = up(inorm), pw_b = up(pw), base_b = up(base);
+  auto qw_b = up(qw), kw_b = up(kw), vw_b = up(vw), ow_b = up(ow);
+  auto qn_b = up(qn), kn_b = up(kn), ck_b = up(ck), cv_b = up(cv);
+  auto out_b = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto mk = [&backend](std::size_t n) {
+    return backend->AllocateBuffer(n * 4, MemoryKind::Device);
+  };
+  auto xn_b = mk(kRows * kHidden), proj_b = mk(kRows * proj_n),
+       h1_b = mk(kRows * kHidden), q_b = mk(kRows * q_dim),
+       k_b = mk(kRows * kv_dim), v_b = mk(kRows * kv_dim),
+       attn_b = mk(kRows * q_dim), oproj_b = mk(kRows * kHidden),
+       side_b = mk(kTaps * kHidden);
+  ASSERT_TRUE(out_b && xn_b && proj_b && h1_b && q_b && k_b && v_b && attn_b &&
+              oproj_b && side_b);
+  auto rms = backend->LoadKernel("rmsnorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto conv = backend->LoadKernel("dflash_conv", {});
+  auto rope = backend->LoadKernel("rope", {});
+  auto attn = backend->LoadKernel("attention", {});
+  ASSERT_TRUE(rms && gemm && conv && rope && attn);
+  auto device = tessera::spec::DraftAttentionDevice(
+      *backend, **rms, **gemm, **conv, **rope, **attn, **xn_b, **proj_b,
+      **h1_b, **q_b, **k_b, **v_b, **attn_b, **oproj_b, **side_b, *x_b,
+      *inorm_b, *pw_b, *base_b, *qw_b, *kw_b, *vw_b, *ow_b, *qn_b, *kn_b,
+      **out_b, kRows, kHidden, kHeads, kKvHeads, kHeadDim, kTaps, kGroup,
+      kBlock, 0, 0, kTheta, kEps, &*ck_b, &*cv_b, kCtx);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<float> got(x.size());
+  backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref(x.size());
+  ASSERT_TRUE(tessera::spec::DraftAttentionRef(
+                  std::span<const float>(x), std::span<const float>(inorm),
+                  std::span<const float>(pw), std::span<const float>(base),
+                  std::span<const float>(qw), std::span<const float>(kw),
+                  std::span<const float>(vw), std::span<const float>(ow),
+                  std::span<const float>(qn), std::span<const float>(kn),
+                  std::span<float>(ref), kRows, kHidden, kHeads, kKvHeads,
+                  kHeadDim, kTaps, kGroup, kBlock, 0, 0, kTheta, kEps,
+                  std::span<const float>(ck), std::span<const float>(cv), kCtx)
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
