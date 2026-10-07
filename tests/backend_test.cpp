@@ -17,6 +17,7 @@
 #include "spec/dflash2_conv.hpp"
 #include "spec/dflash2_mlp.hpp"
 #include "spec/dflash2_attention.hpp"
+#include "spec/dflash2_layer.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -3786,4 +3787,141 @@ TEST(BackendTest, DraftAttentionMatchesRef) {
   }
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: a full DFlash2 draft layer (residual + attention half + MLP
+// half) matches the host reference, with and without a carried residual.
+TEST(BackendTest, DraftLayerMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(96);
+  constexpr std::size_t kRows = 2;
+  constexpr std::size_t kHidden = 4;
+  constexpr std::size_t kHeads = 2;
+  constexpr std::size_t kKvHeads = 1;
+  constexpr std::size_t kHeadDim = 2;
+  constexpr std::size_t kFfn = 8;
+  constexpr std::size_t kTaps = 2;
+  constexpr std::size_t kGroup = 2;
+  constexpr std::size_t kBlock = 2;
+  constexpr std::size_t kWindow = 2;
+  constexpr float kEps = 1e-6f;
+  constexpr double kTheta = 10000.0;
+  const std::size_t q_dim = kHeads * kHeadDim;
+  const std::size_t kv_dim = kKvHeads * kHeadDim;
+  const std::size_t num_groups = kHidden / kGroup;
+  const std::size_t proj_n = 2 * kTaps * num_groups;
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> out(n);
+    for (auto& v : out) v = DrawValue(rng);
+    return out;
+  };
+  std::vector<float> hidden = rnd(kRows * kHidden);
+  std::vector<float> resid = rnd(kRows * kHidden);
+  struct Span {
+    std::vector<float> data;
+  };
+  const std::vector<float> inorm = rnd(kHidden);
+  const std::vector<float> acp = rnd(proj_n * kHidden);
+  const std::vector<float> acb = rnd(2 * kTaps * kHidden);
+  const std::vector<float> qw = rnd(q_dim * kHidden);
+  const std::vector<float> kw = rnd(kv_dim * kHidden);
+  const std::vector<float> vw = rnd(kv_dim * kHidden);
+  const std::vector<float> ow = rnd(kHidden * q_dim);
+  const std::vector<float> qn = rnd(kHeadDim);
+  const std::vector<float> kn = rnd(kHeadDim);
+  const std::vector<float> pnorm = rnd(kHidden);
+  const std::vector<float> mcp = rnd(proj_n * kHidden);
+  const std::vector<float> mcb = rnd(2 * kTaps * kHidden);
+  const std::vector<float> gw = rnd(kFfn * kHidden);
+  const std::vector<float> uw = rnd(kFfn * kHidden);
+  const std::vector<float> dw = rnd(kHidden * kFfn);
+  auto upload = [&backend](const std::vector<float>& data) {
+    auto buf = backend->AllocateBuffer(data.size() * 4, MemoryKind::Device);
+    EXPECT_TRUE(buf.has_value());
+    backend->CopyH2D(**buf, std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(data.data()),
+                               data.size() * 4));
+    return std::move(*buf);
+  };
+  auto inorm_b = upload(inorm), acp_b = upload(acp), acb_b = upload(acb);
+  auto qw_b = upload(qw), kw_b = upload(kw), vw_b = upload(vw);
+  auto ow_b = upload(ow), qn_b = upload(qn), kn_b = upload(kn);
+  auto pnorm_b = upload(pnorm), mcp_b = upload(mcp), mcb_b = upload(mcb);
+  auto gw_b = upload(gw), uw_b = upload(uw), dw_b = upload(dw);
+  auto h_b = upload(hidden), r_b = upload(resid);
+  auto out_b = backend->AllocateBuffer(hidden.size() * 4, MemoryKind::Device);
+  auto rout_b = backend->AllocateBuffer(hidden.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(out_b && rout_b);
+  tessera::spec::DraftLayerBuffers wb;
+  wb.input_norm = &*inorm_b;
+  wb.attn_conv_proj = &*acp_b;
+  wb.attn_conv_base = &*acb_b;
+  wb.q_w = &*qw_b;
+  wb.k_w = &*kw_b;
+  wb.v_w = &*vw_b;
+  wb.o_w = &*ow_b;
+  wb.q_norm_w = &*qn_b;
+  wb.k_norm_w = &*kn_b;
+  wb.post_norm = &*pnorm_b;
+  wb.mlp_conv_proj = &*mcp_b;
+  wb.mlp_conv_base = &*mcb_b;
+  wb.gate_w = &*gw_b;
+  wb.up_w = &*uw_b;
+  wb.down_w = &*dw_b;
+  auto rms = backend->LoadKernel("rmsnorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto conv = backend->LoadKernel("dflash_conv", {});
+  auto rope = backend->LoadKernel("rope", {});
+  auto attn = backend->LoadKernel("attention", {});
+  auto silu = backend->LoadKernel("silu_mul", {});
+  auto add = backend->LoadKernel("add", {});
+  ASSERT_TRUE(rms && gemm && conv && rope && attn && silu && add);
+  tessera::spec::DraftLayerWeights wr;
+  wr.input_norm = std::span<const float>(inorm);
+  wr.attn_conv_proj = std::span<const float>(acp);
+  wr.attn_conv_base = std::span<const float>(acb);
+  wr.q_w = std::span<const float>(qw);
+  wr.k_w = std::span<const float>(kw);
+  wr.v_w = std::span<const float>(vw);
+  wr.o_w = std::span<const float>(ow);
+  wr.q_norm_w = std::span<const float>(qn);
+  wr.k_norm_w = std::span<const float>(kn);
+  wr.post_norm = std::span<const float>(pnorm);
+  wr.mlp_conv_proj = std::span<const float>(mcp);
+  wr.mlp_conv_base = std::span<const float>(mcb);
+  wr.gate_w = std::span<const float>(gw);
+  wr.up_w = std::span<const float>(uw);
+  wr.down_w = std::span<const float>(dw);
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  for (int use_residual = 0; use_residual < 2; ++use_residual) {
+    const tessera::Buffer* residual = use_residual ? &*r_b : nullptr;
+    auto device = tessera::spec::DraftLayerDevice(
+        *backend, **rms, **gemm, **conv, **rope, **attn, **silu, **add, *h_b,
+        residual, wb, **out_b, **rout_b, kRows, kHidden, kHeads, kKvHeads,
+        kHeadDim, kFfn, kTaps, kGroup, kBlock, kWindow, 0, kTheta, kEps);
+    ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+    backend->Synchronize();
+    std::vector<float> out_got(hidden.size()), rout_got(hidden.size());
+    backend->CopyD2H(**out_b, reinterpret_cast<std::byte*>(out_got.data()),
+                     out_got.size() * 4);
+    backend->CopyD2H(**rout_b, reinterpret_cast<std::byte*>(rout_got.data()),
+                     rout_got.size() * 4);
+    std::vector<float> ref(hidden.size()), rref(hidden.size());
+    ASSERT_TRUE(tessera::spec::DraftLayerRef(
+                    std::span<const float>(hidden),
+                    use_residual ? std::span<const float>(resid)
+                                 : std::span<const float>(),
+                    wr, std::span<float>(ref), std::span<float>(rref), kRows,
+                    kHidden, kHeads, kKvHeads, kHeadDim, kFfn, kTaps, kGroup,
+                    kBlock, kWindow, 0, kTheta, kEps)
+                    .has_value());
+    float dout = 0.0f, dres = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      dout = std::max(dout, std::abs(ref[i] - out_got[i]));
+      dres = std::max(dres, std::abs(rref[i] - rout_got[i]));
+    }
+    EXPECT_LE(dout, tol.abs) << "residual=" << use_residual;
+    EXPECT_LE(dres, tol.abs) << "residual=" << use_residual;
+  }
 }

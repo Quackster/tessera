@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 191/191 on both builds.
+`ctest` passes 192/192 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -558,6 +558,14 @@ through RADV GFX1201, rocm through the system ROCm).
   row count (the decode path passes 1) so multi-token blocks rotate
   and attend every row. Host reference and a device-vs-reference
   test.
+
+- 2026-10-07: DFlash2 full draft layer (192/192 `ctest` on both builds).
+  Current head. `src/spec/dflash2_layer.*` assembles a draft layer:
+  the pre-norm residual (add the carried residual, or use the input on
+  the first layer), the attention half, a second residual add, and the
+  MLP half, returning the MLP output and the new residual. Weight
+  handles use small structs. Host reference and a device-vs-reference
+  test, with and without a carried residual.
 
 ## Next (in order)
 
