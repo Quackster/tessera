@@ -859,6 +859,13 @@ through RADV GFX1201, rocm through the system ROCm).
   than greedy and output equal. The DFlash2 block draft uses the same
   batched verifier.
 
+- 2026-10-07: batched prefill (233/233 `ctest` on both builds).
+  `Engine::Generate`/`GenerateStreaming` and `GenerateSpeculative` prefill
+  the whole prompt in one batched trunk forward (`PrefillTokens`), with
+  the output head on the last row only, instead of one forward per token.
+  A 27-token prompt drops from about 38 s to 8.9 s; the last logits and
+  the retained hidden match the sequential prefill.
+
 ## Next (in order)
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`):

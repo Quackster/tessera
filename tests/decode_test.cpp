@@ -448,6 +448,49 @@ TEST(HybridDecodeTest, BatchedLogitsMatchSequential) {
   }
 }
 
+// Batched prefill must equal the sequential per-token prefill: the last
+// logits and the retained hidden match, on both fixtures.
+TEST(HybridDecodeTest, BatchedPrefillMatchesSequential) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  const std::vector<std::string> fixtures = {
+      WriteGatedHybridFixture("prefill-gated.gguf").string(),
+      WriteLinearHybridFixture("prefill-linear.gguf").string()};
+  const std::vector<std::uint32_t> tokens = {0, 1, 0, 26, 5};
+  for (const std::string& path : fixtures) {
+    auto model = engine->LoadModel(ModelOptions{path, 1024});
+    ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+    tessera::core::DecodeCache batched;
+    std::vector<float> batched_hidden;
+    auto fast = tessera::core::PrefillTokens(engine->Owner(), **model, batched,
+                                             tokens, &batched_hidden);
+    ASSERT_TRUE(fast.has_value()) << tessera::ToString(fast.error());
+    tessera::core::DecodeCache seq;
+    for (std::size_t i = 0; i + 1 < tokens.size(); ++i) {
+      ASSERT_TRUE(tessera::core::DecodeForward(engine->Owner(), **model, seq,
+                                               tokens[i])
+                      .has_value());
+    }
+    std::vector<float> seq_hidden;
+    auto slow = tessera::core::DecodeLogits(engine->Owner(), **model, seq,
+                                            tokens.back(), &seq_hidden);
+    ASSERT_TRUE(slow.has_value()) << tessera::ToString(slow.error());
+    ASSERT_EQ(fast->size(), slow->size());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < slow->size(); ++i) {
+      max_abs = std::max(max_abs, std::abs((*fast)[i] - (*slow)[i]));
+    }
+    EXPECT_LE(max_abs, 1e-3f) << path << " logits max_abs " << max_abs;
+    ASSERT_EQ(batched_hidden.size(), seq_hidden.size());
+    float hidden_abs = 0.0f;
+    for (std::size_t i = 0; i < seq_hidden.size(); ++i) {
+      hidden_abs =
+          std::max(hidden_abs, std::abs(batched_hidden[i] - seq_hidden[i]));
+    }
+    EXPECT_LE(hidden_abs, 1e-3f) << path << " hidden max_abs " << hidden_abs;
+  }
+}
+
 // Batched verification must be output preserving: for any draft the
 // accepted tokens plus the bonus token equal the plain greedy sequence,
 // and the rolled-back cache continues greedily from the accepted prefix.

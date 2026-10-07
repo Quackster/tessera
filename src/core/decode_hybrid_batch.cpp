@@ -387,7 +387,7 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
 std::expected<void, StatusCode> HybridForwardBatch(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
-    std::vector<float>* hidden_out) {
+    std::vector<float>* hidden_out, bool all_logits) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -411,11 +411,9 @@ std::expected<void, StatusCode> HybridForwardBatch(
     return std::unexpected(ready.error());
   }
   HybridDecodeCache& h = *cache.hybrid;
-  if (rows > 1) {
-    auto alloc = AllocBatch(backend, cfg, g, h, rows);
-    if (!alloc) {
-      return std::unexpected(alloc.error());
-    }
+  auto alloc = AllocBatch(backend, cfg, g, h, rows);
+  if (!alloc) {
+    return std::unexpected(alloc.error());
   }
   const std::size_t hidden = cfg.hidden_dim;
   auto embed = NeedWeightAny(model, "token_embd.weight");
@@ -437,8 +435,7 @@ std::expected<void, StatusCode> HybridForwardBatch(
     }
     std::copy(row.begin(), row.end(), staged.begin() + t * hidden);
   }
-  Buffer& xbuf = (rows > 1) ? *h.batch->x : *h.x;
-  if (!UploadF32(backend, xbuf, staged)) {
+  if (!UploadF32(backend, *h.batch->x, staged)) {
     return std::unexpected(StatusCode::DeviceError);
   }
   // Position triples for mRoPE (text rows: t == h == w).
@@ -449,8 +446,7 @@ std::expected<void, StatusCode> HybridForwardBatch(
     triples[t * 3 + 1] = p;
     triples[t * 3 + 2] = p;
   }
-  Buffer& posbuf = (rows > 1) ? *h.batch->pos : *h.pos;
-  if (!backend.CopyH2D(posbuf, std::span<const std::byte>(
+  if (!backend.CopyH2D(*h.batch->pos, std::span<const std::byte>(
                                   reinterpret_cast<const std::byte*>(
                                       triples.data()),
                                   triples.size() * 8))) {
@@ -472,7 +468,14 @@ std::expected<void, StatusCode> HybridForwardBatch(
     }
   }
   h.position += rows;
-  Buffer& src_x = (rows > 1) ? *h.batch->x : *h.x;
+  if (hidden_out != nullptr) {
+    hidden_out->resize(hidden);
+    auto last = detail::DownloadF32(backend, *h.batch->x);
+    if (!last) {
+      return std::unexpected(last.error());
+    }
+    std::copy(last->end() - hidden, last->end(), hidden_out->begin());
+  }
   if (logits_out != nullptr) {
     auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
     auto output = NeedWeightAny(model, "output.weight");
@@ -483,28 +486,37 @@ std::expected<void, StatusCode> HybridForwardBatch(
     if (!gemm_out) {
       return std::unexpected(StatusCode::UnsupportedFeature);
     }
-    Buffer& out_logits = (rows > 1) ? *h.batch->logits : *h.logits;
-    Buffer& out_xn = (rows > 1) ? *h.batch->xn : *h.xn;
-    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, src_x, *(*out_norm)->device,
-                       out_xn, rows, hidden, cfg.norm_eps) ||
-        !ProjectDevice(backend, *(*gemm_out), out_xn, *(*output)->device,
-                       out_logits, rows, cfg.vocab_size, hidden)) {
-      return std::unexpected(StatusCode::DeviceError);
+    if (all_logits && rows > 1) {
+      if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.batch->x,
+                         *(*out_norm)->device, *h.batch->xn, rows, hidden,
+                         cfg.norm_eps) ||
+          !ProjectDevice(backend, *(*gemm_out), *h.batch->xn, *(*output)->device,
+                         *h.batch->logits, rows, cfg.vocab_size, hidden)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      logits_out->resize(rows * cfg.vocab_size);
+      if (!backend.CopyD2H(*h.batch->logits,
+                           reinterpret_cast<std::byte*>(logits_out->data()),
+                           rows * cfg.vocab_size * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    } else {
+      // Only the last row needs logits (prefill): head on that row alone.
+      if (!backend.CopyD2D(*h.batch->x, (rows - 1) * hidden * 4, *h.x, 0,
+                           hidden * 4) ||
+          !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
+                         *h.xn, 1, hidden, cfg.norm_eps) ||
+          !ProjectDevice(backend, *(*gemm_out), *h.xn, *(*output)->device,
+                         *h.logits, 1, cfg.vocab_size, hidden)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      logits_out->resize(cfg.vocab_size);
+      if (!backend.CopyD2H(*h.logits,
+                           reinterpret_cast<std::byte*>(logits_out->data()),
+                           cfg.vocab_size * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
     }
-    logits_out->resize(rows * cfg.vocab_size);
-    if (!backend.CopyD2H(out_logits,
-                         reinterpret_cast<std::byte*>(logits_out->data()),
-                         rows * cfg.vocab_size * 4)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-  }
-  if (hidden_out != nullptr) {
-    hidden_out->resize(hidden);
-    auto last = detail::DownloadF32(backend, src_x);
-    if (!last) {
-      return std::unexpected(last.error());
-    }
-    std::copy(last->end() - hidden, last->end(), hidden_out->begin());
   }
   return {};
 }

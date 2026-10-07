@@ -209,17 +209,7 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
   }
   std::vector<float> hidden;
   std::vector<float> current;
-  for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
-    auto forward = core::DecodeForward(*backend_, model, cache, prompt[i]);
-    if (!forward) {
-      diagnostics_.Warn(
-          "engine", std::string("speculative prefill failed: ") +
-                        std::string(ToString(forward.error())));
-      return std::unexpected(forward.error());
-    }
-  }
-  auto logits =
-      core::DecodeLogits(*backend_, model, cache, prompt.back(), &hidden);
+  auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden);
   if (!logits) {
     diagnostics_.Warn("engine", std::string("speculative prefill failed: ") +
                                     std::string(ToString(logits.error())));
@@ -371,29 +361,17 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
                                     std::to_string(prompt.size()) +
                                     " prompt token(s)");
   }
-  for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
-    auto forward = core::DecodeForward(*backend_, model, cache, prompt[i]);
-    if (!forward) {
-      diagnostics_.Warn(
-          "engine", std::string("prompt step ") + std::to_string(i) +
-                        " failed: " + std::string(ToString(forward.error())));
-      return std::unexpected(forward.error());
-    }
-    if (options.progress_every > 0 &&
-        (i + 1) % options.progress_every == 0) {
-      diagnostics_.Info("engine",
-                        std::string("prefill: ") + std::to_string(i + 1) + "/" +
-                            std::to_string(prompt.size()) + " (" +
-                            std::to_string(elapsed_ms()) + " ms)");
-    }
-  }
-  auto first_logits = core::DecodeLogits(*backend_, model, cache, prompt.back());
+  auto first_logits = core::PrefillTokens(*backend_, model, cache, prompt);
   if (!first_logits) {
-    diagnostics_.Warn("engine", std::string("prompt step ") +
-                                    std::to_string(prompt.size() - 1) +
-                                    " failed: " +
+    diagnostics_.Warn("engine", std::string("prefill failed: ") +
                                     std::string(ToString(first_logits.error())));
     return std::unexpected(first_logits.error());
+  }
+  if (options.progress_every > 0) {
+    diagnostics_.Info("engine",
+                      std::string("prefill: ") + std::to_string(prompt.size()) +
+                          " token(s) in " + std::to_string(elapsed_ms()) +
+                          " ms");
   }
   std::mt19937_64 rng(options.seed);
   std::vector<std::uint32_t> history = prompt;

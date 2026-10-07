@@ -84,6 +84,31 @@ std::expected<std::vector<std::vector<float>>, StatusCode> ScoreTokens(
   return rows;
 }
 
+std::expected<std::vector<float>, StatusCode> PrefillTokens(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::span<const std::uint32_t> tokens, std::vector<float>* hidden_out) {
+  if (tokens.empty()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  auto config = model.Config();
+  if (config && config->hybrid) {
+    std::vector<float> logits;
+    auto status = HybridForwardBatch(backend, model, cache, tokens, &logits,
+                                     hidden_out, /*all_logits=*/false);
+    if (!status) {
+      return std::unexpected(status.error());
+    }
+    return logits;
+  }
+  for (std::size_t i = 0; i + 1 < tokens.size(); ++i) {
+    auto forward = DecodeForward(backend, model, cache, tokens[i]);
+    if (!forward) {
+      return std::unexpected(forward.error());
+    }
+  }
+  return DecodeLogits(backend, model, cache, tokens.back(), hidden_out);
+}
+
 std::expected<std::vector<std::vector<float>>, StatusCode> DecodeLogitsBatch(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens) {

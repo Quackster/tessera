@@ -77,6 +77,6 @@ inline std::expected<LinearGeometry, StatusCode> DeriveGeometry(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens,
     std::vector<float>* logits_out = nullptr,
-    std::vector<float>* hidden_out = nullptr);
+    std::vector<float>* hidden_out = nullptr, bool all_logits = true);
 
 }  // namespace tessera::core
