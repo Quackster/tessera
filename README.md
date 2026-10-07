@@ -1,5 +1,15 @@
 # Tessera
 
+<div align="center">
+<img alt="tessera logo" width="256" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' width='256' height='256'%3E%3Crect x='0' y='0' width='32' height='32' rx='6' fill='%230B1220'/%3E%3Cg%3E%3Crect x='2' y='2' width='4' height='4' fill='%2322D3EE'/%3E%3Crect x='8' y='2' width='4' height='4' fill='%2334D399'/%3E%3Crect x='14' y='2' width='4' height='4' fill='%23FBBF24'/%3E%3Crect x='20' y='2' width='4' height='4' fill='%232DD4BF'/%3E%3Crect x='26' y='2' width='4' height='4' fill='%2338BDF8'/%3E%3Crect x='2' y='8' width='4' height='4' fill='%235EEAD4'/%3E%3Crect x='8' y='8' width='4' height='4' fill='%232DD4BF'/%3E%3Crect x='14' y='8' width='4' height='4' fill='%2367E8F9'/%3E%3Crect x='20' y='8' width='4' height='4' fill='%2314B8A6'/%3E%3Crect x='26' y='8' width='4' height='4' fill='%236EE7B7'/%3E%3Crect x='11' y='14' width='4' height='4' fill='%2338BDF8'/%3E%3Crect x='17' y='14' width='4' height='4' fill='%2322D3EE'/%3E%3Crect x='11' y='20' width='4' height='4' fill='%2314B8A6'/%3E%3Crect x='17' y='20' width='4' height='4' fill='%2334D399'/%3E%3Crect x='11' y='26' width='4' height='4' fill='%230EA5E9'/%3E%3Crect x='17' y='26' width='4' height='4' fill='%2334D399'/%3E%3C/g%3E%3C/svg%3E"/>
+</div>
+
+<div align="center">
+
+[![Sponsor](https://img.shields.io/static/v1?label=Sponsor&message=%E2%9D%A4&color=ff69b4)](https://github.com/sponsors/Quackster)
+
+</div>
+
 > Status: Heavy development. The API changes without notice. There is no stable text generation yet. The code is usable for development and for backend tests. It is not ready for production use.
 
 Tessera is a C++20 LLM inference engine. It runs open weight models on GPU. It has two compute backends. Vulkan supports cross vendor GPUs. ROCm supports AMD GPUs. One binary uses one backend. The backend is set at configure time.
