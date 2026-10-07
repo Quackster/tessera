@@ -7,6 +7,7 @@
 #include <expected>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "tessera/backend.hpp"
@@ -84,6 +85,24 @@ inline std::expected<std::vector<float>, StatusCode> DownloadF32(
   std::vector<float> out(buf.Size() / 4);
   std::memcpy(out.data(), raw.data(), raw.size());
   return out;
+}
+
+// Download an F32 buffer once and cache it by name (constant weights:
+// norm vectors, SSM scalars). Saves a per-step host copy.
+inline std::expected<const std::vector<float>*, StatusCode> DownloadF32Cached(
+    Backend& backend,
+    std::unordered_map<std::string, std::vector<float>>& cache,
+    const std::string& name, const Buffer& buf) {
+  auto it = cache.find(name);
+  if (it != cache.end()) {
+    return &it->second;
+  }
+  auto value = DownloadF32(backend, buf);
+  if (!value) {
+    return std::unexpected(value.error());
+  }
+  auto inserted = cache.emplace(name, std::move(*value));
+  return &inserted.first->second;
 }
 
 inline std::expected<void, StatusCode> UploadF32(Backend& backend,

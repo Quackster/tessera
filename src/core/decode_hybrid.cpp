@@ -16,6 +16,7 @@ namespace {
 using detail::Attend;
 using detail::DeriveGeometry;
 using detail::DownloadF32;
+using detail::DownloadF32Cached;
 using detail::GatherEmbedding;
 using detail::GemmFor;
 using detail::LinearGeometry;
@@ -79,13 +80,17 @@ std::expected<std::vector<float>, StatusCode> FullAttentionLayer(
   if (!k_row || !v_row) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  auto q_norm_w = DownloadF32(backend, *(*q_norm)->device);
-  auto k_norm_w = DownloadF32(backend, *(*k_norm)->device);
+  auto q_norm_w = DownloadF32Cached(backend, hc.host_weights,
+                                    base + "attn_q_norm.weight",
+                                    *(*q_norm)->device);
+  auto k_norm_w = DownloadF32Cached(backend, hc.host_weights,
+                                    base + "attn_k_norm.weight",
+                                    *(*k_norm)->device);
   if (!q_norm_w || !k_norm_w) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  NormHeads(q, heads, head_dim, *q_norm_w, cfg.norm_eps);
-  NormHeads(*k_row, kv_heads, head_dim, *k_norm_w, cfg.norm_eps);
+  NormHeads(q, heads, head_dim, **q_norm_w, cfg.norm_eps);
+  NormHeads(*k_row, kv_heads, head_dim, **k_norm_w, cfg.norm_eps);
   HybridDecodeCache::FullLayer& full = hc.full[l];
   const std::size_t pos = full.k.size() / kv_dim;
   const std::vector<std::uint64_t> triple = {pos, pos, pos};
@@ -159,8 +164,10 @@ std::expected<std::vector<float>, StatusCode> LinearAttentionLayer(
   if (!qkv || !z || !beta_raw || !alpha_raw) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  auto a = DownloadF32(backend, *(*w_a)->device);
-  auto dt = DownloadF32(backend, *(*w_dt)->device);
+  auto a = DownloadF32Cached(backend, hc.host_weights, base + "ssm_a",
+                             *(*w_a)->device);
+  auto dt = DownloadF32Cached(backend, hc.host_weights, base + "ssm_dt.bias",
+                              *(*w_dt)->device);
   if (!a || !dt) {
     return std::unexpected(StatusCode::DeviceError);
   }
@@ -221,9 +228,9 @@ std::expected<std::vector<float>, StatusCode> LinearAttentionLayer(
     std::vector<float> k_h(k.begin() + ks, k.begin() + ks + g.head_k_dim);
     std::vector<float> v_h(v.begin() + h * g.head_v_dim,
                            v.begin() + (h + 1) * g.head_v_dim);
-    const float raw = (*alpha_raw)[h] + (*dt)[h];
+    const float raw = (*alpha_raw)[h] + (**dt)[h];
     const float softplus = raw > 20.0f ? raw : std::log1p(std::exp(raw));
-    const float alph = std::exp(-std::exp((*a)[h]) * softplus);
+    const float alph = std::exp(-std::exp((**a)[h]) * softplus);
     const float bet = 1.0f / (1.0f + std::exp(-(*beta_raw)[h]));
     std::vector<float> state_slice(
         st.state.begin() + h * g.head_k_dim * g.head_v_dim,
@@ -239,12 +246,14 @@ std::expected<std::vector<float>, StatusCode> LinearAttentionLayer(
   }
   // Gated RMS norm over the value heads, gated by the z projection.
   std::vector<float> out(g.value_dim);
-  auto norm_w = DownloadF32(backend, *(*w_norm)->device);
+  auto norm_w = DownloadF32Cached(backend, hc.host_weights,
+                                  base + "ssm_norm.weight",
+                                  *(*w_norm)->device);
   if (!norm_w) {
     return std::unexpected(norm_w.error());
   }
   if (auto s = RmsNormGatedRef(std::span<const float>(core),
-                               std::span<const float>(*norm_w),
+                               std::span<const float>(**norm_w),
                                std::span<const float>(*z), std::span<float>(out),
                                g.num_v_heads, g.head_v_dim, cfg.norm_eps);
       !s) {
@@ -278,12 +287,14 @@ std::expected<void, StatusCode> ApplyFfn(Backend& backend, const Model& model,
   if (!gemm_gate || !gemm_up || !gemm_down) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  auto post_w = DownloadF32(backend, *(*post)->device);
+  auto post_w = DownloadF32Cached(backend, hc.host_weights,
+                                  base + "post_attention_norm.weight",
+                                  *(*post)->device);
   if (!post_w) {
     return std::unexpected(post_w.error());
   }
   std::vector<float> work(hidden);
-  RmsNormInto(x, post_w->data(), cfg.norm_eps, work);
+  RmsNormInto(x, (*post_w)->data(), cfg.norm_eps, work);
   auto gate = Project(backend, *(*gemm_gate), work, *(*w_gate)->device,
                       cfg.ffn_dim);
   auto up =
@@ -371,11 +382,13 @@ std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
     if (!norm) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    auto norm_w = DownloadF32(backend, *(*norm)->device);
+    auto norm_w = DownloadF32Cached(backend, hc.host_weights,
+                                    base + "attn_norm.weight",
+                                    *(*norm)->device);
     if (!norm_w) {
       return std::unexpected(norm_w.error());
     }
-    RmsNormInto(x, norm_w->data(), cfg.norm_eps, work);
+    RmsNormInto(x, (*norm_w)->data(), cfg.norm_eps, work);
     std::expected<std::vector<float>, StatusCode> mix =
         cfg.IsFullAttentionLayer(l)
             ? FullAttentionLayer(backend, model, cfg, cache, hc, l, work)
@@ -400,11 +413,13 @@ std::expected<std::uint32_t, StatusCode> HybridDecodeStep(
   if (!gemm_out) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  auto out_norm_w = DownloadF32(backend, *(*out_norm)->device);
+  auto out_norm_w = DownloadF32Cached(backend, hc.host_weights,
+                                      "output_norm.weight",
+                                      *(*out_norm)->device);
   if (!out_norm_w) {
     return std::unexpected(out_norm_w.error());
   }
-  RmsNormInto(x, out_norm_w->data(), cfg.norm_eps, work);
+  RmsNormInto(x, (*out_norm_w)->data(), cfg.norm_eps, work);
   auto logits = Project(backend, *(*gemm_out), work, *(*output)->device,
                         cfg.vocab_size);
   if (!logits) {

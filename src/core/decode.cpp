@@ -11,6 +11,7 @@ namespace {
 
 using detail::Attend;
 using detail::DownloadF32;
+using detail::DownloadF32Cached;
 using detail::GatherEmbedding;
 using detail::NeedWeight;
 using detail::NeedWeightAny;
@@ -105,11 +106,13 @@ std::expected<std::uint32_t, StatusCode> DecodeStep(
         !down) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    auto norm_w = DownloadF32(backend, *(*norm)->device);
+    auto norm_w = DownloadF32Cached(backend, cache.host_weights,
+                                 base + "attn_norm.weight",
+                                 *(*norm)->device);
     if (!norm_w) {
       return std::unexpected(norm_w.error());
     }
-    RmsNormInto(x, norm_w->data(), cfg.norm_eps, work);
+    RmsNormInto(x, (*norm_w)->data(), cfg.norm_eps, work);
     auto q = Project(backend, *cache.gemm_kernel, work, *(*wq)->device,
                      heads * head_dim);
     auto k_row = Project(backend, *cache.gemm_kernel, work, *(*wk)->device,
@@ -176,11 +179,13 @@ std::expected<std::uint32_t, StatusCode> DecodeStep(
     for (std::size_t i = 0; i < hidden; ++i) {
       x[i] += (*proj_out)[i];
     }
-    auto mlp_norm_w = DownloadF32(backend, *(*mlp_norm)->device);
+    auto mlp_norm_w = DownloadF32Cached(backend, cache.host_weights,
+                                    base + "ffn_norm.weight",
+                                    *(*mlp_norm)->device);
     if (!mlp_norm_w) {
       return std::unexpected(mlp_norm_w.error());
     }
-    RmsNormInto(x, mlp_norm_w->data(), cfg.norm_eps, work);
+    RmsNormInto(x, (*mlp_norm_w)->data(), cfg.norm_eps, work);
     auto g = Project(backend, *cache.gemm_kernel, work, *(*gate)->device,
                      cfg.ffn_dim);
     auto u = Project(backend, *cache.gemm_kernel, work, *(*up)->device,
@@ -206,11 +211,13 @@ std::expected<std::uint32_t, StatusCode> DecodeStep(
   if (!out_norm || !output) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto out_norm_w = DownloadF32(backend, *(*out_norm)->device);
+  auto out_norm_w = DownloadF32Cached(backend, cache.host_weights,
+                                    "output_norm.weight",
+                                    *(*out_norm)->device);
   if (!out_norm_w) {
     return std::unexpected(out_norm_w.error());
   }
-  RmsNormInto(x, out_norm_w->data(), cfg.norm_eps, work);
+  RmsNormInto(x, (*out_norm_w)->data(), cfg.norm_eps, work);
   auto logits =
       Project(backend, *cache.gemm_kernel, work, *(*output)->device,
               cfg.vocab_size);

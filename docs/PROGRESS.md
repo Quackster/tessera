@@ -310,6 +310,12 @@ through RADV GFX1201, rocm through the system ROCm).
   drives token-by-token output. The CLI `serve` gains `--api-key` and
   `--allow-origin`. Unimplemented endpoints answer 501.
 
+- 2026-10-07: cache constant host weights (158/158 `ctest` on both
+  builds). Current head. The decode caches download the F32 norm
+  vectors and SSM scalars once (`DownloadF32Cached`) instead of
+  re-downloading them every step; the decode determinism tests cover
+  the cached path. Output is unchanged.
+
 ## Next (in order)
 
 1. **MTP for the 27B target** (arch `qwen35`): the block.64 nextn

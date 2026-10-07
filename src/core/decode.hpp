@@ -25,6 +25,8 @@ struct DecodeCache {
   std::unique_ptr<Kernel> gemm_kernel;
   std::unique_ptr<Kernel> rope_kernel;
   std::unique_ptr<Kernel> attention_kernel;
+  // Constant F32 weights (norms) downloaded once and reused.
+  std::unordered_map<std::string, std::vector<float>> host_weights;
   // Hybrid state, created on the first hybrid step (null for vanilla).
   std::unique_ptr<struct HybridDecodeCache> hybrid;
 };
@@ -49,6 +51,8 @@ struct HybridDecodeCache {
   std::unique_ptr<Kernel> conv_kernel;
   std::unique_ptr<Kernel> delta_kernel;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
+  // Constant F32 weights (norms, SSM scalars) downloaded once.
+  std::unordered_map<std::string, std::vector<float>> host_weights;
   bool ready = false;
 };
 
