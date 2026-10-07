@@ -14,6 +14,7 @@ namespace tessera::core {
 namespace {
 
 using detail::AddDevice;
+using detail::AppendKv;
 using detail::AttentionDevice;
 using detail::DeltaStepHeadsDevice;
 using detail::DownloadF32;
@@ -66,35 +67,6 @@ std::expected<LinearGeometry, StatusCode> DeriveGeometry(
   g.factor = g.num_v_heads / g.num_k_heads;
   g.conv_dim = g.key_dim * 2 + g.value_dim;
   return g;
-}
-
-// Grow a full-attention KV cache by one row.
-std::expected<void, StatusCode> AppendKv(Backend& backend,
-                                         HybridDecodeCache::FullKv& kv,
-                                         const Buffer& k_row,
-                                         const Buffer& v_row,
-                                         std::size_t kv_bytes) {
-  auto grown_k = backend.AllocateBuffer((kv.rows + 1) * kv_bytes,
-                                        MemoryKind::Device);
-  auto grown_v = backend.AllocateBuffer((kv.rows + 1) * kv_bytes,
-                                        MemoryKind::Device);
-  if (!grown_k || !grown_v) {
-    return std::unexpected(StatusCode::OutOfMemory);
-  }
-  if (kv.rows > 0) {
-    if (!backend.CopyD2D(*kv.k, 0, **grown_k, 0, kv.rows * kv_bytes) ||
-        !backend.CopyD2D(*kv.v, 0, **grown_v, 0, kv.rows * kv_bytes)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-  }
-  if (!backend.CopyD2D(k_row, 0, **grown_k, kv.rows * kv_bytes, kv_bytes) ||
-      !backend.CopyD2D(v_row, 0, **grown_v, kv.rows * kv_bytes, kv_bytes)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  kv.k = std::move(*grown_k);
-  kv.v = std::move(*grown_v);
-  ++kv.rows;
-  return {};
 }
 
 std::expected<void, StatusCode> InitScratch(Backend& backend,

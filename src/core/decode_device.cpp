@@ -10,6 +10,7 @@ namespace tessera::core {
 
 namespace {
 
+using detail::AppendKv;
 using detail::DownloadF32;
 using detail::GatherEmbedding;
 using detail::AttentionDevice;
@@ -23,36 +24,6 @@ std::uint32_t FloatBits(float value) {
   std::uint32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
-}
-
-// Grow a KV cache by one row and append `k_row`/`v_row` (kv_dim floats
-// each).
-std::expected<void, StatusCode> AppendKv(Backend& backend,
-                                         DeviceDecodeState::Kv& kv,
-                                         const Buffer& k_row,
-                                         const Buffer& v_row,
-                                         std::size_t kv_bytes) {
-  auto grown_k = backend.AllocateBuffer((kv.rows + 1) * kv_bytes,
-                                        MemoryKind::Device);
-  auto grown_v = backend.AllocateBuffer((kv.rows + 1) * kv_bytes,
-                                        MemoryKind::Device);
-  if (!grown_k || !grown_v) {
-    return std::unexpected(StatusCode::OutOfMemory);
-  }
-  if (kv.rows > 0) {
-    if (!backend.CopyD2D(*kv.k, 0, **grown_k, 0, kv.rows * kv_bytes) ||
-        !backend.CopyD2D(*kv.v, 0, **grown_v, 0, kv.rows * kv_bytes)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-  }
-  if (!backend.CopyD2D(k_row, 0, **grown_k, kv.rows * kv_bytes, kv_bytes) ||
-      !backend.CopyD2D(v_row, 0, **grown_v, kv.rows * kv_bytes, kv_bytes)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  kv.k = std::move(*grown_k);
-  kv.v = std::move(*grown_v);
-  ++kv.rows;
-  return {};
 }
 
 }  // namespace

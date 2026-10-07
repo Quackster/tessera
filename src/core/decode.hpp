@@ -42,6 +42,9 @@ struct DeviceDecodeState {
     std::unique_ptr<Buffer> k;
     std::unique_ptr<Buffer> v;
     std::size_t rows = 0;
+    // Allocated row capacity; grows geometrically so a decode step appends
+    // one row instead of reallocating the whole cache.
+    std::size_t capacity = 0;
   };
   std::unique_ptr<Kernel> rmsnorm_kernel;
   std::unique_ptr<Kernel> add_kernel;
@@ -98,6 +101,8 @@ struct HybridDecodeCache {
     std::unique_ptr<Buffer> k;
     std::unique_ptr<Buffer> v;
     std::size_t rows = 0;
+    // Allocated row capacity; grows geometrically (see DeviceDecodeState).
+    std::size_t capacity = 0;
   };
   struct LinearState {
     std::unique_ptr<Buffer> conv_hist;

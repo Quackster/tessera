@@ -88,6 +88,45 @@ inline std::expected<std::vector<float>, StatusCode> DownloadF32(
   return out;
 }
 
+// Append one key/value row to a preallocated KV cache. Works for both KV
+// cache types (DeviceDecodeState::Kv and HybridDecodeCache::FullKv) so the
+// append logic has one implementation. The buffer grows geometrically, so
+// a decode step copies one row instead of reallocating the whole cache.
+constexpr std::size_t kInitialKvRows = 4;
+
+template <typename Kv>
+inline std::expected<void, StatusCode> AppendKv(Backend& backend, Kv& kv,
+                                                const Buffer& k_row,
+                                                const Buffer& v_row,
+                                                std::size_t kv_bytes) {
+  if (kv.rows == kv.capacity) {
+    const std::size_t new_capacity =
+        kv.capacity == 0 ? kInitialKvRows : kv.capacity * 2;
+    auto grown_k = backend.AllocateBuffer(new_capacity * kv_bytes,
+                                          MemoryKind::Device);
+    auto grown_v = backend.AllocateBuffer(new_capacity * kv_bytes,
+                                          MemoryKind::Device);
+    if (!grown_k || !grown_v) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    if (kv.rows > 0) {
+      if (!backend.CopyD2D(*kv.k, 0, **grown_k, 0, kv.rows * kv_bytes) ||
+          !backend.CopyD2D(*kv.v, 0, **grown_v, 0, kv.rows * kv_bytes)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+    kv.k = std::move(*grown_k);
+    kv.v = std::move(*grown_v);
+    kv.capacity = new_capacity;
+  }
+  if (!backend.CopyD2D(k_row, 0, *kv.k, kv.rows * kv_bytes, kv_bytes) ||
+      !backend.CopyD2D(v_row, 0, *kv.v, kv.rows * kv_bytes, kv_bytes)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  ++kv.rows;
+  return {};
+}
+
 // Greedy argmax over a logits row (first maximum wins, matching the
 // decode loops). Empty input is undefined; callers pass a nonempty row.
 inline std::uint32_t ArgMax(std::span<const float> logits) {

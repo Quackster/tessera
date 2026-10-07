@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 177/177 on both builds.
+`ctest` passes 178/178 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -459,6 +459,15 @@ through RADV GFX1201, rocm through the system ROCm).
   Verified on the 27B (866 tensors): speculative equals greedy on
   vulkan and rocm. Sequential scoring today; batching is the next
   speed step.
+
+- 2026-10-07: preallocated KV caches (178/178 `ctest` on both builds;
+  the real-model tests are env-gated). Current head. The full-attention
+  KV caches (vanilla and hybrid, plus the MTP block) now grow
+  geometrically instead of reallocating and copying the whole cache
+  every step, turning the per-step O(n) append into amortized O(1).
+  The two duplicate append helpers are unified into one templated
+  `AppendKv` in `decode_internal.hpp`. A device test covers the growth
+  boundary; the pinned baselines and the 27B MTP path are unchanged.
 
 ## Next (in order)
 
