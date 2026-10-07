@@ -2,8 +2,12 @@
 
 #include <cstdlib>
 
+#include <memory>
+
 #include "test_helpers.hpp"
 #include "spec/dflash2_config.hpp"
+#include "spec/dflash2_weights.hpp"
+#include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
 
@@ -196,3 +200,28 @@ TEST(SpecConfigTest, LoadsRealConfigWhenProvided) {
   EXPECT_EQ(config->layer_types.size(), 5u);
 }
 
+
+// The real DFlash2 draft checkpoint loads and binds when the directory is
+// provided (set TESSERA_TEST_DFLASH2_DIR).
+TEST(SpecWeightsTest, LoadsRealDraftWhenProvided) {
+  const char* dir = std::getenv("TESSERA_TEST_DFLASH2_DIR");
+  if (dir == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_DFLASH2_DIR not set";
+  }
+  std::unique_ptr<tessera::Engine> engine;
+  tessera::testing::MakeEngineOrSkip(engine);
+  auto config = LoadDFlash2Config(dir);
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  auto store = tessera::spec::DraftWeightStore::Load(engine->Owner(), dir,
+                                                     *config);
+  ASSERT_TRUE(store.has_value()) << tessera::ToString(store.error());
+  EXPECT_EQ(store->Weights().layers.size(), config->num_layers);
+  EXPECT_NE(store->Weights().fc, nullptr);
+  EXPECT_NE(store->Weights().hidden_norm, nullptr);
+  EXPECT_NE(store->Weights().final_norm, nullptr);
+  for (const auto& layer : store->Weights().layers) {
+    EXPECT_NE(layer.q_w, nullptr);
+    EXPECT_NE(layer.down_w, nullptr);
+    EXPECT_NE(layer.hidden_norm, nullptr);
+  }
+}
