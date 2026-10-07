@@ -21,6 +21,7 @@
 #include "spec/dflash2_stack.hpp"
 #include "spec/dflash2_selector.hpp"
 #include "spec/dflash2_fuse.hpp"
+#include "spec/dflash2_context.hpp"
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
@@ -4186,6 +4187,67 @@ TEST(BackendTest, DraftFuseMatchesRef) {
   float max_abs = 0.0f;
   for (std::size_t i = 0; i < ref.size(); ++i) {
     max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the DFlash2 context K/V projection matches the host reference.
+TEST(BackendTest, DraftContextKvMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(100);
+  constexpr std::size_t kCtx = 3, kHidden = 4, kKvHeads = 2, kHeadDim = 2;
+  const std::size_t kv_dim = kKvHeads * kHeadDim;
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = DrawValue(rng);
+    return v;
+  };
+  std::vector<float> ctx = rnd(kCtx * kHidden), hnorm = rnd(kHidden);
+  std::vector<float> kp = rnd(kv_dim * kHidden), vp = rnd(kv_dim * kHidden);
+  std::vector<float> kn = rnd(kHeadDim);
+  auto up = [&backend](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  auto ctx_b = up(ctx), hn_b = up(hnorm), kp_b = up(kp), vp_b = up(vp),
+       kn_b = up(kn);
+  auto normed_b = backend->AllocateBuffer(kCtx * kHidden * 4, MemoryKind::Device);
+  auto k_b = backend->AllocateBuffer(kCtx * kv_dim * 4, MemoryKind::Device);
+  auto v_b = backend->AllocateBuffer(kCtx * kv_dim * 4, MemoryKind::Device);
+  ASSERT_TRUE(normed_b && k_b && v_b);
+  auto rms = backend->LoadKernel("rmsnorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto rope = backend->LoadKernel("rope", {});
+  ASSERT_TRUE(rms && gemm && rope);
+  auto device = tessera::spec::DraftContextKvDevice(
+      *backend, **rms, **gemm, **rope, **normed_b, *ctx_b, *hn_b, *kp_b, *vp_b,
+      *kn_b, **k_b, **v_b, kCtx, kHidden, kKvHeads, kHeadDim, 0, 10000.0,
+      1e-6f);
+  ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
+  backend->Synchronize();
+  std::vector<float> k_got(kCtx * kv_dim), v_got(kCtx * kv_dim);
+  backend->CopyD2H(**k_b, reinterpret_cast<std::byte*>(k_got.data()),
+                   k_got.size() * 4);
+  backend->CopyD2H(**v_b, reinterpret_cast<std::byte*>(v_got.data()),
+                   v_got.size() * 4);
+  std::vector<float> k_ref(kCtx * kv_dim), v_ref(kCtx * kv_dim);
+  ASSERT_TRUE(tessera::spec::DraftContextKvRef(
+                  std::span<const float>(ctx), std::span<const float>(hnorm),
+                  std::span<const float>(kp), std::span<const float>(vp),
+                  std::span<const float>(kn), std::span<float>(k_ref),
+                  std::span<float>(v_ref), kCtx, kHidden, kKvHeads, kHeadDim,
+                  0, 10000.0, 1e-6f)
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < k_ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(k_ref[i] - k_got[i]));
+    max_abs = std::max(max_abs, std::abs(v_ref[i] - v_got[i]));
   }
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
