@@ -100,7 +100,7 @@ namespace tessera::core {
     std::size_t dv, float alpha, float beta);
 // Host reference for the "qgate_split" built-in: split a fused gated
 // attention projection into queries and gates. The fused projection is
-// heads*2*head_dim fp32 laid out per head as query then gate (the
+// heads*2*head_dim fp32 laid out as all queries then all gates (the
 // layout gated attention definitions use); `q` and `gate` are
 // heads*head_dim each. heads and head_dim must be nonzero and the
 // spans must match those lengths; else InvalidArgument.

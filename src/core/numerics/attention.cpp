@@ -272,12 +272,13 @@ std::expected<void, StatusCode> QGateSplitRef(
     return std::unexpected(StatusCode::InvalidArgument);
   }
   for (std::size_t h = 0; h < heads; ++h) {
-    const float* src = fused.data() + h * 2 * head_dim;
+    const float* q_src = fused.data() + h * head_dim;
+    const float* g_src = fused.data() + per_head + h * head_dim;
     float* q_row = q.data() + h * head_dim;
     float* gate_row = gate.data() + h * head_dim;
     for (std::size_t e = 0; e < head_dim; ++e) {
-      q_row[e] = src[e];
-      gate_row[e] = src[head_dim + e];
+      q_row[e] = q_src[e];
+      gate_row[e] = g_src[e];
     }
   }
   return {};

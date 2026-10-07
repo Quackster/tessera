@@ -39,6 +39,7 @@ void PrintUsage() {
                "  --gpu <n>         GPU index to use (default 0, the first)\n"
                "  --draft-block <n> draft block tokens (default %zu)\n"
                "  --prompt <id>     first token id for generation (default 0)\n"
+               "  --prompt-ids <a,b> comma-separated prompt token ids\n"
                "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
                "  --mtp <id>        print the MTP draft after this token id\n"
                "  --tokens <n>      run n greedy decode steps and print them\n"
@@ -105,6 +106,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> api_keys;
   std::vector<std::string> allow_origins;
   std::uint32_t prompt = 0;
+  std::vector<std::uint32_t> prompt_ids;
   std::uint32_t mtp_token = 0;
   bool mtp = false;
   bool speculate = false;
@@ -153,6 +155,19 @@ int main(int argc, char** argv) {
       draft_block = std::stoul(argv[++i]);
     } else if (arg == "--prompt" && i + 1 < argc) {
       prompt = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+    } else if (arg == "--prompt-ids" && i + 1 < argc) {
+      const std::string list = argv[++i];
+      std::size_t start = 0;
+      while (start <= list.size()) {
+        const std::size_t comma = list.find(',', start);
+        const std::string part = list.substr(start, comma - start);
+        if (!part.empty()) {
+          prompt_ids.push_back(
+              static_cast<std::uint32_t>(std::stoul(part)));
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+      }
     } else if (arg == "--mtp" && i + 1 < argc) {
       mtp_token = static_cast<std::uint32_t>(std::stoul(argv[++i]));
       mtp = true;
@@ -348,6 +363,9 @@ int main(int argc, char** argv) {
         return kExitError;
       }
       gen.prompt_tokens = *ids;
+    }
+    if (!prompt_ids.empty()) {
+      gen.prompt_tokens = prompt_ids;
     }
     std::expected<std::vector<std::uint32_t>, tessera::StatusCode> generated;
     if (!image_path.empty()) {

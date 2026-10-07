@@ -290,7 +290,7 @@ class Kernel {
 // the width id. The dispatch is
 // ceil(rows * heads * (rope_dim / 2) / 256) workgroups of 256.
 // "qgate_split": buffer 0 is the fused gated-attention projection
-// (fp32, heads*2*head_dim, per head query then gate), buffer 1 the
+// (fp32, heads*2*head_dim, all queries then all gates), buffer 1 the
 // queries Q (fp32, heads*head_dim), buffer 2 the gates G (fp32,
 // heads*head_dim); scalars are heads and head_dim. The dispatch is
 // ceil(heads * head_dim / 256) workgroups of 256.

@@ -473,7 +473,7 @@ __global__ void MropeKernel(float* data, const unsigned long long* pos,
 }
 
 // Built-in "qgate_split": split a fused gated-attention projection
-// into queries and gates (per head query then gate). One thread per
+// into queries and gates (all queries, then all gates). One thread per
 // (head, element).
 __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
                                  unsigned long long heads,
@@ -485,9 +485,8 @@ __global__ void QGateSplitKernel(const float* fused, float* q, float* gate,
   }
   const unsigned long long head = t / head_dim;
   const unsigned long long e = t % head_dim;
-  const unsigned long long src = head * 2 * head_dim;
-  q[t] = fused[src + e];
-  gate[t] = fused[src + head_dim + e];
+  q[t] = fused[head * head_dim + e];
+  gate[t] = fused[heads * head_dim + head * head_dim + e];
 }
 // Built-in "add": elementwise o = a + b over n fp32. One thread per
 // element.

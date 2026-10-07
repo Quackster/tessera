@@ -357,7 +357,7 @@ std::vector<std::uint32_t> SpeculativeTokens(const std::string& path,
 TEST(HybridDecodeTest, GatedBaselineIsPinned) {
   const auto got = GreedyTokens(WriteGatedHybridFixture("gated.gguf").string(),
                                 8);
-  const std::vector<std::uint32_t> want = {1, 0, 26, 18, 17, 3, 3, 3};
+  const std::vector<std::uint32_t> want = {17, 10, 10, 21, 24, 24, 24, 24};
   EXPECT_EQ(got, want);
 }
 
@@ -398,7 +398,7 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
   auto rows = tessera::core::ScoreTokens(engine->Owner(), **model, prefix);
   ASSERT_TRUE(rows.has_value()) << tessera::ToString(rows.error());
   ASSERT_EQ(rows->size(), prefix.size());
-  const std::vector<std::uint32_t> want = {1, 0, 26, 18};
+  const std::vector<std::uint32_t> want = {17, 12, 18, 3};
   for (std::size_t i = 0; i < rows->size(); ++i) {
     EXPECT_EQ((*rows)[i].size(), cfg->vocab_size);
     EXPECT_EQ(RowArgMax((*rows)[i]), want[i]);
@@ -407,7 +407,7 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
   auto one = tessera::core::DecodeLogits(engine->Owner(), **model, cache, 0);
   ASSERT_TRUE(one.has_value()) << tessera::ToString(one.error());
   EXPECT_EQ(*one, (*rows)[0]);
-  EXPECT_EQ(RowArgMax(*one), 1u);
+  EXPECT_EQ(RowArgMax(*one), 17u);
 
   auto empty = tessera::core::ScoreTokens(
       engine->Owner(), **model, std::span<const std::uint32_t>{});
@@ -422,7 +422,7 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
 // full-attention and the stateful linear fixtures.
 TEST(HybridDecodeTest, SpeculationMatchesGreedy) {
   const std::string gated = WriteGatedHybridFixture("gated.gguf").string();
-  const std::vector<std::uint32_t> want_gated = {1, 0, 26, 18, 17, 3, 3, 3};
+  const std::vector<std::uint32_t> want_gated = {17, 10, 10, 21, 24, 24, 24, 24};
   EXPECT_EQ(SpeculativeTokens(gated, 8, 31), want_gated);
   EXPECT_EQ(SpeculativeTokens(gated, 8, 1), want_gated);
   const std::string linear = WriteLinearHybridFixture("linear.gguf").string();
