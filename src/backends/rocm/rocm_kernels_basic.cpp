@@ -256,4 +256,37 @@ __global__ void Conv1dKernel(const float* x, const float* w, float* y,
   }
   y[i] = acc;
 }
+// Built-in "delta_step": one gated delta-rule recurrent step over a
+// dk x dv state updated in place. One thread per state column with
+// sequential accumulation, so columns never race.
+__global__ void DeltaStepKernel(float* s, const float* k, const float* v,
+                                const float* q, float* o,
+                                unsigned long long dk, unsigned long long dv,
+                                unsigned long long alpha_bits,
+                                unsigned long long beta_bits) {
+  const unsigned long long d =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (d >= dv) {
+    return;
+  }
+  float alpha = 0.0f;
+  float beta = 0.0f;
+  static_assert(sizeof(alpha) == 4);
+  std::uint32_t alpha_raw = static_cast<std::uint32_t>(alpha_bits);
+  std::uint32_t beta_raw = static_cast<std::uint32_t>(beta_bits);
+  std::memcpy(&alpha, &alpha_raw, 4);
+  std::memcpy(&beta, &beta_raw, 4);
+  float read = 0.0f;
+  for (unsigned long long j = 0; j < dk; ++j) {
+    read = fmaf(s[j * dv + d], k[j], read);
+  }
+  float out = 0.0f;
+  for (unsigned long long j = 0; j < dk; ++j) {
+    const float updated = alpha * (s[j * dv + d] - beta * k[j] * read) +
+                          beta * v[d] * k[j];
+    s[j * dv + d] = updated;
+    out = fmaf(updated, q[j], out);
+  }
+  o[d] = out;
+}
 }  // namespace tessera::backends::rocm

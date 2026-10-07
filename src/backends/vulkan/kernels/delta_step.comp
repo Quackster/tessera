@@ -1,0 +1,56 @@
+#version 450
+
+// One thread per state column; the dispatch is ceil(dv / 256)
+// workgroups via grid_x.
+layout(local_size_x = 256) in;
+
+// "delta_step" contract: buffer 0 is the dk x dv state updated in
+// place, buffers 1..3 are k (dk), v (dv) and q (dk), buffer 4 the
+// output o (dv). Scalars: dk v[0], dv v[2], alpha bits v[4],
+// beta bits v[6].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer S {
+  float s[];
+};
+
+layout(set = 0, binding = 1) buffer K {
+  float k[];
+};
+
+layout(set = 0, binding = 2) buffer V {
+  float v[];
+};
+
+layout(set = 0, binding = 3) buffer Q {
+  float q[];
+};
+
+layout(set = 0, binding = 4) buffer O {
+  float o[];
+};
+
+void main() {
+  uint d = gl_GlobalInvocationID.x;
+  uint dv = pc.v[2];
+  if (d >= dv) {
+    return;
+  }
+  uint dk = pc.v[0];
+  float alpha = uintBitsToFloat(pc.v[4]);
+  float beta = uintBitsToFloat(pc.v[6]);
+  float read = 0.0;
+  for (uint j = 0; j < dk; ++j) {
+    read += s[j * dv + d] * k[j];
+  }
+  float total = 0.0;
+  for (uint j = 0; j < dk; ++j) {
+    float updated = alpha * (s[j * dv + d] - beta * k[j] * read) +
+                    beta * v[d] * k[j];
+    s[j * dv + d] = updated;
+    total += updated * q[j];
+  }
+  o[d] = total;
+}

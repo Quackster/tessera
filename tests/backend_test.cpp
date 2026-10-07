@@ -1801,3 +1801,135 @@ TEST(BackendTest, ConvRejectsBadArgs) {
   ASSERT_FALSE(zero_width.has_value());
   EXPECT_EQ(zero_width.error(), StatusCode::InvalidArgument);
 }
+
+// Device: three gated delta steps match the host reference, outputs
+// and the carried state alike (dk 8, dv 12, decay 0.9, rate 0.5).
+TEST(BackendTest, DeltaStepDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(44);
+  constexpr std::size_t kDk = 8;
+  constexpr std::size_t kDv = 12;
+  constexpr std::size_t kSteps = 3;
+  constexpr float kAlpha = 0.9f;
+  constexpr float kBeta = 0.5f;
+  std::vector<float> state(kDk * kDv);
+  for (auto& v : state) {
+    v = DrawValue(rng);
+  }
+  auto s_buf = backend->AllocateBuffer(state.size() * 4, MemoryKind::Device);
+  auto k_buf = backend->AllocateBuffer(kDk * 4, MemoryKind::Device);
+  auto v_buf = backend->AllocateBuffer(kDv * 4, MemoryKind::Device);
+  auto q_buf = backend->AllocateBuffer(kDk * 4, MemoryKind::Device);
+  auto o_buf = backend->AllocateBuffer(kDv * 4, MemoryKind::Device);
+  ASSERT_TRUE(s_buf.has_value() && k_buf.has_value() && v_buf.has_value() &&
+              q_buf.has_value() && o_buf.has_value());
+  auto upload = [&backend](auto& buf, const std::vector<float>& data) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(data.data()),
+                   data.size() * 4));
+  };
+  ASSERT_TRUE(upload(s_buf, state).has_value());
+
+  std::uint32_t alpha_bits = 0;
+  std::uint32_t beta_bits = 0;
+  static_assert(sizeof(alpha_bits) == sizeof(kAlpha));
+  std::memcpy(&alpha_bits, &kAlpha, sizeof(alpha_bits));
+  std::memcpy(&beta_bits, &kBeta, sizeof(beta_bits));
+  auto kernel = backend->LoadKernel("delta_step", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kDv + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*s_buf).get(), (*k_buf).get(), (*v_buf).get(),
+                    (*q_buf).get(), (*o_buf).get()};
+  launch.scalars = {kDk, kDv, alpha_bits, beta_bits};
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  std::vector<float> ref_state = state;
+  for (std::size_t step = 0; step < kSteps; ++step) {
+    std::vector<float> k(kDk);
+    std::vector<float> v(kDv);
+    std::vector<float> q(kDk);
+    for (auto& x : k) {
+      x = DrawValue(rng);
+    }
+    for (auto& x : v) {
+      x = DrawValue(rng);
+    }
+    for (auto& x : q) {
+      x = DrawValue(rng);
+    }
+    ASSERT_TRUE(upload(k_buf, k).has_value());
+    ASSERT_TRUE(upload(v_buf, v).has_value());
+    ASSERT_TRUE(upload(q_buf, q).has_value());
+    auto result = backend->LaunchKernel(**kernel, launch);
+    ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+    backend->Synchronize();
+
+    std::vector<float> ref_out(kDv);
+    auto ref_status = core::DeltaStepRef(
+        std::span<float>(ref_state), std::span<const float>(k),
+        std::span<const float>(v), std::span<const float>(q),
+        std::span<float>(ref_out), kDk, kDv, kAlpha, kBeta);
+    ASSERT_TRUE(ref_status.has_value())
+        << tessera::ToString(ref_status.error());
+    std::vector<std::byte> readback(kDv * 4);
+    auto download =
+        backend->CopyD2H(**o_buf, readback.data(), readback.size());
+    ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+    const auto* device_out = reinterpret_cast<const float*>(readback.data());
+    for (std::size_t i = 0; i < ref_out.size(); ++i) {
+      EXPECT_NEAR(device_out[i], ref_out[i], tol.abs)
+          << "backend " << backend->Name() << " step " << step;
+    }
+  }
+  std::vector<std::byte> state_back(state.size() * 4);
+  auto download_state =
+      backend->CopyD2H(**s_buf, state_back.data(), state_back.size());
+  ASSERT_TRUE(download_state.has_value())
+      << tessera::ToString(download_state.error());
+  const auto* device_state = reinterpret_cast<const float*>(state_back.data());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref_state.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(device_state[i] - ref_state[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Host and contract: the delta-step reference and the launch contract
+// reject malformed shapes at the boundary (zero dims, size gaps).
+TEST(BackendTest, DeltaRejectsBadArgs) {
+  std::vector<float> s(8 * 12, 0.5f);
+  std::vector<float> k(8, 0.5f);
+  std::vector<float> v(12, 0.5f);
+  std::vector<float> q(8, 0.5f);
+  std::vector<float> o(12);
+  auto bad = core::DeltaStepRef(std::span<float>(s), std::span<const float>(k),
+                                std::span<const float>(v),
+                                std::span<const float>(q), std::span<float>(o),
+                                0, 12, 0.9f, 0.5f);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+  std::vector<float> short_k(4, 0.5f);
+  bad = core::DeltaStepRef(std::span<float>(s), std::span<const float>(short_k),
+                           std::span<const float>(v), std::span<const float>(q),
+                           std::span<float>(o), 8, 12, 0.9f, 0.5f);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
+
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto delta = backend->LoadKernel("delta_step", {});
+  ASSERT_TRUE(delta.has_value()) << tessera::ToString(delta.error());
+  tessera::KernelLaunch launch;
+  // Delta step wants 5 buffers and 4 scalars; zero dk is rejected.
+  const std::vector<const tessera::Buffer*> five_buffers{
+      nullptr, nullptr, nullptr, nullptr, nullptr};
+  launch.buffers = five_buffers;
+  launch.scalars = {0, 12, 0, 0};
+  auto zero_dk = backend->LaunchKernel(**delta, launch);
+  ASSERT_FALSE(zero_dk.has_value());
+  EXPECT_EQ(zero_dk.error(), StatusCode::InvalidArgument);
+}

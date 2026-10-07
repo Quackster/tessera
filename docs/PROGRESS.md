@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 121/121 on both builds.
+`ctest` passes 123/123 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -46,6 +46,11 @@ through RADV GFX1201, rocm through the system ROCm).
 - Generic causal depthwise conv1d with fp32 sequential accumulation.
   Linear-attention blocks run the qkv mix through this before the
   recurrent scan. Verified against the host reference on both devices.
+- Generic gated delta-rule scan step with fp32 sequential
+  accumulation. One step reads, edits, and writes the recurrent state
+  in place and reports the query read-out. Verified over three chained
+  steps (outputs and carried state) against the host reference on both
+  devices.
 - Weight upload: `Model::Load` allocates one device buffer per
   manifest tensor and copies the file bytes through the backend.
   `Model::Weights` exposes them next to the manifest. Unsized
@@ -156,19 +161,26 @@ through RADV GFX1201, rocm through the system ROCm).
   attention, Qwen3-Next blog), credited in CREDITS.md; no llama.cpp
   source was read, per the new AGENTS.md rule.
 - 2026-10-07: conv1d kernel (121/121 `ctest` on both builds).
-  Current head. Generic causal depthwise "conv1d" (one thread per
+  Generic causal depthwise "conv1d" (one thread per
   output element) on vulkan (GLSL) and rocm (HIP) with a host
   reference in the new `src/core/numerics/conv.*` pair. Contract in
   `include/tessera/backend.hpp`; device-vs-reference and bad-arg
   tests use the per backend attention tolerance.
+- 2026-10-07: delta scan step (123/123 `ctest` on both builds).
+  Current head. Generic "delta_step" (one thread per state column,
+  state updated in place) on vulkan (GLSL) and rocm (HIP) with a host
+  reference next to the attention refs. Three chained steps prove the
+  carried state matches on both devices. Contract in
+  `include/tessera/backend.hpp`.
 
 ## Next (in order)
 
 1. **Hybrid SSM decode** for the 27B target (arch `qwen35`):
-   definition, load, and norm/gate/conv kernels are done (the file
-   loads with 866 tensors on both backends). Still missing: fused
-   Q-plus-gate splitting with mRoPE on full layers, the recurrent
-   scan with gated norm, and MTP handling. `DecodeStep` rejects
+   definition, load, and norm/gate/conv/scan kernels are done (the
+   file loads with 866 tensors on both backends). Still missing:
+   fused Q-plus-gate splitting with mRoPE on full layers, wiring the
+   scan into the decode loop (recurrent state, gate projections,
+   conv/SiLU/norm plumbing), and MTP handling. `DecodeStep` rejects
    hybrid configs as unsupported today.
 2. **DFlash2**: local dynamic convolution (grouped causal convolutions),
    candidate selector (low rank transition scores), verification loop.

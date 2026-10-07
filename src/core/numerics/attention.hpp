@@ -40,4 +40,20 @@ namespace tessera::core {
     std::size_t n, std::size_t heads, std::size_t kv_heads,
     std::size_t head_dim, std::uint64_t q_base);
 
+// Host reference for the "delta_step" built-in: one gated delta-rule
+// recurrent step over a dk x dv fp32 state (linear attention without
+// softmax). With read r = S^T k, the state moves to
+// S' = alpha * (S - beta * k r^T) + beta * v k^T and reports
+// o = S'^T q. The state buffer updates in place with ascending,
+// per-column accumulation (deterministic, the order the kernels use).
+// dk and dv must be nonzero and the spans must hold dk*dv (s),
+// dk (k, q) and dv (v, o) elements; else InvalidArgument.
+//
+// Usage:
+//   auto status = DeltaStepRef(s, k, v, q, o, dk, dv, 0.9f, 0.5f);
+[[nodiscard]] std::expected<void, StatusCode> DeltaStepRef(
+    std::span<float> s, std::span<const float> k, std::span<const float> v,
+    std::span<const float> q, std::span<float> o, std::size_t dk,
+    std::size_t dv, float alpha, float beta);
+
 }  // namespace tessera::core

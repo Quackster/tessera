@@ -96,4 +96,32 @@ std::expected<void, StatusCode> AttentionRef(
   return {};
 }
 
+std::expected<void, StatusCode> DeltaStepRef(
+    std::span<float> s, std::span<const float> k, std::span<const float> v,
+    std::span<const float> q, std::span<float> o, std::size_t dk,
+    std::size_t dv, float alpha, float beta) {
+  if (dk == 0 || dv == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (s.size() != dk * dv || k.size() != dk || v.size() != dv ||
+      q.size() != dk || o.size() != dv) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t d = 0; d < dv; ++d) {
+    float read = 0.0f;
+    for (std::size_t j = 0; j < dk; ++j) {
+      read = std::fma(s[j * dv + d], k[j], read);
+    }
+    float out = 0.0f;
+    for (std::size_t j = 0; j < dk; ++j) {
+      const float updated = alpha * (s[j * dv + d] - beta * k[j] * read) +
+                            beta * v[d] * k[j];
+      s[j * dv + d] = updated;
+      out = std::fma(updated, q[j], out);
+    }
+    o[d] = out;
+  }
+  return {};
+}
+
 }  // namespace tessera::core

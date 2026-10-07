@@ -174,6 +174,13 @@ class Kernel {
 // channels x length); scalars are channels, length, width. Y is the
 // causal depthwise convolution with sequential accumulation. The
 // dispatch is ceil(channels * length / 256) workgroups of 256.
+// "delta_step": buffer 0 is the recurrent state S (fp32, dk x dv,
+// updated in place), buffers 1..3 are k (dk), v (dv) and q (dk),
+// buffer 4 the output o (dv); scalars are dk, dv, the fp32 alpha bits
+// and the fp32 beta bits. One step reads r = S^T k, writes
+// S' = alpha*(S - beta*k*r^T) + beta*v*k^T, and reports o = S'^T q
+// with per-column sequential accumulation. The dispatch is
+// ceil(dv / 256) workgroups of 256.
 [[nodiscard]] inline StatusCode CheckBuiltInArgs(const Kernel& kernel,
                                                  const KernelLaunch& launch) {
   if (kernel.Id() == "fill" &&
@@ -277,6 +284,14 @@ class Kernel {
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
         launch.scalars[2] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "delta_step") {
+    if (launch.buffers.size() != 5 || launch.scalars.size() != 4) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

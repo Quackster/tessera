@@ -102,5 +102,10 @@ __global__ void Conv1dKernel(const float* x, const float* w, float* y,
                              unsigned long long channels,
                              unsigned long long length,
                              unsigned long long width);
+__global__ void DeltaStepKernel(float* s, const float* k, const float* v,
+                                const float* q, float* o,
+                                unsigned long long dk, unsigned long long dv,
+                                unsigned long long alpha_bits,
+                                unsigned long long beta_bits);
 
 }  // namespace tessera::backends::rocm
