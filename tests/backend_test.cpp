@@ -4452,8 +4452,9 @@ TEST(BackendTest, DraftBlockMatchesRef) {
   auto concat = backend->LoadKernel("concat_features", {});
   ASSERT_TRUE(rms && gemm && conv && rope && attn && silu && add && concat);
   auto device = tessera::spec::DraftBlockDevice(
-      *backend, **rms, **gemm, **conv, **rope, **attn, **silu, **add, **concat,
-      *mask_b, *aux_b, *fc_b, dev_layers, *fnormal_b, *outw_b, **logits_b,
+      *backend, **rms, **gemm, **gemm, **conv, **rope, **attn, **silu, **add,
+      **concat, *mask_b, *aux_b, *fc_b, dev_layers, *fnormal_b, *outw_b,
+      **logits_b,
       kRows, kCtx, kHidden, kN, kFeatures, kVocab, kHeads, kKvHeads, kHeadDim,
       kFfn, kTaps, kGroup, kBlock, kWindow, 0, kTheta, kEps);
   ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());

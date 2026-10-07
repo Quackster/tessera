@@ -46,11 +46,10 @@ std::expected<void, StatusCode> DFlash2Drafter::Run(
     std::size_t rows, std::size_t ctx, std::size_t vocab) const {
   const std::size_t n = config_.target_layer_ids.size();
   // The draft layer weights are fp32 after conversion, so gemm_f32 runs
-  // them; `head_gemm` is accepted for the target's quantized shared head.
-  (void)head_gemm;
+  // them; the head uses `head_gemm` for the target's quantized shared head.
   return DraftBlockDevice(
-      backend, *rmsnorm_, *gemm_, *conv_, *rope_, *attention_, *silu_, *add_,
-      *concat_, mask_embeds, aux, *store_.Weights().fc,
+      backend, *rmsnorm_, *gemm_, head_gemm, *conv_, *rope_, *attention_,
+      *silu_, *add_, *concat_, mask_embeds, aux, *store_.Weights().fc,
       store_.Weights().layers, *store_.Weights().final_norm, output_w, logits,
       rows, ctx, config_.hidden_size, n, config_.hidden_size, vocab,
       config_.num_heads, config_.num_kv_heads, config_.head_dim,

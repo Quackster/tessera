@@ -478,8 +478,11 @@ std::expected<void, StatusCode> HybridForward(
 // forward for all but the last token without the vocab-sized projection.
 std::expected<std::vector<float>, StatusCode> HybridDecodeLogits(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out) {
-  auto forward = HybridForward(backend, model, cache, token, hidden_out);
+    std::uint32_t token, std::vector<float>* hidden_out,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture) {
+  auto forward = HybridForward(backend, model, cache, token, hidden_out,
+                               capture_layers, capture);
   if (!forward) {
     return std::unexpected(forward.error());
   }

@@ -272,8 +272,11 @@ int main(int argc, char** argv) {
       }
       gen.prompt_tokens = *ids;
     }
-    auto generated = speculate ? engine.GenerateSpeculative(loaded, gen)
-                               : engine.Generate(loaded, gen);
+    auto generated =
+        draft_path.empty()
+            ? (speculate ? engine.GenerateSpeculative(loaded, gen)
+                         : engine.Generate(loaded, gen))
+            : engine.GenerateDraft(loaded, gen, draft_path);
     if (!generated) {
       log.Warn("cli", std::string("generation failed (") +
                           std::string(tessera::ToString(generated.error())) +

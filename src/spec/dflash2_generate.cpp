@@ -1,0 +1,145 @@
+#include "spec/dflash2_generate.hpp"
+
+#include <cstring>
+#include <memory>
+
+#include "core/decode.hpp"
+#include "core/decode_internal.hpp"
+#include "core/loaders/safetensors.hpp"
+#include "spec/dflash2_config.hpp"
+#include "spec/dflash2_drafter.hpp"
+#include "spec/dflash2_mask.hpp"
+
+namespace tessera::spec {
+
+std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
+    Backend& backend, Model& target, const GenerateOptions& options,
+    const std::string& draft_path) {
+  if (options.max_tokens == 0) {
+    return std::vector<std::uint32_t>{};
+  }
+  auto config = target.Config();
+  if (!config || !config->hybrid) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  auto draft_config = LoadDFlash2Config(draft_path);
+  if (!draft_config) {
+    return std::unexpected(draft_config.error());
+  }
+  auto drafter = DFlash2Drafter::Create(backend, draft_path, *draft_config);
+  if (!drafter) {
+    return std::unexpected(drafter.error());
+  }
+  const DeviceTensor* embed = nullptr;
+  const DeviceTensor* output = nullptr;
+  for (const DeviceTensor& weight : target.Weights()) {
+    if (weight.manifest.name == "token_embd.weight") {
+      embed = &weight;
+    } else if (weight.manifest.name == "output.weight") {
+      output = &weight;
+    }
+  }
+  if (embed == nullptr || output == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
+  auto head_gemm = core::detail::GemmFor(backend, gemms, output->manifest.dtype);
+  if (!head_gemm) {
+    return std::unexpected(head_gemm.error());
+  }
+  const std::size_t hidden = config->hidden_dim;
+  const std::size_t vocab = draft_config->vocab_size;
+  const std::size_t block = draft_config->block_size;
+  const std::size_t n = draft_config->target_layer_ids.size();
+  std::vector<std::size_t> capture_layers(draft_config->target_layer_ids.begin(),
+                                          draft_config->target_layer_ids.end());
+  std::vector<std::unique_ptr<Buffer>> capture_storage;
+  std::vector<Buffer*> captures;
+  for (std::size_t i = 0; i < n; ++i) {
+    auto buffer = backend.AllocateBuffer(hidden * 4, MemoryKind::Device);
+    if (!buffer) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    capture_storage.push_back(std::move(*buffer));
+    captures.push_back(capture_storage.back().get());
+  }
+  auto aux = backend.AllocateBuffer(n * hidden * 4, MemoryKind::Device);
+  auto logits = backend.AllocateBuffer(block * vocab * 4, MemoryKind::Device);
+  if (!aux || !logits) {
+    return std::unexpected(StatusCode::OutOfMemory);
+  }
+  core::DecodeCache cache;
+  std::vector<std::uint32_t> prompt = options.prompt_tokens;
+  if (prompt.empty()) {
+    prompt.push_back(options.first_token);
+  }
+  for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
+    auto forward = core::DecodeForward(backend, target, cache, prompt[i]);
+    if (!forward) {
+      return std::unexpected(forward.error());
+    }
+  }
+  std::vector<float> hidden_state;
+  auto first = core::DecodeLogits(backend, target, cache, prompt.back(),
+                                  &hidden_state, &capture_layers, &captures);
+  if (!first) {
+    return std::unexpected(first.error());
+  }
+  std::vector<std::uint32_t> produced;
+  produced.reserve(options.max_tokens);
+  std::uint32_t next = core::detail::ArgMax(*first);
+  while (produced.size() < options.max_tokens) {
+    produced.push_back(next);
+    if (produced.size() >= options.max_tokens) {
+      break;
+    }
+    auto current = core::DecodeLogits(backend, target, cache, next,
+                                      &hidden_state, &capture_layers, &captures);
+    if (!current) {
+      return std::unexpected(current.error());
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+      if (!backend.CopyD2D(*captures[i], 0, **aux, i * hidden * 4, hidden * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+    auto mask = MaskEmbeddings(backend, *embed, draft_config->mask_token_id,
+                               block, hidden);
+    if (!mask) {
+      return std::unexpected(mask.error());
+    }
+    auto run = drafter->Run(backend, **mask, **aux, *output->device, **head_gemm,
+                            **logits, block, 1, vocab);
+    if (!run) {
+      return std::unexpected(run.error());
+    }
+    backend.Synchronize();
+    std::vector<float> draft_logits(block * vocab);
+    if (!backend.CopyD2H(**logits,
+                         reinterpret_cast<std::byte*>(draft_logits.data()),
+                         draft_logits.size() * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    std::vector<std::uint32_t> draft_tokens(block);
+    for (std::size_t r = 0; r < block; ++r) {
+      std::span<const float> row(draft_logits.data() + r * vocab, vocab);
+      draft_tokens[r] = core::detail::ArgMax(row);
+    }
+    auto verify = core::VerifyDraft(backend, target, cache, draft_tokens,
+                                    *current, &hidden_state);
+    if (!verify) {
+      return std::unexpected(verify.error());
+    }
+    for (std::size_t i = 0; i < verify->accepted; ++i) {
+      if (produced.size() >= options.max_tokens) {
+        break;
+      }
+      produced.push_back(draft_tokens[i]);
+    }
+    // The bonus token is emitted by the loop top on the next iteration.
+    next = verify->next_token;
+  }
+  return produced;
+}
+
+}  // namespace tessera::spec

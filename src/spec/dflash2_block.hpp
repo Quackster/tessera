@@ -38,7 +38,8 @@ namespace tessera::spec {
 // concat (concat_features). Scratch is allocated internally.
 [[nodiscard]] std::expected<void, StatusCode> DraftBlockDevice(
     Backend& backend, const Kernel& rmsnorm, const Kernel& gemm,
-    const Kernel& conv, const Kernel& rope, const Kernel& attention,
+    const Kernel& head_gemm, const Kernel& conv, const Kernel& rope,
+    const Kernel& attention,
     const Kernel& silu, const Kernel& add, const Kernel& concat,
     const Buffer& mask_embeds, const Buffer& aux, const Buffer& fc_w,
     const std::vector<DraftLayerBuffers>& layers, const Buffer& final_norm,

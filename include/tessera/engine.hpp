@@ -5,6 +5,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "tessera/backend.hpp"
@@ -97,6 +98,13 @@ class Engine {
   // UnsupportedFeature when the model has no MTP block.
   [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraft(
       Model& model, std::uint32_t token);
+
+  // Greedy generation with the DFlash2 draft checkpoint at `draft_path`.
+  // The output equals plain greedy decoding. UnsupportedFeature when the
+  // target is not hybrid or the draft does not load.
+  [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
+  GenerateDraft(Model& model, const GenerateOptions& options,
+                const std::string& draft_path);
 
   // Greedy generation with MTP speculative decoding. Each step drafts one
   // token with the MTP head, verifies it against the target, and accepts

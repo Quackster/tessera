@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 206/206 on both builds.
+`ctest` passes 207/207 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -669,6 +669,16 @@ through RADV GFX1201, rocm through the system ROCm).
   embedding row at `mask_token_id` (any quantized format, via the
   shared gather) and tiles it to the draft block query rows. Test on
   the gated fixture: every row equals the gathered row.
+
+- 2026-10-07: DFlash2 speculative generation (207/207 `ctest` on both
+  builds; the real-model test is env-gated). Current head.
+  `spec::GenerateDFlash2` captures the target hidden at the draft's
+  target_layer_ids during each target step, drafts a top-1 block with
+  the loaded draft (mask-token queries, fused context, shared
+  quantized head), verifies the block with `VerifyDraft`, and accepts
+  the matching prefix. `Engine::GenerateDraft` exposes it; the CLI
+  routes `--draft` generation through it. Output equals greedy on the
+  27B. Fixed a double-emitted bonus token.
 
 ## Next (in order)
 

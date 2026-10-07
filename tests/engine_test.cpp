@@ -685,3 +685,26 @@ TEST(EngineTest, SampleGenerationIsDeterministic) {
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
 }
+
+// The DFlash2 draft must be output preserving: speculative generation
+// equals plain greedy on the real target. Needs TESSERA_TEST_GGUF (the
+// target) and TESSERA_TEST_DFLASH2_DIR (the draft).
+TEST(EngineTest, DFlash2MatchesGreedyOnModel) {
+  const char* target = std::getenv("TESSERA_TEST_GGUF");
+  const char* draft = std::getenv("TESSERA_TEST_DFLASH2_DIR");
+  if (target == nullptr || draft == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_GGUF / TESSERA_TEST_DFLASH2_DIR not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{target, 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions options;
+  options.max_tokens = 4;
+  options.first_token = 0;
+  auto greedy = engine->Generate(**model, options);
+  ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());
+  auto spec = engine->GenerateDraft(**model, options, draft);
+  ASSERT_TRUE(spec.has_value()) << tessera::ToString(spec.error());
+  EXPECT_EQ(*spec, *greedy);
+}

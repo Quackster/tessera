@@ -7,6 +7,7 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/sampling.hpp"
+#include "spec/dflash2_generate.hpp"
 
 namespace tessera {
 
@@ -59,6 +60,12 @@ std::expected<std::unique_ptr<Model>, StatusCode> Engine::LoadModel(
       "model", std::string("loaded ") + format_name + " model with " +
                    std::to_string(loaded->Tensors().size()) + " tensors");
   return model;
+}
+
+std::expected<std::vector<std::uint32_t>, StatusCode> Engine::GenerateDraft(
+    Model& model, const GenerateOptions& options,
+    const std::string& draft_path) {
+  return spec::GenerateDFlash2(*backend_, model, options, draft_path);
 }
 
 std::expected<std::vector<std::uint32_t>, StatusCode>

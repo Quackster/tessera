@@ -49,7 +49,8 @@ std::expected<void, StatusCode> DraftBlockRef(
 
 std::expected<void, StatusCode> DraftBlockDevice(
     Backend& backend, const Kernel& rmsnorm, const Kernel& gemm,
-    const Kernel& conv, const Kernel& rope, const Kernel& attention,
+    const Kernel& head_gemm, const Kernel& conv, const Kernel& rope,
+    const Kernel& attention,
     const Kernel& silu, const Kernel& add, const Kernel& concat,
     const Buffer& mask_embeds, const Buffer& aux, const Buffer& fc_w,
     const std::vector<DraftLayerBuffers>& layers, const Buffer& final_norm,
@@ -79,8 +80,8 @@ std::expected<void, StatusCode> DraftBlockDevice(
   if (!stack) {
     return std::unexpected(stack.error());
   }
-  return core::detail::ProjectDevice(backend, gemm, **hidden, output_w, logits,
-                                     rows, vocab, hidden_dim);
+  return core::detail::ProjectDevice(backend, head_gemm, **hidden, output_w,
+                                     logits, rows, vocab, hidden_dim);
 }
 
 }  // namespace tessera::spec

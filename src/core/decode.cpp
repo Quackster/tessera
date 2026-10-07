@@ -42,7 +42,9 @@ std::expected<void, StatusCode> DecodeForward(Backend& backend,
 
 std::expected<std::vector<float>, StatusCode> DecodeLogits(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden) {
+    std::uint32_t token, std::vector<float>* hidden,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -51,7 +53,8 @@ std::expected<std::vector<float>, StatusCode> DecodeLogits(
     if (!cache.hybrid) {
       cache.hybrid = std::make_unique<HybridDecodeCache>();
     }
-    return HybridDecodeLogits(backend, model, cache, token, hidden);
+    return HybridDecodeLogits(backend, model, cache, token, hidden,
+                              capture_layers, capture);
   }
   return DecodeStepDeviceLogits(backend, model, cache, token, hidden);
 }

@@ -156,7 +156,9 @@ struct HybridDecodeCache {
 [[nodiscard]] std::expected<std::vector<float>, StatusCode>
 HybridDecodeLogits(Backend& backend, const Model& model, DecodeCache& cache,
                    std::uint32_t token,
-                   std::vector<float>* hidden_out = nullptr);
+                   std::vector<float>* hidden_out = nullptr,
+                   const std::vector<std::size_t>* capture_layers = nullptr,
+                   std::vector<Buffer*>* capture = nullptr);
 
 // The full vocab logits for one device-resident vanilla step.
 [[nodiscard]] std::expected<std::vector<float>, StatusCode>
@@ -191,7 +193,9 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
 // speculative verifier scores candidates with.
 [[nodiscard]] std::expected<std::vector<float>, StatusCode> DecodeLogits(
     Backend& backend, const Model& model, DecodeCache& cache,
-    std::uint32_t token, std::vector<float>* hidden_out = nullptr);
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr,
+    const std::vector<std::size_t>* capture_layers = nullptr,
+    std::vector<Buffer*>* capture = nullptr);
 
 // Score a token sequence with a fresh cache: run each token in order and
 // return the logits at every position (row i is the distribution after
