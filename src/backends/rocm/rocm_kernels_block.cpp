@@ -345,6 +345,71 @@ __global__ void GemmQ4KBatchedKernel(const float* a, const unsigned char* w,
   }
 }
 
+// Built-in "gemm_q5k_batched": tiled C = A x dequant(W)^T for a batch.
+// One workgroup handles 8 activation rows x one weight column; the 256
+// Q5_K elements of a block are dequantized once into shared memory and
+// reused across the rows. Element `e` is sub-block `e / 32`; sub-block
+// `s` uses scale/min pair `s`, low nibble byte `48 + (s/2)*32 + e%32`,
+// the high bit `1 << s` of byte `16 + e%32`, and the high nibble for odd
+// `s`. The dot uses the gemm_q5k order (per 64-element group, low then
+// high half). Dispatch is ceil(m / 8) * n workgroups of 256.
+__global__ void GemmQ5KBatchedKernel(const float* a, const unsigned char* w,
+                                     float* c, unsigned long long m,
+                                     unsigned long long n,
+                                     unsigned long long k) {
+  const unsigned long long wg =
+      static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long tid =
+      static_cast<unsigned long long>(threadIdx.x);
+  const unsigned long long tm = wg / n;
+  const unsigned long long row_w = wg % n;
+  const unsigned long long base_row = tm * 8;
+  const bool dot_valid = tid < 8 && base_row + tid < m;
+  const unsigned long long row_a = base_row + tid;
+  const unsigned long long blocks = k / 256;
+  __shared__ float wq[256];
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char* base = w + (row_w * blocks + b) * 176;
+    std::uint16_t d_bits = 0;
+    std::uint16_t dm_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&dm_bits, base + 2, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    const float dm = Fp16ToFloatDev(dm_bits);
+    const unsigned long long e = tid;
+    const unsigned long long s = e / 32;
+    const unsigned long long lane = e % 32;
+    const unsigned long long grp = s / 2;
+    const unsigned long long parity = s % 2;
+    std::uint8_t sc = 0;
+    std::uint8_t mn = 0;
+    GetScaleMinDev(s, base + 4, &sc, &mn);
+    const std::uint8_t low = base[48 + grp * 32 + lane];
+    const std::uint8_t high = base[16 + lane];
+    const std::uint8_t nib = parity != 0 ? (low >> 4) : (low & 15);
+    const std::uint8_t hb = (high & (1u << s)) != 0 ? 16u : 0u;
+    wq[e] = d * static_cast<float>(sc) * static_cast<float>(nib + hb) -
+            dm * static_cast<float>(mn);
+    __syncthreads();
+    if (dot_valid) {
+      const float* ar = a + row_a * k + b * 256;
+      for (unsigned long long g = 0; g < 4; ++g) {
+        for (unsigned long long l = 0; l < 32; ++l) {
+          const unsigned long long t0 = g * 64 + l;
+          const unsigned long long t1 = t0 + 32;
+          acc += ar[t0] * wq[t0];
+          acc += ar[t1] * wq[t1];
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (dot_valid) {
+    c[row_a * n + row_w] = acc;
+  }
+}
+
 // Built-in "gemm_q80": buffer 0 is the activation A (fp32, m x k),
 // buffer 1 the quantized weights W (Q8_0, n x k), buffer 2 the output
 // C (fp32, m x n); scalars are m, n, k. A Q8_0 block is 34 bytes:

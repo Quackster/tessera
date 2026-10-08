@@ -151,6 +151,10 @@ __global__ void GemmQ4KBatchedKernel(const float* a, const unsigned char* w,
 __global__ void GemmQ5KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);
+__global__ void GemmQ5KBatchedKernel(const float* a, const unsigned char* w,
+                                     float* c, unsigned long long m,
+                                     unsigned long long n,
+                                     unsigned long long k);
 __global__ void GemmQ6KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);

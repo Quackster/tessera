@@ -1,0 +1,114 @@
+#version 450
+
+// Tiled batched Q5_K GEMM: one workgroup handles 8 activation rows x one
+// weight column; the 256 Q5_K elements of a block are dequantized once
+// into shared memory and reused across the rows. Element `e` is
+// sub-block `e / 32`; sub-block `s` uses scale/min pair `s`, low nibble
+// byte `48 + (s/2)*32 + e%32`, the high bit `1 << s` of byte
+// `16 + e%32`, and the high nibble for odd `s`. The dot uses the gemm_q5k
+// order (per 64-element group, low then high half). Dispatch is
+// ceil(m / 8) * n workgroups of 256.
+layout(local_size_x = 256) in;
+
+// "gemm_q5k_batched" contract (tessera API): buffers and scalars match
+// gemm_q5k (m, n, k, k a multiple of 256). Scalars are 64-bit, so field
+// m lives at pc.v[0], n at pc.v[2], k at pc.v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) buffer C {
+  float c[];
+};
+
+// Byte `offset` of the Q5_K buffer (little-endian extraction).
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+// IEEE binary16 (little-endian) -> fp32, exact.
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+// The 6-bit scale/min pair of sub-block j (same packing as Q4_K).
+void scale_min4(uint j, uint base, out uint scale, out uint min) {
+  uint sj = wbyte(base + 4 + j);
+  uint sj4 = wbyte(base + 8 + j);
+  uint sjm4 = wbyte(base + j);
+  if (j < 4) {
+    scale = sj & 63;
+    min = sj4 & 63;
+  } else {
+    scale = (sj4 & 15) | ((sjm4 >> 6) << 4);
+    min = (sj4 >> 4) | ((sj >> 6) << 4);
+  }
+}
+
+shared float wq[256];
+
+void main() {
+  uint wg = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  uint base_row = (wg / n) * 8u;
+  uint row_w = wg % n;
+  bool dot_valid = tid < 8u && base_row + tid < m;
+  uint row_a = base_row + tid;
+  uint blocks = k / 256u;
+  float acc = 0.0;
+  for (uint b = 0u; b < blocks; ++b) {
+    uint base = row_w * (blocks * 176u) + b * 176u;
+    float d = fp16_at(base);
+    float dmin = fp16_at(base + 2u);
+    uint e = tid;
+    uint s = e / 32u;
+    uint lane = e % 32u;
+    uint grp = s / 2u;
+    uint parity = s % 2u;
+    uint sc, mn;
+    scale_min4(s, base, sc, mn);
+    uint low = wbyte(base + 48u + grp * 32u + lane);
+    uint high = wbyte(base + 16u + lane);
+    uint nib = parity != 0u ? (low >> 4u) : (low & 15u);
+    uint hb = (high & (1u << s)) != 0u ? 16u : 0u;
+    wq[e] = d * float(sc) * float(nib + hb) - dmin * float(mn);
+    barrier();
+    if (dot_valid) {
+      uint ab = row_a * k + b * 256u;
+      for (uint g = 0u; g < 4u; ++g) {
+        for (uint l = 0u; l < 32u; ++l) {
+          uint t0 = g * 64u + l;
+          uint t1 = t0 + 32u;
+          acc += a[ab + t0] * wq[t0];
+          acc += a[ab + t1] * wq[t1];
+        }
+      }
+    }
+    barrier();
+  }
+  if (dot_valid) {
+    c[row_a * n + row_w] = acc;
+  }
+}

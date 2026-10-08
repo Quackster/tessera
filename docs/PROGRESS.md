@@ -1370,6 +1370,34 @@ through RADV GFX1201, rocm through the system ROCm).
   reassociation (1e-2 instead of 1e-3). The earlier "reduced word reads"
   note above stands. 259/259 `ctest` on both backends.
 
+- 2026-10-08: **Tiled Q5_K GEMM (item 3a).** `gemm_q5k_batched` on both
+  backends: one workgroup handles 8 activation rows x one weight column,
+  the 256 Q5_K elements of a block are dequantized once into shared
+  memory and reused across the rows, and the dot uses the `gemm_q5k`
+  order. Element `e` is sub-block `e/32`; its high bit is `1 << s` of
+  byte `16 + e%32` and the low nibble byte is `48 + (s/2)*32 + e%32`.
+  Registered as the tiled kernel for Q5_K so `ProjectBatch` picks it for
+  rows > 1. `BackendTest.GemmQ5KBatchedMatchesRef` covers both backends
+  and a non-multiple-of-8 row count. 262/262 `ctest` on vulkan and rocm.
+  The 5-token GGUF prefill is unchanged (812 ms against 799 ms) and the
+  decode is 311 ms/token: at a five-row batch the GEMV's repeated weight
+  reads already hit cache, so tiling saves little DRAM traffic. The tiled
+  Q6_K and IQ4_XS kernels are still to do.
+- 2026-10-08: **Per-kernel profile of the GGUF decode (item 3).**
+  `rocprofv3 --kernel-trace` on `EngineTest.GgufGeneratesWhenProvided`
+  (27B GGUF, 5-token prefill plus 4 decode tokens) ranks the kernels by
+  total device time (total 972 ms over 8775 dispatches):
+  `gemm_q5k` 304 ms (31%), `gemm_q4k_batched` (the tiled prefill) 204 ms
+  (21%), `gemm_q6k` 164 ms (17%), `gemm_iq4xs` 148 ms (15%), then
+  `delta_step_heads` 27 ms, `l2norm` 26 ms, `gemm_q4k` (decode) 24 ms,
+  `gemm_q80` 23 ms. The UD-Q4_K_M mix is not mostly Q4_K: the Q5_K, Q6_K
+  and IQ4_XS GEMVs dominate the decode, and only Q4_K has a tiled kernel,
+  so the Q5_K/Q6_K/IQ4_XS prefill still runs the per-row GEMV at m = 5.
+  The next item 3 work is therefore (a) tiled kernels for Q5_K, Q6_K and
+  IQ4_XS for the batched prefill, and (b) the same wide-read/vectorized
+  treatment on those GEMVs. The coalesced Q4_K kernel above does not show
+  up because its decode contribution is small.
+
 - 2026-10-08: **GPU-only device tests.** The vulkan backend listed the
   llvmpipe CPU rasterizer as `gpu 2`, so `--gpu 2` or `TESSERA_TEST_GPU=2`
   silently ran the whole suite on software rendering. `Init` and
@@ -1533,14 +1561,18 @@ through RADV GFX1201, rocm through the system ROCm).
    planned Ornith-1.5-35B-A3B and stay on this item. Remaining
    architecture specific behavior moves behind the `Architecture` module
    interface (see item 0).
-3. **GEMM throughput**: the model runs far below memory bandwidth
-   (about 20 GB/s of 16 GB weights per 0.76 s/step), so the GEMM kernels
-   are bound by the per-element byte-wise weight reads, not by the
-   multiply-accumulate. Two changes: (a) read and dequantize a weight
-   block once and apply it to a tile of rows (the batched prefill
-   dequantizes each weight m times for an m-token batch); (b) vectorize
-   the byte reads (read 4 bytes at a time and extract). Applies to
-   gemm_q4k/q5k/q6k/q3k/q8_0/iq4xs/iq4nl/fp8 on both backends. The
+3. **GEMM throughput**: the model runs far below memory bandwidth, so the
+   GEMM kernels are the cost. The per-kernel profile above shows the hot
+   ones: `gemm_q5k` (31%), `gemm_q4k_batched` (21%), `gemm_q6k` (17%),
+   `gemm_iq4xs` (15%); the plain `gemm_q4k` decode is small. Done so far:
+   tiled `gemm_q4k_batched`/`gemm_q5k_batched`/`gemm_mxfp4_batched`, wide
+   MXFP4 and Q4_K reads, the E8M0 bit cast, and the coalesced
+   `gemm_q4k_row` (kept, but slower). Next: (a) tiled kernels for Q6_K and
+   IQ4_XS so the batched prefill dequantizes each weight block once per
+   tile instead of once per row; (b) the same wide-read treatment on those
+   GEMVs; (c) a split-K GEMV for the m = 1 decode, designed so the block
+   header is decoded once per workgroup (the naive coalesced version lost
+   to the reduction overhead). Applies on both backends. The
    attention_q8/attention_q4 kernels still recompute the dot product per
    output dimension.
 4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
@@ -1587,6 +1619,11 @@ through RADV GFX1201, rocm through the system ROCm).
 - Parallel builds: build with `-j1`. The gcc-15 toolchain segfaults
   (including an ICE in `c_parse_final_cleanups` and corrupt assembler
   output) under `-j3`/`-j4`; a serial build completes.
+- After a compiler crash, touch and rebuild the affected translation
+  units before trusting the result. An ICE during a HIP or C++ compile
+  left a stale object that still linked but produced wrong numbers
+  (`VisionStackMatchesRef` failed until `vision_stack.cpp` and its
+  neighbours were recompiled). A clean serial build avoids this.
 - HTTP serving is deferred. `src/serve/` already serves a first
   endpoint set; do not add endpoints, SSE variants, auth changes, or
   concurrency there unless the project owner explicitly asks. The
