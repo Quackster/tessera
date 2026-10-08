@@ -964,31 +964,22 @@ through RADV GFX1201, rocm through the system ROCm).
    hiddens)))` (`_project_context_kv`, `_get_dflash_fc_input_size` =
    target_hidden_size * num_aux_layers). The 1+N layout and the
    anchor-out-of-context rule are implemented (see the 2026-10-08 Done
-   entry), but acceptance still cannot be measured on the correct target:
-   the DFlash2 drafter is tested against the Qwen3.8 27B MXFP4 model
-   (`~/models/Qwen3.8-27B-MXFP4-MTPFP8/`), which the engine cannot run
-   end to end yet. The directory loader now parses the MXFP4 safetensors
-   (including the rank-5 vision tensor), but `Model::Load` still builds
-   the MXFP4 model with no `TransformerConfig`, no tokenizer and no
-   weight-name map (the checkpoint uses HuggingFace names such as
-   `model.language_model.layers.N.linear_attn.in_proj_qkv.weight`; the
-   Qwen3.5 module looks up GGUF names such as `blk.N.attn_qkv.weight`).
-   The MXFP4 block weights also need packing so `gemm_mxfp4` receives the
-   blob and its E8M0 scale (today they are two tensors). Until that lands
-   the acceptance is only measurable against the GGUF target, which is
-   the wrong target (its aux hidden states differ from the MXFP4 ones).
-
-   The MXFP4 checkpoint also stores the SSM value heads in a different
-   order than the internal (GGUF) layout, and `A_log` in log space. The
-   GGUF order is a deterministic permutation of the MXFP4 order: HF
-   value head `p` (`p = f + 3*kh`) goes to internal row
-   `16*(p%3) + p//3` (verified against `blk.0.ssm_dt.bias` and
-   `blk.0.ssm_alpha.weight`, correlation 0.99). So the MXFP4 loader must
-   apply a value-head reorder to `dt_bias`, `A_log` (then `-exp` to the
-   internal F32 `ssm_a`), `in_proj_a/b`, `in_proj_z`, the value block of
-   `in_proj_qkv` and `conv1d`, and the input of `ssm_out`. This is
-   architecture specific and belongs in the Qwen3.5 module (a new
-   Architecture transform hook), not in core.
+   entries). The Qwen3.8 27B MXFP4 target
+   (`~/models/Qwen3.8-27B-MXFP4-MTPFP8/`) now loads and decodes end to
+   end through the Qwen3.5 module: the `Architecture` hooks
+   `ParseConfigJson`, `MapWeightName` and `ConvertWeight` read config.json,
+   rename the HuggingFace tensors, and apply the value-head reorder
+   (HF value head `p = f + 3*kh` goes to internal row `16*(p%3) + p//3`:
+   `dt_bias`, `A_log` (then `-exp` to F32 `ssm_a`), `in_proj_a/b`,
+   `in_proj_z`, the value block of `in_proj_qkv`/`conv1d` and the input
+   of `ssm_out` all reorder); the loader packs each F4E2M1 blob with its
+   E8M0 scale. Acceptance can now be measured against the correct target.
+   Two gaps remain: the MXFP4 GEMM is very slow (about 23 s/token on the
+   27B, versus 0.9 s/token for the GGUF; the `gemm_mxfp4` kernel needs
+   item 2 work), and the HF tokenizer is not parsed yet (use
+   `--prompt-ids`). The `gemm_mxfp4` kernel now reads the scale from the
+   packed weight tail, so its contract, host reference and device test
+   changed.
 1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.

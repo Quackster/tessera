@@ -477,6 +477,15 @@ int main(int argc, char** argv) {
           }
         }
       }
+    } else if (quiet) {
+      std::string ids;
+      for (std::size_t i = 0; i < generated->size(); ++i) {
+        if (i != 0) {
+          ids += ",";
+        }
+        ids += std::to_string((*generated)[i]);
+      }
+      std::printf("%s\n", ids.c_str());
     } else {
       log.Info("cli", std::string(speculate ? "speculative " : "generated ") +
                           std::to_string(generated->size()) + " token(s)");
