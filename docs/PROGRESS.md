@@ -1370,6 +1370,18 @@ through RADV GFX1201, rocm through the system ROCm).
   reassociation (1e-2 instead of 1e-3). The earlier "reduced word reads"
   note above stands. 259/259 `ctest` on both backends.
 
+- 2026-10-08: **GPU-only device tests.** The vulkan backend listed the
+  llvmpipe CPU rasterizer as `gpu 2`, so `--gpu 2` or `TESSERA_TEST_GPU=2`
+  silently ran the whole suite on software rendering. `Init` and
+  `ListGpuNames` now share one `EnumerateGpuDevices` helper that drops
+  `VK_PHYSICAL_DEVICE_TYPE_CPU` devices, so a GPU index can never select
+  the CPU; vulkan now lists 2 GPUs here (was 3). The rocm backend needs no
+  change (`hipGetDeviceCount` only sees real GPUs). Both test helpers now
+  read the index from one `TestDeviceIndex` (the backend tests previously
+  ignored `TESSERA_TEST_GPU` and always used device 0). New tests assert
+  the GPU list has no llvmpipe entry and cover the env parsing. 262/262
+  `ctest` on both builds.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -1588,6 +1600,10 @@ through RADV GFX1201, rocm through the system ROCm).
   which backend was used.
 - Tests: single test target (`tessera-tests`), no new top level test
   files. Device dependent tests skip cleanly when no device is present.
+- Device tests are GPU-only. The vulkan backend filters CPU-type physical
+  devices from enumeration, so `--gpu` and `TESSERA_TEST_GPU` cannot
+  select software rendering (llvmpipe). The rocm runtime only sees real
+  GPUs, so it needs no filter.
 - No model names in tests. A qwen shaped test tests the generic path
   with qwen shaped parameters.
 - Diagnostics: `tessera::log::Diagnostics` with a pluggable sink is the

@@ -86,24 +86,40 @@ std::expected<VkInstance, StatusCode> CreateInstance() {
   return instance;
 }
 
-// Best-effort device name list; empty when the backend is unavailable.
+// Enumerate the real GPUs. The ICD list may include CPU rasterizers
+// (llvmpipe reports VK_PHYSICAL_DEVICE_TYPE_CPU); those are not GPUs,
+// so they are filtered out here, the single place both Init and
+// ListDeviceNames enumerate from.
+std::vector<VkPhysicalDevice> EnumerateGpuDevices(VkInstance instance) {
+  std::uint32_t count = 0;
+  if (vkEnumeratePhysicalDevices(instance, &count, nullptr) != VK_SUCCESS ||
+      count == 0) {
+    return {};
+  }
+  std::vector<VkPhysicalDevice> devices(count);
+  if (vkEnumeratePhysicalDevices(instance, &count, devices.data()) !=
+      VK_SUCCESS) {
+    return {};
+  }
+  std::vector<VkPhysicalDevice> gpus;
+  gpus.reserve(devices.size());
+  for (VkPhysicalDevice device : devices) {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(device, &props);
+    if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+      gpus.push_back(device);
+    }
+  }
+  return gpus;
+}
+
+// Best-effort GPU name list; empty when the backend is unavailable.
 std::vector<std::string> ListDeviceNames() {
   auto instance = CreateInstance();
   if (!instance) {
     return {};
   }
-  std::uint32_t count = 0;
-  if (vkEnumeratePhysicalDevices(*instance, &count, nullptr) != VK_SUCCESS ||
-      count == 0) {
-    vkDestroyInstance(*instance, nullptr);
-    return {};
-  }
-  std::vector<VkPhysicalDevice> devices(count);
-  if (vkEnumeratePhysicalDevices(*instance, &count, devices.data()) !=
-      VK_SUCCESS) {
-    vkDestroyInstance(*instance, nullptr);
-    return {};
-  }
+  const std::vector<VkPhysicalDevice> devices = EnumerateGpuDevices(*instance);
   std::vector<std::string> names;
   names.reserve(devices.size());
   for (VkPhysicalDevice device : devices) {
@@ -146,29 +162,22 @@ class VulkanBackend final : public Backend {
     state_.instance = *instance;
     VkResult result = VK_SUCCESS;
     // Select the requested GPU index (default 0, the first GPU); it must
-    // expose a compute queue family.
-    std::uint32_t device_count = 0;
-    result = vkEnumeratePhysicalDevices(state_.instance, &device_count, nullptr);
-    if (result != VK_SUCCESS || device_count == 0) {
-      LogError("vkEnumeratePhysicalDevices found no devices; run vulkaninfo "
+    // expose a compute queue family. CPU rasterizers never appear here;
+    // EnumerateGpuDevices filters them out, so a GPU index cannot hit
+    // the CPU.
+    const std::vector<VkPhysicalDevice> devices = EnumerateGpuDevices(state_.instance);
+    if (devices.empty()) {
+      LogError("vkEnumeratePhysicalDevices found no GPUs; run vulkaninfo "
                "to list devices and check the ICDs");
       DestroyState(state_);
-      return std::unexpected(FromVkResult(result));
-    }
-    std::vector<VkPhysicalDevice> devices(device_count);
-    result =
-        vkEnumeratePhysicalDevices(state_.instance, &device_count, devices.data());
-    if (result != VK_SUCCESS) {
-      LogError(std::string("vkEnumeratePhysicalDevices failed (") +
-               std::to_string(static_cast<int>(result)) + ")");
-      DestroyState(state_);
-      return std::unexpected(FromVkResult(result));
+      return std::unexpected(StatusCode::DeviceError);
     }
     if (device_index_ < 0 ||
-        static_cast<std::uint32_t>(device_index_) >= device_count) {
+        static_cast<std::uint32_t>(device_index_) >= devices.size()) {
       LogError("requested GPU " + std::to_string(device_index_) + " but only " +
-               std::to_string(device_count) + " device(s) are present; pass "
-               "--gpu in the range [0, " + std::to_string(device_count - 1) +
+               std::to_string(devices.size()) + " device(s) are present; pass "
+               "--gpu in the range [0, " +
+               std::to_string(devices.size() - 1) +
                "] (defaults to the first GPU)");
       DestroyState(state_);
       return std::unexpected(StatusCode::InvalidArgument);
@@ -199,7 +208,7 @@ class VulkanBackend final : public Backend {
     vkGetPhysicalDeviceProperties(state_.physical, &props);
     device_name_ = props.deviceName;
     LogInfo("selected GPU " + std::to_string(device_index_) + " of " +
-            std::to_string(device_count) + ": " + device_name_);
+            std::to_string(devices.size()) + ": " + device_name_);
 
     std::uint32_t queue_family = 0;
     bool found_family = false;

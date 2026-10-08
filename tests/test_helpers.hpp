@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -23,14 +24,20 @@
 
 namespace tessera::testing {
 
+// GPU index the test run targets (default 0). Reads TESSERA_TEST_GPU so
+// a run can pick a free device when another process holds the default
+// one. Every device-test helper uses this, so the suite targets one GPU.
+inline int TestDeviceIndex() {
+  if (const char* gpu = std::getenv("TESSERA_TEST_GPU")) {
+    return std::atoi(gpu);
+  }
+  return 0;
+}
+
 // Create an engine for a device test; skips cleanly without a device.
 inline void MakeEngineOrSkip(std::unique_ptr<Engine>& engine) {
-  // Honor TESSERA_TEST_GPU so a run can pick a free device when another
-  // process (for example a server) already holds the default one.
   EngineOptions options;
-  if (const char* gpu = std::getenv("TESSERA_TEST_GPU")) {
-    options.device_index = std::atoi(gpu);
-  }
+  options.device_index = TestDeviceIndex();
   auto created = Engine::Create(options);
   if (!created) {
     GTEST_SKIP() << "no device available: "

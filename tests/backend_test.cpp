@@ -4,9 +4,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -46,10 +48,14 @@ using tessera::testing::DrawValue;
 using tessera::testing::GemmTolerance;
 using tessera::testing::QuantizeRows;
 using tessera::testing::TestGetScaleMin;
+using tessera::testing::TestDeviceIndex;
 using tessera::testing::ToleranceFor;
 namespace core = tessera::core;
 
 namespace {
+
+// CPU rasterizer marker: it must never appear in the GPU list.
+constexpr const char* kLlvmpipeDeviceName = "llvmpipe";
 
 // A device is required for these tests; skip cleanly without one.
 void MakeBackendOrSkip(std::unique_ptr<Backend>& backend) {
@@ -57,6 +63,7 @@ void MakeBackendOrSkip(std::unique_ptr<Backend>& backend) {
   if (!backend) {
     GTEST_SKIP() << "no backend in this build";
   }
+  backend->SetDeviceIndex(TestDeviceIndex());
   auto init = backend->Init();
   if (!init) {
     GTEST_SKIP() << "no device available: "
@@ -74,6 +81,36 @@ TEST(BackendTest, CreateAndInit) {
   // Init is idempotent.
   auto second = backend->Init();
   ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
+}
+
+// GPU-only enumeration: a CPU rasterizer must never appear in the GPU
+// list, so no test run can silently execute on software rendering.
+TEST(BackendTest, ListGpuNamesHasNoCpuRasterizer) {
+  auto names = tessera::ListGpuNames();
+  if (!names) {
+    GTEST_SKIP() << "no device available: "
+                 << tessera::ToString(names.error());
+  }
+  for (const auto& name : *names) {
+    EXPECT_EQ(name.find(kLlvmpipeDeviceName), std::string::npos) << name;
+  }
+}
+
+// TESSERA_TEST_GPU parsing: unset means GPU 0, a set value is honored.
+// The previous value is restored, so later tests see an intact env.
+TEST(BackendTest, TestDeviceIndexReadsEnv) {
+  const char* saved = std::getenv("TESSERA_TEST_GPU");
+  const bool had_value = saved != nullptr;
+  const std::string saved_value = had_value ? saved : "";
+  ::unsetenv("TESSERA_TEST_GPU");
+  EXPECT_EQ(TestDeviceIndex(), 0);
+  ::setenv("TESSERA_TEST_GPU", "1", 1);
+  EXPECT_EQ(TestDeviceIndex(), 1);
+  if (had_value) {
+    ::setenv("TESSERA_TEST_GPU", saved_value.c_str(), 1);
+  } else {
+    ::unsetenv("TESSERA_TEST_GPU");
+  }
 }
 
 TEST(BackendTest, BufferRoundTrip) {
