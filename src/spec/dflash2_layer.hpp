@@ -46,8 +46,8 @@ struct DraftLayerWeights {
     std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
     std::size_t ffn, std::size_t taps, std::size_t group_size,
     std::size_t block_size, std::size_t window, std::uint64_t pos_base,
-    double theta, float eps,
-    std::span<const float> context_hidden = {});
+    double theta, float eps, std::span<const float> context_hidden = {},
+    bool causal = true);
 
 // The device weight buffers (fp32) of one layer.
 struct DraftLayerBuffers {
@@ -81,6 +81,7 @@ struct DraftLayerBuffers {
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    const Buffer* context_hidden = nullptr, std::size_t ctx = 0);
+    const Buffer* context_hidden = nullptr, std::size_t ctx = 0,
+    bool causal = true);
 
 }  // namespace tessera::spec

@@ -23,7 +23,7 @@ std::expected<void, StatusCode> DraftStackRef(
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    std::span<const float> context_hidden) {
+    std::span<const float> context_hidden, bool causal) {
   const std::size_t elements = rows * hidden_dim;
   if (embed.size() != elements || out.size() != elements ||
       final_norm.size() != hidden_dim) {
@@ -40,7 +40,7 @@ std::expected<void, StatusCode> DraftStackRef(
                          : std::span<const float>(residual),
         layer, std::span<float>(layer_out), std::span<float>(layer_res), rows,
         hidden_dim, heads, kv_heads, head_dim, ffn, taps, group_size,
-        block_size, window, pos_base, theta, eps, context_hidden);
+        block_size, window, pos_base, theta, eps, context_hidden, causal);
     if (!status) {
       return std::unexpected(status.error());
     }
@@ -67,7 +67,7 @@ std::expected<void, StatusCode> DraftStackDevice(
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    const Buffer* context_hidden, std::size_t ctx) {
+    const Buffer* context_hidden, std::size_t ctx, bool causal) {
   if (rows == 0 || hidden_dim == 0 || layers.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -92,7 +92,7 @@ std::expected<void, StatusCode> DraftStackDevice(
         backend, rmsnorm, gemm, conv, rope, attention, silu, add, *in,
         l == 0 ? nullptr : residual->get(), layers[l], *out_swap, **residual,
         rows, hidden_dim, heads, kv_heads, head_dim, ffn, taps, group_size,
-        block_size, window, pos_base, theta, eps, context_hidden, ctx);
+        block_size, window, pos_base, theta, eps, context_hidden, ctx, causal);
     if (!status) {
       return std::unexpected(status.error());
     }

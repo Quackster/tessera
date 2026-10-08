@@ -130,7 +130,9 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
 [[nodiscard]] std::expected<void, StatusCode> DecodeForward(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out = nullptr,
-    const Buffer* embedding = nullptr);
+    const Buffer* embedding = nullptr,
+    const std::vector<std::size_t>* capture_layers = nullptr,
+    std::vector<Buffer*>* capture = nullptr);
 
 // One decoder step returning the vocab logits instead of the argmax
 // token. Dispatches to the hybrid or device path, preserving the cache

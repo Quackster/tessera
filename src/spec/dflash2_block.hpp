@@ -31,7 +31,7 @@ namespace tessera::spec {
     std::size_t vocab, std::size_t heads, std::size_t kv_heads,
     std::size_t head_dim, std::size_t ffn, std::size_t taps,
     std::size_t group_size, std::size_t block_size, std::size_t window,
-    std::uint64_t pos_base, double theta, float eps);
+    std::uint64_t pos_base, double theta, float eps, bool causal = true);
 
 // Device version. All kernels are built-ins: gemm (gemm_f32), conv
 // (dflash_conv), rmsnorm, rope, attention, silu (silu_mul), add and
@@ -49,6 +49,6 @@ namespace tessera::spec {
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    Buffer* hidden_out = nullptr);
+    bool causal = true, Buffer* hidden_out = nullptr);
 
 }  // namespace tessera::spec

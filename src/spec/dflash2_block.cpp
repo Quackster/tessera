@@ -20,7 +20,7 @@ std::expected<void, StatusCode> DraftBlockRef(
     std::size_t vocab, std::size_t heads, std::size_t kv_heads,
     std::size_t head_dim, std::size_t ffn, std::size_t taps,
     std::size_t group_size, std::size_t block_size, std::size_t window,
-    std::uint64_t pos_base, double theta, float eps) {
+    std::uint64_t pos_base, double theta, float eps, bool causal) {
   if (mask_embeds.size() != rows * hidden_dim ||
       logits.size() != rows * vocab || output_w.size() != vocab * hidden_dim) {
     return std::unexpected(StatusCode::InvalidArgument);
@@ -36,7 +36,7 @@ std::expected<void, StatusCode> DraftBlockRef(
                              std::span<float>(hidden), rows, hidden_dim, heads,
                              kv_heads, head_dim, ffn, taps, group_size,
                              block_size, window, pos_base, theta, eps,
-                             std::span<const float>(fused));
+                             std::span<const float>(fused), causal);
   if (!stack) {
     return std::unexpected(stack.error());
   }
@@ -59,7 +59,8 @@ std::expected<void, StatusCode> DraftBlockDevice(
     std::size_t vocab, std::size_t heads, std::size_t kv_heads,
     std::size_t head_dim, std::size_t ffn, std::size_t taps,
     std::size_t group_size, std::size_t block_size, std::size_t window,
-    std::uint64_t pos_base, double theta, float eps, Buffer* hidden_out) {
+    std::uint64_t pos_base, double theta, float eps, bool causal,
+    Buffer* hidden_out) {
   auto fused = backend.AllocateBuffer(ctx * hidden_dim * 4, MemoryKind::Device);
   auto concat_scratch =
       backend.AllocateBuffer(ctx * n * features * 4, MemoryKind::Device);
@@ -76,7 +77,7 @@ std::expected<void, StatusCode> DraftBlockDevice(
       backend, rmsnorm, gemm, conv, rope, attention, silu, add, mask_embeds,
       layers, final_norm, **hidden, rows, hidden_dim, heads, kv_heads, head_dim,
       ffn, taps, group_size, block_size, window, pos_base, theta, eps,
-      fused->get(), ctx);
+      fused->get(), ctx, causal);
   if (!stack) {
     return std::unexpected(stack.error());
   }

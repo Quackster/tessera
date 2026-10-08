@@ -44,7 +44,7 @@ std::expected<void, StatusCode> DraftAttentionRef(
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
     std::span<const float> context_k, std::span<const float> context_v,
-    std::size_t ctx) {
+    std::size_t ctx, bool causal) {
   if (auto valid = Validate(rows, hidden, heads, kv_heads, head_dim, taps,
                             group_size, block_size);
       !valid) {
@@ -117,7 +117,7 @@ std::expected<void, StatusCode> DraftAttentionRef(
   const std::size_t n = ctx + rows;
   if (!core::AttentionRef(std::span<const float>(q), keys, values,
                           std::span<float>(attn), rows, n, heads, kv_heads,
-                          head_dim, query_base, window) ||
+                          head_dim, query_base, window, causal) ||
       !core::GemmF32Ref(std::span<const float>(attn), o_w,
                         std::span<float>(oproj), rows, hidden, q_dim) ||
       !GroupedConvFinishRef(std::span<const float>(oproj),
@@ -140,7 +140,8 @@ std::expected<void, StatusCode> DraftAttentionDevice(
     std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    const Buffer* context_k, const Buffer* context_v, std::size_t ctx) {
+    const Buffer* context_k, const Buffer* context_v, std::size_t ctx,
+    bool causal) {
   if (auto valid = Validate(rows, hidden, heads, kv_heads, head_dim, taps,
                             group_size, block_size);
       !valid) {
@@ -200,7 +201,8 @@ std::expected<void, StatusCode> DraftAttentionDevice(
     n = ctx + rows;
   }
   if (!AttentionDevice(backend, attention, q, *keys, *values, attn, n, heads,
-                       kv_heads, head_dim, query_base, window, rows) ||
+                       kv_heads, head_dim, query_base, window, rows,
+                       /*kv_f16=*/false, causal) ||
       !ProjectDevice(backend, gemm, attn, o_w, oproj, rows, hidden, q_dim) ||
       !GroupedConvFinishDevice(backend, conv, oproj, proj, conv_base,
                                side_base, out, rows, hidden, taps, group_size,

@@ -147,6 +147,19 @@ std::expected<DFlash2Config, StatusCode> ParseDFlash2Config(
     }
     config.layer_types.push_back(type.AsString());
   }
+  // Draft attention causality, mirroring vLLM's `_dflash_layer_causal`: an
+  // explicit `is_causal` wins, else `dflash_config.causal`, else sliding
+  // attention is causal and full attention is not.
+  const Json* is_causal = root.Find("is_causal");
+  const Json* causal_override = dflash->Find("causal");
+  if (is_causal != nullptr && is_causal->type() == Json::Type::Bool) {
+    config.attn_causal = is_causal->AsBool();
+  } else if (causal_override != nullptr &&
+             causal_override->type() == Json::Type::Bool) {
+    config.attn_causal = causal_override->AsBool();
+  } else {
+    config.attn_causal = config.layer_types.front() == "sliding_attention";
+  }
   return config;
 }
 

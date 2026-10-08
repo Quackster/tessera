@@ -986,10 +986,35 @@ through RADV GFX1201, rocm through the system ROCm).
   candidate selector (bypassing it and taking the unary top-1 gives the
   same rate) and the draft context window (`TESSERA_DFLASH2_CTX` of 1, 8
   and 32 all agree). So the raw draft mask-row logits are wrong, and the
-  fault is in the draft forward or the aux hidden capture. Next: compare
-  the draft's first-mask logits against the target's at the same position,
-  and check the aux capture point (layer output vs input) and the fuse/fc
-  and grouped-conv order against vLLM.
+  fault is in the draft forward or the aux hidden capture.
+  Two vLLM mismatches were found and fixed, and the rest of the draft
+  forward was verified equal to vLLM stage by stage. First, the prefill
+  did not capture the aux target hidden states (it used `DecodeForward`),
+  so the draft context only ever held the last prompt position; the
+  prefill now captures every position (`DecodeForward` gained capture
+  arguments) and `TESSERA_DFLASH2_CTX` can widen the window. Second, the
+  draft self-attention is non-causal: the config sets `is_causal: false`,
+  which vLLM's `_dflash_layer_causal` uses directly (it overrides the
+  per-layer-type default), so the whole block and the whole context are
+  visible to every query. The draft config now carries `attn_causal`
+  (parsed from `is_causal`, then `dflash_config.causal`, then the layer
+  type) and threads it to the draft `attention` call.
+  Verified equal to vLLM: the aux capture point (vLLM adds 1 to
+  `target_layer_ids` and captures after that layer, so `[5,19,33,47,61]`
+  means after layers `[5,19,33,47,61]`, which is what `capture_layer`
+  does); the fp8 block dequant; the draft norms (plain, no unit offset);
+  the RoPE theta and NeoX style; the `fc` concat layout and the
+  layer-major aux order; the grouped dynamic convolution (position = row
+  mod block_size, base + delta, prepare side 0 and finish side 1); the
+  pre-norm residual structure and the final `norm(hidden + residual)`; the
+  context `KV = k/v_proj(rms_norm(fc))` with K-norm and RoPE on K only.
+  The head is the target's `output.weight` (using the embedding is worse:
+  0 of 56). Neither fix moved acceptance, so the dominant bug is still
+  unknown. The draft's first mask-row logits are wrong, so the next step
+  is a host or vLLM reference of one draft step to bisect the forward.
+  One more mismatch is not yet handled: vLLM uses `1 + num_speculative_tokens`
+  query rows (8 for the README's 7 draft tokens), while we use
+  `config.block_size + 1` (9); the extra mask is wasted, not harmful.
 
 ## Next (in order)
 

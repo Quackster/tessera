@@ -134,6 +134,38 @@ TEST(SpecConfigTest, ParsesValidConfig) {
   EXPECT_EQ(config->target_layer_ids, (std::vector<std::uint32_t>{5, 19, 33, 47, 61}));
   EXPECT_EQ(config->layer_types.size(), 5u);
   EXPECT_DOUBLE_EQ(config->rope_theta, 10000000.0);
+  // Sliding attention with no explicit is_causal resolves to causal.
+  EXPECT_TRUE(config->attn_causal);
+}
+
+TEST(SpecConfigTest, ResolvesAttentionCausality) {
+  // An explicit top-level is_causal wins (the Qwen3.8 DFlash2 draft case).
+  std::string explicit_false = kDraftConfig;
+  explicit_false.insert(explicit_false.find("\"sliding_window\""),
+                        "\"is_causal\": false, ");
+  auto non_causal = ParseDFlash2Config(explicit_false);
+  ASSERT_TRUE(non_causal.has_value()) << tessera::ToString(non_causal.error());
+  EXPECT_FALSE(non_causal->attn_causal);
+
+  // dflash_config.causal is the fallback when is_causal is absent.
+  std::string with_override = kDraftConfig;
+  with_override.replace(with_override.find("\"dflash_config\": {"),
+                        std::string("\"dflash_config\": {").size(),
+                        "\"dflash_config\": {\"causal\": false,");
+  auto override = ParseDFlash2Config(with_override);
+  ASSERT_TRUE(override.has_value()) << tessera::ToString(override.error());
+  EXPECT_FALSE(override->attn_causal);
+
+  // Full attention with no explicit flag resolves to non-causal.
+  std::string full = kDraftConfig;
+  for (std::size_t pos = full.find("sliding_attention"); pos != std::string::npos;
+       pos = full.find("sliding_attention", pos + 1)) {
+    full.replace(pos, std::string("sliding_attention").size(),
+                 "full_attention");
+  }
+  auto full_attn = ParseDFlash2Config(full);
+  ASSERT_TRUE(full_attn.has_value()) << tessera::ToString(full_attn.error());
+  EXPECT_FALSE(full_attn->attn_causal);
 }
 
 TEST(SpecConfigTest, RejectsMalformedConfigs) {
@@ -200,6 +232,8 @@ TEST(SpecConfigTest, LoadsRealConfigWhenProvided) {
   EXPECT_EQ(config->selector_top_k, 16u);
   EXPECT_EQ(config->target_layer_ids.size(), 5u);
   EXPECT_EQ(config->layer_types.size(), 5u);
+  // The Qwen3.8 DFlash2 draft is non-causal.
+  EXPECT_FALSE(config->attn_causal);
 }
 
 

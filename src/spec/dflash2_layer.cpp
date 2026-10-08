@@ -30,7 +30,8 @@ std::expected<void, StatusCode> DraftLayerRef(
     std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
     std::size_t ffn, std::size_t taps, std::size_t group_size,
     std::size_t block_size, std::size_t window, std::uint64_t pos_base,
-    double theta, float eps, std::span<const float> context_hidden) {
+    double theta, float eps, std::span<const float> context_hidden,
+    bool causal) {
   const std::size_t elements = rows * hidden_dim;
   if (hidden.size() != elements || out.size() != elements ||
       residual_out.size() != elements ||
@@ -69,7 +70,8 @@ std::expected<void, StatusCode> DraftLayerRef(
       w.attn_conv_base, w.q_w, w.k_w, w.v_w, w.o_w, w.q_norm_w, w.k_norm_w,
       std::span<float>(attn_out), rows, hidden_dim, heads, kv_heads, head_dim,
       taps, group_size, block_size, window, pos_base, theta, eps,
-      std::span<const float>(ctx_k), std::span<const float>(ctx_v), ctx);
+      std::span<const float>(ctx_k), std::span<const float>(ctx_v), ctx,
+      causal);
   if (!attn) {
     return std::unexpected(attn.error());
   }
@@ -101,7 +103,7 @@ std::expected<void, StatusCode> DraftLayerDevice(
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    const Buffer* context_hidden, std::size_t ctx) {
+    const Buffer* context_hidden, std::size_t ctx, bool causal) {
   if (rows == 0 || hidden_dim == 0 || heads == 0 || kv_heads == 0 ||
       head_dim == 0 || ffn == 0 || taps == 0 || group_size == 0 ||
       block_size == 0 || hidden_dim % group_size != 0) {
@@ -181,7 +183,7 @@ std::expected<void, StatusCode> DraftLayerDevice(
       *w.attn_conv_base, *w.q_w, *w.k_w, *w.v_w, *w.o_w, *w.q_norm_w,
       *w.k_norm_w, *attn_out, rows, hidden_dim, heads, kv_heads, head_dim,
       taps, group_size, block_size, window, pos_base, theta, eps, ctx_k, ctx_v,
-      ctx);
+      ctx, causal);
   if (!attn_status) {
     return std::unexpected(attn_status.error());
   }

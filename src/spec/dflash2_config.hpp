@@ -34,6 +34,12 @@ struct DFlash2Config {
   std::size_t selector_top_k = 0;
   std::vector<std::uint32_t> target_layer_ids;
   std::vector<std::string> layer_types;
+  // Whether the draft self-attention is causal. DFlash2 drafts are usually
+  // non-causal (block diffusion): every query sees the whole block and the
+  // whole context. Follows vLLM's `_dflash_layer_causal`: an explicit
+  // `is_causal` wins, else `dflash_config.causal`, else the layer type
+  // (sliding attention is causal, full attention is not).
+  bool attn_causal = true;
 };
 
 // Parse a DFlash2 draft config.json. MalformedFile when a required field

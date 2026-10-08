@@ -57,7 +57,8 @@ std::expected<void, StatusCode> DFlash2Drafter::Run(
       config_.intermediate_size, config_.conv_kernel_size,
       config_.conv_group_size, config_.block_size, config_.sliding_window,
       pos_base, config_.rope_theta,
-      static_cast<float>(config_.rms_norm_eps), hidden_out);
+      static_cast<float>(config_.rms_norm_eps), config_.attn_causal,
+      hidden_out);
 }
 
 }  // namespace tessera::spec

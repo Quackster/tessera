@@ -105,12 +105,6 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   if (max_tokens == 0) {
     return std::vector<std::uint32_t>{};
   }
-  for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
-    auto forward = core::DecodeForward(backend, target, cache, prompt[i]);
-    if (!forward) {
-      return std::unexpected(forward.error());
-    }
-  }
   std::vector<float> hidden_state;
   std::vector<std::vector<std::vector<float>>> hist(n);
   const auto push_capture = [&]() -> std::expected<void, StatusCode> {
@@ -126,6 +120,20 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     }
     return {};
   };
+  // Capture the aux hiddens of every prompt position, not just the last.
+  // vLLM's draft context is the whole prefix up to the anchor, so the early
+  // prompt positions are context too; dropping them starves the draft.
+  for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
+    auto forward = core::DecodeForward(backend, target, cache, prompt[i],
+                                       &hidden_state, nullptr, &capture_layers,
+                                       &captures);
+    if (!forward) {
+      return std::unexpected(forward.error());
+    }
+    if (auto pushed = push_capture(); !pushed) {
+      return std::unexpected(pushed.error());
+    }
+  }
   auto first = core::DecodeLogits(backend, target, cache, prompt.back(),
                                   &hidden_state, &capture_layers, &captures);
   if (!first) {

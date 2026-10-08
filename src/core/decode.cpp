@@ -25,20 +25,19 @@ std::expected<std::uint32_t, StatusCode> DecodeStep(
   return DecodeStepDevice(backend, model, cache, token, hidden);
 }
 
-std::expected<void, StatusCode> DecodeForward(Backend& backend,
-                                              const Model& model,
-                                              DecodeCache& cache,
-                                              std::uint32_t token,
-                                              std::vector<float>* hidden,
-                                              const Buffer* embedding) {
+std::expected<void, StatusCode> DecodeForward(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden, const Buffer* embedding,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
   }
   const Architecture* arch = model.Arch();
   if (arch != nullptr) {
-    return arch->Forward(backend, model, cache, token, hidden, nullptr, nullptr,
-                         embedding);
+    return arch->Forward(backend, model, cache, token, hidden, capture_layers,
+                         capture, embedding);
   }
   if (embedding != nullptr) {
     return std::unexpected(StatusCode::UnsupportedFeature);
