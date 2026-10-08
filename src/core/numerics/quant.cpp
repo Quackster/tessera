@@ -196,7 +196,8 @@ float Fp8E4M3ToFloat(std::uint8_t bits) {
   const std::uint32_t mant = bits & 0x7;
   float value;
   if (exp == 0) {
-    value = static_cast<float>(mant) * 0x1p-10f;
+    // Subnormal: mant / 8 * 2^(1 - bias) with the E4M3 bias of 7.
+    value = static_cast<float>(mant) * 0x1p-9f;
   } else if (exp == 15) {
     // Only the all-ones mantissa is NaN; the rest encode 2^8 scale.
     if (mant == 7) {
@@ -205,7 +206,7 @@ float Fp8E4M3ToFloat(std::uint8_t bits) {
     value = (1.0f + static_cast<float>(mant) / 8.0f) * 256.0f;
   } else {
     value = (1.0f + static_cast<float>(mant) / 8.0f) *
-            std::ldexp(1.0f, static_cast<int>(exp) - 8);
+            std::ldexp(1.0f, static_cast<int>(exp) - 7);
   }
   return sign != 0 ? -value : value;
 }
@@ -238,54 +239,37 @@ std::uint8_t Fp32ToFp8E4M3Bits(float value) {
   if ((bits & 0x7FFFFFFF) > 0x7F800000 || !(value == value)) {
     return static_cast<std::uint8_t>((sign << 7) | 0x7F);
   }
-  float abs = value < 0 ? -value : value;
+  const float abs = value < 0 ? -value : value;
   if (abs == 0.0f) {
     return static_cast<std::uint8_t>(sign << 7);
   }
   if (abs > 448.0f) {
     return static_cast<std::uint8_t>((sign << 7) | 0x7F);
   }
-  if (abs > 240.0f) {
-    // Top bin: 2^8 scale, mantissas 0..6 (448 max).
-    long long mant = std::llrint(abs / 256.0f * 8.0f - 8.0f);
-    if (mant < 0) {
-      mant = 0;
-    }
-    if (mant > 6) {
-      return static_cast<std::uint8_t>((sign << 7) | 0x7F);
-    }
-    return static_cast<std::uint8_t>((sign << 7) | (15 << 3) |
-                                     static_cast<std::uint32_t>(mant));
-  }
   int exp = 0;
-  const float frac = std::frexp(abs, &exp);  // abs = frac * 2^exp
-  int field = exp + 7;  // 2^(field-8) brackets abs with frac in [1, 2)
+  const float frac = std::frexp(abs, &exp);  // abs = frac * 2^exp, frac in [0.5, 1)
+  // The E4M3 exponent bias is 7: a normal value is (1 + m/8) * 2^(field - 7)
+  // and the subnormal is m * 2^-9. frexp's frac has an implicit 0.5, so
+  // (1 + m/8) = 2 * frac and field = exp + 6.
+  int field = exp + 6;
   if (field < 1) {
-    const long long mant = std::llrint(abs * 1024.0f);
-    if (mant >= 8) {
-      return static_cast<std::uint8_t>((sign << 7) | (1 << 3));
+    long long mant = std::llrint(abs * 512.0f);
+    if (mant > 7) {
+      mant = 7;
     }
     return static_cast<std::uint8_t>((sign << 7) |
                                      static_cast<std::uint32_t>(mant));
   }
   long long mant = std::llrint((frac * 2.0f - 1.0f) * 8.0f);
   if (mant == 8) {
-    if (field == 14) {
-      mant = 7;  // 120 beats 256 below the 188 midpoint
-    } else {
-      ++field;
-      mant = 0;
-    }
+    mant = 0;
+    ++field;
   }
-  if (field > 14) {
-    // Between the E=14 max (120) and the E=15 base (256).
-    if (abs < 188.0f) {
-      field = 14;
-      mant = 7;
-    } else {
-      field = 15;
-      mant = 0;
-    }
+  if (field > 15) {
+    field = 15;
+  }
+  if (field == 15 && mant > 6) {
+    mant = 6;  // saturate to the 448 max
   }
   return static_cast<std::uint8_t>(
       (sign << 7) | (static_cast<std::uint32_t>(field) << 3) |

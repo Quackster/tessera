@@ -40,11 +40,11 @@ float fp8_at(uint b) {
   uint m = b & 7;
   float value;
   if (e == 0) {
-    value = float(m) * exp2(-10.0);
+    value = float(m) * exp2(-9.0);
   } else if (e == 15) {
     value = m == 7 ? 0.0 / 0.0 : (1.0 + float(m) / 8.0) * 256.0;
   } else {
-    value = (1.0 + float(m) / 8.0) * exp2(float(e) - 8.0);
+    value = (1.0 + float(m) / 8.0) * exp2(float(e) - 7.0);
   }
   return s > 0 ? -value : value;
 }

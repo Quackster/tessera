@@ -128,15 +128,15 @@ FpTolerance FpToleranceFor(std::string_view backend) {
 // Host: the fp8 and mxfp4 codecs hit exact known patterns.
 TEST(BackendTest, FpCodecsHitKnownPatterns) {
   EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x00), 0.0f);
-  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x38), 0.5f);
-  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x40), 1.0f);
-  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0xBC), -0.75f);
-  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0xC4), -1.5f);
-  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x76), 112.0f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x38), 1.0f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x40), 2.0f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0xBC), -1.5f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0xC4), -3.0f);
+  EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x76), 224.0f);
   EXPECT_FLOAT_EQ(core::Fp8E4M3ToFloat(0x7E), 448.0f);
   EXPECT_TRUE(std::isnan(core::Fp8E4M3ToFloat(0x7F)));
   EXPECT_TRUE(std::isnan(core::Fp8E4M3ToFloat(0xFF)));
-  EXPECT_EQ(core::Fp32ToFp8E4M3Bits(1.0f), 0x40);
+  EXPECT_EQ(core::Fp32ToFp8E4M3Bits(1.0f), 0x38);
   EXPECT_EQ(core::Fp32ToFp8E4M3Bits(-0.0f), 0x80);
   EXPECT_EQ(core::Fp32ToFp8E4M3Bits(448.0f), 0x7E);
   EXPECT_EQ(core::Fp32ToFp8E4M3Bits(1e30f), 0x7F);

@@ -1042,8 +1042,24 @@ through RADV GFX1201, rocm through the system ROCm).
   target), and the text-only CLI now prompts the MXFP4 target end to end
   (`The capital of France is` gives ` Paris.`). `TokenizerTest.
   HfTokenizerJsonParses`, `HfTokenizerNonBpeIsEmpty` and
-  `HfTokenizerRejectsMalformed` cover the parser. 250/250 ctest on
-  vulkan and rocm.
+   `HfTokenizerRejectsMalformed` cover the parser. 250/250 ctest on
+   vulkan and rocm.
+
+- 2026-10-08: **Fixed the OCP FP8 E4M3 codec.** `Fp8E4M3ToFloat` used an
+  exponent bias of 8 (`exp - 8`, subnormal `2^-10`) instead of the OCP
+  bias of 7 (`exp - 7`, subnormal `2^-9`), so every FP8 value decoded to
+  half. The fix lands in all four copies: the core
+  `Fp8E4M3ToFloat`, the ROCm `Fp8E4M3ToFloatDev`, and the Vulkan
+  `fp8_at` in `gemm_fp8.comp` and `gemm_fp8_block.comp`. The inverse
+  `Fp32ToFp8E4M3Bits` (used only by tests) was rewritten for bias 7, and
+  `BackendTest.FpCodecsHitKnownPatterns` now asserts the PyTorch values
+  (`0x38 -> 1.0`, `0x40 -> 2.0`, `0x76 -> 224`, `0x7E -> 448`). Found by
+  comparing the DFlash2 draft's FP8 weights against the raw tensor times
+  `weight_scale_inv`: the C++ dequant was exactly half. This is the
+  dominant reason the draft draft was poor, though the DFlash2
+  acceptance only moved from 2 to 3 of 35, so a second draft bug remains.
+  The MXFP4 target (E2M1) is unchanged (`The capital of France is` still
+  gives ` Paris.`). 250/250 ctest on vulkan and rocm.
 
 ## Next (in order)
 

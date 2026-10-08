@@ -168,7 +168,7 @@ __host__ __device__ float Fp8E4M3ToFloatDev(std::uint8_t bits) {
   const std::uint32_t mant = bits & 0x7;
   float value;
   if (exp == 0) {
-    value = static_cast<float>(mant) * 0x1p-10f;
+    value = static_cast<float>(mant) * 0x1p-9f;
   } else if (exp == 15) {
     if (mant == 7) {
       return std::numeric_limits<float>::quiet_NaN();
@@ -176,7 +176,7 @@ __host__ __device__ float Fp8E4M3ToFloatDev(std::uint8_t bits) {
     value = (1.0f + static_cast<float>(mant) / 8.0f) * 256.0f;
   } else {
     value = (1.0f + static_cast<float>(mant) / 8.0f) *
-            std::ldexp(1.0f, static_cast<int>(exp) - 8);
+            std::ldexp(1.0f, static_cast<int>(exp) - 7);
   }
   return sign != 0 ? -value : value;
 }
