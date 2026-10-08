@@ -966,8 +966,9 @@ through RADV GFX1201, rocm through the system ROCm).
 
 ## Next (in order)
 
-- **PERF (urgent, do first)**: make the MXFP4 model load fast. Target: the
-  whole load under 60 s, not counting prefill or decode. The load reads the
+- **PERF (urgent, do first)**: make MXFP4 inference fast. Targets: the
+  whole load under 60 s (not counting prefill or decode), and 35 to 40
+  tokens/s decode without MTP. The load reads the
   19 GB safetensors, dequantizes and packs every fp4 blob, and converts
   large BF16 tensors to F32 (the `lm_head` alone becomes a 5 GB F32
   matrix). The reference runtime loads the same file in 8 s because it
@@ -985,12 +986,16 @@ through RADV GFX1201, rocm through the system ROCm).
   conversion; upload the F32 tensor without an extra copy; skip the second
   fp4 copy when there is no reorder.
   Decode is still about 2.6 s/token, against 1.1 s/token for the same
-  model in GGUF, so the gap is the MXFP4 GEMM. It is not the E2M1 decode
-  or the byte loads: a nibble lookup table and 32-bit word loads (eight
-  nibbles per load) did not change the time. The scalar kernel launches one
-  thread per output with a long serial k loop, so it runs at low occupancy.
-  The fix is a tiled or split-K GEMV with a deterministic reduction
-  (item 3).
+  model in GGUF, so the gap is the MXFP4 GEMM. It is not the host: a
+  per-kernel pass on the Vulkan backend put the launch overhead in the low
+  tens of milliseconds for the whole run. The fence wait is the cost, and
+  `gemm_mxfp4` is 5.9 s of it (the remaining kernels together about 1.4 s,
+  with `rmsnorm` next at 0.65 s). The E2M1 decode and the byte loads are
+  not the cause: a nibble lookup table and 32-bit word loads (eight
+  nibbles per load) did not change the time. The scalar kernel launches
+  one thread per output with a long serial k loop, so it runs at low
+  occupancy. The fix is a tiled or split-K GEMV with a deterministic
+  reduction, and a parallel row reduction for `rmsnorm` (item 3).
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are
