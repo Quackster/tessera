@@ -1393,8 +1393,25 @@ through RADV GFX1201, rocm through the system ROCm).
   Q6_K so `ProjectBatch` picks it. `BackendTest.GemmQ6KBatchedMatchesRef`
   covers both backends. 263/263 `ctest` on vulkan and rocm. The 5-token
   prefill is still 805 ms and the decode 310 ms/token, so tiling the
-  remaining formats is not where the time is; only IQ4_XS has no tiled
-  kernel left.
+  remaining formats is not where the time is.
+
+- 2026-10-08: **Tiled IQ4_XS GEMM (item 3a, tiling set complete).**
+  `gemm_iq4xs_batched` on both backends, the same 8-row tile. Thread `e`
+  is element `e`: `ib = e/32`, `j = e%16`, the nibble byte is
+  `8 + ib*16 + j` (low nibble for the low half of the sub-block, high for
+  the high half), the 6-bit scale is the 4 low bits at `4 + ib/2` plus
+  the 2 high bits at bit `2*ib` of the u16 at 2, and the value is
+  `d * (scale - 32) * codebook[nibble]`. Registered for IQ4_XS, so every
+  hot GEMM format (Q4_K, Q5_K, Q6_K, IQ4_XS, MXFP4) now has a tiled
+  kernel for the batched prefill.
+  `BackendTest.GemmIq4XsBatchedMatchesRef` covers both backends. 264/264
+  `ctest` on vulkan and rocm (the ROCm run is flaky: `VisionStackMatchesRef`
+  intermittently fails inside the full suite and passes standalone or on a
+  re-run, with no docker/GPU process present; treat a single failure there
+  as environmental). The 27B GGUF decode measures 310 to 359 ms/token
+  across runs and the 5-token prefill 805 to 1004 ms, so run-to-run noise
+  exceeds any tiling effect at this batch size. The remaining item 3 work
+  is the m = 1 decode GEMV, not the tiling.
 - 2026-10-08: **Per-kernel profile of the GGUF decode (item 3).**
   `rocprofv3 --kernel-trace` on `EngineTest.GgufGeneratesWhenProvided`
   (27B GGUF, 5-token prefill plus 4 decode tokens) ranks the kernels by
@@ -1577,15 +1594,15 @@ through RADV GFX1201, rocm through the system ROCm).
    GEMM kernels are the cost. The per-kernel profile above shows the hot
    ones: `gemm_q5k` (31%), `gemm_q4k_batched` (21%), `gemm_q6k` (17%),
    `gemm_iq4xs` (15%); the plain `gemm_q4k` decode is small. Done so far:
-   tiled `gemm_q4k_batched`/`gemm_q5k_batched`/`gemm_mxfp4_batched`, wide
-   MXFP4 and Q4_K reads, the E8M0 bit cast, and the coalesced
-   `gemm_q4k_row` (kept, but slower). Next: (a) the tiled IQ4_XS kernel
-   (the last hot format without one); (b) the same wide-read treatment on
-   the Q5_K/Q6_K/IQ4_XS GEMVs; (c) a split-K GEMV for the m = 1 decode,
-   designed so the block header is decoded once per workgroup (the naive
-   coalesced version lost to the reduction overhead). Note the tiling
-   saves nothing at a five-row batch, so (c) is where the decode time is.
-   Applies on both backends. The
+   tiled `gemm_q4k_batched`/`gemm_q5k_batched`/`gemm_q6k_batched`/
+   `gemm_iq4xs_batched`/`gemm_mxfp4_batched`, wide MXFP4 and Q4_K reads,
+   the E8M0 bit cast, and the coalesced `gemm_q4k_row` (kept, but slower).
+   The tiling set covers every hot format. Next: (a) the same wide-read
+   treatment on the Q5_K/Q6_K/IQ4_XS decode GEMVs; (b) a split-K GEMV for
+   the m = 1 decode, designed so the block header is decoded once per
+   workgroup (the naive coalesced version lost to the reduction overhead).
+   Tiling saves nothing at a five-row batch, so (b) is where the decode
+   time is. Applies on both backends. The
    attention_q8/attention_q4 kernels still recompute the dot product per
    output dimension.
 4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless

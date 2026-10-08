@@ -413,7 +413,7 @@ class Kernel {
   if (kernel.Id() == "gemm_q5k" || kernel.Id() == "gemm_q5k_batched" ||
       kernel.Id() == "gemm_q6k" || kernel.Id() == "gemm_q6k_batched" ||
       kernel.Id() == "gemm_q3k" || kernel.Id() == "gemm_iq4xs" ||
-      kernel.Id() == "gemm_iq3s") {
+      kernel.Id() == "gemm_iq4xs_batched" || kernel.Id() == "gemm_iq3s") {
     if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
       return StatusCode::InvalidArgument;
     }

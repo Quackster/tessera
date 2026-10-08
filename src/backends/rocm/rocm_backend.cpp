@@ -53,6 +53,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_q3k", reinterpret_cast<void*>(&GemmQ3KKernel)},
     {"gemm_iq4nl", reinterpret_cast<void*>(&GemmIq4NlKernel)},
     {"gemm_iq4xs", reinterpret_cast<void*>(&GemmIq4XsKernel)},
+    {"gemm_iq4xs_batched", reinterpret_cast<void*>(&GemmIq4XsBatchedKernel)},
     {"gemm_iq3s", reinterpret_cast<void*>(&GemmIq3SKernel)},
     {"gemm_q80", reinterpret_cast<void*>(&GemmQ80Kernel)},
     {"rmsnorm", reinterpret_cast<void*>(&RmsnormKernel)},

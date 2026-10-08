@@ -77,6 +77,69 @@ __global__ void GemmIq4XsKernel(const float* a, const unsigned char* w,
   c[idx] = acc;
 }
 
+// Built-in "gemm_iq4xs_batched": tiled C = A x dequant(W)^T for a batch.
+// One workgroup handles 8 activation rows x one weight column; the 256
+// IQ4_XS elements of a block are dequantized once into shared memory and
+// reused across the rows. Thread `e` is element `e`: ib = e / 32,
+// j = e % 16, the nibble byte is `8 + ib*16 + j` (low nibble for the low
+// half of the sub-block, high for the high half), the 6-bit scale is the
+// 4 low bits at `4 + ib/2` plus the 2 high bits at bit `2*ib` of the u16
+// at 2, and the value is `d * (scale - 32) * codebook[nibble]`. The dot
+// uses the gemm_iq4xs order (ib, j, low then high). Dispatch is
+// ceil(m / 8) * n workgroups of 256.
+__global__ void GemmIq4XsBatchedKernel(const float* a,
+                                       const unsigned char* w, float* c,
+                                       unsigned long long m,
+                                       unsigned long long n,
+                                       unsigned long long k) {
+  const unsigned long long wg =
+      static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long tid =
+      static_cast<unsigned long long>(threadIdx.x);
+  const unsigned long long tm = wg / n;
+  const unsigned long long row_w = wg % n;
+  const unsigned long long base_row = tm * 8;
+  const bool dot_valid = tid < 8 && base_row + tid < m;
+  const unsigned long long row_a = base_row + tid;
+  const unsigned long long blocks = k / 256;
+  __shared__ float wq[256];
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char* base = w + (row_w * blocks + b) * 136;
+    std::uint16_t d_bits = 0;
+    std::uint16_t scales_h = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&scales_h, base + 2, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    const unsigned long long e = tid;
+    const unsigned long long ib = e / 32;
+    const unsigned long long lane = e % 32;
+    const unsigned long long j = lane % 16;
+    const unsigned char byte = base[8 + ib * 16 + j];
+    const unsigned char nib = lane < 16 ? (byte & 15) : (byte >> 4);
+    const unsigned char packed = base[4 + ib / 2];
+    const int ls = ((packed >> (4 * (ib % 2))) & 15) |
+                   (((scales_h >> (2 * ib)) & 3) << 4);
+    const float dl = d * static_cast<float>(ls - 32);
+    wq[e] = dl * static_cast<float>(kIq4NlValuesDev[nib]);
+    __syncthreads();
+    if (dot_valid) {
+      const float* ar = a + row_a * k + b * 256;
+      for (unsigned long long g = 0; g < 8; ++g) {
+        for (unsigned long long jj = 0; jj < 16; ++jj) {
+          const unsigned long long e0 = g * 32 + jj;
+          acc += ar[e0] * wq[e0];
+          acc += ar[e0 + 16] * wq[e0 + 16];
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (dot_valid) {
+    c[row_a * n + row_w] = acc;
+  }
+}
+
 // IQ3_S 3-bit grid (ports iq3s_grid; see CREDITS.md).
 __constant__ std::uint32_t kIq3sGridDev[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301,
