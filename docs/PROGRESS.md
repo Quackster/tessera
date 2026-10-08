@@ -937,11 +937,18 @@ through RADV GFX1201, rocm through the system ROCm).
    mask positions predict; `num_query_per_req = 1 + num_steps`,
    `is_bonus = query_off == 0`, `sample_off = 1`), the mask id is
    `dflash_config.mask_token_id`, and the draft context K/V is the target
-   hidden at the context positions. Our draft feeds only N mask tokens
-   with no anchor query. The DFlash2 fc fuses the aux target-layer hiddens
-   (`_get_dflash_fc_input_size` = target_hidden_size * num_aux_layers).
-   The context width does not lift acceptance; a first 1+N attempt did not
-   either and was reverted.
+   hidden at the context positions. Exact vLLM layout
+   (`_prepare_dflash_inputs_kernel`): the context is the prefix up to the
+   anchor (`last_valid_pos`), it does NOT include the bonus; query 0 is
+   the bonus token at `P+1` (`input_id = bonus_token`), queries 1..N are
+   mask tokens at `P+2..`; only masks predict (`sample_off=1`). The
+   context K/V is `KV_proj(rms_norm(fc(concat of aux target-layer
+   hiddens)))` (`_project_context_kv`, `_get_dflash_fc_input_size` =
+   target_hidden_size * num_aux_layers). Our draft feeds N mask tokens and
+   its context INCLUDES the anchor, so a 1+N attempt must also move the
+   anchor out of the context. A naive 1+N (context still including the
+   anchor, context width 1) regressed; the context width alone does not
+   lift acceptance.
 1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
@@ -971,13 +978,18 @@ through RADV GFX1201, rocm through the system ROCm).
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-5. **Multimodal (mmproj)**: config, weights, encoder+merger, image
+5. **Prefill optimisation**: make the batched prefill faster. Each GEMM
+   still dequantizes each weight once per prompt row. Read each weight
+   block once and reuse it across a tile of rows. Keep one sync per
+   prefill and preallocate the KV caches up front. Measure prompt
+   tokens per second on a text prompt and on an image prompt.
+6. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, image-embedding injection, the CLI wiring and the
    `<|image_pad|>` placeholder default are done
    (`Engine::GenerateMultimodal`). Still to do: deepstack feature
    injection and the image prefill speed (attention kernel).
 
-6. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
+7. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism
    (shard attention heads and MLP rows across GPUs with an all-reduce per
    layer; vLLM tensor parallelism, Megatron-LM TP) or layer/pipeline
