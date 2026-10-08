@@ -614,6 +614,7 @@ inline std::string_view GemmKernelName(DType dtype) {
     case DType::IQ3_S: return "gemm_iq3s";
     case DType::F32: return "gemm_f32";
     case DType::BF16: return "gemm_bf16";
+    case DType::F4E2M1: return "gemm_mxfp4";
     default: return {};
   }
 }
