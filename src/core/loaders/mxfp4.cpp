@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/json.hpp"
+#include "core/numerics/quant.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 
@@ -180,9 +181,8 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
   }
   std::vector<DeviceTensor> weights;
   for (const auto& tensor : tensors) {
-    if (tensor.entry.dtype == DType::F8E8M0 ||
-        tensor.entry.dtype == DType::F8E4M3) {
-      continue;  // scales pair with their blob; FP8 MTP is not packed yet
+    if (tensor.entry.dtype == DType::F8E8M0) {
+      continue;  // E8M0 scales pair with their F4E2M1 blob
     }
     auto internal = module.MapWeightName(tensor.name, config);
     if (!internal) {
@@ -247,6 +247,41 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
       }
       device = std::move(*buffer);
       out_dtype = DType::F4E2M1;
+    } else if (tensor.entry.dtype == DType::F8E4M3) {
+      // FP8 E4M3 with one scale per output channel (ch_axis 0), the MTP
+      // head's format: dequant = fp8(row, col) * scale(row). Dequantize to
+      // F32 at load, matching how the DFlash2 draft handles FP8.
+      const auto scale = by_name.find(tensor.name + "_scale");
+      if (scale == by_name.end() || scale->second->entry.dtype != DType::F32 ||
+          scale->second->entry.shape.rank != 1 ||
+          scale->second->entry.shape.dims[0] != rows) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      const std::span<const std::byte> scale_bytes = file.subspan(
+          scale->second->begin,
+          scale->second->end - scale->second->begin);
+      if (scale_bytes.size() != rows * 4 || payload.size() != rows * cols) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      const float* scales = reinterpret_cast<const float*>(scale_bytes.data());
+      std::vector<float> values(rows * cols);
+      for (std::size_t r = 0; r < rows; ++r) {
+        const float channel = scales[r];
+        for (std::size_t c = 0; c < cols; ++c) {
+          values[r * cols + c] =
+              Fp8E4M3ToFloat(static_cast<std::uint8_t>(payload[r * cols + c])) *
+              channel;
+        }
+      }
+      const std::span<const std::byte> f32_bytes(
+          reinterpret_cast<const std::byte*>(values.data()),
+          values.size() * 4);
+      auto buffer = Upload(backend, f32_bytes);
+      if (!buffer) {
+        return std::unexpected(buffer.error());
+      }
+      device = std::move(*buffer);
+      out_dtype = DType::F32;
     } else {
       const std::size_t elem_bytes = PlainElemBytes(tensor.entry.dtype);
       if (elem_bytes == 0) {

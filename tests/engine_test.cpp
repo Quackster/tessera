@@ -904,6 +904,83 @@ TEST(EngineTest, LoadMxFp4ModulePathConvertsAndPacks) {
   }
 }
 
+// The MXFP4 MTP head ships in FP8 E4M3 with one F32 scale per output
+// channel (fp8_mtp.py); the loader dequantizes it to F32 so the head's
+// gemms run.
+TEST(EngineTest, LoadMxFp4Fp8MtpHeadDequantizes) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  const std::string config = R"({
+    "model_type": "qwen3_5",
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "text_config": {
+      "hidden_size": 8,
+      "num_hidden_layers": 64,
+      "num_attention_heads": 24,
+      "num_key_value_heads": 4,
+      "head_dim": 256,
+      "intermediate_size": 17408,
+      "vocab_size": 248320,
+      "rms_norm_eps": 1e-6,
+      "full_attention_interval": 4,
+      "partial_rotary_factor": 0.25,
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 48,
+      "linear_value_head_dim": 128,
+      "rope_parameters": {"rope_theta": 10000000.0, "mrope_section": [11, 11, 10]}
+    }
+  })";
+  // mtp.fc.weight [2, 4] F8_E4M3 with a per-output-channel F32 scale [2].
+  const std::string json = R"({
+    "mtp.fc.weight":{"dtype":"F8_E4M3","shape":[2,4],"data_offsets":[0,8]},
+    "mtp.fc.weight_scale":{"dtype":"F32","shape":[2],"data_offsets":[8,16]}
+  })";
+  const std::uint8_t fp8[8] = {0x38, 0x40, 0x44, 0x30, 0x40, 0x3C, 0x3E, 0x28};
+  const float scales[2] = {0.5f, 2.0f};
+  auto container = MakeSafetensorsContainer(json);
+  for (std::uint8_t byte : fp8) {
+    container.push_back(static_cast<std::byte>(byte));
+  }
+  for (float scale : scales) {
+    std::byte bytes[4];
+    std::memcpy(bytes, &scale, 4);
+    for (std::byte byte : bytes) {
+      container.push_back(byte);
+    }
+  }
+  auto dir = FreshTempDir("tessera_tests_mxfp4_fp8_mtp");
+  std::vector<std::byte> config_bytes(config.size());
+  std::memcpy(config_bytes.data(), config.data(), config.size());
+  WriteBytes(dir / "config.json", config_bytes);
+  WriteBytes(dir / "model.safetensors", container);
+  auto model = engine->LoadModel(ModelOptions{dir.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+
+  const tessera::Buffer* weight =
+      (*model)->FindWeight("blk.64.nextn.eh_proj.weight");
+  ASSERT_NE(weight, nullptr);
+  EXPECT_EQ(weight->Size(), 2u * 4u * 4u);  // dequantized to F32
+  std::vector<float> got(8);
+  ASSERT_TRUE(engine->Owner()
+                  .CopyD2H(*weight, reinterpret_cast<std::byte*>(got.data()),
+                           got.size() * 4)
+                  .has_value());
+  for (std::size_t r = 0; r < 2; ++r) {
+    for (std::size_t c = 0; c < 4; ++c) {
+      const float expected =
+          tessera::core::Fp8E4M3ToFloat(fp8[r * 4 + c]) * scales[r];
+      EXPECT_FLOAT_EQ(got[r * 4 + c], expected);
+    }
+  }
+  for (const tessera::TensorEntry& entry : (*model)->Tensors()) {
+    if (entry.name == "blk.64.nextn.eh_proj.weight") {
+      EXPECT_EQ(entry.dtype, tessera::DType::F32);
+    }
+  }
+}
+
 TEST(EngineTest, LoadModelMissingFile) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);

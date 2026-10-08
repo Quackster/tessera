@@ -1505,6 +1505,21 @@ through RADV GFX1201, rocm through the system ROCm).
   measurement or a different approach (for example a warp-per-output
   GEMV with shuffle broadcast), not another micro-optimization.
 
+- 2026-10-08: **FP8 MTP head now loads on the MXFP4 target (item 2).**
+  The MXFP4 loader skipped every `F8_E4M3` tensor, so the
+  `Qwen3.8-27B-MXFP4-MTPFP8` MTP head never reached the device and
+  `MtpDraftStep` failed with `UnsupportedFeature`. The head is eight
+  projections stored as `float8_e4m3fn` with one `F32` scale per output
+  channel (`fp8_mtp.py`: `scale = amax/448` per row, dequant
+  `flat = fp8 * scale[row]`). `BuildMxFp4Weights` now handles `F8E4M3`:
+  it pairs each weight with its `_scale`, dequantizes to `F32` at load
+  the same way the DFlash2 draft handles FP8, and uploads; the
+  architecture's `MapWeightName` already renames the `mtp.*` tensors to
+  `blk.<trunk>.nextn.*`. New `EngineTest.LoadMxFp4Fp8MtpHeadDequantizes`
+  pins the dequant. `HybridDecodeTest.MtpDraftWhenModelProvided` now
+  passes on the MXFP4 target (866 tensors, was 858), so MTP speculation
+  is available there.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -1653,9 +1668,12 @@ through RADV GFX1201, rocm through the system ROCm).
    `embedding_q4k`) run on the device; the gated MLP is gemm + silu_mul +
    gemm on the device. The Qwen 3.8 27B definition is dense, so no MoE
    kernel is needed for it; the MoE router/expert kernels are for the
-   planned Ornith-1.5-35B-A3B and stay on this item. Remaining
-   architecture specific behavior moves behind the `Architecture` module
-   interface (see item 0).
+   planned Ornith-1.5-35B-A3B and stay on this item. The Qwen 3.8 MXFP4
+   definition's MTP head is now complete: its eight FP8 E4M3 projections
+   (the `fp8_mtp.py` head, per-output-channel F32 scales) load and
+   dequantize to F32, so `Engine::GenerateSpeculative` / MTP drafting
+   works on that target. Remaining architecture specific behavior moves
+   behind the `Architecture` module interface (see item 0).
 3. **GEMM throughput**: the model runs far below memory bandwidth, so the
    GEMM kernels are the cost. The per-kernel profile above shows the hot
    ones: `gemm_q5k` (31%), `gemm_q4k_batched` (21%), `gemm_q6k` (17%),
