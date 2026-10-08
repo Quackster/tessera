@@ -286,7 +286,9 @@ Current inventory (the first-class targets):
 - `~/models/Qwen3.8-27B-MXFP4-MTPFP8/` — MXFP4 model with fp8 MTP
   (`model.safetensors`, tokenizer/processor configs, `config.json`).
 - `~/models/Qwen3.8-27B-DFlash2-FP8/` — DFlash2 draft checkpoint (FP8
-  `model.safetensors` + `config.json`).
+  `model.safetensors` + `config.json`). The Qwen 3.8 DFlash2 drafter is
+  tested against the Qwen 3.8 27B MXFP4 target, not the GGUF. The aux
+  target hidden states the drafter consumes come from the MXFP4 target.
 
 Model paths are runtime configuration (CLI flag / engine option). Never
 hard-code `~/models/...` paths in code or tests; tests take model paths as

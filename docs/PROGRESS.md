@@ -918,6 +918,24 @@ through RADV GFX1201, rocm through the system ROCm).
   stays about 0 to 15 percent), so the draft block quality, not the
   context, is the limit.
 
+- 2026-10-08: MXFP4 multimodal tensors parse (237/237 `ctest` on both
+  builds). `TensorShape::kMaxRank` is raised from 4 to 6 so the rank-5
+  vision conv weights in the Qwen3.8 MXFP4 checkpoint (for example
+  `model.visual.patch_embed.proj.weight`, `[1152, 3, 2, 16, 16]`) no
+  longer reject the whole safetensors map as malformed. Covered by
+  `EngineTest.LoadMxFp4Rank5Tensor`. See item 0: the MXFP4 directory
+  still does not run end to end.
+
+- 2026-10-08: DFlash2 draft 1+N query layout (237/237 `ctest` on both
+  builds). The draft now matches vLLM's `_prepare_dflash_inputs_kernel`:
+  the anchor (bonus) token embedding is query 0, the N mask tokens are
+  queries 1..N, only the mask rows predict, and the draft context
+  excludes the anchor (it is the prefix before it). New
+  `spec::QueryEmbeddings` builds the 1+N query block (covered by
+  `HybridDecodeTest.QueryEmbeddingsAnchorThenMask`); `GenerateDFlash2`
+  runs `block + 1` rows and reads the mask rows at offset 1. Acceptance
+  still cannot be judged until the target is the MXFP4 model (item 0).
+
 ## Next (in order)
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
@@ -944,11 +962,21 @@ through RADV GFX1201, rocm through the system ROCm).
    mask tokens at `P+2..`; only masks predict (`sample_off=1`). The
    context K/V is `KV_proj(rms_norm(fc(concat of aux target-layer
    hiddens)))` (`_project_context_kv`, `_get_dflash_fc_input_size` =
-   target_hidden_size * num_aux_layers). Our draft feeds N mask tokens and
-   its context INCLUDES the anchor, so a 1+N attempt must also move the
-   anchor out of the context. A naive 1+N (context still including the
-   anchor, context width 1) regressed; the context width alone does not
-   lift acceptance.
+   target_hidden_size * num_aux_layers). The 1+N layout and the
+   anchor-out-of-context rule are implemented (see the 2026-10-08 Done
+   entry), but acceptance still cannot be measured on the correct target:
+   the DFlash2 drafter is tested against the Qwen3.8 27B MXFP4 model
+   (`~/models/Qwen3.8-27B-MXFP4-MTPFP8/`), which the engine cannot run
+   end to end yet. The directory loader now parses the MXFP4 safetensors
+   (including the rank-5 vision tensor), but `Model::Load` still builds
+   the MXFP4 model with no `TransformerConfig`, no tokenizer and no
+   weight-name map (the checkpoint uses HuggingFace names such as
+   `model.language_model.layers.N.linear_attn.in_proj_qkv.weight`; the
+   Qwen3.5 module looks up GGUF names such as `blk.N.attn_qkv.weight`).
+   The MXFP4 block weights also need packing so `gemm_mxfp4` receives the
+   blob and its E8M0 scale (today they are two tensors). Until that lands
+   the acceptance is only measurable against the GGUF target, which is
+   the wrong target (its aux hidden states differ from the MXFP4 ones).
 1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.

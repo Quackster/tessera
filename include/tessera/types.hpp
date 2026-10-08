@@ -187,7 +187,9 @@ struct AttentionParams {
 //   shape.dims[0] = 4096;
 //   shape.dims[1] = 8;
 struct TensorShape {
-  static constexpr std::size_t kMaxRank = 4;
+  // Multimodal checkpoints carry rank-5 vision tensors (for example a
+  // patch-embedding conv weight [out, in, t, h, w]), so the cap is 6.
+  static constexpr std::size_t kMaxRank = 6;
 
   std::size_t rank = 0;
   std::array<std::size_t, kMaxRank> dims{};

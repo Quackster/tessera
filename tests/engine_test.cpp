@@ -360,6 +360,33 @@ TEST(EngineTest, LoadMxFp4BlobAndScalePair) {
   EXPECT_EQ(loaded->FindWeight("w.weight_scale")->Size(), 4u);
 }
 
+TEST(EngineTest, LoadMxFp4Rank5Tensor) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  // A multimodal checkpoint carries rank-5 vision tensors (a patch
+  // embedding conv weight); the loader must accept them.
+  std::string json =
+      R"({"patch.weight":{"dtype":"BF16","shape":[2,3,2,4,4],)"
+      R"("data_offsets":[0,384]}})";
+  auto container = MakeSafetensorsContainer(json);
+  container.insert(container.end(), 384, std::byte{0});
+  auto dir = FreshTempDir("tessera_tests_mxfp4_rank5");
+  WritePlaceholderConfig(dir);
+  WriteBytes(dir / "model.safetensors", container);
+  auto model = engine->LoadModel(ModelOptions{dir.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const TensorEntry* patch = nullptr;
+  for (const auto& entry : (*model)->Tensors()) {
+    if (entry.name == "patch.weight") {
+      patch = &entry;
+    }
+  }
+  ASSERT_NE(patch, nullptr);
+  EXPECT_EQ(patch->shape.rank, 5u);
+  EXPECT_EQ(patch->shape.dims[0], 2u);
+  EXPECT_EQ(patch->shape.dims[4], 4u);
+}
+
 TEST(EngineTest, LoadModelMissingFile) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);

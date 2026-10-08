@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
@@ -58,8 +59,9 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     block = options.draft_tokens;
   }
   const std::size_t n = draft_config->target_layer_ids.size();
-  // Number of target positions the draft block conditions on. 1 uses only
-  // the anchor; a wider window lets the draft attend to more context.
+  // Number of prefix target positions the draft block conditions on, not
+  // counting the anchor. vLLM's draft context is the prefix up to the
+  // anchor; the anchor itself is query 0, not context.
   std::size_t ctx_window = 1;
   if (const char* env = std::getenv("TESSERA_DFLASH2_CTX"); env != nullptr) {
     const int v = std::atoi(env);
@@ -67,6 +69,8 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
       ctx_window = static_cast<std::size_t>(v);
     }
   }
+  const std::size_t hist_window = ctx_window + 1;
+  const std::size_t query_rows = block + 1;
   std::vector<std::size_t> capture_layers(draft_config->target_layer_ids.begin(),
                                           draft_config->target_layer_ids.end());
   std::vector<std::unique_ptr<Buffer>> capture_storage;
@@ -81,10 +85,13 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   }
   auto aux =
       backend.AllocateBuffer(n * ctx_window * hidden * 4, MemoryKind::Device);
-  auto logits = backend.AllocateBuffer(block * vocab * 4, MemoryKind::Device);
-  auto draft_hidden = backend.AllocateBuffer(block * hidden * 4,
-                                             MemoryKind::Device);
-  if (!aux || !logits || !draft_hidden) {
+  auto logits =
+      backend.AllocateBuffer(query_rows * vocab * 4, MemoryKind::Device);
+  auto draft_hidden =
+      backend.AllocateBuffer(query_rows * hidden * 4, MemoryKind::Device);
+  auto sel_hidden =
+      backend.AllocateBuffer(block * hidden * 4, MemoryKind::Device);
+  if (!aux || !logits || !draft_hidden || !sel_hidden) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   auto selector_gemm = backend.LoadKernel("gemm_f32", {});
@@ -110,7 +117,7 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
         return std::unexpected(down.error());
       }
       hist[i].push_back(std::move(*down));
-      if (hist[i].size() > ctx_window) {
+      if (hist[i].size() > hist_window) {
         hist[i].erase(hist[i].begin());
       }
     }
@@ -143,7 +150,11 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (auto pushed = push_capture(); !pushed) {
       return std::unexpected(pushed.error());
     }
-    const std::size_t ctx = hist[0].size();
+    // The anchor (bonus) is the last generated token. vLLM's draft layout is
+    // 1+N: query 0 is the anchor, queries 1..N are mask tokens, and only the
+    // mask rows predict. The context is the prefix before the anchor, so the
+    // anchor's own hidden is excluded from `aux`.
+    const std::size_t ctx = hist[0].size() - 1;
     std::vector<float> aux_host(n * ctx * hidden);
     for (std::size_t i = 0; i < n; ++i) {
       for (std::size_t t = 0; t < ctx; ++t) {
@@ -154,27 +165,30 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (!core::detail::UploadF32(backend, **aux, aux_host)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    auto mask = MaskEmbeddings(backend, *embed, draft_config->mask_token_id,
-                               block, hidden);
-    if (!mask) {
-      return std::unexpected(mask.error());
+    auto query = QueryEmbeddings(backend, *embed, next,
+                                 draft_config->mask_token_id, block, hidden);
+    if (!query) {
+      return std::unexpected(query.error());
     }
-    // The draft block uses block-local positions: the context occupies
-    // 0..ctx-1 and the mask queries ctx..ctx+block-1, which preserves the
-    // relative distances the attention mask and RoPE expect.
-    auto run = drafter->Run(backend, **mask, **aux, *output->device, **head_gemm,
-                            **logits, block, ctx, /*pos_base=*/0, vocab,
-                            draft_hidden->get());
+    // Block-local positions: the context occupies 0..ctx-1 and the queries
+    // ctx..ctx+block (anchor first, then the masks), preserving the relative
+    // distances the attention mask, RoPE and grouped convolution expect.
+    auto run = drafter->Run(backend, **query, **aux, *output->device,
+                            **head_gemm, **logits, query_rows, ctx,
+                            /*pos_base=*/0, vocab, draft_hidden->get());
     if (!run) {
       return std::unexpected(run.error());
     }
     backend.Synchronize();
-    std::vector<float> draft_logits(block * vocab);
+    std::vector<float> draft_logits(query_rows * vocab);
     if (!backend.CopyD2H(**logits,
                          reinterpret_cast<std::byte*>(draft_logits.data()),
                          draft_logits.size() * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }
+    // Only the mask rows (one after the anchor) predict draft tokens.
+    std::span<const float> mask_logits(draft_logits);
+    mask_logits = mask_logits.subspan(vocab);
     std::vector<std::uint32_t> draft_tokens(block);
     const DraftSelectorWeights& selector = drafter->Weights().Selector();
     if (selector.projection != nullptr && selector_gemm.has_value() &&
@@ -183,10 +197,9 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
       const std::size_t rank = draft_config->selector_rank;
       std::vector<std::uint32_t> cand_ids(block * topk);
       std::vector<float> unary(block * topk);
-      auto candidates = DraftCandidates(std::span<const float>(draft_logits),
-                                        std::span<std::uint32_t>(cand_ids),
-                                        std::span<float>(unary), block, vocab,
-                                        topk);
+      auto candidates =
+          DraftCandidates(mask_logits, std::span<std::uint32_t>(cand_ids),
+                          std::span<float>(unary), block, vocab, topk);
       if (!candidates) {
         return std::unexpected(candidates.error());
       }
@@ -210,9 +223,15 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
       if (!cand_buf || !anchor_buf || !unary_buf || !proj_buf || !scores_buf) {
         return std::unexpected(StatusCode::OutOfMemory);
       }
+      // The selector conditions on the draft hidden at the mask rows, which
+      // start one row after the anchor.
+      if (!backend.CopyD2D(**draft_hidden, hidden * 4, **sel_hidden, 0,
+                           block * hidden * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
       auto scored = DraftSelectorDevice(
           backend, **selector_gemm, **selector_kernel, **proj_buf,
-          **draft_hidden, *selector.projection, *selector.predecessor,
+          **sel_hidden, *selector.projection, *selector.predecessor,
           *selector.successor, **cand_buf, **anchor_buf, **unary_buf,
           **scores_buf, block, hidden, rank, vocab, topk);
       if (!scored) {
@@ -239,7 +258,7 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
       }
     } else {
       for (std::size_t r = 0; r < block; ++r) {
-        std::span<const float> row(draft_logits.data() + r * vocab, vocab);
+        std::span<const float> row(mask_logits.data() + r * vocab, vocab);
         draft_tokens[r] = core::detail::ArgMax(row);
       }
     }

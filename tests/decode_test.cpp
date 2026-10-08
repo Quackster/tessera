@@ -769,8 +769,9 @@ TEST(HybridDecodeTest, ForwardCapturesLayerHidden) {
   EXPECT_EQ(captured, hidden_out);
 }
 
-// The mask-token embeddings tile the gathered target embedding row.
-TEST(HybridDecodeTest, MaskEmbeddingsTileGather) {
+// The 1+N draft queries put the anchor row first and tile the mask rows
+// after it; an out-of-range anchor is rejected.
+TEST(HybridDecodeTest, QueryEmbeddingsAnchorThenMask) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
   auto model = engine->LoadModel(
@@ -786,24 +787,35 @@ TEST(HybridDecodeTest, MaskEmbeddingsTileGather) {
     }
   }
   ASSERT_NE(embed, nullptr);
-  constexpr std::size_t kRows = 3;
-  auto buffer = tessera::spec::MaskEmbeddings(engine->Owner(), *embed, 0, kRows,
-                                              hidden);
+  constexpr std::size_t kMasks = 2;
+  auto buffer = tessera::spec::QueryEmbeddings(engine->Owner(), *embed, 1, 0,
+                                               kMasks, hidden);
   ASSERT_TRUE(buffer.has_value()) << tessera::ToString(buffer.error());
   engine->Owner().Synchronize();
-  std::vector<float> tiled(kRows * hidden);
+  std::vector<float> queries((1 + kMasks) * hidden);
   engine->Owner().CopyD2H(**buffer,
-                          reinterpret_cast<std::byte*>(tiled.data()),
-                          tiled.size() * 4);
-  std::vector<float> row(hidden);
-  ASSERT_TRUE(tessera::core::detail::GatherEmbedding(
-                  engine->Owner(), *embed, 0, hidden, row)
+                          reinterpret_cast<std::byte*>(queries.data()),
+                          queries.size() * 4);
+  std::vector<float> anchor(hidden);
+  std::vector<float> mask(hidden);
+  ASSERT_TRUE(tessera::core::detail::GatherEmbedding(engine->Owner(), *embed, 1,
+                                                     hidden, anchor)
                   .has_value());
-  for (std::size_t r = 0; r < kRows; ++r) {
+  ASSERT_TRUE(tessera::core::detail::GatherEmbedding(engine->Owner(), *embed, 0,
+                                                     hidden, mask)
+                  .has_value());
+  for (std::size_t c = 0; c < hidden; ++c) {
+    EXPECT_EQ(queries[c], anchor[c]);
+  }
+  for (std::size_t r = 1; r <= kMasks; ++r) {
     for (std::size_t c = 0; c < hidden; ++c) {
-      EXPECT_EQ(tiled[r * hidden + c], row[c]);
+      EXPECT_EQ(queries[r * hidden + c], mask[c]);
     }
   }
+  auto bad = tessera::spec::QueryEmbeddings(engine->Owner(), *embed, 999, 0,
+                                            kMasks, hidden);
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), tessera::StatusCode::InvalidArgument);
 }
 
 // The fp16 KV cache path decodes deterministically (a fresh cache with the
