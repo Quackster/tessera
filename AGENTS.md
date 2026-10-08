@@ -230,6 +230,12 @@ These are hard rules, set by the project owner:
       27B target and the draft for every value of a sweep.
     - When you only need a small value, do not load a full model to get it. Use
       `TESSERA_TEST_*` paths that point at the model you need.
+    - Keep reference and diagnostic Python scripts memory-light. Load one
+      tensor at a time, keep float32 (never float64), and never `.float()` or
+      copy a whole multi-GB checkpoint at once. A script that materializes the
+      full checkpoint in host memory next to a running server has crashed the
+      workstation. A 2 GB FP8 checkpoint becomes many gigabytes once `.float()`
+      copies a [5120, 25600] tensor; free each tensor before loading the next.
     - If a command could exceed the machine's memory, split it or ask the
       project owner first.
 

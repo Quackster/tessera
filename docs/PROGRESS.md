@@ -1112,6 +1112,53 @@ through RADV GFX1201, rocm through the system ROCm).
   holding device 0 and caused a GPU context loss. 255/255 ctest on
   vulkan.
 
+- 2026-10-08: **DFlash2: the FP8 draft block itself is numerically
+  unstable.** A faithful reference exists at
+  `~/git/radiance-vllm-mxfp4/paroquant/drafter/train_drafter.py` (plain
+  Torch; the same equations as vLLM). Running it on the dumped inputs with
+  the `Qwen3.8-27B-DFlash2-FP8` weights reproduces the same behaviour as
+  the C++: the block's activations grow layer over layer (layer 0 reaches
+  ~1.6e6 from a 0.06-magnitude input) and intermittently overflow to
+  NaN/inf, so the logits are garbage and acceptance is near zero. The C++
+  and the reference agree to correlation 0.99999 on q/k/v, so the port is
+  faithful and the checkpoint/quantization is the variable. The C++
+  dequantizes the FP8 blocks to normal magnitudes (rms ~0.1), and the
+  channel layout is the plain 128x128 block scale, not an AWQ fold. Next:
+  try the alternate draft checkpoints (`~/models/malicz/...-DFlash2-FP8`,
+  or the radiance MXFP4 drafter from `quantize_dflash_mxfp4.py`) and, if
+  they are stable, treat the `tcclaviger` FP8 quant as bad; if all are
+  unstable, find the stabilizer vLLM applies (the dynamic per-token FP8
+  activation quantization is the remaining candidate). Temporary
+  diagnostic dumps were used to reach this and removed; the run is
+  nondeterministic once the block NaNs, so comparisons must capture the
+  inputs and the output in one run.
+
+- 2026-10-08: **DFlash2 correction: the draft forward is faithful and
+  numerically stable.** The two entries above are wrong. The "NaN draft
+  block" was an artifact of a bug in the throwaway Python reference: its
+  `fc` projection used `W @ x.t()` instead of `x @ W.t()`, so the context
+  was the transpose and the forward "exploded" with a huge/NaN hidden.
+  With the reference fixed to mirror radiance's `train_drafter.py`
+  (`~/git/radiance-vllm-mxfp4/paroquant/drafter/train_drafter.py`) exactly,
+  the C++ draft forward matches the reference at correlation 0.99976 on
+  the same inputs: reference absmax 31.5, C++ absmax 31.06, no NaN. The
+  C++ draft hidden is finite and stable across runs (absmax about 31, no
+  NaN or inf). Also verified this session: the query embeddings are
+  byte-exact with the target `embed_tokens` (row 248070 matches
+  `model.language_model.embed_tokens.weight`; rows 1..7 are the identical
+  mask row, row 0 the anchor), the context is the target hidden at the
+  capture layers, `RunFullBlock`/`RunFfn` both add into `h.x` before the
+  capture, and the context window is used (widening it changes the
+  acceptance: `TESSERA_DFLASH2_CTX=64` gives 1 of 42). Shifting the
+  capture to layers `target_layer_ids - 1` (vLLM's `_maybe_add_hidden_state`
+  captures after 0-based layer `T-1`, see `qwen3_next.py`) does not change
+  the acceptance either (still 3 of 35). The acceptance is 3 of 35 on the
+  fixture. The remaining suspects are the aux hidden **values** (which
+  need an independent target forward to compare) and the FP8 draft
+  weights; both targets (MXFP4 and GGUF) give the same low acceptance, and
+  the `fc` orientation fix confirms the port itself is correct. Temporary
+  dumps removed; 255/255 ctest.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -1162,14 +1209,20 @@ through RADV GFX1201, rocm through the system ROCm).
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are
-   done (see the Done entry). Note: DFlash2 has a slower boot (it loads
+   done (see the Done entry). Corrected 2026-10-08: the draft block is
+   NOT NaN and NOT unstable. The forward is faithful to radiance's
+   `train_drafter.py` (correlation 0.99976) and stable (absmax ~31); the
+   query embeddings are byte-exact with the target. The low acceptance is
+   therefore not the block math; the remaining suspects are the aux hidden
+   values and the FP8 draft weights (see the correction Done entry).
+   Note: DFlash2 has a slower boot (it loads
    the 5-layer draft) and each step costs more than one greedy step, so it
    is only a win at a high enough acceptance; the target is steady-state
    tokens/s, not the first few tokens. Measure tokens/s over a long
    generation. Measured on the 27B over 32 tokens: greedy 0.86 s/token,
    DFlash2 about 4.8 s/token (acceptance 5 of 108) even at steady state,
    so the draft quality, not the boot, is the blocker. The draft accepts
-   about 0 to 15 percent; the draft block is the suspect. Align it with
+   about 0 to 15 percent. Align it with
    vLLM's DFlash handling (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py`
    and `.../dflash2/speculator.py`, `vllm/model_executor/models/qwen3_dflash.py`
    and `qwen3_dflash2.py`): the draft block has a 1+N query layout (query 0
