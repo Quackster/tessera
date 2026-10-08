@@ -29,6 +29,37 @@ std::expected<std::size_t, StatusCode> AsIndex(const Json& value) {
   return static_cast<std::size_t>(number);
 }
 
+// Append the eos token ids in one document (`eos_token_id`, a number or an
+// array of numbers) to `out`; invalid entries are skipped and duplicates
+// are dropped.
+void AppendEosIds(const Json& document, std::vector<std::uint32_t>& out) {
+  const Json* eos = document.Find("eos_token_id");
+  if (eos == nullptr) {
+    return;
+  }
+  const auto append = [&out](const Json& value) {
+    if (value.type() != Json::Type::Number) {
+      return;
+    }
+    const double number = value.AsNumber();
+    if (number < 0.0 || number != std::floor(number) ||
+        number > 4294967295.0) {
+      return;
+    }
+    const auto id = static_cast<std::uint32_t>(number);
+    if (std::find(out.begin(), out.end(), id) == out.end()) {
+      out.push_back(id);
+    }
+  };
+  if (eos->isArray()) {
+    for (const Json& value : eos->AsArray()) {
+      append(value);
+    }
+  } else {
+    append(*eos);
+  }
+}
+
 }  // namespace
 
 std::expected<std::optional<Tokenizer>, StatusCode> ParseHfTokenizer(
@@ -146,6 +177,24 @@ std::string LoadHfChatTemplate(const std::filesystem::path& dir) {
                        jinja->size());
   }
   return std::string{};
+}
+
+std::vector<std::uint32_t> LoadHfStopTokens(
+    const std::filesystem::path& dir) {
+  std::vector<std::uint32_t> stops;
+  for (const char* name : {"generation_config.json", "config.json"}) {
+    auto bytes = ReadFile(dir / name);
+    if (!bytes) {
+      continue;
+    }
+    const std::string_view text(reinterpret_cast<const char*>(bytes->data()),
+                                bytes->size());
+    auto document = Json::Parse(text);
+    if (document && document->isObject()) {
+      AppendEosIds(*document, stops);
+    }
+  }
+  return stops;
 }
 
 }  // namespace tessera::core

@@ -1074,6 +1074,23 @@ through RADV GFX1201, rocm through the system ROCm).
   streaming contract: the streamed ids match `Generate`, and a false
   return stops the run. 251/251 ctest on vulkan.
 
+- 2026-10-08: **Generation stops at declared stop tokens.** The decode
+  loops ran to `max_tokens`, so a chat prompt streamed the answer and then
+  kept emitting `<|im_end|><|endoftext|><|im_start|>...` without end. The
+  GGUF declares `tokenizer.ggml.eos_token_id` and the MXFP4 target declares
+  `eos_token_id` in `generation_config.json`; neither was read. The model
+  now exposes `Model::StopTokens()` (parsed by `GgufStopTokens` and
+  `LoadHfStopTokens`) and `GenerateOptions` gained `stop_tokens`.
+  `GenerateStreaming`, `GenerateMultimodal`, `GenerateSpeculative` and the
+  DFlash2 loop all end before emitting a stop token, so the output is the
+  answer alone. Verified with the CLI: `Explain gravity in one sentence.`
+  stops at token 248046 (`<|im_end|>`) and prints one sentence.
+  `EngineTest.GenerateStopsAtStopToken`,
+  `EngineTest.LoadGgufModelReadsStopTokens` and the
+  `TokenizerTest.LoadHfStopTokens*` cases cover it. 255/255 ctest on
+  vulkan and rocm. AGENTS.md gained rule 19 (garbage is a bug) and rule 20
+  (probe device and host memory before every command).
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load

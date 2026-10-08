@@ -62,6 +62,11 @@ struct GenerateOptions {
   std::size_t progress_every = 64;
   // Storage type of the full-attention KV cache (default fp32).
   KvCacheType kv_type = KvCacheType::F32;
+  // Extra stop token ids for this request, added to the model's declared
+  // stop tokens (Model::StopTokens). Generation ends when it samples one
+  // of them, and the stop token is not emitted. Use this for a chat
+  // template's end-of-turn token when the definition does not declare it.
+  std::vector<std::uint32_t> stop_tokens;
 };
 
 // Top-level facade: owns the backend and the loaded models.

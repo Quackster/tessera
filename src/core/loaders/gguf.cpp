@@ -1,6 +1,7 @@
 #include "core/files.hpp"
 #include "core/loaders/gguf.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <optional>
 
@@ -254,6 +255,46 @@ bool FileAlignment(const GgufFile& file, std::uint32_t* alignment) {
 const GgufValue* GgufFile::Find(std::string_view key) const {
   auto it = metadata.find(std::string(key));
   return it == metadata.end() ? nullptr : &it->second;
+}
+
+std::vector<std::uint32_t> GgufStopTokens(const GgufFile& file) {
+  // A metadata integer as a token id; nullopt for a non-integral, negative
+  // or out-of-range value.
+  const auto to_id = [](const GgufValue& value) -> std::optional<std::uint32_t> {
+    constexpr std::uint64_t kMaxId = 0xFFFFFFFFull;
+    if (const auto* v = std::get_if<std::uint32_t>(&value)) {
+      return *v;
+    }
+    if (const auto* v = std::get_if<std::uint64_t>(&value)) {
+      return *v > kMaxId ? std::nullopt : std::optional<std::uint32_t>(*v);
+    }
+    if (const auto* v = std::get_if<std::int32_t>(&value)) {
+      return *v < 0 ? std::nullopt : std::optional<std::uint32_t>(*v);
+    }
+    if (const auto* v = std::get_if<std::int64_t>(&value)) {
+      return (*v < 0 || static_cast<std::uint64_t>(*v) > kMaxId)
+                 ? std::nullopt
+                 : std::optional<std::uint32_t>(static_cast<std::uint32_t>(*v));
+    }
+    return std::nullopt;
+  };
+  std::vector<std::uint32_t> stops;
+  const auto append = [&stops, &to_id](const GgufValue& value) {
+    const auto id = to_id(value);
+    if (id && std::find(stops.begin(), stops.end(), *id) == stops.end()) {
+      stops.push_back(*id);
+    }
+  };
+  if (const GgufValue* value = file.Find("tokenizer.ggml.eos_token_id")) {
+    append(*value);
+  }
+  if (const auto it = file.small_arrays.find("tokenizer.ggml.eos_token_ids");
+      it != file.small_arrays.end()) {
+    for (const GgufValue& value : it->second) {
+      append(value);
+    }
+  }
+  return stops;
 }
 
 std::expected<GgufFile, StatusCode> ParseGguf(

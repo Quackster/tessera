@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -268,6 +269,13 @@ inline std::uint32_t ArgMax(std::span<const float> logits) {
     }
   }
   return best;
+}
+
+// True when `token` is in a stop set. A stop token ends generation and is
+// not emitted (the tokens before it are the answer).
+inline bool IsStopToken(std::uint32_t token,
+                        std::span<const std::uint32_t> stops) {
+  return std::find(stops.begin(), stops.end(), token) != stops.end();
 }
 
 // Download an F32 buffer once and cache it by name (constant weights:

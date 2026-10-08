@@ -353,13 +353,15 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
              std::string architecture, std::optional<AttentionParams> attention,
              std::optional<TransformerConfig> config,
              std::vector<DeviceTensor> weights,
-             std::optional<Tokenizer> tokenizer, std::string chat_template)
+             std::optional<Tokenizer> tokenizer, std::string chat_template,
+             std::vector<std::uint32_t> stop_tokens)
     : backend_(backend), options_(std::move(options)), format_(format),
       tensors_(std::move(tensors)), name_(std::move(name)),
       architecture_(std::move(architecture)),
       attention_(std::move(attention)), config_(std::move(config)),
       weights_(std::move(weights)), tokenizer_(std::move(tokenizer)),
-      chat_template_(std::move(chat_template)) {
+      chat_template_(std::move(chat_template)),
+      stop_tokens_(std::move(stop_tokens)) {
   module_ = CreateArchitecture(architecture_);
 }
 
@@ -456,11 +458,12 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         chat_template = *text;
       }
     }
+    std::vector<std::uint32_t> stop_tokens = core::GgufStopTokens(*gguf);
     return std::unique_ptr<Model>(new Model(
         backend, options, ModelFormat::Gguf, std::move(gguf->tensors),
         std::move(name), std::move(architecture), std::move(*attention),
         std::move(*config), std::move(*weights), std::move(*tokenizer),
-        std::move(chat_template)));
+        std::move(chat_template), std::move(stop_tokens)));
   }
   if (std::filesystem::is_directory(path, ec) && !ec) {
     auto layout = core::InspectMxFp4Directory(path);
@@ -507,13 +510,15 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
           return std::unexpected(tokenizer.error());
         }
         std::string chat_template = core::LoadHfChatTemplate(path);
+        std::vector<std::uint32_t> stop_tokens = core::LoadHfStopTokens(path);
         std::optional<AttentionParams> attention = config->attention;
         std::optional<TransformerConfig> parsed_config = std::move(*config);
         return std::unique_ptr<Model>(new Model(
             backend, options, ModelFormat::MxFp4, std::move(tensors),
             std::string{}, std::move(architecture), std::move(attention),
             std::move(parsed_config), std::move(*weights),
-            std::move(*tokenizer), std::move(chat_template)));
+            std::move(*tokenizer), std::move(chat_template),
+            std::move(stop_tokens)));
       }
     }
     std::vector<TensorEntry> tensors;
@@ -529,10 +534,11 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!weights) {
       return std::unexpected(weights.error());
     }
-    return std::unique_ptr<Model>(
-        new Model(backend, options, ModelFormat::MxFp4, std::move(tensors),
-                  std::string{}, std::string{}, std::nullopt, std::nullopt,
-                  std::move(*weights), std::nullopt, std::string{}));
+    return std::unique_ptr<Model>(new Model(
+        backend, options, ModelFormat::MxFp4, std::move(tensors),
+        std::string{}, std::string{}, std::nullopt, std::nullopt,
+        std::move(*weights), std::nullopt, std::string{},
+        core::LoadHfStopTokens(path)));
   }
   return std::unexpected(StatusCode::InvalidArgument);
 }
@@ -599,5 +605,9 @@ const Tokenizer* Model::GetTokenizer() const {
 }
 
 std::string_view Model::ChatTemplate() const { return chat_template_; }
+
+std::span<const std::uint32_t> Model::StopTokens() const {
+  return std::span<const std::uint32_t>(stop_tokens_);
+}
 
 }  // namespace tessera

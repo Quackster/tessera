@@ -44,6 +44,15 @@ struct GgufFile {
   [[nodiscard]] const GgufValue* Find(std::string_view key) const;
 };
 
+// Stop token ids a definition declares: the scalar
+// `tokenizer.ggml.eos_token_id` and the array `tokenizer.ggml.eos_token_ids`
+// (when present), in order and without duplicates. Empty when the file
+// declares none. Out-of-range or non-integral values are skipped.
+//
+// Usage:
+//   auto stops = GgufStopTokens(file);
+[[nodiscard]] std::vector<std::uint32_t> GgufStopTokens(const GgufFile& file);
+
 // Parse a GGUF v2/v3 image from memory (little-endian; v2 and v3 share
 // the byte layout, v3 additionally defines a big-endian encoding that
 // this reader does not accept). Scalar metadata lands in metadata;

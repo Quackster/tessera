@@ -203,6 +203,27 @@ These are hard rules, set by the project owner:
     sentences, one idea per sentence, no idioms, no contractions. Do not
     use em dashes; use a period, a comma, or a new sentence instead.
 
+19. **Repeated garbage is a bug, not noise** — when a streamed prompt produces
+    visibly wrong output, for example a loop, a tail that never ends, repeated
+    special tokens, or a turn that should have closed, treat it as a defect.
+    Stop the run and root-cause it in the same session. Do not dismiss it as a
+    bad sample and do not generate past it. Research how the reference runtimes
+    handle the case (vLLM, llama.cpp, the model card and the HuggingFace docs),
+    implement the mechanism that prevents it, and add a regression test. This
+    project finds most of its bugs by streaming prompts, so the fix is part of
+    the task, not an extra.
+
+20. **Protect the machine before every command** — before you run a command,
+    estimate how much device and host memory it will use. The 27B models need
+    tens of gigabytes, so the workstation can run out of memory and become
+    unusable when several heavy steps overlap. Never start two model loads at
+    the same time. Never put a model load, a GPU test and a build in one
+    command, a shell loop, or a background job. Run one heavy step, wait for it
+    to finish and free its memory, then start the next. When you only need a
+    small value, do not load a full model to get it. If a command could exceed
+    the machine's memory, split it or ask the project owner first. See the
+    memory warning under Building and Testing.
+
 ## Working Principles
 
 Repository-specific constraints on top of the hard rules:
@@ -227,6 +248,11 @@ Repository-specific constraints on top of the hard rules:
   kernel or scheduler change, not a speculative-strategy bug.
 - If a diagnostic hardcoded path is used briefly to prove a cause, remove it
   before finalizing. The permanent fix must obey the architecture rules above.
+- Test prompts by streaming the output and watch the whole stream. Stop at the
+  first sign of garbage (a loop, a repeated special token, a tail that never
+  ends) and fix the root cause before continuing. A model must stop when it
+  emits its declared end-of-turn or end-of-text token; a run that streams past
+  that token is a defect in the engine, not a property of the model.
 
 ## Git
 
@@ -250,6 +276,21 @@ Do not create new CMake test executables or new top-level test files. All
 runtime coverage goes into the single test target; add test functions to the
 `tests/*.cpp` sources compiled into it. New suites only fragment ctest output
 and bloat configure time.
+
+### Do not exhaust memory with heavy test runs
+
+Each model test loads the full model (tens of gigabytes) and allocates device
+memory. Never start several of them at the same time, and never put a heavy
+run in a shell loop or combine it with a build or a full-checkpoint Python
+step. These have crashed the workstation:
+
+    for w in 5 8 16 64; do TESSERA_TEST_MODEL=... ./tessera-tests ...; done
+    cmake --build ... -j && ./tessera-tests ... && python full_checkpoint.py
+
+Run one heavy command at a time. Wait for it to finish and free its memory
+before the next one starts. Use `TESSERA_TEST_*` paths that point at the model
+you need; do not load the 27B target and the draft for every value of a sweep.
+For a CSV sweep, run one process, not one process per value.
 
 ## Where Things Live
 

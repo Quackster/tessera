@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "tessera/tokenizer.hpp"
 #include "tessera/types.hpp"
@@ -29,5 +31,13 @@ LoadHfTokenizer(const std::filesystem::path& dir);
 // `chat_template` string in `tokenizer_config.json`, else the contents of
 // `chat_template.jinja`. Empty when neither is present or parsable.
 [[nodiscard]] std::string LoadHfChatTemplate(const std::filesystem::path& dir);
+
+// Stop token ids for a HuggingFace model directory: the `eos_token_id`
+// field of `generation_config.json`, then of `config.json`. The field is a
+// number or an array of numbers; entries are appended in order and
+// without duplicates. Empty when neither file declares one. A malformed or
+// non-integral id is skipped, so a bad side file never fails the load.
+[[nodiscard]] std::vector<std::uint32_t> LoadHfStopTokens(
+    const std::filesystem::path& dir);
 
 }  // namespace tessera::core

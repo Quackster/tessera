@@ -1,5 +1,6 @@
 #include "tessera/engine.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <random>
 #include <string>
@@ -15,6 +16,20 @@ namespace tessera {
 namespace {
 // MTP drafts per batched verification when the caller does not set one.
 constexpr std::size_t kDefaultMtpBlock = 4;
+
+// The stop set for one request: the model's declared stop tokens first, then
+// the caller's extras from GenerateOptions, without duplicates.
+std::vector<std::uint32_t> StopSet(const Model& model,
+                                   const GenerateOptions& options) {
+  const std::span<const std::uint32_t> declared = model.StopTokens();
+  std::vector<std::uint32_t> stops(declared.begin(), declared.end());
+  for (std::uint32_t token : options.stop_tokens) {
+    if (std::find(stops.begin(), stops.end(), token) == stops.end()) {
+      stops.push_back(token);
+    }
+  }
+  return stops;
+}
 }  // namespace
 
 Engine::Engine(std::unique_ptr<Backend> backend, log::Diagnostics diagnostics)
@@ -155,8 +170,14 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
                ? core::SampleToken(logits, options.sampling, history, rng)
                : core::detail::ArgMax(logits);
   };
+  const std::vector<std::uint32_t> stops = StopSet(model, options);
   std::uint32_t next = pick(current);
+  bool stopped = false;
   while (produced.size() < max_tokens) {
+    if (core::detail::IsStopToken(next, stops)) {
+      stopped = true;
+      break;
+    }
     produced.push_back(next);
     if (produced.size() >= max_tokens) {
       break;
@@ -167,6 +188,11 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
       return std::unexpected(logits.error());
     }
     next = pick(*logits);
+  }
+  if (stopped) {
+    diagnostics_.Info("engine", std::string("multimodal: stopped at declared "
+                                            "stop token ") +
+                                    std::to_string(next));
   }
   if (!produced.empty()) {
     const long long ms = elapsed_ms();
@@ -183,7 +209,8 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::GenerateDraft(
     Model& model, const GenerateOptions& options,
     const std::string& draft_path) {
-  return spec::GenerateDFlash2(*backend_, model, options, draft_path,
+  const std::vector<std::uint32_t> stops = StopSet(model, options);
+  return spec::GenerateDFlash2(*backend_, model, options, draft_path, stops,
                                &diagnostics_);
 }
 
@@ -223,11 +250,17 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
   produced.reserve(max_tokens);
   const Architecture* arch = model.Arch();
   std::uint64_t pos = prompt.size();
+  const std::vector<std::uint32_t> stops = StopSet(model, options);
   std::uint32_t next = core::detail::ArgMax(current);
+  bool stopped = false;
   // Number of MTP tokens to draft before one batched verification forward.
   const std::size_t block =
       options.draft_tokens > 0 ? options.draft_tokens : kDefaultMtpBlock;
   while (produced.size() < max_tokens) {
+    if (core::detail::IsStopToken(next, stops)) {
+      stopped = true;
+      break;
+    }
     produced.push_back(next);
     if (produced.size() >= max_tokens) {
       break;
@@ -286,17 +319,25 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
       arch->DraftTruncate(cache, mtp_base + verify->accepted);
     }
     for (std::size_t i = 0; i < verify->accepted; ++i) {
+      if (core::detail::IsStopToken(drafts[i], stops)) {
+        stopped = true;
+        break;
+      }
       produced.push_back(drafts[i]);
       if (produced.size() >= max_tokens) {
         break;
       }
     }
-    if (produced.size() >= max_tokens) {
+    if (stopped || produced.size() >= max_tokens) {
       break;
     }
     current = std::move(verify->logits);
     next = verify->next_token;
     pos += verify->accepted;
+  }
+  if (stopped) {
+    diagnostics_.Info("engine",
+                      "speculative: stopped at a declared stop token");
   }
   return produced;
 }
@@ -383,6 +424,7 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   }
   std::mt19937_64 rng(options.seed);
   std::vector<std::uint32_t> history = prompt;
+  const std::vector<std::uint32_t> stops = StopSet(model, options);
   const auto pick = [&](std::span<const float> logits) {
     return options.sample
                ? core::SampleToken(logits, options.sampling, history, rng)
@@ -390,7 +432,12 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   };
   std::uint32_t next = pick(*first_logits);
   std::size_t produced = 0;
+  bool stopped = false;
   for (std::size_t step = 0; step < max_tokens; ++step) {
+    if (core::detail::IsStopToken(next, stops)) {
+      stopped = true;
+      break;
+    }
     if (!on_token(next)) {
       break;
     }
@@ -407,6 +454,10 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       return std::unexpected(logits.error());
     }
     next = pick(*logits);
+  }
+  if (stopped) {
+    diagnostics_.Info("engine", std::string("stopped at declared stop token ") +
+                                    std::to_string(next));
   }
   if (produced > 0) {
     const long long ms = elapsed_ms();

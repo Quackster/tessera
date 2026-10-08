@@ -159,3 +159,24 @@ TEST(TokenizerTest, HfTokenizerRejectsMalformed) {
   ASSERT_FALSE(tokenizer.has_value());
   EXPECT_EQ(tokenizer.error(), StatusCode::MalformedFile);
 }
+
+// The stop token loader reads `eos_token_id` from generation_config.json,
+// then config.json, accepting a number or an array and dropping duplicates.
+TEST(TokenizerTest, LoadHfStopTokensParsesConfigs) {
+  auto dir = tessera::testing::FreshTempDir("tessera_tests_hf_stops");
+  tessera::testing::WriteString(dir / "config.json",
+                                R"({"eos_token_id": 5})");
+  tessera::testing::WriteString(dir / "generation_config.json",
+                                R"({"eos_token_id": [7, 5, 42]})");
+  auto stops = tessera::core::LoadHfStopTokens(dir);
+  ASSERT_EQ(stops.size(), 3u);
+  EXPECT_EQ(stops[0], 7u);
+  EXPECT_EQ(stops[1], 5u);
+  EXPECT_EQ(stops[2], 42u);
+}
+
+// A directory without either config declares no stop tokens.
+TEST(TokenizerTest, LoadHfStopTokensEmptyWithoutConfig) {
+  auto dir = tessera::testing::FreshTempDir("tessera_tests_hf_stops_empty");
+  EXPECT_TRUE(tessera::core::LoadHfStopTokens(dir).empty());
+}

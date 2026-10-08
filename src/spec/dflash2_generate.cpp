@@ -19,7 +19,8 @@ namespace tessera::spec {
 
 std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     Backend& backend, Model& target, const GenerateOptions& options,
-    const std::string& draft_path, const log::Diagnostics* log) {
+    const std::string& draft_path, std::span<const std::uint32_t> stop_tokens,
+    const log::Diagnostics* log) {
   auto config = target.Config();
   if (!config || !config->hybrid) {
     return std::unexpected(StatusCode::UnsupportedFeature);
@@ -154,7 +155,12 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   std::size_t accepted = 0;
   std::size_t steps = 0;
   std::uint32_t next = core::detail::ArgMax(*first);
+  bool stopped = false;
   while (produced.size() < max_tokens) {
+    if (core::detail::IsStopToken(next, stop_tokens)) {
+      stopped = true;
+      break;
+    }
     produced.push_back(next);
     if (produced.size() >= max_tokens) {
       break;
@@ -288,13 +294,23 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     proposed += draft_tokens.size();
     accepted += verify->accepted;
     for (std::size_t i = 0; i < verify->accepted; ++i) {
+      if (core::detail::IsStopToken(draft_tokens[i], stop_tokens)) {
+        stopped = true;
+        break;
+      }
       if (produced.size() >= max_tokens) {
         break;
       }
       produced.push_back(draft_tokens[i]);
     }
+    if (stopped || produced.size() >= max_tokens) {
+      break;
+    }
     // The bonus token is emitted by the loop top on the next iteration.
     next = verify->next_token;
+  }
+  if (stopped && log != nullptr) {
+    log->Info("spec dflash2", "stopped at a declared stop token");
   }
   if (log != nullptr) {
     log->Info("spec dflash2",

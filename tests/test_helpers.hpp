@@ -177,6 +177,18 @@ struct GgufBuilder {
     PushF64(value);
   }
 
+  // Metadata array of u32 values (type 9: element type, count, values).
+  void KvArrayU32(const char* key,
+                  std::initializer_list<std::uint32_t> values) {
+    PushString(key);
+    PushU32(9);
+    PushU32(4);  // element type uint32
+    PushU64(values.size());
+    for (std::uint32_t value : values) {
+      PushU32(value);
+    }
+  }
+
   // Tensor entry: name, rank, rank dims (u64), ggml type, offset.
   void Tensor(const char* name, std::uint32_t rank,
               std::initializer_list<std::uint64_t> dims, std::uint32_t ggml_type,

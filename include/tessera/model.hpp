@@ -108,6 +108,15 @@ class Model {
   // The model's chat template (GGUF tokenizer.chat_template); empty when
   // the file carries none.
   [[nodiscard]] std::string_view ChatTemplate() const;
+  // Stop token ids the definition declares: GGUF
+  // `tokenizer.ggml.eos_token_id`, or the HuggingFace `eos_token_id` from
+  // `generation_config.json` then `config.json`. A generation loop ends
+  // and does not emit a token in this set. Empty when the file declares
+  // none.
+  //
+  // Usage:
+  //   for (std::uint32_t id : model.StopTokens()) ...
+  [[nodiscard]] std::span<const std::uint32_t> StopTokens() const;
   // Render a single user message through the model's chat template with
   // the generation prompt appended, so a tokenizer can produce the ids the
   // model was trained on. UnsupportedFeature when the model has no chat
@@ -125,7 +134,8 @@ class Model {
         std::string architecture, std::optional<AttentionParams> attention,
         std::optional<TransformerConfig> config,
         std::vector<DeviceTensor> weights,
-        std::optional<Tokenizer> tokenizer, std::string chat_template);
+        std::optional<Tokenizer> tokenizer, std::string chat_template,
+        std::vector<std::uint32_t> stop_tokens);
   Backend& backend_;
   ModelOptions options_;
   ModelFormat format_;
@@ -137,6 +147,7 @@ class Model {
   std::vector<DeviceTensor> weights_;
   std::optional<Tokenizer> tokenizer_;
   std::string chat_template_;
+  std::vector<std::uint32_t> stop_tokens_;
   std::unique_ptr<Architecture> module_;
 };
 

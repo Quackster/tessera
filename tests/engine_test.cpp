@@ -278,6 +278,52 @@ TEST(EngineTest, GenerateTinyModelGreedy) {
   EXPECT_EQ(*ids, *again);
 }
 
+// The model exposes the stop token ids its definition declares (the scalar
+// `tokenizer.ggml.eos_token_id` and the array `tokenizer.ggml.eos_token_ids`).
+TEST(EngineTest, LoadGgufModelReadsStopTokens) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 0, 3);
+  builder.KvString("general.name", "stop-model");
+  builder.KvU32("tokenizer.ggml.eos_token_id", 7);
+  builder.KvArrayU32("tokenizer.ggml.eos_token_ids", {7, 9});
+  auto dir = FreshTempDir("tessera_tests_stop_tokens");
+  auto path = dir / "stops.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const std::span<const std::uint32_t> stops = (*model)->StopTokens();
+  ASSERT_EQ(stops.size(), 2u);
+  EXPECT_EQ(stops[0], 7u);
+  EXPECT_EQ(stops[1], 9u);
+}
+
+// A generation loop ends at a stop token and does not emit it, for both the
+// model's declared stops and the caller's extras.
+TEST(EngineTest, GenerateStopsAtStopToken) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("stopping.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions free_opts;
+  free_opts.first_token = 0;
+  free_opts.max_tokens = 8;
+  auto ids = engine->Generate(**model, free_opts);
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  ASSERT_GE(ids->size(), 3u);
+  // Stop on the third generated token: the first two survive, the stop does
+  // not appear in the output.
+  GenerateOptions stop_opts = free_opts;
+  stop_opts.stop_tokens = {(*ids)[2]};
+  auto stopped = engine->Generate(**model, stop_opts);
+  ASSERT_TRUE(stopped.has_value()) << tessera::ToString(stopped.error());
+  ASSERT_EQ(stopped->size(), 2u);
+  EXPECT_EQ((*stopped)[0], (*ids)[0]);
+  EXPECT_EQ((*stopped)[1], (*ids)[1]);
+}
+
 // A zero max_tokens fills the remaining context: context minus prompt,
 // saturating at zero when the prompt already fills it.
 TEST(EngineTest, GenerateZeroMaxTokensFillsContext) {
