@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <span>
 
 #include "core/decode.hpp"
 #include "models/qwen3_5/state.hpp"
@@ -53,6 +54,14 @@ inline std::expected<LinearGeometry, StatusCode> DeriveGeometry(
 [[nodiscard]] std::expected<void, StatusCode> EnsureHybridReady(
     Backend& backend, const TransformerConfig& cfg, core::DecodeCache& cache,
     const LinearGeometry& g);
+
+// Gather `tokens` embedding rows of the model's token_embd.weight into
+// `out` (rows x hidden fp32) on the device. Uses a device gather kernel
+// for the formats it covers (f32, bf16, Q4_K) and a host dequantize plus
+// upload otherwise. `out` must hold rows * hidden floats.
+[[nodiscard]] std::expected<void, StatusCode> GatherEmbeddingRows(
+    Backend& backend, const Model& model, Qwen35State& h,
+    std::span<const std::uint32_t> tokens, std::size_t hidden, Buffer& out);
 
 // Runs the block's gated MLP (post-attention norm, gate/up/down, residual
 // add) on h.x in place. The attention output must already be added to h.x.

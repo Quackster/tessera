@@ -37,6 +37,7 @@
 
 using tessera::Backend;
 using tessera::CreateBackend;
+using tessera::DType;
 using tessera::MemoryKind;
 using tessera::StatusCode;
 using tessera::kQ4KBlockElements;
@@ -1400,6 +1401,66 @@ TEST(BackendTest, GemmQ4KDeviceMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
   EXPECT_LE(max_rel, tol.rel)
       << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
+// Device: the tiled batched Q4_K GEMM (weight blocks dequantized once per
+// 8-row tile) matches the reference, including a row count that is not a
+// multiple of the tile. Skips on backends without the tiled kernel.
+TEST(BackendTest, GemmQ4KBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_q4k_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled Q4_K kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(5678);
+  constexpr std::size_t kM = 10;
+  constexpr std::size_t kN = 96;
+  constexpr std::size_t kK = 512;
+  std::vector<float> a(kM * kK);
+  std::vector<float> w_raw(kN * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  for (auto& v : w_raw) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = QuantizeRows(w_raw, kN, kK);
+
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value());
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  ASSERT_TRUE(w_buf.has_value());
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(a.data()),
+                                           a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ4KRef(std::span<const float>(a),
+                                     std::span<const std::byte>(w),
+                                     std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value());
+  const GemmTolerance tol = ToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
 // Per backend attention tolerance (same shape as the GEMM table).
@@ -3553,6 +3614,106 @@ TEST(BackendTest, GemmBf16DeviceMatchesRef) {
   }
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the token-embedding gather matches a host gather for f32, bf16
+// and Q4_K tables; an out-of-range id writes a zero row.
+TEST(BackendTest, EmbeddingGatherMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kCols = 512;
+  constexpr std::size_t kVocab = 8;
+  const std::vector<std::uint32_t> ids = {3, 0, 7, kVocab};
+  std::mt19937 rng(4321);
+  std::vector<float> values(kVocab * kCols);
+  for (auto& v : values) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> table_bf16(kVocab * kCols * 2);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &values[i], sizeof(bits));
+    const std::uint16_t half = static_cast<std::uint16_t>(bits >> 16);
+    std::memcpy(table_bf16.data() + i * 2, &half, 2);
+  }
+  const std::vector<std::byte> table_q4k = QuantizeRows(values, kVocab, kCols);
+
+  const DType dtypes[3] = {DType::F32, DType::BF16, DType::Q4K};
+  for (const DType dtype : dtypes) {
+    std::span<const std::byte> table;
+    std::size_t row_bytes = 0;
+    if (dtype == DType::F32) {
+      row_bytes = kCols * 4;
+      table = std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(values.data()),
+          values.size() * 4);
+    } else if (dtype == DType::BF16) {
+      row_bytes = kCols * 2;
+      table = table_bf16;
+    } else {
+      row_bytes = (kCols / 256) * core::kQ4KBlockBytes;
+      table = table_q4k;
+    }
+    // Host reference: dequantize the requested row, zero for an OOB id.
+    std::vector<float> ref(kRows * kCols, 0.0f);
+    for (std::size_t r = 0; r < kRows; ++r) {
+      const std::uint32_t id = ids[r];
+      if (id >= kVocab) {
+        continue;
+      }
+      float* dst = ref.data() + r * kCols;
+      if (dtype == DType::F32) {
+        std::memcpy(dst, values.data() + id * kCols, kCols * 4);
+      } else if (dtype == DType::BF16) {
+        for (std::size_t i = 0; i < kCols; ++i) {
+          std::uint16_t half = 0;
+          std::memcpy(&half, table_bf16.data() + (id * kCols + i) * 2, 2);
+          dst[i] = core::Bf16ToFloat(half);
+        }
+      } else {
+        auto status = core::DequantizeBlocks(
+            dtype, table.subspan(id * row_bytes, row_bytes),
+            std::span<float>(dst, kCols));
+        ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
+      }
+    }
+
+    auto w_buf = backend->AllocateBuffer(table.size(), MemoryKind::Device);
+    ASSERT_TRUE(w_buf.has_value());
+    auto ids_buf = backend->AllocateBuffer(kRows * 4, MemoryKind::Device);
+    ASSERT_TRUE(ids_buf.has_value());
+    auto out_buf = backend->AllocateBuffer(kRows * kCols * 4, MemoryKind::Device);
+    ASSERT_TRUE(out_buf.has_value());
+    ASSERT_TRUE(backend->CopyH2D(**w_buf, table).has_value());
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**ids_buf,
+                              std::span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(ids.data()),
+                                  ids.size() * 4))
+                    .has_value());
+    const std::string_view name = core::detail::EmbeddingKernelName(dtype);
+    ASSERT_FALSE(name.empty());
+    auto kernel = backend->LoadKernel(name, {});
+    ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+    auto launch = core::detail::GatherEmbeddingDevice(
+        *backend, **kernel, **ids_buf, **w_buf, **out_buf, kRows, kCols, kVocab);
+    ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+    backend->Synchronize();
+
+    std::vector<std::byte> readback(kRows * kCols * 4);
+    ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                    .has_value());
+    const auto* got = reinterpret_cast<const float*>(readback.data());
+    const GemmTolerance tol = ToleranceFor(backend->Name());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << "dtype " << static_cast<int>(dtype) << " backend "
+        << backend->Name() << " max_abs " << max_abs;
+  }
 }
 
 // Device: the block-scaled fp8 GEMM (one scale per 128x128 block) matches

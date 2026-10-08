@@ -1212,6 +1212,90 @@ through RADV GFX1201, rocm through the system ROCm).
   workstation. GPU1/`:9301` (`g1a`) is intentionally stopped. AGENTS rule 20
   now says to run a model server in the foreground and not background it.
 
+- 2026-10-08: **DFlash2 W4A4 activation quant is deferred (about 34x too
+  slow).** The working hypothesis was that vLLM quantize-and-dequantizes
+  the MXFP4 linear inputs (W4A4, E2M1 plus one E8M0 scale per 32 elements)
+  and that the DFlash2 drafter was trained on that QDQ'd target hidden, so
+  the C++ W4A16 target hidden mismatches the draft and acceptance stays at
+  about 0.2 per step against the reference 2.85. The activation half is
+  implemented: `MxFp4QuantizeBlock` in `src/core/numerics/quant.*`, used by
+  `GemmMxFp4Ref`, and a fused E2M1/E8M0 quant inside the ROCm
+  `GemmMxFp4Kernel` (bit-trick `MxFp4BlockScaleDev`/`E2M1CodeDev`).
+  `BackendTest.GemmMxFp4DeviceMatchesRef` passes with the W4A4 reference.
+  The real-model run does not confirm the hypothesis yet. On GPU0,
+  `EngineTest.DFlash2MatchesGreedyOnModel` loads the 27B MXFP4 target (858
+  tensors) and prefills 5 tokens, but plain greedy decode is **17686
+  ms/token** (141490 ms for 8 tokens) against the about 513 ms/token
+  baseline, so the run was aborted before the `spec dflash2: accepted X of
+  Y` line and the acceptance is unmeasured. The ROCm object was verified
+  newer than the edited source, so the slow path is the new kernel. The
+  likely cause is that the activation block amax and code are recomputed
+  inside the per-output element loop, so a usable W4A4 must quantize each
+  activation block once and share it across output columns. The source
+  change stays uncommitted and DFlash2 acceptance is deferred. The
+  production container `r9700-qwen3.8-mxfp4-g0a` was stopped for the run.
+
+- 2026-10-08: **Focus moved to item 2** (MoE, MLP, RMSNorm and embedding
+  kernels). DFlash2 is deferred per the entry above. The production
+  container is stopped while GPU0 is used for kernel work.
+
+- 2026-10-08: **Generic device embedding gather (item 2).** New
+  "embedding_f32", "embedding_bf16" and "embedding_q4k" built-ins on
+  Vulkan (GLSL) and ROCm (HIP): buffer 0 is the token ids (u32, rows),
+  buffer 1 the embedding table (vocab x cols), buffer 2 the fp32 output
+  (rows x cols); scalars are rows, cols, vocab, one thread per output
+  element. Q4_K reads element `(e % 64) / 32` of a 256-element block from
+  the same nibble layout as `gemm_q4k`. The Qwen3.5 module gathers through
+  `GatherEmbeddingRows`, so the single decode, the batched prefill and the
+  MTP head no longer dequantize embedding rows on the host; a dtype with no
+  device kernel, or a width that does not align with the 256-element block,
+  falls back to the canonical host gather. `BackendTest.
+  EmbeddingGatherMatchesRef` covers f32, bf16 and Q4_K against the host
+  dequant, including an out-of-range id that must write a zero row. The
+  gated (Q4_K `token_embd`) and f32-embedding fixtures decode to the same
+  tokens on both backends. `CachedKernel` is extracted from `GemmFor` so
+  both kernel families share the load-once cache. 256/256 `ctest` on
+  vulkan and rocm. The W4A4 DFlash2 experiment is preserved in a git
+  stash, not in the build.
+
+- 2026-10-08: **Release is the default build type (perf prerequisite).**
+  The documented `cmake -B` left `CMAKE_BUILD_TYPE` empty, so the binary
+  ran at `-O0`: a 27B GGUF decode measured 10814 ms/token (prefill 24738
+  ms for 5 tokens). `CMakeLists.txt` now defaults an unspecified build
+  type to Release (an explicit `-DCMAKE_BUILD_TYPE=...` is still
+  honored). Both backends rebuilt at Release and the full suite passes
+  256/256 on both. The same GGUF run now prefills 5 tokens in 690 ms and
+  decodes at 256 ms/token with the identical token sequence (`11751, 13,
+  198, 760`), so performance work (items 3 and 6) can now be measured.
+  Builds stay serial (`-j1`): the gcc-15 toolchain segfaults and emits
+  corrupt assembly under `-j3`/`-j4`.
+
+- 2026-10-08: **Tiled batched Q4_K GEMM, first item 3 step (ROCm).** New
+  "gemm_q4k_batched" on ROCm: one workgroup handles 8 activation rows x
+  one weight column, the Q4_K block is dequantized once into shared
+  memory and reused across the 8 rows, and the 8 dots accumulate in the
+  `gemm_q4k` element order so the batch matches the sequential forward.
+  `GemmTiledKernelName`/`GemmTiledFor`/`ProjectTiledDevice` (plus the
+  shared `kGemmTileRows`) live next to the GEMV helpers, and the Qwen3.5
+  batch path projects through a `ProjectBatch` that picks the tiled
+  kernel when rows > 1 and the dtype has one, else the GEMV kernel.
+  `BackendTest.GemmQ4KBatchedMatchesRef` covers a non-multiple-of-8 row
+  count; `HybridDecodeTest.BatchedPrefillMatchesSequential` pins the
+  batch against sequential (it caught a reordered reduction, now fixed).
+  257/257 `ctest` on rocm; 257/257 on vulkan (the tiled test skips there,
+  and the batch falls back to GEMV). A 5-token GGUF prefill measures
+  790 ms with the tiled kernel against 690 ms with GEMV, so the win (if
+  any) needs a larger batch to show; the Vulkan tiled kernel and the
+  MXFP4 tiled kernel are still to do.
+
+- 2026-10-08: **Tiled batched Q4_K GEMM on Vulkan (item 3).** The ROCm
+  tiled kernel is ported to GLSL (`gemm_q4k_batched.comp`, shared-memory
+  tile, `barrier()` syncs, the `gemm_q4k` accumulation order). The batch
+  path now uses it on both backends through the same `ProjectBatch`
+  selection. `BackendTest.GemmQ4KBatchedMatchesRef` runs on Vulkan (no
+  longer skips) and the full suite is 257/257 on both builds. The MXFP4
+  tiled kernel and the vectorized reads are still to do.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -1260,8 +1344,13 @@ through RADV GFX1201, rocm through the system ROCm).
   from 789 ms to 513 ms/token (and the GGUF from 1100 ms to 492 ms). A
   tiled or split-K GEMV would then help the remaining kernel time.
 
-0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
-   and output equals greedy. Batching and the draft context width are
+0. **DFlash2 (DEFERRED 2026-10-08)**: runs end to end
+   (`Engine::GenerateDraft`, CLI `--draft`) and output equals greedy.
+   Deferred: the W4A4 activation-quant candidate is implemented but the
+   ROCm kernel decodes at about 17.7 s/token, so acceptance could not be
+   measured (see the latest Done entry). Resume only after an activation
+   quant that runs at the baseline decode rate, or another root cause.
+   Batching and the draft context width are
    done (see the Done entry). Corrected 2026-10-08: the draft block is
    NOT NaN and NOT unstable. The forward is faithful to radiance's
    `train_drafter.py` (correlation 0.99976) and stable (absmax ~31); the
@@ -1349,11 +1438,15 @@ through RADV GFX1201, rocm through the system ROCm).
 - **Hybrid SSM device path (done)**: the causal conv1d, the SiLU and the
   q/k/v split now run on the device (`conv1d_state`), with the history in
   `linear[l].conv_hist`, in both trunk paths. See the Done entry.
-2. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
-   definition needs them. The generic RMSNorm kernel is done. The
-   decode loop runs projections, RoPE and attention on the device.
-   Norms and SiLU still run on the host. Architecture specific behavior
-   moves behind the `Architecture` module interface (see item 0).
+2. **MoE, MLP, RMSNorm and embedding kernels (current focus)** as the
+   Qwen 3.8 definition needs them. RMSNorm, sigmoid-gate, add, silu_mul
+   and the embedding gather (`embedding_f32`/`embedding_bf16`/
+   `embedding_q4k`) run on the device; the gated MLP is gemm + silu_mul +
+   gemm on the device. The Qwen 3.8 27B definition is dense, so no MoE
+   kernel is needed for it; the MoE router/expert kernels are for the
+   planned Ornith-1.5-35B-A3B and stay on this item. Remaining
+   architecture specific behavior moves behind the `Architecture` module
+   interface (see item 0).
 3. **GEMM throughput**: the model runs far below memory bandwidth
    (about 20 GB/s of 16 GB weights per 0.76 s/step), so the GEMM kernels
    are bound by the per-element byte-wise weight reads, not by the
@@ -1400,6 +1493,14 @@ through RADV GFX1201, rocm through the system ROCm).
 
 ## Notes and decisions
 
+- Build type: an unspecified `CMAKE_BUILD_TYPE` now defaults to
+  Release in `CMakeLists.txt`. Before that fix, the documented `cmake
+  -B` compiled at `-O0` and a 27B decode measured 7.7 s/token (MXFP4)
+  to 10.8 s/token (GGUF), which confounded every performance
+  comparison. Measure only on a Release build.
+- Parallel builds: build with `-j1`. The gcc-15 toolchain segfaults
+  (including an ICE in `c_parse_final_cleanups` and corrupt assembler
+  output) under `-j3`/`-j4`; a serial build completes.
 - HTTP serving is deferred. `src/serve/` already serves a first
   endpoint set; do not add endpoints, SSE variants, auth changes, or
   concurrency there unless the project owner explicitly asks. The

@@ -1,5 +1,11 @@
 # Tessera: C++ LLM inference engine (vulkan / rocm backends).
 cmake_minimum_required(VERSION 3.30)
+# Default to an optimized build when no type is given (an empty build
+# type compiles at -O0, which makes a 27B decode 15 to 20x slow; see
+# docs/PROGRESS.md). An explicit -DCMAKE_BUILD_TYPE=... is honored.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 project(tessera LANGUAGES CXX)
 
 # std::expected (mandated by AGENTS.md) is a C++23 feature of libstdc++;
@@ -89,11 +95,11 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8 gemm_fp8_block gemm_f32 gemm_bf16
         gemm_mxfp4 gemm_q5k gemm_q6k gemm_q3k gemm_iq4nl gemm_iq4xs
         gemm_iq3s gemm_q80 rmsnorm sigmoid_gate l2norm rmsnorm_gated
-        conv1d conv1d_step conv1d_state dflash_conv selector_edge_score delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads concat_features cast_f32_f16 quantize_q8 attention_q8 quantize_q4 attention_q4 layernorm gelu bias_add image_patchify spatial_merge)
+        conv1d conv1d_step conv1d_state dflash_conv selector_edge_score delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads concat_features cast_f32_f16 quantize_q8 attention_q8 quantize_q4 attention_q4 layernorm gelu bias_add image_patchify spatial_merge embedding_f32 embedding_bf16 embedding_q4k gemm_q4k_batched)
     set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8 GemmFp8Block GemmF32 GemmBf16
         GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S
         GemmQ80 Rmsnorm SigmoidGate L2Norm RmsnormGated Conv1d Conv1dStep Conv1dState DflashConv SelectorEdgeScore DeltaStep
-        Mrope QgateSplit Add SiluMul RepeatHeads SsmGate DeltaStepHeads ConcatFeatures CastF32F16 QuantizeQ8 AttentionQ8 QuantizeQ4 AttentionQ4 Layernorm Gelu BiasAdd ImagePatchify SpatialMerge)
+        Mrope QgateSplit Add SiluMul RepeatHeads SsmGate DeltaStepHeads ConcatFeatures CastF32F16 QuantizeQ8 AttentionQ8 QuantizeQ4 AttentionQ4 Layernorm Gelu BiasAdd ImagePatchify SpatialMerge EmbeddingF32 EmbeddingBf16 EmbeddingQ4k GemmQ4kBatched)
     set(TESSERA_KERNEL_HEADER
 "#pragma once
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.
@@ -169,12 +175,14 @@ elseif(TESSERA_BACKEND STREQUAL "rocm")
     target_sources(tessera PRIVATE src/backends/rocm/rocm_backend.cpp
                                    src/backends/rocm/rocm_kernels_basic.cpp
                                    src/backends/rocm/rocm_kernels_block.cpp
-                                   src/backends/rocm/rocm_kernels_iq.cpp)
+                                   src/backends/rocm/rocm_kernels_iq.cpp
+                                   src/backends/rocm/rocm_kernels_embedding.cpp)
     set_source_files_properties(
         src/backends/rocm/rocm_backend.cpp
         src/backends/rocm/rocm_kernels_basic.cpp
         src/backends/rocm/rocm_kernels_block.cpp
-        src/backends/rocm/rocm_kernels_iq.cpp PROPERTIES LANGUAGE HIP)
+        src/backends/rocm/rocm_kernels_iq.cpp
+        src/backends/rocm/rocm_kernels_embedding.cpp PROPERTIES LANGUAGE HIP)
     target_include_directories(tessera PRIVATE src/backends)
     # The ROCm headers require an explicit platform selection.
     target_compile_definitions(tessera PRIVATE __HIP_PLATFORM_AMD__)

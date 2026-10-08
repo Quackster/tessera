@@ -73,6 +73,10 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"ssm_gate", kSsmGateSpirV, sizeof(kSsmGateSpirV)},
     {"delta_step_heads", kDeltaStepHeadsSpirV, sizeof(kDeltaStepHeadsSpirV)},
     {"silu_mul", kSiluMulSpirV, sizeof(kSiluMulSpirV)},
+    {"embedding_f32", kEmbeddingF32SpirV, sizeof(kEmbeddingF32SpirV)},
+    {"embedding_bf16", kEmbeddingBf16SpirV, sizeof(kEmbeddingBf16SpirV)},
+    {"embedding_q4k", kEmbeddingQ4kSpirV, sizeof(kEmbeddingQ4kSpirV)},
+    {"gemm_q4k_batched", kGemmQ4kBatchedSpirV, sizeof(kGemmQ4kBatchedSpirV)},
 };
 
 int LookupBuiltIn(std::string_view name) {

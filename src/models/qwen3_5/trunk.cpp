@@ -1,7 +1,9 @@
 #include "core/decode.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -311,6 +313,60 @@ std::expected<void, StatusCode> EnsureHybridReady(
   return {};
 }
 
+std::expected<void, StatusCode> GatherEmbeddingRows(
+    Backend& backend, const Model& model, Qwen35State& h,
+    std::span<const std::uint32_t> tokens, std::size_t hidden, Buffer& out) {
+  auto embed = NeedWeightAny(model, "token_embd.weight");
+  if (!embed) {
+    return std::unexpected(embed.error());
+  }
+  const DType dtype = (*embed)->manifest.dtype;
+  const std::size_t rows = tokens.size();
+  const std::size_t vocab = (*embed)->manifest.shape.Numel() / hidden;
+  for (const std::uint32_t token : tokens) {
+    if (token >= vocab) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+  }
+  const std::string_view name = detail::EmbeddingKernelName(dtype);
+  // A Q4_K table is quantized in 256-element blocks, so the width must
+  // align with the block.
+  const bool aligned = dtype != DType::Q4K || hidden % 256 == 0;
+  if (!name.empty() && aligned) {
+    auto kernel = detail::CachedKernel(backend, h.embed_kernels,
+                                       static_cast<int>(dtype), name);
+    if (!kernel) {
+      return std::unexpected(kernel.error());
+    }
+    if (h.embed_ids == nullptr || h.embed_ids->Size() < rows * 4) {
+      auto allocated = backend.AllocateBuffer(rows * 4, MemoryKind::Device);
+      if (!allocated) {
+        return std::unexpected(allocated.error());
+      }
+      h.embed_ids = std::move(*allocated);
+    }
+    if (!backend.CopyH2D(*h.embed_ids, std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(tokens.data()), rows * 4))) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    return detail::GatherEmbeddingDevice(backend, **kernel, *h.embed_ids,
+                                         *(*embed)->device, out, rows, hidden,
+                                         vocab);
+  }
+  // Host fallback: dequantize each row and upload.
+  std::vector<float> staged(rows * hidden);
+  std::vector<float> row(hidden);
+  for (std::size_t t = 0; t < rows; ++t) {
+    auto gathered =
+        GatherEmbedding(backend, **embed, tokens[t], hidden, row);
+    if (!gathered) {
+      return std::unexpected(gathered.error());
+    }
+    std::copy(row.begin(), row.end(), staged.begin() + t * hidden);
+  }
+  return UploadF32(backend, out, staged);
+}
+
 std::expected<void, StatusCode> Qwen35Architecture::Forward(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out,
@@ -339,30 +395,19 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
   }
   Qwen35State& h = State(cache);
   const std::size_t hidden = cfg.hidden_dim;
-  auto embed = NeedWeightAny(model, "token_embd.weight");
-  if (!embed) {
-    return std::unexpected(embed.error());
-  }
   if (embedding != nullptr) {
     // A precomputed embedding (an image token) replaces the gathered row.
     if (embedding->Size() < hidden * 4 ||
         !backend.CopyD2D(*embedding, 0, *h.x, 0, hidden * 4)) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
-  } else if ((*embed)->manifest.dtype == DType::F32) {
-    const std::size_t offset = static_cast<std::size_t>(token) * hidden * 4;
-    auto copy = backend.CopyD2D(*(*embed)->device, offset, *h.x, 0, hidden * 4);
-    if (!copy) {
-      return std::unexpected(copy.error());
-    }
   } else {
-    std::vector<float> row(hidden);
-    auto gathered = GatherEmbedding(backend, **embed, token, hidden, row);
+    const std::uint32_t id = token;
+    auto gathered = GatherEmbeddingRows(
+        backend, model, h, std::span<const std::uint32_t>(&id, 1), hidden,
+        *h.x);
     if (!gathered) {
       return std::unexpected(gathered.error());
-    }
-    if (!UploadF32(backend, *h.x, row)) {
-      return std::unexpected(StatusCode::DeviceError);
     }
   }
   const std::uint64_t p = h.position;

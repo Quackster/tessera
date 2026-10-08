@@ -25,13 +25,10 @@ using detail::Conv1dStateDevice;
 using detail::DeltaStepHeadsDevice;
 using detail::DownloadF32;
 using detail::DownloadF32Cached;
-using detail::GatherEmbedding;
-using detail::GemmFor;
 using detail::L2NormDevice;
 using detail::MropeDevice;
 using detail::NeedWeight;
 using detail::NeedWeightAny;
-using detail::ProjectDevice;
 using detail::QGateSplitDevice;
 using detail::RepeatHeadsDevice;
 using detail::RmsNormDevice;
@@ -39,7 +36,6 @@ using detail::RmsNormGatedDevice;
 using detail::SigmoidGateDevice;
 using detail::SiluMulDevice;
 using detail::SsmGateDevice;
-using detail::UploadF32;
 
 // Allocates (or reallocates) the batched scratch for `rows` tokens.
 std::expected<void, StatusCode> AllocBatch(Backend& backend,
@@ -103,6 +99,27 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
   return {};
 }
 
+std::expected<void, StatusCode> ProjectBatch(
+    Backend& backend, Qwen35State& h, DType dtype, const Buffer& a,
+    const Buffer& w, Buffer& out, std::size_t m, std::size_t n,
+    std::size_t k) {
+  if (m > 1 && !detail::GemmTiledKernelName(dtype).empty()) {
+    auto tiled = detail::GemmTiledFor(backend, h.gemm_tiled, dtype);
+    if (tiled) {
+      return detail::ProjectTiledDevice(backend, **tiled, a, w, out, m, n, k);
+    }
+    if (tiled.error() != StatusCode::UnsupportedFeature) {
+      return std::unexpected(tiled.error());
+    }
+    // The backend has no tiled kernel for this dtype; use the GEMV one.
+  }
+  auto gemm = detail::GemmFor(backend, h.gemms, dtype);
+  if (!gemm) {
+    return std::unexpected(gemm.error());
+  }
+  return detail::ProjectDevice(backend, **gemm, a, w, out, m, n, k);
+}
+
 // Batched gated MLP over `rows` rows of h.batch->x in place.
 std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
                                             const Model& model,
@@ -119,23 +136,17 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
   if (!mlp_norm || !fg || !fu || !fd) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto gemm_fgate = GemmFor(backend, h.gemms, (*fg)->manifest.dtype);
-  auto gemm_fup = GemmFor(backend, h.gemms, (*fu)->manifest.dtype);
-  auto gemm_fdown = GemmFor(backend, h.gemms, (*fd)->manifest.dtype);
-  if (!gemm_fgate || !gemm_fup || !gemm_fdown) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
   Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*mlp_norm)->device,
                      *b.xn, rows, cfg.hidden_dim, cfg.norm_eps) ||
-      !ProjectDevice(backend, *(*gemm_fgate), *b.xn, *(*fg)->device, *b.fgate,
-                     rows, cfg.ffn_dim, cfg.hidden_dim) ||
-      !ProjectDevice(backend, *(*gemm_fup), *b.xn, *(*fu)->device, *b.fup,
-                     rows, cfg.ffn_dim, cfg.hidden_dim) ||
+      !ProjectBatch(backend, h, (*fg)->manifest.dtype, *b.xn, *(*fg)->device,
+                    *b.fgate, rows, cfg.ffn_dim, cfg.hidden_dim) ||
+      !ProjectBatch(backend, h, (*fu)->manifest.dtype, *b.xn, *(*fu)->device,
+                    *b.fup, rows, cfg.ffn_dim, cfg.hidden_dim) ||
       !SiluMulDevice(backend, *h.silu_mul_kernel, *b.fgate, *b.fup, *b.fmlp,
                      rows * cfg.ffn_dim) ||
-      !ProjectDevice(backend, *(*gemm_fdown), *b.fmlp, *(*fd)->device, *b.proj,
-                     rows, cfg.hidden_dim, cfg.ffn_dim) ||
+      !ProjectBatch(backend, h, (*fd)->manifest.dtype, *b.fmlp, *(*fd)->device,
+                    *b.proj, rows, cfg.hidden_dim, cfg.ffn_dim) ||
       !AddDevice(backend, *h.add_kernel, *b.x, *b.proj, *b.x,
                  rows * cfg.hidden_dim)) {
     return std::unexpected(StatusCode::DeviceError);
@@ -168,24 +179,17 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   if (!norm || !wq || !wk || !wv || !wo || !q_norm || !k_norm) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto gemm_q = GemmFor(backend, h.gemms, (*wq)->manifest.dtype);
-  auto gemm_k = GemmFor(backend, h.gemms, (*wk)->manifest.dtype);
-  auto gemm_v = GemmFor(backend, h.gemms, (*wv)->manifest.dtype);
-  auto gemm_o = GemmFor(backend, h.gemms, (*wo)->manifest.dtype);
-  if (!gemm_q || !gemm_k || !gemm_v || !gemm_o) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
   Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*norm)->device, *b.xn,
                      rows, hidden, cfg.norm_eps) ||
-      !ProjectDevice(backend, *(*gemm_q), *b.xn, *(*wq)->device, *b.fused,
-                     rows, heads * head_dim * 2, hidden) ||
+      !ProjectBatch(backend, h, (*wq)->manifest.dtype, *b.xn, *(*wq)->device,
+                    *b.fused, rows, heads * head_dim * 2, hidden) ||
       !QGateSplitDevice(backend, *h.qgate_split_kernel, *b.fused, *b.q, *b.gate,
                         heads, head_dim, rows) ||
-      !ProjectDevice(backend, *(*gemm_k), *b.xn, *(*wk)->device, *b.kf, rows,
-                     kv_dim, hidden) ||
-      !ProjectDevice(backend, *(*gemm_v), *b.xn, *(*wv)->device, *b.vf, rows,
-                     kv_dim, hidden) ||
+      !ProjectBatch(backend, h, (*wk)->manifest.dtype, *b.xn, *(*wk)->device,
+                    *b.kf, rows, kv_dim, hidden) ||
+      !ProjectBatch(backend, h, (*wv)->manifest.dtype, *b.xn, *(*wv)->device,
+                    *b.vf, rows, kv_dim, hidden) ||
       !RmsNormDevice(backend, *h.rmsnorm_kernel, *b.q, *(*q_norm)->device, *b.q,
                      rows * heads, head_dim, cfg.norm_eps) ||
       !RmsNormDevice(backend, *h.rmsnorm_kernel, *b.kf, *(*k_norm)->device,
@@ -227,8 +231,8 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   if (!attention_ok ||
       !SigmoidGateDevice(backend, *h.sigmoid_gate_kernel, *b.attn, *b.gate,
                          *b.attn, rows * heads * head_dim) ||
-      !ProjectDevice(backend, *(*gemm_o), *b.attn, *(*wo)->device, *b.proj,
-                     rows, hidden, heads * head_dim) ||
+      !ProjectBatch(backend, h, (*wo)->manifest.dtype, *b.attn, *(*wo)->device,
+                    *b.proj, rows, hidden, heads * head_dim) ||
       !AddDevice(backend, *h.add_kernel, *b.x, *b.proj, *b.x,
                  rows * hidden)) {
     return std::unexpected(StatusCode::DeviceError);
@@ -258,25 +262,19 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
       !w_dt || !w_norm || !w_out) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto gemm_qkv = GemmFor(backend, h.gemms, (*w_qkv)->manifest.dtype);
-  auto gemm_gate = GemmFor(backend, h.gemms, (*w_gate)->manifest.dtype);
-  auto gemm_alpha = GemmFor(backend, h.gemms, (*w_alpha)->manifest.dtype);
-  auto gemm_beta = GemmFor(backend, h.gemms, (*w_beta)->manifest.dtype);
-  auto gemm_out = GemmFor(backend, h.gemms, (*w_out)->manifest.dtype);
-  if (!gemm_qkv || !gemm_gate || !gemm_alpha || !gemm_beta || !gemm_out) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
   Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*norm)->device, *b.xn,
                      rows, hidden, cfg.norm_eps) ||
-      !ProjectDevice(backend, *(*gemm_qkv), *b.xn, *(*w_qkv)->device, *b.qkv,
-                     rows, g.conv_dim, hidden) ||
-      !ProjectDevice(backend, *(*gemm_gate), *b.xn, *(*w_gate)->device, *b.z,
-                     rows, g.value_dim, hidden) ||
-      !ProjectDevice(backend, *(*gemm_beta), *b.xn, *(*w_beta)->device,
-                     *b.beta_raw, rows, g.num_v_heads, hidden) ||
-      !ProjectDevice(backend, *(*gemm_alpha), *b.xn, *(*w_alpha)->device,
-                     *b.alpha_raw, rows, g.num_v_heads, hidden) ||
+      !ProjectBatch(backend, h, (*w_qkv)->manifest.dtype, *b.xn,
+                    *(*w_qkv)->device, *b.qkv, rows, g.conv_dim, hidden) ||
+      !ProjectBatch(backend, h, (*w_gate)->manifest.dtype, *b.xn,
+                    *(*w_gate)->device, *b.z, rows, g.value_dim, hidden) ||
+      !ProjectBatch(backend, h, (*w_beta)->manifest.dtype, *b.xn,
+                    *(*w_beta)->device, *b.beta_raw, rows, g.num_v_heads,
+                    hidden) ||
+      !ProjectBatch(backend, h, (*w_alpha)->manifest.dtype, *b.xn,
+                    *(*w_alpha)->device, *b.alpha_raw, rows, g.num_v_heads,
+                    hidden) ||
       !SsmGateDevice(backend, *h.ssm_gate_kernel, *(*w_a)->device,
                      *(*w_dt)->device, *b.alpha_raw, *b.beta_raw, *b.alpha,
                      *b.beta, g.num_v_heads, rows)) {
@@ -338,8 +336,8 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
       return std::unexpected(StatusCode::DeviceError);
     }
   }
-  if (!ProjectDevice(backend, *(*gemm_out), *b.out, *(*w_out)->device, *b.proj,
-                     rows, hidden, g.value_dim) ||
+  if (!ProjectBatch(backend, h, (*w_out)->manifest.dtype, *b.out,
+                    *(*w_out)->device, *b.proj, rows, hidden, g.value_dim) ||
       !AddDevice(backend, *h.add_kernel, *b.x, *b.proj, *b.x,
                  rows * hidden)) {
     return std::unexpected(StatusCode::DeviceError);
@@ -382,10 +380,6 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     return std::unexpected(alloc.error());
   }
   const std::size_t hidden = cfg.hidden_dim;
-  auto embed = NeedWeightAny(model, "token_embd.weight");
-  if (!embed) {
-    return std::unexpected(embed.error());
-  }
   if (embeddings != nullptr) {
     // A caller-supplied embedding per row (text rows and image rows).
     if (embeddings->Size() < rows * hidden * 4 ||
@@ -393,23 +387,10 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
       return std::unexpected(StatusCode::InvalidArgument);
     }
   } else {
-    // Embed the tokens into a host staging buffer (quant weights gather on
-    // the host) and upload once.
-    std::vector<float> staged(rows * hidden);
-    std::vector<float> row(hidden);
-    for (std::size_t t = 0; t < rows; ++t) {
-      if (tokens[t] >= cfg.vocab_size) {
-        return std::unexpected(StatusCode::InvalidArgument);
-      }
-      auto gathered =
-          GatherEmbedding(backend, **embed, tokens[t], hidden, row);
-      if (!gathered) {
-        return std::unexpected(gathered.error());
-      }
-      std::copy(row.begin(), row.end(), staged.begin() + t * hidden);
-    }
-    if (!UploadF32(backend, *h.batch->x, staged)) {
-      return std::unexpected(StatusCode::DeviceError);
+    auto gathered =
+        GatherEmbeddingRows(backend, model, h, tokens, hidden, *h.batch->x);
+    if (!gathered) {
+      return std::unexpected(gathered.error());
     }
   }
   // Position triples for mRoPE (text rows: t == h == w).
@@ -456,16 +437,13 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     if (!out_norm || !output) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    auto gemm_out = GemmFor(backend, h.gemms, (*output)->manifest.dtype);
-    if (!gemm_out) {
-      return std::unexpected(StatusCode::UnsupportedFeature);
-    }
     if (all_logits && rows > 1) {
       if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.batch->x,
                          *(*out_norm)->device, *h.batch->xn, rows, hidden,
                          cfg.norm_eps) ||
-          !ProjectDevice(backend, *(*gemm_out), *h.batch->xn, *(*output)->device,
-                         *h.batch->logits, rows, cfg.vocab_size, hidden)) {
+          !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.batch->xn,
+                        *(*output)->device, *h.batch->logits, rows,
+                        cfg.vocab_size, hidden)) {
         return std::unexpected(StatusCode::DeviceError);
       }
       logits_out->resize(rows * cfg.vocab_size);
@@ -476,12 +454,14 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
       }
     } else {
       // Only the last row needs logits (prefill): head on that row alone.
+      // ProjectBatch with one row uses the GEMV kernel.
       if (!backend.CopyD2D(*h.batch->x, (rows - 1) * hidden * 4, *h.x, 0,
                            hidden * 4) ||
           !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
                          *h.xn, 1, hidden, cfg.norm_eps) ||
-          !ProjectDevice(backend, *(*gemm_out), *h.xn, *(*output)->device,
-                         *h.logits, 1, cfg.vocab_size, hidden)) {
+          !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
+                        *(*output)->device, *h.logits, 1, cfg.vocab_size,
+                        hidden)) {
         return std::unexpected(StatusCode::DeviceError);
       }
       logits_out->resize(cfg.vocab_size);

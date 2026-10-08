@@ -178,6 +178,11 @@ class Kernel {
 // quantized weights W, buffer 2 the output C (fp32, m x n); scalars
 // are m, n, k with k a positive multiple of 256 (32 for iq4nl and
 // q80). The dispatch is ceil(m * n / 256) workgroups of 256.
+// "gemm_q4k_batched": tiled C = A x dequant(W)^T for a batch. Buffers
+// and scalars match gemm_q4k (m, n, k, k a multiple of 256). One
+// workgroup handles 8 activation rows x one weight column; the Q4_K
+// block is dequantized once into shared memory and reused across the
+// 8 rows. The dispatch is ceil(m / 8) * n workgroups of 256.
 // "rmsnorm": buffer 0 is X (fp32, rows x cols), buffer 1 the weight W
 // (fp32, cols), buffer 2 the output Y (fp32, rows x cols); scalars
 // are rows, cols, and the fp32 epsilon bits. Y = X / sqrt(mean(X^2) +
@@ -217,6 +222,12 @@ class Kernel {
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
 // (fp32, n); scalar 0 is n. O = silu(G) * U elementwise. The dispatch
 // for both is ceil(n / 256) workgroups of 256.
+// "embedding_f32", "embedding_bf16", "embedding_q4k": buffer 0 is the
+// token ids (u32, rows), buffer 1 the embedding table (vocab x cols:
+// fp32, bf16 or Q4_K), buffer 2 the fp32 output (rows x cols); scalars
+// are rows, cols and vocab. Out[row] = table[ids[row]], with a zero row
+// for an out-of-range id. cols must be a multiple of 256 for Q4_K. The
+// dispatch is ceil(rows * cols / 256) workgroups of 256.
 // "spatial_merge": buffer 0 In (tokens x embed, grid_h x grid_w), buffer 1
 // Out ((grid_h/merge)*(grid_w/merge) x merge*merge*embed); scalars embed,
 // grid_w, grid_h and merge. The dispatch is ceil(out_elems / 256).
@@ -304,6 +315,16 @@ class Kernel {
     return StatusCode::InvalidArgument;
   }
   if (kernel.Id() == "gemm_q4k") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t k = launch.scalars[2];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || k == 0 ||
+        k % kQ4KBlockElements != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "gemm_q4k_batched") {
     if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
       return StatusCode::InvalidArgument;
     }
@@ -654,6 +675,19 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "embedding_f32" || kernel.Id() == "embedding_bf16" ||
+      kernel.Id() == "embedding_q4k") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t cols = launch.scalars[1];
+    if (launch.scalars[0] == 0 || cols == 0 || launch.scalars[2] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+    if (kernel.Id() == "embedding_q4k" && cols % kQ4KBlockElements != 0) {
       return StatusCode::InvalidArgument;
     }
   }

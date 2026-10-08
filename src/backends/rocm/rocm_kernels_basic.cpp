@@ -181,17 +181,9 @@ __host__ __device__ float Fp8E4M3ToFloatDev(std::uint8_t bits) {
   return sign != 0 ? -value : value;
 }
 
-// OCP MX E8M0 scale byte to fp32 (device port of E8M0ToFloat).
-__host__ __device__ float E8M0ToFloatDev(std::uint8_t scale) {
-  return static_cast<float>(
-      std::ldexp(1.0, static_cast<int>(scale) - 127));
-}
-
-// OCP MX E2M1 nibble values (port of the core F4E2M1ToFloat). A table
-// lookup avoids the branch and the ldexp in the hot loop.
-__device__ const float kE2M1Dev[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+// E8M0ToFloatDev and kE2M1Dev (the MXFP4 codec) now live in
+// rocm_kernels.hpp so the batched MXFP4 kernel in this translation unit
+// and any other share one definition.
 
 // bf16 -> fp32 on the device: shift the 16 bits into the high half.
 __device__ float Bf16ToFloatDev(unsigned short bits) {

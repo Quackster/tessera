@@ -71,6 +71,20 @@ inline __host__ __device__ void GetScaleMinDev(
     *min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
   }
 }
+
+// OCP MX E8M0 scale byte to fp32 (device port of the core
+// E8M0ToFloat). Inline so every kernel TU carries its own copy.
+inline __host__ __device__ float E8M0ToFloatDev(std::uint8_t scale) {
+  return static_cast<float>(
+      std::ldexp(1.0, static_cast<int>(scale) - 127));
+}
+
+// OCP MX E2M1 nibble values (port of the core F4E2M1ToFloat). A table
+// lookup avoids the branch and the ldexp in the hot loop. Inline so
+// every kernel TU carries its own copy.
+inline __device__ const float kE2M1Dev[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 __global__ void FillKernel(int* out, unsigned long long value,
                            unsigned long long count);
 __global__ void RopeKernel(float* data, unsigned long long rows,
@@ -112,6 +126,10 @@ __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
 __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);
+__global__ void GemmQ4KBatchedKernel(const float* a, const unsigned char* w,
+                                     float* c, unsigned long long m,
+                                     unsigned long long n,
+                                     unsigned long long k);
 __global__ void GemmQ5KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);
@@ -262,5 +280,22 @@ __global__ void DeltaStepHeadsKernel(
     unsigned long long dk, unsigned long long dv);
 __global__ void SiluMulKernel(const float* g, const float* u, float* o,
                               unsigned long long n);
+// Built-in "embedding_f32"/"embedding_bf16"/"embedding_q4k": buffer 0
+// token ids (u32, rows), buffer 1 the embedding table (vocab x cols),
+// buffer 2 the fp32 output (rows x cols); scalars are rows, cols, vocab.
+__global__ void EmbeddingF32Kernel(const unsigned int* ids, const float* w,
+                                   float* out, unsigned long long rows,
+                                   unsigned long long cols,
+                                   unsigned long long vocab);
+__global__ void EmbeddingBf16Kernel(const unsigned int* ids,
+                                    const unsigned short* w, float* out,
+                                    unsigned long long rows,
+                                    unsigned long long cols,
+                                    unsigned long long vocab);
+__global__ void EmbeddingQ4KKernel(const unsigned int* ids,
+                                   const unsigned char* w, float* out,
+                                   unsigned long long rows,
+                                   unsigned long long cols,
+                                   unsigned long long vocab);
 
 }  // namespace tessera::backends::rocm

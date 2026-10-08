@@ -1,0 +1,32 @@
+#version 450
+
+// One thread per output element; dispatch ceil(rows * cols / 256).
+layout(local_size_x = 256) in;
+
+// "embedding_f32" contract (tessera API): buffer 0 is the token ids
+// (u32, rows), buffer 1 the fp32 embedding table (vocab x cols),
+// buffer 2 the output (rows x cols fp32). Scalars are 64-bit, so field
+// rows lives at pc.v[0], cols at pc.v[2], vocab at pc.v[4]. Row t of
+// the table starts at element t * cols. An out-of-range id writes a
+// zero row.
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer Ids { uint ids[]; };
+layout(set = 0, binding = 1) buffer W { float w[]; };
+layout(set = 0, binding = 2) buffer O { float o[]; };
+
+void main() {
+  uint g = gl_GlobalInvocationID.x;
+  uint rows = pc.v[0];
+  uint cols = pc.v[2];
+  uint vocab = pc.v[4];
+  if (g >= rows * cols) {
+    return;
+  }
+  uint row = g / cols;
+  uint i = g % cols;
+  uint id = ids[row];
+  o[g] = id < vocab ? w[id * cols + i] : 0.0;
+}

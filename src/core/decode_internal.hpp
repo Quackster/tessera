@@ -625,7 +625,8 @@ inline std::expected<void, StatusCode> RepeatHeadsDevice(
   return backend.LaunchKernel(kernel, launch);
 }
 
-// GEMM kernel id for a projection dtype (the formats the GGUF targets// use). Empty when the dtype has no GEMM kernel.
+// GEMM kernel id for a projection dtype (the formats the targets use).
+// Empty when the dtype has no GEMM kernel.
 inline std::string_view GemmKernelName(DType dtype) {
   switch (dtype) {
     case DType::Q4K: return "gemm_q4k";
@@ -643,16 +644,28 @@ inline std::string_view GemmKernelName(DType dtype) {
   }
 }
 
-// Load (once, into `cache`) and return the GEMM kernel for a projection
-// dtype.
-inline std::expected<Kernel*, StatusCode> GemmFor(
+// Embedding-gather kernel id for a weight dtype. Empty when the dtype
+// has no device gather kernel (the caller falls back to the host
+// gather).
+inline std::string_view EmbeddingKernelName(DType dtype) {
+  switch (dtype) {
+    case DType::F32: return "embedding_f32";
+    case DType::BF16: return "embedding_bf16";
+    case DType::Q4K: return "embedding_q4k";
+    default: return {};
+  }
+}
+
+// Load (once, into `cache`) and return the kernel registered under
+// `name`, or UnsupportedFeature for an empty name. The cache key can be
+// the dtype so a map serves every kernel family.
+inline std::expected<Kernel*, StatusCode> CachedKernel(
     Backend& backend, std::unordered_map<int, std::unique_ptr<Kernel>>& cache,
-    DType dtype) {
-  auto it = cache.find(static_cast<int>(dtype));
+    int key, std::string_view name) {
+  auto it = cache.find(key);
   if (it != cache.end()) {
     return it->second.get();
   }
-  const std::string_view name = GemmKernelName(dtype);
   if (name.empty()) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
@@ -661,8 +674,70 @@ inline std::expected<Kernel*, StatusCode> GemmFor(
     return std::unexpected(kernel.error());
   }
   Kernel* raw = kernel->get();
-  cache.emplace(static_cast<int>(dtype), std::move(*kernel));
+  cache.emplace(key, std::move(*kernel));
   return raw;
+}
+
+// Load (once, into `cache`) and return the GEMM kernel for a projection
+// dtype.
+inline std::expected<Kernel*, StatusCode> GemmFor(
+    Backend& backend, std::unordered_map<int, std::unique_ptr<Kernel>>& cache,
+    DType dtype) {
+  return CachedKernel(backend, cache, static_cast<int>(dtype),
+                      GemmKernelName(dtype));
+}
+
+// Gather `rows` token embedding rows on the device: out[row] =
+// table[ids[row]]. Scalars are rows, cols, vocab; `cols` must match the
+// embedding width and `rows * cols` must not overflow 32 bits.
+inline std::expected<void, StatusCode> GatherEmbeddingDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& ids,
+    const Buffer& weights, Buffer& out, std::size_t rows, std::size_t cols,
+    std::size_t vocab) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((rows * cols + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&ids, &weights, &out};
+  launch.scalars = {rows, cols, vocab};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Rows per workgroup tile of the tiled batched GEMM (matches the
+// 8-row tile of the "gemm_q4k_batched" kernel).
+constexpr std::size_t kGemmTileRows = 8;
+
+// Tiled batched GEMM kernel id for a dtype, or empty when the dtype has
+// no tiled kernel (the caller uses the GEMV kernel).
+inline std::string_view GemmTiledKernelName(DType dtype) {
+  switch (dtype) {
+    case DType::Q4K: return "gemm_q4k_batched";
+    default: return {};
+  }
+}
+
+// Load (once, into `cache`) and return the tiled batched GEMM kernel for
+// a dtype, or UnsupportedFeature when the dtype has none.
+inline std::expected<Kernel*, StatusCode> GemmTiledFor(
+    Backend& backend, std::unordered_map<int, std::unique_ptr<Kernel>>& cache,
+    DType dtype) {
+  return CachedKernel(backend, cache, static_cast<int>(dtype),
+                      GemmTiledKernelName(dtype));
+}
+
+// C = A x dequant(W)^T with the tiled batched kernel: each weight block
+// is dequantized once per tile and reused across kGemmTileRows rows.
+// Same buffers and scalars as ProjectDevice (m, n, k); m must be
+// positive and k a multiple of the block elements.
+inline std::expected<void, StatusCode> ProjectTiledDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& a, const Buffer& w,
+    Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(
+      ((m + kGemmTileRows - 1) / kGemmTileRows) * n);
+  launch.block_x = 256;
+  launch.buffers = {&a, &w, &c};
+  launch.scalars = {m, n, k};
+  return backend.LaunchKernel(kernel, launch);
 }
 
 }  // namespace tessera::core::detail

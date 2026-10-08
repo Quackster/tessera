@@ -49,6 +49,12 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
+  // Device embedding-gather kernel, keyed by the embedding weight dtype.
+  std::unordered_map<int, std::unique_ptr<Kernel>> embed_kernels;
+  // Token ids for the embedding-gather launch, grown on demand.
+  std::unique_ptr<Buffer> embed_ids;
+  // Tiled batched GEMM kernels, keyed by dtype (used when rows > 1).
+  std::unordered_map<int, std::unique_ptr<Kernel>> gemm_tiled;
   // Shared scratch buffers (sized from the config).
   std::unique_ptr<Buffer> x, xn, proj, logits, pos;
   std::unique_ptr<Buffer> fused, q, gate, kf, vf, attn;

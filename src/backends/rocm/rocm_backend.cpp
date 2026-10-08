@@ -36,6 +36,7 @@ struct BuiltInKernel {
 const BuiltInKernel kBuiltInKernels[] = {
     {"fill", reinterpret_cast<void*>(&FillKernel)},
     {"gemm_q4k", reinterpret_cast<void*>(&GemmQ4KKernel)},
+    {"gemm_q4k_batched", reinterpret_cast<void*>(&GemmQ4KBatchedKernel)},
     {"attention", reinterpret_cast<void*>(&AttentionKernel)},
     {"rope", reinterpret_cast<void*>(&RopeKernel)},
     {"gemm_fp8", reinterpret_cast<void*>(&GemmFp8Kernel)},
@@ -78,6 +79,9 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},
+    {"embedding_f32", reinterpret_cast<void*>(&EmbeddingF32Kernel)},
+    {"embedding_bf16", reinterpret_cast<void*>(&EmbeddingBf16Kernel)},
+    {"embedding_q4k", reinterpret_cast<void*>(&EmbeddingQ4KKernel)},
 };
 
 int LookupBuiltIn(std::string_view name) {

@@ -209,6 +209,78 @@ __global__ void GemmQ3KKernel(const float* a, const unsigned char* w,
   c[idx] = acc;
 }
 
+// Built-in "gemm_q4k_batched": tiled C = A x dequant(W)^T for a batch
+// of rows. One workgroup handles 8 activation rows x one weight column;
+// the Q4_K block is dequantized once into shared memory and reused
+// across the 8 rows, so a weight block is dequantized once per tile
+// instead of once per row. The 8 dot threads accumulate sequentially
+// over k in the same order as gemm_q4k, so the result matches the GEMV
+// kernel up to floating-point reassociation (none here: one chain).
+// Buffers and scalars match gemm_q4k (m, n, k, k a multiple of 256);
+// grid_x is ceil(m / 8) * n, block_x is 256. The 8-row tile matches
+// core::detail::kGemmTileRows. Threads outside the 8 dot rows still
+// help dequantize but write no output.
+__global__ void GemmQ4KBatchedKernel(const float* a, const unsigned char* w,
+                                     float* c, unsigned long long m,
+                                     unsigned long long n,
+                                     unsigned long long k) {
+  const unsigned long long wg =
+      static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long tid =
+      static_cast<unsigned long long>(threadIdx.x);
+  const unsigned long long tm = wg / n;
+  const unsigned long long row_w = wg % n;
+  const unsigned long long base_row = tm * 8;
+  const bool dot_valid = tid < 8 && base_row + tid < m;
+  const unsigned long long row_a = base_row + tid;
+  const unsigned long long blocks = k / 256;
+  __shared__ float wq[256];
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    // Cooperatively dequantize block (row_w, b): thread tid writes
+    // element tid, using the same sub-block map as gemm_q4k.
+    const unsigned char* base = w + (row_w * blocks + b) * 144;
+    std::uint16_t d_bits = 0;
+    std::uint16_t dm_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&dm_bits, base + 2, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    const float dm = Fp16ToFloatDev(dm_bits);
+    const unsigned char* scales = base + 4;
+    const unsigned char* qs = base + 16;
+    const unsigned long long e = tid;
+    const unsigned long long grp = e / 64;
+    const unsigned long long half = (e % 64) / 32;
+    const unsigned long long l = e % 32;
+    std::uint8_t sc = 0;
+    std::uint8_t mn = 0;
+    GetScaleMinDev(2 * grp + half, scales, &sc, &mn);
+    const std::uint8_t q = qs[grp * 32 + l];
+    const std::uint8_t nib = half != 0 ? (q >> 4) : (q & 15);
+    wq[e] = d * static_cast<float>(sc) * static_cast<float>(nib) -
+            dm * static_cast<float>(mn);
+    __syncthreads();
+    // One dot per tile row in the gemm_q4k element order (per 64-element
+    // group, the low 32 then the high 32, interleaved per lane) so the
+    // accumulation matches the GEMV kernel.
+    if (dot_valid) {
+      const float* ar = a + row_a * k + b * 256;
+      for (unsigned long long grp = 0; grp < 4; ++grp) {
+        for (unsigned long long l = 0; l < 32; ++l) {
+          const unsigned long long t0 = grp * 64 + l;
+          const unsigned long long t1 = t0 + 32;
+          acc += ar[t0] * wq[t0];
+          acc += ar[t1] * wq[t1];
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (dot_valid) {
+    c[row_a * n + row_w] = acc;
+  }
+}
+
 // Built-in "gemm_q80": buffer 0 is the activation A (fp32, m x k),
 // buffer 1 the quantized weights W (Q8_0, n x k), buffer 2 the output
 // C (fp32, m x n); scalars are m, n, k. A Q8_0 block is 34 bytes:

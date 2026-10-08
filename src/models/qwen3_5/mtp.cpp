@@ -1,6 +1,7 @@
 #include "models/qwen3_5/architecture.hpp"
 
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -12,7 +13,6 @@
 namespace tessera::models::qwen3_5 {
 
 using core::detail::DownloadF32;
-using core::detail::GatherEmbedding;
 using core::detail::GemmFor;
 using core::detail::NeedWeight;
 using core::detail::NeedWeightAny;
@@ -52,8 +52,7 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
     auto shnorm =
         NeedWeight(model, base + "nextn.shared_head_norm.weight", DType::F32);
     auto output = NeedWeightAny(model, "output.weight");
-    auto embed = NeedWeightAny(model, "token_embd.weight");
-    if (!eh || !enorm || !hnorm || !shnorm || !output || !embed) {
+    if (!eh || !enorm || !hnorm || !shnorm || !output) {
       return std::unexpected(StatusCode::UnsupportedFeature);
     }
     auto gemm_eh = GemmFor(backend, h.gemms, (*eh)->manifest.dtype);
@@ -62,21 +61,11 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
       return std::unexpected(StatusCode::UnsupportedFeature);
     }
     // e_n = RMSNorm(embed(token), enorm).
-    if ((*embed)->manifest.dtype == DType::F32) {
-      auto copy = backend.CopyD2D(*(*embed)->device, token * hidden_dim * 4,
-                                  *h.mtp_h, 0, hidden_dim * 4);
-      if (!copy) {
-        return std::unexpected(copy.error());
-      }
-    } else {
-      std::vector<float> row(hidden_dim);
-      auto gathered = GatherEmbedding(backend, **embed, token, hidden_dim, row);
-      if (!gathered) {
-        return std::unexpected(gathered.error());
-      }
-      if (!UploadF32(backend, *h.mtp_h, row)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
+    auto gathered = GatherEmbeddingRows(
+        backend, model, h, std::span<const std::uint32_t>(&token, 1),
+        hidden_dim, *h.mtp_h);
+    if (!gathered) {
+      return std::unexpected(gathered.error());
     }
     if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.mtp_h, *(*enorm)->device,
                        *h.mtp_h, 1, hidden_dim, cfg.norm_eps)) {
