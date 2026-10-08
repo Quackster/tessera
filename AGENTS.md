@@ -208,21 +208,30 @@ These are hard rules, set by the project owner:
     special tokens, or a turn that should have closed, treat it as a defect.
     Stop the run and root-cause it in the same session. Do not dismiss it as a
     bad sample and do not generate past it. Research how the reference runtimes
-    handle the case (vLLM, llama.cpp, the model card and the HuggingFace docs),
-    implement the mechanism that prevents it, and add a regression test. This
+    handle the case (https://codeberg.org/ggz14/radiance-vllm-mxfp4 first, then
+    vLLM, llama.cpp, the model card and the HuggingFace docs), implement the
+    mechanism that prevents it, and add a regression test. This
     project finds most of its bugs by streaming prompts, so the fix is part of
     the task, not an extra.
 
-20. **Protect the machine before every command** — before you run a command,
-    estimate how much device and host memory it will use. The 27B models need
-    tens of gigabytes, so the workstation can run out of memory and become
-    unusable when several heavy steps overlap. Never start two model loads at
-    the same time. Never put a model load, a GPU test and a build in one
-    command, a shell loop, or a background job. Run one heavy step, wait for it
-    to finish and free its memory, then start the next. When you only need a
-    small value, do not load a full model to get it. If a command could exceed
-    the machine's memory, split it or ask the project owner first. See the
-    memory warning under Building and Testing.
+20. **Protect the machine before every command** — estimate the device and
+    host memory a command will use before you run it. The 27B models need tens
+    of gigabytes, so overlapping heavy steps can exhaust memory and make the
+    workstation unusable.
+
+    - Run one heavy command at a time: one model load, one GPU test or one
+      build. Wait for it to finish and free its memory before the next starts.
+    - Never start two model loads together. Never put a heavy run in a shell
+      loop, a background job, or one command with a build or a full-checkpoint
+      Python step. These have crashed the workstation:
+      `for w in 5 8 16 64; do TESSERA_TEST_MODEL=... ./tessera-tests ...; done`
+      and `cmake --build ... -j && ./tessera-tests ... && python ...`.
+    - A sweep runs in one process, not one process per value. Do not load the
+      27B target and the draft for every value of a sweep.
+    - When you only need a small value, do not load a full model to get it. Use
+      `TESSERA_TEST_*` paths that point at the model you need.
+    - If a command could exceed the machine's memory, split it or ask the
+      project owner first.
 
 ## Working Principles
 
@@ -239,8 +248,10 @@ Repository-specific constraints on top of the hard rules:
   in the same change so the feature is usable from the command line.
 - Search with `rg` before assuming a behavior is missing.
 - Research model architecture online: use papers, model cards, and
-  public specs for algorithm details. Do not read the local llama.cpp
-  checkout when designing or porting model logic.
+  public specs for algorithm details. Prefer the reference at
+  https://codeberg.org/ggz14/radiance-vllm-mxfp4 first, then vLLM, for
+  algorithm behavior. Do not read the local llama.cpp checkout when
+  designing or porting model logic.
 - Do not encode model names into tests: a "qwen3" test is a test of the
   generic attention path fed with qwen3-shaped parameters.
 - When a numerical regression appears, check whether the reference baseline
@@ -276,21 +287,6 @@ Do not create new CMake test executables or new top-level test files. All
 runtime coverage goes into the single test target; add test functions to the
 `tests/*.cpp` sources compiled into it. New suites only fragment ctest output
 and bloat configure time.
-
-### Do not exhaust memory with heavy test runs
-
-Each model test loads the full model (tens of gigabytes) and allocates device
-memory. Never start several of them at the same time, and never put a heavy
-run in a shell loop or combine it with a build or a full-checkpoint Python
-step. These have crashed the workstation:
-
-    for w in 5 8 16 64; do TESSERA_TEST_MODEL=... ./tessera-tests ...; done
-    cmake --build ... -j && ./tessera-tests ... && python full_checkpoint.py
-
-Run one heavy command at a time. Wait for it to finish and free its memory
-before the next one starts. Use `TESSERA_TEST_*` paths that point at the model
-you need; do not load the 27B target and the draft for every value of a sweep.
-For a CSV sweep, run one process, not one process per value.
 
 ## Where Things Live
 

@@ -1091,6 +1091,27 @@ through RADV GFX1201, rocm through the system ROCm).
   vulkan and rocm. AGENTS.md gained rule 19 (garbage is a bug) and rule 20
   (probe device and host memory before every command).
 
+- 2026-10-08: **DFlash2 acceptance root-caused to a NaN draft block.**
+  With the FP8 codec fixed, the draft forward matches an independent
+  Python port stage by stage (attention-conv h1, q/k/v, the attention
+  output and o_proj all at correlation 1.0; the context K matches
+  exactly). But the draft block's hidden state is **NaN**: at layer 0 the
+  activations grow from the token embedding (absmax 0.06) through
+  input_layernorm (3.1), the attention conv (28), v_proj (145) and o_proj
+  (8695) to a post residual of 21255, and the MLP then overflows. The
+  draft logits are garbage, so acceptance is near zero (0 to 3 of 35 on
+  the 5-token fixture, and 0 of 49 against the GGUF target too, so it is
+  not the MXFP4 aux capture). vLLM runs the same weights without
+  exploding (the checkpoint card reports greedy acceptance 4.2 at block
+  8), so the port misses a stabilizer; the dynamic per-token FP8
+  activation quantization the card names is the prime candidate. Also
+  fixed a real CLI bug: `--draft-block` defaulted to 4, but the
+  checkpoint is trained for block 8; it now defaults to 0 ("use the
+  checkpoint's block", accepted by the strategy as a sentinel). Tests
+  can target a free GPU with `TESSERA_TEST_GPU` because a vLLM server was
+  holding device 0 and caused a GPU context loss. 255/255 ctest on
+  vulkan.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load

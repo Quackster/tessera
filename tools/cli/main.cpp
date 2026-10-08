@@ -23,7 +23,10 @@ constexpr int kExitUsage = 2;
 constexpr std::size_t kPrintedTensorNames = 5;
 // Defaults for the runtime options; override with the flags below.
 constexpr std::size_t kDefaultContext = 4096;
-constexpr std::size_t kDefaultDraftBlock = 4;
+// 0 keeps the draft checkpoint's configured block size. A block-diffusion
+// drafter is trained for one fixed block; a mismatched block silently
+// lowers acceptance (the DFlash2 checkpoint is trained for block 8).
+constexpr std::size_t kDefaultDraftBlock = 0;
 
 void PrintUsage() {
   std::fprintf(stderr,
@@ -38,7 +41,8 @@ void PrintUsage() {
                "  --draft <dir>     DFlash2 draft checkpoint directory\n"
                "  --context <n>     maximum context length (default %zu)\n"
                "  --gpu <n>         GPU index to use (default 0, the first)\n"
-               "  --draft-block <n> draft block tokens (default %zu)\n"
+               "  --draft-block <n> draft block tokens (0 = checkpoint "
+               "default, %zu)\n"
   "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
   "  --tokens <n>      decode steps (default: fill the context)\n"
                "  --speculate       verify MTP drafts instead of plain greedy\n"

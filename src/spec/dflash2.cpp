@@ -6,9 +6,11 @@ namespace tessera::spec {
 
 namespace {
 
-// DFlash2 draft block size must stay in the reference range (1..8); the
-// candidate selector and dynamic convolution assume small blocks.
-constexpr std::size_t kMinDraftBlockSize = 1;
+// DFlash2 draft block size must stay in the reference range; the candidate
+// selector and dynamic convolution assume small blocks. 0 means "use the
+// checkpoint's configured block size", which is what the drafter was
+// trained for.
+constexpr std::size_t kMinDraftBlockSize = 0;
 constexpr std::size_t kMaxDraftBlockSize = 8;
 
 // DFlash2 strategy: local dynamic convolution (grouped causal convolutions

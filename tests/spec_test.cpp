@@ -47,13 +47,15 @@ TEST(SpecTest, AttachEmptyPath) {
   EXPECT_EQ(result.error(), StatusCode::InvalidArgument);
 }
 
-TEST(SpecTest, AttachBadBlockSize) {
+TEST(SpecTest, AttachBlockSize) {
   auto dir = MakeDraftDir();
-  auto strategy = CreateDFlash2Strategy();
-  auto too_small = strategy->Attach(StrategyOptions{dir.string(), 0});
-  ASSERT_FALSE(too_small.has_value());
-  EXPECT_EQ(too_small.error(), StatusCode::InvalidArgument);
-  auto too_big = strategy->Attach(StrategyOptions{dir.string(), 9});
+  // 0 means "use the checkpoint's configured block size" and is accepted.
+  auto default_block =
+      CreateDFlash2Strategy()->Attach(StrategyOptions{dir.string(), 0});
+  EXPECT_TRUE(default_block.has_value());
+  // Out-of-range blocks are rejected.
+  auto too_big =
+      CreateDFlash2Strategy()->Attach(StrategyOptions{dir.string(), 9});
   ASSERT_FALSE(too_big.has_value());
   EXPECT_EQ(too_big.error(), StatusCode::InvalidArgument);
 }

@@ -25,7 +25,13 @@ namespace tessera::testing {
 
 // Create an engine for a device test; skips cleanly without a device.
 inline void MakeEngineOrSkip(std::unique_ptr<Engine>& engine) {
-  auto created = Engine::Create(EngineOptions{});
+  // Honor TESSERA_TEST_GPU so a run can pick a free device when another
+  // process (for example a server) already holds the default one.
+  EngineOptions options;
+  if (const char* gpu = std::getenv("TESSERA_TEST_GPU")) {
+    options.device_index = std::atoi(gpu);
+  }
+  auto created = Engine::Create(options);
   if (!created) {
     GTEST_SKIP() << "no device available: "
                  << tessera::ToString(created.error());
