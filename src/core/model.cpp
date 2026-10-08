@@ -5,12 +5,14 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <variant>
 #include <vector>
 
 #include "core/files.hpp"
 #include "core/loaders/gguf.hpp"
+#include "core/loaders/mxfp4.hpp"
 #include "core/loaders/safetensors.hpp"
 
 namespace tessera {
@@ -473,6 +475,42 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!parsed) {
       return std::unexpected(parsed.error());
     }
+    // When config.json names a registered architecture, build the
+    // internal weights through its module: renamed, value-converted and
+    // MXFP4-packed. Other directories (test fixtures, unknown models)
+    // fall back to the raw safetensors map.
+    auto config_bytes = core::ReadFile(path / "config.json");
+    if (config_bytes) {
+      const std::string_view text(
+          reinterpret_cast<const char*>(config_bytes->data()),
+          config_bytes->size());
+      std::string architecture = core::MxFp4ArchitectureName(text);
+      auto module = CreateArchitecture(architecture);
+      if (module != nullptr) {
+        auto config = module->ParseConfigJson(text);
+        if (!config) {
+          return std::unexpected(config.error());
+        }
+        auto weights = core::BuildMxFp4Weights(
+            backend, std::span<const std::byte>(*bytes), *parsed, *module,
+            *config);
+        if (!weights) {
+          return std::unexpected(weights.error());
+        }
+        std::vector<TensorEntry> tensors;
+        tensors.reserve(weights->size());
+        for (const auto& weight : *weights) {
+          tensors.push_back(weight.manifest);
+        }
+        std::optional<AttentionParams> attention = config->attention;
+        std::optional<TransformerConfig> parsed_config = std::move(*config);
+        return std::unique_ptr<Model>(new Model(
+            backend, options, ModelFormat::MxFp4, std::move(tensors),
+            std::string{}, std::move(architecture), std::move(attention),
+            std::move(parsed_config), std::move(*weights), std::nullopt,
+            std::string{}));
+      }
+    }
     std::vector<TensorEntry> tensors;
     std::vector<std::uint64_t> offsets;
     tensors.reserve(parsed->size());
@@ -529,9 +567,6 @@ std::string_view Model::Name() const {
 }
 
 std::expected<AttentionParams, StatusCode> Model::Attention() const {
-  if (format_ != ModelFormat::Gguf) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
   if (!attention_) {
     return std::unexpected(StatusCode::MalformedFile);
   }
@@ -539,9 +574,6 @@ std::expected<AttentionParams, StatusCode> Model::Attention() const {
 }
 
 std::expected<TransformerConfig, StatusCode> Model::Config() const {
-  if (format_ != ModelFormat::Gguf) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
   if (!config_) {
     return std::unexpected(StatusCode::MalformedFile);
   }

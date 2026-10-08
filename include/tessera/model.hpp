@@ -69,8 +69,8 @@ class Model {
   // and <arch>.rope.dimension_count, rope.freq_base. Hybrid definitions
   // carry <arch>.attention.key_length/value_length instead; the head
   // dim comes from those and embedding divisibility is not required.
-  // MalformedFile when the definition lacks them; UnsupportedFeature
-  // for MXFP4 (config.json parsing is a later milestone).
+  // An MXFP4 model reads them from config.json through its module.
+  // MalformedFile when the definition lacks them.
   //
   // Usage:
   //   auto params = model.Attention();
@@ -82,8 +82,8 @@ class Model {
   // from the output weight shape. Hybrid definitions also provide the
   // ssm.* keys and full_attention_interval, plus the rope section
   // array; layers counts trunk blocks (block_count minus
-  // nextn_predict_layers). MalformedFile when the definition lacks
-  // them; UnsupportedFeature for MXFP4.
+  // nextn_predict_layers). An MXFP4 model reads them from config.json
+  // through its module. MalformedFile when the definition lacks them.
   //
   // Usage:
   //   auto config = model.Config();

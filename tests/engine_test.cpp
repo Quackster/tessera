@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstring>
 
 #include <optional>
 #include <random>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/decode_internal.hpp"
 #include "core/sampling.hpp"
 #include "test_helpers.hpp"
 #include "tessera/architecture.hpp"
@@ -531,6 +533,124 @@ TEST(EngineTest, Qwen35ModuleConvertsMxFp4ValueLayout) {
   EXPECT_FALSE(convert("output.weight").has_value());
 }
 
+// The MXFP4 loader, driven by a config.json with a known architecture,
+// renames, value-converts (value-head reorder) and packs the weights.
+TEST(EngineTest, LoadMxFp4ModulePathConvertsAndPacks) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  const std::string config = R"({
+    "model_type": "qwen3_5",
+    "architectures": ["Qwen3_5ForConditionalGeneration"],
+    "text_config": {
+      "hidden_size": 8,
+      "num_hidden_layers": 64,
+      "num_attention_heads": 24,
+      "num_key_value_heads": 4,
+      "head_dim": 256,
+      "intermediate_size": 17408,
+      "vocab_size": 248320,
+      "rms_norm_eps": 1e-6,
+      "full_attention_interval": 4,
+      "partial_rotary_factor": 0.25,
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 48,
+      "linear_value_head_dim": 128,
+      "rope_parameters": {"rope_theta": 10000000.0, "mrope_section": [11, 11, 10]}
+    }
+  })";
+  // norm [8] BF16; dt_bias [48] BF16 = 0..47; an MXFP4 blob + scale.
+  const std::string json = R"({
+    "model.language_model.norm.weight":{"dtype":"BF16","shape":[8],"data_offsets":[0,16]},
+    "model.language_model.layers.0.linear_attn.dt_bias":{"dtype":"BF16","shape":[48],"data_offsets":[16,112]},
+    "model.language_model.layers.0.linear_attn.in_proj_a.weight":{"dtype":"U8","shape":[48,32],"data_offsets":[112,1648]},
+    "model.language_model.layers.0.linear_attn.in_proj_a.weight_scale":{"dtype":"U8","shape":[48,2],"data_offsets":[1648,1744]},
+    "model.language_model.embed_tokens.weight":{"dtype":"BF16","shape":[16,8],"data_offsets":[1744,2000]}
+  })";
+  const auto to_bf16 = [](float f) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &f, 4);
+    return static_cast<std::uint16_t>(bits >> 16);
+  };
+  auto container = MakeSafetensorsContainer(json);
+  const auto append = [&container](const std::vector<std::byte>& bytes) {
+    container.insert(container.end(), bytes.begin(), bytes.end());
+  };
+  append(std::vector<std::byte>(16, std::byte{0}));  // norm
+  std::vector<std::byte> dt(96);
+  for (std::size_t i = 0; i < 48; ++i) {
+    const std::uint16_t bf = to_bf16(static_cast<float>(i));
+    std::memcpy(dt.data() + i * 2, &bf, 2);
+  }
+  append(dt);
+  append(std::vector<std::byte>(1536, std::byte{0}));         // blob
+  append(std::vector<std::byte>(96, std::byte{127}));         // scales = 1.0
+  std::vector<std::byte> embed_bytes(16 * 8 * 2, std::byte{0});  // embed
+  for (std::size_t j = 0; j < 8; ++j) {
+    const std::uint16_t bf = to_bf16(static_cast<float>(j + 1));
+    std::memcpy(embed_bytes.data() + (8 + j) * 2, &bf, 2);  // row 1 = 1..8
+  }
+  append(embed_bytes);
+
+  auto dir = FreshTempDir("tessera_tests_mxfp4_module");
+  std::vector<std::byte> config_bytes(config.size());
+  std::memcpy(config_bytes.data(), config.data(), config.size());
+  WriteBytes(dir / "config.json", config_bytes);
+  WriteBytes(dir / "model.safetensors", container);
+  auto model = engine->LoadModel(ModelOptions{dir.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value()) << tessera::ToString(cfg.error());
+  EXPECT_EQ(cfg->layers, 64u);
+  EXPECT_EQ(cfg->ssm.time_step_rank, 48u);
+
+  const auto* dt_bias = (*model)->FindWeight("blk.0.ssm_dt.bias");
+  ASSERT_NE(dt_bias, nullptr);
+  EXPECT_EQ(dt_bias->Size(), 48u * 4u);
+  std::vector<float> reordered(48);
+  ASSERT_TRUE(engine->Owner()
+                  .CopyD2H(*dt_bias,
+                           reinterpret_cast<std::byte*>(reordered.data()),
+                           reordered.size() * 4)
+                  .has_value());
+  // internal head 0 <- checkpoint 0, head 1 <- checkpoint 3, head 16 <- 1.
+  EXPECT_FLOAT_EQ(reordered[0], 0.0f);
+  EXPECT_FLOAT_EQ(reordered[1], 3.0f);
+  EXPECT_FLOAT_EQ(reordered[16], 1.0f);
+
+  const auto* packed = (*model)->FindWeight("blk.0.ssm_alpha.weight");
+  ASSERT_NE(packed, nullptr);
+  EXPECT_EQ(packed->Size(), 48u * 32u + 48u * 2u);
+  const auto* norm = (*model)->FindWeight("output_norm.weight");
+  ASSERT_NE(norm, nullptr);
+  EXPECT_EQ(norm->Size(), 8u * 4u);
+
+  const tessera::DeviceTensor* embed = nullptr;
+  for (const auto& weight : (*model)->Weights()) {
+    if (weight.manifest.name == "token_embd.weight") {
+      embed = &weight;
+    }
+  }
+  ASSERT_NE(embed, nullptr);
+  EXPECT_EQ(embed->manifest.dtype, tessera::DType::BF16);
+  std::vector<float> row(8);
+  ASSERT_TRUE(tessera::core::detail::GatherEmbedding(engine->Owner(), *embed, 1,
+                                                     8, row)
+                  .has_value());
+  for (std::size_t j = 0; j < 8; ++j) {
+    EXPECT_FLOAT_EQ(row[j], static_cast<float>(j + 1));
+  }
+  for (const tessera::TensorEntry& entry : (*model)->Tensors()) {
+    if (entry.name == "blk.0.ssm_alpha.weight") {
+      EXPECT_EQ(entry.dtype, tessera::DType::F4E2M1);
+    }
+    if (entry.name == "output_norm.weight") {
+      EXPECT_EQ(entry.dtype, tessera::DType::F32);
+    }
+  }
+}
+
 TEST(EngineTest, LoadModelMissingFile) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
@@ -683,7 +803,9 @@ TEST(EngineTest, LoadGgufModelHybridMissingSections) {
   EXPECT_EQ(model.error(), StatusCode::MalformedFile);
 }
 
-TEST(EngineTest, LoadModelAttentionMxFp4Unsupported) {
+TEST(EngineTest, LoadModelMxFp4WithoutConfigHasNoAttention) {
+  // A directory with no recognized architecture loads the raw tensor map
+  // but carries no config: both accessors report MalformedFile.
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
   auto dir = FreshTempDir("tessera_tests_attention_mxfp4");
@@ -693,7 +815,10 @@ TEST(EngineTest, LoadModelAttentionMxFp4Unsupported) {
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   auto params = (*model)->Attention();
   ASSERT_FALSE(params.has_value());
-  EXPECT_EQ(params.error(), StatusCode::UnsupportedFeature);
+  EXPECT_EQ(params.error(), StatusCode::MalformedFile);
+  auto config = (*model)->Config();
+  ASSERT_FALSE(config.has_value());
+  EXPECT_EQ(config.error(), StatusCode::MalformedFile);
 }
 
 TEST(EngineTest, LoadModelRejectsMalformedGguf) {

@@ -29,6 +29,7 @@ add_library(tessera STATIC
     src/core/buffer.cpp
     src/core/loaders/gguf.cpp
     src/core/loaders/safetensors.cpp
+    src/core/loaders/mxfp4.cpp
     src/core/json.cpp
     src/core/sampling.cpp
     src/core/vision.cpp

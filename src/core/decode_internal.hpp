@@ -314,6 +314,21 @@ inline std::expected<void, StatusCode> GatherEmbedding(
     }
     return {};
   }
+  if (embed.manifest.dtype == DType::BF16) {
+    std::vector<std::byte> raw(hidden * 2);
+    auto row = backend.CopyD2HAt(*embed.device, token * hidden * 2, raw.data(),
+                                 raw.size());
+    if (!row) {
+      return std::unexpected(row.error());
+    }
+    for (std::size_t i = 0; i < hidden; ++i) {
+      std::uint16_t half = 0;
+      std::memcpy(&half, raw.data() + i * 2, 2);
+      const std::uint32_t bits = static_cast<std::uint32_t>(half) << 16;
+      std::memcpy(&x[i], &bits, 4);
+    }
+    return {};
+  }
   const auto layout = BlockLayout(embed.manifest.dtype);
   if (!layout) {
     return std::unexpected(layout.error());
