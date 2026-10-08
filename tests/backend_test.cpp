@@ -527,6 +527,59 @@ TEST(BackendTest, GemmQ5KBatchedMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
+// Device: the tiled batched Q6_K GEMM (weight blocks dequantized once per
+// 8-row tile) matches the reference, including a non-multiple-of-8 row
+// count.
+TEST(BackendTest, GemmQ6KBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_q6k_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled Q6_K kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(9753);
+  constexpr std::size_t kM = 10;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 210, 208);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value());
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  ASSERT_TRUE(w_buf.has_value());
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(a.data()),
+                                           a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ6KRef(std::span<const float>(a),
+                                     std::span<const std::byte>(w),
+                                     std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
 // Device: Q6_K GEMM matches the host reference (2 x 8 outputs).
 TEST(BackendTest, GemmQ6KDeviceMatchesRef) {
   std::unique_ptr<Backend> backend;
