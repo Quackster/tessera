@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <cstdio>
 
 #include <cstdlib>
 #include <cstring>
@@ -327,6 +328,53 @@ TEST(EngineTest, RealModelLoadPathWhenProvided) {
   auto step = tessera::core::DecodeStep(engine->Owner(), **model, cache, 0);
   ASSERT_TRUE(step.has_value()) << tessera::ToString(step.error());
   EXPECT_LT(*step, config->vocab_size);
+}
+
+// The MXFP4 target loads through its module and decodes when its
+// directory is provided (set TESSERA_TEST_MXFP4_DIR).
+TEST(EngineTest, MxFp4GeneratesWhenProvided) {
+  const char* dir = std::getenv("TESSERA_TEST_MXFP4_DIR");
+  if (dir == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_MXFP4_DIR not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{dir, 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto config = (*model)->Config();
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_TRUE(config->hybrid);
+  EXPECT_EQ(config->layers, 64u);
+  GenerateOptions options;
+  options.max_tokens = 4;
+  options.prompt_tokens = {760, 6511, 314, 9338, 369};
+  auto generated = engine->Generate(**model, options);
+  ASSERT_TRUE(generated.has_value()) << tessera::ToString(generated.error());
+  EXPECT_EQ(generated->size(), 4u);
+  for (std::size_t i = 0; i < generated->size(); ++i) {
+    std::fprintf(stderr, "mxfp4 token %zu: %u\n", i, (*generated)[i]);
+  }
+}
+
+// Same prompt as MxFp4GeneratesWhenProvided, on the GGUF target, so the
+// per-layer trace can be compared (set TESSERA_TEST_GGUF).
+TEST(EngineTest, GgufGeneratesWhenProvided) {
+  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{path, 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions options;
+  options.max_tokens = 4;
+  options.prompt_tokens = {760, 6511, 314, 9338, 369};
+  auto generated = engine->Generate(**model, options);
+  ASSERT_TRUE(generated.has_value()) << tessera::ToString(generated.error());
+  for (std::size_t i = 0; i < generated->size(); ++i) {
+    std::fprintf(stderr, "gguf token %zu: %u\n", i, (*generated)[i]);
+  }
 }
 
 TEST(EngineTest, LoadMxFp4BlobAndScalePair) {

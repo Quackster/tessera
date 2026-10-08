@@ -195,9 +195,8 @@ __host__ __device__ float F4E2M1ToFloatDev(std::uint8_t nibble) {
   float value;
   if (exp == 0) {
     value = static_cast<float>(mant) * 0.5f;
-  } else if (exp == 3 && mant == 1) {
-    return std::numeric_limits<float>::quiet_NaN();
   } else {
+    // E2M1 has no NaN/inf; exponent 3 with mantissa 1 is 6.0.
     value = (1.0f + static_cast<float>(mant) / 2.0f) *
             std::ldexp(1.0f, static_cast<int>(exp) - 1);
   }

@@ -936,6 +936,20 @@ through RADV GFX1201, rocm through the system ROCm).
   runs `block + 1` rows and reads the mask rows at offset 1. Acceptance
   still cannot be judged until the target is the MXFP4 model (item 0).
 
+- 2026-10-08: MXFP4 E2M1 codec fix (242/242 `ctest` on both builds). The
+  OCP MX E2M1 nibble `0x7`/`0xF` is `+-6.0`, not NaN; `F4E2M1ToFloat`,
+  `Fp32ToF4E2M1Nibble` (max now 6.0), the Vulkan `gemm_mxfp4` shader and
+  the ROCm kernel are corrected, and the codec/GEMM tests cover 6.0. This
+  was the cause of the all-NaN MXFP4 logits. The Quark MXFP4 on-disk
+  layout (low nibble first, `[rows, cols/32]` E8M0 scales, dequant scale
+  `2**(byte-127)`, max 6.0) was confirmed against the amd-quark Triton
+  reference (`quark/torch/kernel/mx/triton.py`), so the layout matches
+  ours and is not the bug. The MXFP4 target now decodes without NaN, but
+  the residual hidden still diverges from the GGUF from layer 0 onward
+  (layer 7 jumps to about 32000); the SSM tensors were verified correct
+  against the GGUF (`dt_bias`, `ssm_a`, `alpha`, `beta`, `conv1d` value
+  block reorder), so the divergence is elsewhere (item 0).
+
 ## Next (in order)
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)

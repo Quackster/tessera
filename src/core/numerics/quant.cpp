@@ -215,14 +215,14 @@ float E8M0ToFloat(std::uint8_t scale) {
 }
 
 float F4E2M1ToFloat(std::uint8_t nibble) {
+  // OCP MX E2M1 has no NaN or infinity: exponent 3 encodes 4 (mantissa 0)
+  // and 6 (mantissa 1). The general formula already yields 6 for 0x7/0xF.
   const std::uint32_t sign = (nibble >> 3) & 1;
   const std::uint32_t exp = (nibble >> 1) & 0x3;
   const std::uint32_t mant = nibble & 1;
   float value;
   if (exp == 0) {
     value = static_cast<float>(mant) * 0.5f;
-  } else if (exp == 3 && mant == 1) {
-    value = std::nanf("");
   } else {
     value = (1.0f + static_cast<float>(mant) / 2.0f) *
             std::ldexp(1.0f, static_cast<int>(exp) - 1);
@@ -294,16 +294,17 @@ std::uint8_t Fp32ToFp8E4M3Bits(float value) {
 
 std::uint8_t Fp32ToF4E2M1Nibble(float value) {
   if (!(value == value)) {
-    return 0x7;
+    return 0x0;  // NaN has no E2M1 encoding; use zero
   }
   float abs = value < 0 ? -value : value;
-  if (abs > 4.0f) {
-    abs = 4.0f;
+  if (abs > 6.0f) {
+    abs = 6.0f;
   }
-  constexpr float kGrid[7] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
+  constexpr float kGrid[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                              2.0f, 3.0f, 4.0f, 6.0f};
   std::uint32_t best = 0;
   float best_dist = abs;
-  for (std::uint32_t i = 1; i < 7; ++i) {
+  for (std::uint32_t i = 1; i < 8; ++i) {
     const float dist = abs > kGrid[i] ? abs - kGrid[i] : kGrid[i] - abs;
     if (dist < best_dist) {
       best_dist = dist;
@@ -326,7 +327,11 @@ std::uint8_t Fp32ToF4E2M1Nibble(float value) {
       exp = 2;
       mant = 1;
       break;
-    default: exp = 3; break;  // 4.0
+    case 6: exp = 3; break;
+    default:
+      exp = 3;
+      mant = 1;
+      break;  // 6.0
   }
   return static_cast<std::uint8_t>(sign | (exp << 1) | mant);
 }

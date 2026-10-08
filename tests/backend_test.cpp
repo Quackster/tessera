@@ -140,8 +140,10 @@ TEST(BackendTest, FpCodecsHitKnownPatterns) {
   EXPECT_EQ(core::Fp32ToFp8E4M3Bits(-0.0f), 0x80);
   EXPECT_EQ(core::Fp32ToFp8E4M3Bits(448.0f), 0x7E);
   EXPECT_EQ(core::Fp32ToFp8E4M3Bits(1e30f), 0x7F);
-  const float grid[7] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
-  for (std::uint32_t i = 0; i < 7; ++i) {
+  // OCP MX E2M1 has no NaN/inf: 0x7/0xF are +-6.0.
+  const float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                         2.0f, 3.0f, 4.0f, 6.0f};
+  for (std::uint32_t i = 0; i < 8; ++i) {
     EXPECT_FLOAT_EQ(core::F4E2M1ToFloat(static_cast<std::uint8_t>(i)),
                                        grid[i])
         << "nibble " << i;
@@ -151,7 +153,8 @@ TEST(BackendTest, FpCodecsHitKnownPatterns) {
     EXPECT_EQ(core::Fp32ToF4E2M1Nibble(grid[i]),
               static_cast<std::uint8_t>(i));
   }
-  EXPECT_TRUE(std::isnan(core::F4E2M1ToFloat(7)));
+  EXPECT_FLOAT_EQ(core::Fp32ToF4E2M1Nibble(6.0f), 0x7);
+  EXPECT_FLOAT_EQ(core::Fp32ToF4E2M1Nibble(-6.0f), 0xF);
   EXPECT_FLOAT_EQ(core::E8M0ToFloat(126), 0.5f);
   EXPECT_FLOAT_EQ(core::E8M0ToFloat(127), 1.0f);
   EXPECT_FLOAT_EQ(core::E8M0ToFloat(128), 2.0f);
@@ -242,7 +245,8 @@ TEST(BackendTest, GemmMxFp4DeviceMatchesRef) {
   constexpr std::size_t kM = 2;
   constexpr std::size_t kN = 32;
   constexpr std::size_t kK = 64;
-  constexpr float kGrid[7] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
+  constexpr float kGrid[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                              2.0f, 3.0f, 4.0f, 6.0f};
   std::vector<float> a(kM * kK);
   std::vector<std::byte> w(kN * kK / 2, std::byte{0});
   std::vector<std::byte> s(kN * kK / 32);
@@ -255,7 +259,7 @@ TEST(BackendTest, GemmMxFp4DeviceMatchesRef) {
       for (std::size_t l = 0; l < 32; ++l) {
         const std::size_t t = b * 32 + l;
         const std::uint8_t nib = core::Fp32ToF4E2M1Nibble(
-            kGrid[(j + t) % 7] * (t % 3 == 0 ? -1.0f : 1.0f));
+            kGrid[(j + t) % 8] * (t % 3 == 0 ? -1.0f : 1.0f));
         const std::size_t at = (j * kK + t) / 2;
         std::uint8_t packed = static_cast<std::uint8_t>(w[at]);
         if (t % 2 == 0) {

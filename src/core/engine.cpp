@@ -365,6 +365,7 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
                                     std::string(ToString(first_logits.error())));
     return std::unexpected(first_logits.error());
   }
+
   if (options.progress_every > 0) {
     diagnostics_.Info("engine",
                       std::string("prefill: ") + std::to_string(prompt.size()) +

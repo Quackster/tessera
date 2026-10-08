@@ -39,9 +39,8 @@ float e2m1(uint nib) {
   float value;
   if (e == 0) {
     value = float(m) * 0.5;
-  } else if (e == 3 && m == 1) {
-    value = 0.0 / 0.0;
   } else {
+    // E2M1 has no NaN/inf; exponent 3 with mantissa 1 is 6.0.
     value = (1.0 + float(m) / 2.0) * exp2(float(e) - 1.0);
   }
   return s > 0 ? -value : value;
