@@ -5777,7 +5777,12 @@ TEST(BackendTest, VisionStackMatchesRef) {
   std::vector<float> plnw = rnd(kEmbed), plnb = rnd(kEmbed);
   std::vector<tessera::core::VisionBlockWeights> ref_blocks;
   std::vector<tessera::core::VisionBlockBuffers> dev_blocks;
+  // The reference weights must outlive the loop: VisionBlockWeights holds
+  // spans, and the loop-local `parts` would dangle (the reference then
+  // reads freed memory, which is why this test was flaky). `keep` owns
+  // them, reserved so the spans stay valid.
   std::vector<std::vector<float>> keep;
+  keep.reserve(kBlocks * 12);
   std::vector<std::unique_ptr<tessera::Buffer>> keep_b;
   for (std::size_t b = 0; b < kBlocks; ++b) {
     std::vector<std::vector<float>> parts = {
@@ -5785,36 +5790,48 @@ TEST(BackendTest, VisionStackMatchesRef) {
         rnd(3 * kEmbed),    rnd(kEmbed * kEmbed), rnd(kEmbed),
         rnd(kEmbed),        rnd(kEmbed),        rnd(kFfn * kEmbed),
         rnd(kFfn),          rnd(kEmbed * kFfn),  rnd(kEmbed)};
+    for (const auto& part : parts) {
+      keep.push_back(part);
+    }
+    const std::size_t k = keep.size() - parts.size();
     tessera::core::VisionBlockWeights rw;
-    rw.ln1_weight = parts[0]; rw.ln1_bias = parts[1]; rw.qkv_weight = parts[2];
-    rw.qkv_bias = parts[3]; rw.out_weight = parts[4]; rw.out_bias = parts[5];
-    rw.ln2_weight = parts[6]; rw.ln2_bias = parts[7]; rw.up_weight = parts[8];
-    rw.up_bias = parts[9]; rw.down_weight = parts[10]; rw.down_bias = parts[11];
+    rw.ln1_weight = keep[k + 0];
+    rw.ln1_bias = keep[k + 1];
+    rw.qkv_weight = keep[k + 2];
+    rw.qkv_bias = keep[k + 3];
+    rw.out_weight = keep[k + 4];
+    rw.out_bias = keep[k + 5];
+    rw.ln2_weight = keep[k + 6];
+    rw.ln2_bias = keep[k + 7];
+    rw.up_weight = keep[k + 8];
+    rw.up_bias = keep[k + 9];
+    rw.down_weight = keep[k + 10];
+    rw.down_bias = keep[k + 11];
     ref_blocks.push_back(rw);
     tessera::core::VisionBlockBuffers bw;
-    keep_b.push_back(up(parts[0]));
+    keep_b.push_back(up(keep[k + 0]));
     bw.ln1_weight = keep_b.back().get();
-    keep_b.push_back(up(parts[1]));
+    keep_b.push_back(up(keep[k + 1]));
     bw.ln1_bias = keep_b.back().get();
-    keep_b.push_back(up(parts[2]));
+    keep_b.push_back(up(keep[k + 2]));
     bw.qkv_weight = keep_b.back().get();
-    keep_b.push_back(up(parts[3]));
+    keep_b.push_back(up(keep[k + 3]));
     bw.qkv_bias = keep_b.back().get();
-    keep_b.push_back(up(parts[4]));
+    keep_b.push_back(up(keep[k + 4]));
     bw.out_weight = keep_b.back().get();
-    keep_b.push_back(up(parts[5]));
+    keep_b.push_back(up(keep[k + 5]));
     bw.out_bias = keep_b.back().get();
-    keep_b.push_back(up(parts[6]));
+    keep_b.push_back(up(keep[k + 6]));
     bw.ln2_weight = keep_b.back().get();
-    keep_b.push_back(up(parts[7]));
+    keep_b.push_back(up(keep[k + 7]));
     bw.ln2_bias = keep_b.back().get();
-    keep_b.push_back(up(parts[8]));
+    keep_b.push_back(up(keep[k + 8]));
     bw.up_weight = keep_b.back().get();
-    keep_b.push_back(up(parts[9]));
+    keep_b.push_back(up(keep[k + 9]));
     bw.up_bias = keep_b.back().get();
-    keep_b.push_back(up(parts[10]));
+    keep_b.push_back(up(keep[k + 10]));
     bw.down_weight = keep_b.back().get();
-    keep_b.push_back(up(parts[11]));
+    keep_b.push_back(up(keep[k + 11]));
     bw.down_bias = keep_b.back().get();
     dev_blocks.push_back(bw);
   }

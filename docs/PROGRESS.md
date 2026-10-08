@@ -1427,15 +1427,18 @@ through RADV GFX1201, rocm through the system ROCm).
   `head_dim = 4`); only lanes below `head_dim` have an output element, so
   the loop is now guarded. 264/264 `ctest` on vulkan and rocm.
 
-- 2026-10-08: **ROCm `VisionStackMatchesRef` is intermittently flaky.**
-  The vision stack device test fails roughly 40% of runs on ROCm with an
-  absolute error of order 1 to 3, and passes the rest; it passes when run
-  alone repeatedly in some sessions and fails in others, and it is not
-  reproducible with the vision block or non-causal attention tests run
-  alone (20/20 each). It is not caused by the attention out-of-bounds fix
-  above (the flake predates it and persists). Treat a single failure as
-  environmental until it is reproduced in isolation; the Vulkan path is
-  stable. This is the only known flaky test.
+- 2026-10-08: **Fixed the flaky `VisionStackMatchesRef` (a test bug).**
+  The test failed about 40% of runs with an absolute error of order 1 to
+  3. Instrumenting it showed the device output `got` was identical across
+  failures while the host reference `ref` changed, and the failing `ref`
+  was column-constant (equal to the post-LN bias), i.e. the reference had
+  run on an all-zero input. Root cause: `VisionBlockWeights` holds
+  `std::span`s, and the test filled them from a loop-local `parts` vector
+  that was destroyed each iteration, so `ref_blocks` held dangling spans
+  and the reference read freed memory. The device path was correct. The
+  test now owns the weights in a reserved `keep` vector. 30/30 passes on
+  ROCm after the fix. The attention out-of-bounds fix above is a separate,
+  real bug and stays.
 
 - 2026-10-08: **Item 7 deepstack is not needed for the target.** The
   Qwen3.8 vision config sets `deepstack_visual_indexes` to the empty list,
