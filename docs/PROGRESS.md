@@ -929,9 +929,19 @@ through RADV GFX1201, rocm through the system ROCm).
    generation. Measured on the 27B over 32 tokens: greedy 0.86 s/token,
    DFlash2 about 4.8 s/token (acceptance 5 of 108) even at steady state,
    so the draft quality, not the boot, is the blocker. The draft accepts
-   about 0 to 15 percent; the draft block is the suspect: check its layer
-   order against the reference and the mask/candidate setup. The context
-   width does not lift acceptance.
+   about 0 to 15 percent; the draft block is the suspect. Align it with
+   vLLM's DFlash handling (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py`
+   and `.../dflash2/speculator.py`, `vllm/model_executor/models/qwen3_dflash.py`
+   and `qwen3_dflash2.py`): the draft block has a 1+N query layout (query 0
+   is the bonus/anchor token, queries 1..N are mask tokens, and only the
+   mask positions predict; `num_query_per_req = 1 + num_steps`,
+   `is_bonus = query_off == 0`, `sample_off = 1`), the mask id is
+   `dflash_config.mask_token_id`, and the draft context K/V is the target
+   hidden at the context positions. Our draft feeds only N mask tokens
+   with no anchor query. The DFlash2 fc fuses the aux target-layer hiddens
+   (`_get_dflash_fc_input_size` = target_hidden_size * num_aux_layers).
+   The context width does not lift acceptance; a first 1+N attempt did not
+   either and was reverted.
 1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
