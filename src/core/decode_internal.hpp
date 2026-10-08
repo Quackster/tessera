@@ -360,13 +360,26 @@ inline std::expected<void, StatusCode> GatherEmbedding(
 // the device and chain kernels. The device-resident block forward uses
 // these instead of Project (which round-trips through the host).
 
+// Grid rule shared by the GEMM launch helpers: a kernel id ending in
+// "_row" runs one workgroup per output element (coalesced reads across
+// the workgroup); every other quant/plain GEMM runs one thread per
+// output element with 256-thread workgroups. Both backends implement the
+// same ids, so the rule stays backend-agnostic.
+inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
+                                 std::size_t n) {
+  if (gemm.Id().ends_with("_row")) {
+    return static_cast<std::uint32_t>(m * n);
+  }
+  return static_cast<std::uint32_t>((m * n + 255) / 256);
+}
+
 // C = A (m x k) times dequant(W) with A and C on the device; scalars
 // follow the shared (m, n, k) order.
 inline std::expected<void, StatusCode> ProjectDevice(
     Backend& backend, const Kernel& gemm, const Buffer& a, const Buffer& w,
     Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((m * n + 255) / 256);
+  launch.grid_x = GemmGridFor(gemm, m, n);
   launch.block_x = 256;
   launch.buffers = {&a, &w, &c};
   launch.scalars = {m, n, k};
@@ -629,7 +642,7 @@ inline std::expected<void, StatusCode> RepeatHeadsDevice(
 // Empty when the dtype has no GEMM kernel.
 inline std::string_view GemmKernelName(DType dtype) {
   switch (dtype) {
-    case DType::Q4K: return "gemm_q4k";
+    case DType::Q4K: return "gemm_q4k_row";
     case DType::Q5K: return "gemm_q5k";
     case DType::Q6K: return "gemm_q6k";
     case DType::Q3K: return "gemm_q3k";

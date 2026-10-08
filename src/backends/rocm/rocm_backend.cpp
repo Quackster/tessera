@@ -36,6 +36,7 @@ struct BuiltInKernel {
 const BuiltInKernel kBuiltInKernels[] = {
     {"fill", reinterpret_cast<void*>(&FillKernel)},
     {"gemm_q4k", reinterpret_cast<void*>(&GemmQ4KKernel)},
+    {"gemm_q4k_row", reinterpret_cast<void*>(&GemmQ4KRowKernel)},
     {"gemm_q4k_batched", reinterpret_cast<void*>(&GemmQ4KBatchedKernel)},
     {"attention", reinterpret_cast<void*>(&AttentionKernel)},
     {"rope", reinterpret_cast<void*>(&RopeKernel)},

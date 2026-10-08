@@ -221,6 +221,9 @@ These are hard rules, set by the project owner:
 
     - Run one heavy command at a time: one model load, one GPU test or one
       build. Wait for it to finish and free its memory before the next starts.
+    - Only one GPU must be free. Leave the other device alone if another owner
+      already holds it (for example a reference vLLM container). Do not stop a
+      busy device's server to free both; run the command on the free GPU.
     - Never start two model loads together. Never put a heavy run in a shell
       loop, a background job, or one command with a build or a full-checkpoint
       Python step. These have crashed the workstation:

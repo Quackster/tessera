@@ -95,11 +95,11 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8 gemm_fp8_block gemm_f32 gemm_bf16
         gemm_mxfp4 gemm_q5k gemm_q6k gemm_q3k gemm_iq4nl gemm_iq4xs
         gemm_iq3s gemm_q80 rmsnorm sigmoid_gate l2norm rmsnorm_gated
-        conv1d conv1d_step conv1d_state dflash_conv selector_edge_score delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads concat_features cast_f32_f16 quantize_q8 attention_q8 quantize_q4 attention_q4 layernorm gelu bias_add image_patchify spatial_merge embedding_f32 embedding_bf16 embedding_q4k gemm_q4k_batched gemm_mxfp4_batched)
+        conv1d conv1d_step conv1d_state dflash_conv selector_edge_score delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads concat_features cast_f32_f16 quantize_q8 attention_q8 quantize_q4 attention_q4 layernorm gelu bias_add image_patchify spatial_merge embedding_f32 embedding_bf16 embedding_q4k gemm_q4k_batched gemm_mxfp4_batched gemm_q4k_row)
     set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8 GemmFp8Block GemmF32 GemmBf16
         GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S
         GemmQ80 Rmsnorm SigmoidGate L2Norm RmsnormGated Conv1d Conv1dStep Conv1dState DflashConv SelectorEdgeScore DeltaStep
-        Mrope QgateSplit Add SiluMul RepeatHeads SsmGate DeltaStepHeads ConcatFeatures CastF32F16 QuantizeQ8 AttentionQ8 QuantizeQ4 AttentionQ4 Layernorm Gelu BiasAdd ImagePatchify SpatialMerge EmbeddingF32 EmbeddingBf16 EmbeddingQ4k GemmQ4kBatched GemmMxfp4Batched)
+        Mrope QgateSplit Add SiluMul RepeatHeads SsmGate DeltaStepHeads ConcatFeatures CastF32F16 QuantizeQ8 AttentionQ8 QuantizeQ4 AttentionQ4 Layernorm Gelu BiasAdd ImagePatchify SpatialMerge EmbeddingF32 EmbeddingBf16 EmbeddingQ4k GemmQ4kBatched GemmMxfp4Batched GemmQ4kRow)
     set(TESSERA_KERNEL_HEADER
 "#pragma once
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.

@@ -1352,6 +1352,23 @@ through RADV GFX1201, rocm through the system ROCm).
   thread reads a whole row, uncoalesced across the warp) are the remaining
   item 3 lever; that is a GEMV redesign, not a micro-optimization. The
   tiled kernels already fix the batched case.
+  A coalesced Q4_K GEMV is now kept as a feature even though it measured
+  slower. `gemm_q4k_row` on both backends uses one workgroup per output
+  element (thread `t` owns element `b * 256 + t`, shared-memory
+  reduction), so the activation and weight reads coalesce across the
+  workgroup instead of striding per thread. `ProjectDevice` selects
+  `grid_x = m * n` for an id ending in `_row` (the shared `GemmGridFor`
+  rule). `GemmKernelName(Q4K)` returns it, so the model uses it.
+  `BackendTest.GemmQ4KRowMatchesRef` covers it on both backends. On the
+  27B GGUF it measures 310 ms/token against 280 ms/token for the
+  word-read GEMV: the 256-wide reduction per output and the `m * n`
+  workgroups outweigh the coalescing gain at k = 5120. The owner asked to
+  keep it as a feature regardless, so it stays wired in. Because the
+  batched path uses the tiled kernel and the sequential path this coalesced
+  one, their fp reductions associate differently;
+  `HybridDecodeTest.BatchedPrefillMatchesSequential` now tolerates that
+  reassociation (1e-2 instead of 1e-3). The earlier "reduced word reads"
+  note above stands. 259/259 `ctest` on both backends.
 
 ## Next (in order)
 

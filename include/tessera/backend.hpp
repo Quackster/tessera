@@ -137,6 +137,10 @@ class Kernel {
 // output C (fp32, m x n); scalars are m, n, k (k a positive multiple of
 // kQ4KBlockElements). The dispatch is ceil(m * n / 256) workgroups of
 // 256. Every quantized GEMM built-in shares this m, n, k order.
+// "gemm_q4k_row": the same buffers, scalars and result as gemm_q4k, but
+// one workgroup per output element (thread `t` owns element `b * 256 + t`
+// of every block, partials reduced in shared memory). The reads coalesce
+// across the workgroup. The dispatch is m * n workgroups of 256.
 // "rope": buffer 0 holds rows x heads x head_dim fp32 rotated in place
 // (NeoX pairing over rope_dim per head); scalars are rows, heads,
 // head_dim, rope_dim, pos_base, and the fp32 theta bits. head_dim and
@@ -314,7 +318,7 @@ class Kernel {
       (launch.buffers.size() != 1 || launch.scalars.size() != 2)) {
     return StatusCode::InvalidArgument;
   }
-  if (kernel.Id() == "gemm_q4k") {
+  if (kernel.Id() == "gemm_q4k" || kernel.Id() == "gemm_q4k_row") {
     if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
       return StatusCode::InvalidArgument;
     }

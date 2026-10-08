@@ -62,6 +62,61 @@ __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
   c[idx] = acc;
 }
 
+// Built-in "gemm_q4k_row": C = A x dequant(W)^T with one workgroup per
+// output element (row_a, row_w), so the weight and activation reads are
+// coalesced across the workgroup instead of strided per thread. Thread t
+// owns element `b * 256 + t` of every block: the activation read is 256
+// consecutive floats and the Q4_K byte read hits sub-block `t / 32`
+// (lane `t % 32`). Partial sums reduce in shared memory. Dispatch is
+// m * n workgroups of 256 (block_x = 256); wave-size independent.
+__global__ void GemmQ4KRowKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k) {
+  const unsigned long long out =
+      static_cast<unsigned long long>(blockIdx.x);
+  if (out >= m * n) {
+    return;
+  }
+  const unsigned long long row_a = out / n;
+  const unsigned long long row_w = out % n;
+  const unsigned long long blocks = k / 256;
+  const unsigned int t = threadIdx.x;
+  const unsigned int s = t / 32;
+  const unsigned int lane = t % 32;
+  const unsigned int byte_off = 16 + (s / 2) * 32 + lane;
+  const float* a_row = a + row_a * k;
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char* base = w + (row_w * blocks + b) * 144;
+    std::uint16_t d_bits = 0;
+    std::uint16_t dm_bits = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&dm_bits, base + 2, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    const float dm = Fp16ToFloatDev(dm_bits);
+    std::uint8_t sc = 0;
+    std::uint8_t mn = 0;
+    GetScaleMinDev(s, base + 4, &sc, &mn);
+    const std::uint8_t byte = base[byte_off];
+    const std::uint8_t nib = (s & 1u) == 0 ? (byte & 15u) : (byte >> 4);
+    const float wv = d * static_cast<float>(sc) * static_cast<float>(nib) -
+                     dm * static_cast<float>(mn);
+    acc = fmaf(a_row[b * 256 + t], wv, acc);
+  }
+  __shared__ float sh[256];
+  sh[t] = acc;
+  __syncthreads();
+  for (unsigned int off = 128; off > 0; off >>= 1) {
+    if (t < off) {
+      sh[t] += sh[t + off];
+    }
+    __syncthreads();
+  }
+  if (t == 0u) {
+    c[row_a * n + row_w] = sh[0];
+  }
+}
+
 // Built-in "gemm_q5k": C = A x dequant(W)^T, fp32 sequential
 // accumulation; W holds Q5_K blocks (176 bytes per 256).
 __global__ void GemmQ5KKernel(const float* a, const unsigned char* w,

@@ -1548,6 +1548,70 @@ TEST(BackendTest, GemmMxFp4BatchedMatchesRef) {
       << "backend " << backend->Name() << " max_rel " << max_rel;
 }
 
+// Device: the coalesced Q4_K GEMV (one workgroup per output, shared-memory
+// reduction, grid selected by ProjectDevice) matches the reference. This is
+// the Q4_K kernel the model selects.
+TEST(BackendTest, GemmQ4KRowMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_q4k_row", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no coalesced Q4_K kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(1357);
+  constexpr std::size_t kM = 4;
+  constexpr std::size_t kN = 96;
+  constexpr std::size_t kK = 512;
+  std::vector<float> a(kM * kK);
+  std::vector<float> w_raw(kN * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  for (auto& v : w_raw) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = QuantizeRows(w_raw, kN, kK);
+
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value());
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  ASSERT_TRUE(w_buf.has_value());
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(a.data()),
+                                           a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+
+  auto launch = core::detail::ProjectDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ4KRef(std::span<const float>(a),
+                                     std::span<const std::byte>(w),
+                                     std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value());
+  const GemmTolerance tol = ToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+    rel = std::max(rel,
+                   std::abs(got[i] - ref[i]) / std::max(1.0f, std::abs(ref[i])));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(rel, tol.rel) << "backend " << backend->Name() << " max_rel " << rel;
+}
+
 // Per backend attention tolerance (same shape as the GEMM table).
 struct AttentionTolerance {
   float abs = 0.0f;
