@@ -1488,6 +1488,23 @@ through RADV GFX1201, rocm through the system ROCm).
   the GPU list has no llvmpipe entry and cover the env parsing. 262/262
   `ctest` on both builds.
 
+- 2026-10-08: **Hardware fp16 block-scale decode (item 3).** The ROCm
+  `Fp16ToFloatDev` ran a branchy software IEEE conversion, and every
+  quant GEMM decodes a block scale per block per thread, so it was a
+  significant per-element cost. On the device it now uses the exact
+  hardware `__half2float` (`cvt`), with the software path kept for host
+  compilation as the reference. `BackendTest.Gemm*` (22 tests) pass, so
+  the conversion matches the host reference. The 27B GGUF decode measures
+  336 ms/token, still inside the 310 to 359 ms/token run-to-run band, so
+  as with the other micro-optimizations the effect is below the noise
+  floor. Conclusion for item 3's decode: the GEMM kernels are at a local
+  optimum (per-thread decode with no barriers beats both the shared
+  once-per-workgroup decode, whose barriers cost more than the redundant
+  work saved, and the coalesced reduction), and the run-to-run noise
+  exceeds the remaining effects. Further decode work needs a quieter
+  measurement or a different approach (for example a warp-per-output
+  GEMV with shuffle broadcast), not another micro-optimization.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load

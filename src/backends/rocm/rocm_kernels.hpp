@@ -5,6 +5,7 @@
 // rocm_backend.cpp). No vendor type crosses the backend boundary;
 // only this directory includes HIP headers.
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -40,7 +41,14 @@ inline __host__ __device__ std::uint16_t FloatToFp16Dev(float value) {
       (mantissa >> 13));
 }
 
+// On the device the hardware cvt instruction is exact and much cheaper
+// than the branchy software port (the GEMMs decode a block scale per
+// block per thread). The software path stays for host compilation and is
+// the reference the device conversion must match.
 inline __host__ __device__ float Fp16ToFloatDev(std::uint16_t half) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  return __half2float(__ushort_as_half(half));
+#else
   const std::uint32_t sign = half >> 15;
   const std::uint32_t exp = (half >> 10) & 0x1F;
   const std::uint32_t mant = half & 0x3FF;
@@ -56,6 +64,7 @@ inline __host__ __device__ float Fp16ToFloatDev(std::uint16_t half) {
             std::ldexp(1.0f, static_cast<int>(exp) - 15);
   }
   return sign != 0 ? -value : value;
+#endif
 }
 
 // The 6-bit scale/min pair of sub-block j from the 12-byte packing
