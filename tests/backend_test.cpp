@@ -1663,7 +1663,8 @@ TEST(BackendTest, RmsnormDeviceMatchesRef) {
   auto kernel = backend->LoadKernel("rmsnorm", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kRows + 255) / 256;
+  // One workgroup per row; the row sum reduces across the group.
+  launch.grid_x = kRows;
   launch.block_x = 256;
   launch.buffers = {(*x_buf).get(), (*w_buf).get(), (*y_buf).get()};
   launch.scalars = {kRows, kCols, eps_bits};

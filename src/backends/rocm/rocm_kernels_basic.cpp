@@ -318,27 +318,37 @@ __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
   }
   c[idx] = acc;
 }
-// Built-in "rmsnorm": row-wise RMS norm over rows x cols fp32.
-// One thread per row with sequential accumulation.
+// Built-in "rmsnorm": row-wise RMS norm over rows x cols fp32. One block
+// per row; the row sum reduces across the block so a single-row decode
+// step does not serialize the row on one thread.
 __global__ void RmsnormKernel(const float* x, const float* w, float* y,
                               unsigned long long rows, unsigned long long cols,
                               unsigned long long eps_bits) {
-  const unsigned long long r =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  __shared__ float partial[256];
+  const unsigned long long r = blockIdx.x;
   if (r >= rows) {
     return;
   }
+  const unsigned int tid = threadIdx.x;
   float eps = 0.0f;
   static_assert(sizeof(eps) == 4);
   std::uint32_t bits = static_cast<std::uint32_t>(eps_bits);
   std::memcpy(&eps, &bits, 4);
-  float mean = 0.0f;
-  for (unsigned long long c = 0; c < cols; ++c) {
-    mean = fmaf(x[r * cols + c], x[r * cols + c], mean);
+  float sum = 0.0f;
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
+    sum = fmaf(x[r * cols + c], x[r * cols + c], sum);
   }
-  mean /= static_cast<float>(cols);
+  partial[tid] = sum;
+  __syncthreads();
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      partial[tid] += partial[tid + s];
+    }
+    __syncthreads();
+  }
+  const float mean = partial[0] / static_cast<float>(cols);
   const float gain = 1.0f / sqrtf(mean + eps);
-  for (unsigned long long c = 0; c < cols; ++c) {
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
     y[r * cols + c] = x[r * cols + c] * gain * w[c];
   }
 }

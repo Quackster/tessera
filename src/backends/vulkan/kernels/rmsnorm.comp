@@ -1,7 +1,8 @@
 #version 450
 
-// One thread per row; the dispatch is ceil(rows / 256) workgroups
-// via grid_x.
+// One workgroup per row; the dispatch is `rows` workgroups via grid_x.
+// The row sum runs across the workgroup so a single-row decode step does
+// not serialize 5120 elements on one thread.
 layout(local_size_x = 256) in;
 
 // "rmsnorm" contract: buffers X (rows x cols), W (cols), Y (out).
@@ -22,21 +23,33 @@ layout(set = 0, binding = 2) buffer Y {
   float y[];
 };
 
+shared float partial[256];
+
 void main() {
-  uint r = gl_GlobalInvocationID.x;
+  uint r = gl_WorkGroupID.x;
   uint rows = pc.v[0];
   if (r >= rows) {
     return;
   }
   uint cols = pc.v[2];
   float eps = uintBitsToFloat(pc.v[4]);
-  float mean = 0.0;
-  for (uint c = 0; c < cols; ++c) {
-    mean += x[r * cols + c] * x[r * cols + c];
+  uint lid = gl_LocalInvocationID.x;
+  float sum = 0.0;
+  for (uint c = lid; c < cols; c += 256) {
+    float value = x[r * cols + c];
+    sum += value * value;
   }
-  mean /= float(cols);
+  partial[lid] = sum;
+  barrier();
+  for (uint s = 128; s > 0; s >>= 1) {
+    if (lid < s) {
+      partial[lid] += partial[lid + s];
+    }
+    barrier();
+  }
+  float mean = partial[0] / float(cols);
   float gain = inversesqrt(mean + eps);
-  for (uint c = 0; c < cols; ++c) {
+  for (uint c = lid; c < cols; c += 256) {
     y[r * cols + c] = x[r * cols + c] * gain * w[c];
   }
 }

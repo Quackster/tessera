@@ -56,8 +56,9 @@ void main() {
     float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
     uint base = b * 32;
     // A 32-bit word holds eight nibbles, so load one word per eight
-    // elements instead of one byte per two.
-    uint word = (w_base + base) >> 2;
+    // elements instead of one byte per two. `w_base + base` is an element
+    // index; /2 gives bytes and /4 words, so the shift is 3.
+    uint word = (w_base + base) >> 3;
     for (uint q = 0; q < 4; ++q) {
       uint bits = w[word + q];
       for (uint j = 0; j < 8; ++j) {

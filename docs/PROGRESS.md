@@ -968,7 +968,9 @@ through RADV GFX1201, rocm through the system ROCm).
 
 - **PERF (urgent, do first)**: make MXFP4 inference fast. Targets: the
   whole load under 60 s (not counting prefill or decode), and 35 to 40
-  tokens/s decode without MTP. The load reads the
+  tokens/s decode without MTP. Count the decode rate on generation only:
+  the model load is a one-time cost and is not part of tokens/s. The load
+  reads the
   19 GB safetensors, dequantizes and packs every fp4 blob, and converts
   large BF16 tensors to F32 (the `lm_head` alone becomes a 5 GB F32
   matrix). The reference runtime loads the same file in 8 s because it
@@ -985,17 +987,18 @@ through RADV GFX1201, rocm through the system ROCm).
   and the 18 GB anonymous allocation); vectorize the bulk BF16-to-F32
   conversion; upload the F32 tensor without an extra copy; skip the second
   fp4 copy when there is no reorder.
-  Decode is still about 2.6 s/token, against 1.1 s/token for the same
-  model in GGUF, so the gap is the MXFP4 GEMM. It is not the host: a
-  per-kernel pass on the Vulkan backend put the launch overhead in the low
-  tens of milliseconds for the whole run. The fence wait is the cost, and
-  `gemm_mxfp4` is 5.9 s of it (the remaining kernels together about 1.4 s,
-  with `rmsnorm` next at 0.65 s). The E2M1 decode and the byte loads are
-  not the cause: a nibble lookup table and 32-bit word loads (eight
-  nibbles per load) did not change the time. The scalar kernel launches
-  one thread per output with a long serial k loop, so it runs at low
-  occupancy. The fix is a tiled or split-K GEMV with a deterministic
-  reduction, and a parallel row reduction for `rmsnorm` (item 3).
+  Decode fell from about 2.6 s/token to 789 ms/token (and prefill from
+  5.5 s to 1.8 s) with the same output. Two changes did it. `gemm_mxfp4`
+  now decodes a 16-entry nibble table and loads one 32-bit word (eight
+  nibbles) per eight elements instead of one byte per two; a per-kernel
+  pass had shown this kernel was 5.9 s of the ~7.3 s fence-wait total, and
+  the earlier version of this change was committed but never recompiled,
+  so it read the wrong word offset. `rmsnorm` now uses one workgroup per
+  row with a shared-memory reduction instead of one thread per row (the
+  old form serialized a 5120-element row on a single thread). The
+  remaining cost is still the scalar GEMV (one thread per output, long
+  serial k loop, low occupancy); the fix is a tiled or split-K GEMV with a
+  deterministic reduction (item 3).
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are

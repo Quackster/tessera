@@ -374,7 +374,8 @@ inline std::expected<void, StatusCode> RmsNormDevice(
   static_assert(sizeof(bits) == sizeof(eps_f));
   std::memcpy(&bits, &eps_f, sizeof(bits));
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
+  // One workgroup per row; the kernel reduces the row across the group.
+  launch.grid_x = static_cast<std::uint32_t>(rows);
   launch.block_x = 256;
   launch.buffers = {&x, &w, &y};
   launch.scalars = {rows, cols, bits};
