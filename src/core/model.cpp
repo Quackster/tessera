@@ -12,6 +12,7 @@
 
 #include "core/files.hpp"
 #include "core/loaders/gguf.hpp"
+#include "core/loaders/hf_tokenizer.hpp"
 #include "core/loaders/mxfp4.hpp"
 #include "core/loaders/safetensors.hpp"
 
@@ -501,13 +502,18 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         for (const auto& weight : *weights) {
           tensors.push_back(weight.manifest);
         }
+        auto tokenizer = core::LoadHfTokenizer(path);
+        if (!tokenizer) {
+          return std::unexpected(tokenizer.error());
+        }
+        std::string chat_template = core::LoadHfChatTemplate(path);
         std::optional<AttentionParams> attention = config->attention;
         std::optional<TransformerConfig> parsed_config = std::move(*config);
         return std::unique_ptr<Model>(new Model(
             backend, options, ModelFormat::MxFp4, std::move(tensors),
             std::string{}, std::move(architecture), std::move(attention),
-            std::move(parsed_config), std::move(*weights), std::nullopt,
-            std::string{}));
+            std::move(parsed_config), std::move(*weights),
+            std::move(*tokenizer), std::move(chat_template)));
       }
     }
     std::vector<TensorEntry> tensors;

@@ -1029,6 +1029,22 @@ through RADV GFX1201, rocm through the system ROCm).
   draft tokens); this also removes the conv position wrap on the last row.
   Acceptance is unchanged (2 of 35 over 5 steps).
 
+- 2026-10-08: MXFP4 HF tokenizer. `LoadHfTokenizer` (`src/core/loaders/
+  hf_tokenizer.{hpp,cpp}`) parses `tokenizer.json` at MXFP4 load and
+  builds the byte-level BPE `Tokenizer`: it inverts `model.vocab`,
+  reads `model.merges`, and marks `added_tokens` as control (type 3)
+  tokens. `LoadHfChatTemplate` reads the `chat_template` string from
+  `tokenizer_config.json`, else `chat_template.jinja`. `Model::Load`
+  wires both into the MXFP4 model (previously it passed no tokenizer and
+  an empty template). The parsed tokenizer reproduces the GGUF
+  reference ids for ASCII, code and CJK
+  (`TokenizerTest.RealTokenizerMatchesReference` run against the MXFP4
+  target), and the text-only CLI now prompts the MXFP4 target end to end
+  (`The capital of France is` gives ` Paris.`). `TokenizerTest.
+  HfTokenizerJsonParses`, `HfTokenizerNonBpeIsEmpty` and
+  `HfTokenizerRejectsMalformed` cover the parser. 250/250 ctest on
+  vulkan and rocm.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -1132,31 +1148,31 @@ through RADV GFX1201, rocm through the system ROCm).
    embedding and the linear-attention value-head reorder match the GGUF to
    correlation 0.99, so the layout and permutation are right. Acceptance
    can now be measured against the correct target.
-   Two other gaps remain: the MXFP4 GEMM is very slow (about 2.5 s/token on
-   the 27B, versus 0.9 s/token for the GGUF; the `gemm_mxfp4` kernel needs
-   item 3 work), and the HF tokenizer is not parsed yet, so the text-only
-   CLI cannot prompt this target. The `gemm_mxfp4` kernel now reads the scale from the
-    packed weight tail, so its contract, host reference and device test
-    changed. Tokenizer research (vLLM and Quark): vLLM never derives the
-    tokenizer from the weights. `get_tokenizer`
-    (`vllm/tokenizers/registry.py`) calls `AutoTokenizer.from_pretrained`
-    on the model repo path, so the tokenizer always comes from the
-    checkpoint directory. The `--tokenizer`, `--tokenizer-mode`,
-    `--tokenizer-revision` and `--chat-template` flags only override
-    that default. Quark keeps this working: `quantize_quark.py`
-    `--model_export hf_format` runs `maybe_save_preprocessors` and
-    `restore_aux_files`, so the export carries the source tokenizer
-    files unchanged next to the quantized safetensors. The local MXFP4
-    target has all of them (`tokenizer.json`, `tokenizer_config.json`,
-    `vocab.json`, `merges.txt`, `chat_template.jinja`). The plan mirrors
-    that split. Parse `tokenizer.json` at MXFP4 load: the BPE `vocab`
-    and `merges` already match the `tessera::Tokenizer` inputs (byte
-    level form, `left right` merge lines), and special `added_tokens`
-    map to the control type. Take the chat template from
-    `tokenizer_config.json`. Weight loading stays untouched. Verify
-    first: the file carries 248044 entries plus 33 added tokens, while
-    the GGUF target reports a 248320 vocabulary, so check the MXFP4
-    output head width against the tokenizer size before wiring it up.
+   One gap remains: the MXFP4 GEMM is very slow (about 2.5 s/token on the
+   27B, versus 0.9 s/token for the GGUF; the `gemm_mxfp4` kernel needs
+   item 3 work). The `gemm_mxfp4` kernel now reads the scale from the
+   packed weight tail, so its contract, host reference and device test
+   changed.
+   The HF tokenizer is now parsed. vLLM never derives the tokenizer from
+   the weights: `get_tokenizer` (`vllm/tokenizers/registry.py`) calls
+   `AutoTokenizer.from_pretrained` on the model repo path, so the
+   tokenizer comes from the checkpoint directory; Quark's
+   `--model_export hf_format` carries the source tokenizer files next to
+   the quantized safetensors, which the local MXFP4 target has
+   (`tokenizer.json`, `tokenizer_config.json`, `vocab.json`,
+   `merges.txt`, `chat_template.jinja`). `LoadHfTokenizer`
+   (`src/core/loaders/hf_tokenizer.cpp`) reads `tokenizer.json` at MXFP4
+   load and builds the byte-level BPE tokenizer: it inverts `model.vocab`
+   (byte-level tokens to ids), reads `model.merges` ("left right" in rank
+   order) and marks `added_tokens` as control tokens. `LoadHfChatTemplate`
+   reads the `chat_template` string from `tokenizer_config.json`, else
+   `chat_template.jinja`. Weight loading is untouched. The tokenizer
+   covers ids 0..248076 (248044 BPE entries plus 33 added tokens); the
+   head is 248320 wide, so the last 243 rows are unused padding.
+   `TokenizerTest.RealTokenizerMatchesReference` now passes against the
+   MXFP4 target (the same ids as the GGUF reference across ASCII, code
+   and CJK), and the text-only CLI prompts the MXFP4 target end to end
+   (`The capital of France is` gives ` Paris.`).
 - **Hybrid SSM device path (done)**: the causal conv1d, the SiLU and the
   q/k/v split now run on the device (`conv1d_state`), with the history in
   `linear[l].conv_hist`, in both trunk paths. See the Done entry.

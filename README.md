@@ -29,16 +29,16 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. |
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. |
 | DFlash2 | Partial | Draft forward built: grouped dynamic convolution, sliding attention, candidate selector and target-hidden fusion. The real draft loads and runs one block. |
-| CLI | Partial | Loads model, prints summary, generates tokens (`--tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). Text prompts need a tokenizer. |
+| CLI | Partial | Loads model, prints summary, generates tokens (`--tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). Text prompts work for GGUF and MXFP4. |
 | Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in one batched forward. A zero `max_tokens` fills the remaining context. Runtime options: `--context`, `--tokens`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`) or 4-bit (`--kv-q4`) KV cache. |
 | Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Host reference check. Per backend tolerance. |
 | Attention and RoPE | Done | GQA path driven by model data; tiled O(n*d) attention (one workgroup per query/head, online softmax). RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. The 27B hybrid path generates coherent text. |
-| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. The recurrent causal conv1d still runs on the host (see PROGRESS item 1). |
+| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. The causal conv1d, SiLU and q/k/v split run on the device (`conv1d_state`). |
 | Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculation run end to end; output equals greedy. Multi-token drafts are scored in one batched target forward. |
-| MXFP4 path | Partial | Tensor map parsing. FP8 and MXFP4 kernels. HuggingFace config, weight name map and value-head reorder; the Qwen 3.8 27B MXFP4 target loads and decodes end to end (no HuggingFace tokenizer yet). |
+| MXFP4 path | Partial | Tensor map parsing. FP8 and MXFP4 kernels. HuggingFace config, weight name map, value-head reorder and tokenizer; the Qwen 3.8 27B MXFP4 target loads, tokenizes and decodes end to end. |
 | DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). Output equals greedy. |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
 | MoE, MLP, norms | Partial | RMSNorm and sigmoid-gate kernels done. MLP and embedding kernels in work. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
@@ -109,7 +109,7 @@ Simple text prompt with the CLI:
 
 `--tokens` is optional. Without it the run fills the remaining context.
 
-The CLI applies the model chat template by default. It uses the raw text with `--no-chat`. String prompts need a model with a tokenizer. Today only GGUF provides one. MXFP4 decodes from token ids through the C++ API, with or without the DFlash2 draft, but it has no tokenizer yet so the CLI and the HTTP server refuse string prompts for it.
+The CLI applies the model chat template by default. It uses the raw text with `--no-chat`. String prompts need a model with a tokenizer. Both formats provide one: GGUF carries it in metadata, and the MXFP4 loader parses the HuggingFace `tokenizer.json` (and the chat template from `tokenizer_config.json` or `chat_template.jinja`). The CLI and the HTTP server accept string prompts for either format. String prompts still fail on a model without a tokenizer, such as a bare DFlash2 draft directory.
 
 C++ API with a text prompt:
 

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "core/loaders/hf_tokenizer.hpp"
 #include "test_helpers.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
@@ -116,4 +117,45 @@ TEST(TokenizerTest, SpecialTokenMatched) {
   auto text = tok.Decode(*ids);
   ASSERT_TRUE(text.has_value()) << tessera::ToString(text.error());
   EXPECT_EQ(*text, "<|im_start|>hi");
+}
+
+// The HuggingFace tokenizer.json parser inverts model.vocab (token -> id),
+// reads the merges and marks added_tokens as control tokens.
+TEST(TokenizerTest, HfTokenizerJsonParses) {
+  const char* json = R"({
+    "model": {
+      "type": "BPE",
+      "vocab": {"a": 0, "b": 1, "ab": 2, "c": 3},
+      "merges": ["a b"]
+    },
+    "added_tokens": [{"id": 4, "content": "<|endoftext|>", "special": true}]
+  })";
+  auto tokenizer = tessera::core::ParseHfTokenizer(json);
+  ASSERT_TRUE(tokenizer.has_value()) << tessera::ToString(tokenizer.error());
+  ASSERT_TRUE(tokenizer->has_value());
+  const Tokenizer& tok = **tokenizer;
+  EXPECT_EQ(tok.VocabSize(), 5u);
+  auto ids = tok.Encode("abc");
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  const std::vector<std::uint32_t> want = {2, 3};
+  EXPECT_EQ(*ids, want);
+  auto special = tok.SpecialTokenId("<|endoftext|>");
+  ASSERT_TRUE(special.has_value());
+  EXPECT_EQ(*special, 4u);
+}
+
+// A non-BPE tokenizer resolves to no tokenizer.
+TEST(TokenizerTest, HfTokenizerNonBpeIsEmpty) {
+  auto tokenizer =
+      tessera::core::ParseHfTokenizer(R"({"model": {"type": "WordPiece"}})");
+  ASSERT_TRUE(tokenizer.has_value()) << tessera::ToString(tokenizer.error());
+  EXPECT_FALSE(tokenizer->has_value());
+}
+
+// A malformed tokenizer.json is rejected.
+TEST(TokenizerTest, HfTokenizerRejectsMalformed) {
+  auto tokenizer =
+      tessera::core::ParseHfTokenizer(R"({"model": {"type": "BPE"}})");
+  ASSERT_FALSE(tokenizer.has_value());
+  EXPECT_EQ(tokenizer.error(), StatusCode::MalformedFile);
 }
