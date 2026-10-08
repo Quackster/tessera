@@ -123,8 +123,9 @@ auto model = (*engine)->LoadModel(
 if (!model) return 1;
 
 const tessera::Tokenizer* tokenizer = (*model)->GetTokenizer();
-auto prompt = (*model)->ChatPrompt("Explain gravity in one sentence.");
-auto ids = tokenizer->Encode(prompt ? *prompt : "Explain gravity in one sentence.");
+std::string text = "Explain gravity in one sentence.";
+if (auto rendered = (*model)->ChatPrompt(text)) text = *rendered;
+auto ids = tokenizer->Encode(text);
 
 tessera::GenerateOptions options;
 options.max_tokens = 64;  // Optional. Zero fills the remaining context.

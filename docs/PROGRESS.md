@@ -992,8 +992,27 @@ through RADV GFX1201, rocm through the system ROCm).
    27B, versus 0.9 s/token for the GGUF; the `gemm_mxfp4` kernel needs
    item 3 work), and the HF tokenizer is not parsed yet (use
    `--prompt-ids`). The `gemm_mxfp4` kernel now reads the scale from the
-   packed weight tail, so its contract, host reference and device test
-   changed.
+    packed weight tail, so its contract, host reference and device test
+    changed. Tokenizer research (vLLM and Quark): vLLM never derives the
+    tokenizer from the weights. `get_tokenizer`
+    (`vllm/tokenizers/registry.py`) calls `AutoTokenizer.from_pretrained`
+    on the model repo path, so the tokenizer always comes from the
+    checkpoint directory. The `--tokenizer`, `--tokenizer-mode`,
+    `--tokenizer-revision` and `--chat-template` flags only override
+    that default. Quark keeps this working: `quantize_quark.py`
+    `--model_export hf_format` runs `maybe_save_preprocessors` and
+    `restore_aux_files`, so the export carries the source tokenizer
+    files unchanged next to the quantized safetensors. The local MXFP4
+    target has all of them (`tokenizer.json`, `tokenizer_config.json`,
+    `vocab.json`, `merges.txt`, `chat_template.jinja`). The plan mirrors
+    that split. Parse `tokenizer.json` at MXFP4 load: the BPE `vocab`
+    and `merges` already match the `tessera::Tokenizer` inputs (byte
+    level form, `left right` merge lines), and special `added_tokens`
+    map to the control type. Take the chat template from
+    `tokenizer_config.json`. Weight loading stays untouched. Verify
+    first: the file carries 248044 entries plus 33 added tokens, while
+    the GGUF target reports a 248320 vocabulary, so check the MXFP4
+    output head width against the tokenizer size before wiring it up.
 1. **Hybrid SSM device path**: the recurrent causal conv1d still runs
    on the host in both trunk paths. The single-token and the batched
    trunk download the fused qkv, run `Conv1dStepRef` on the host and
