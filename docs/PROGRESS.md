@@ -1009,12 +1009,25 @@ through RADV GFX1201, rocm through the system ROCm).
   pre-norm residual structure and the final `norm(hidden + residual)`; the
   context `KV = k/v_proj(rms_norm(fc))` with K-norm and RoPE on K only.
   The head is the target's `output.weight` (using the embedding is worse:
-  0 of 56). Neither fix moved acceptance, so the dominant bug is still
-  unknown. The draft's first mask-row logits are wrong, so the next step
-  is a host or vLLM reference of one draft step to bisect the forward.
-  One more mismatch is not yet handled: vLLM uses `1 + num_speculative_tokens`
-  query rows (8 for the README's 7 draft tokens), while we use
-  `config.block_size + 1` (9); the extra mask is wasted, not harmful.
+  0 of 56).
+  A per-step diagnostic (env `TESSERA_DFLASH2_RANK`, since removed) pinned
+  the failure. The draft's first mask row is often exactly right (step 0:
+  the target's token is the draft's argmax), but the later mask rows
+  collapse to a short repeating pattern (for example `13,0,3,6,3,6,3,6`)
+  and are all wrong. The grouped conv is net positive (row 0 drops from
+  rank 1 to rank 7 when the conv is bypassed, and step 1 goes from rank 8
+  to rank 202377), so the conv is most likely correct; the collapse is
+  that every mask row has the same input, so the depthwise conv yields the
+  same value for rows with the same tap pattern, and the row differences
+  come only from the RoPE positions. The bug is in how the mask rows are
+  differentiated (the attention, or the mask/position layout), not in the
+  weights. The next step remains a host or vLLM reference of one draft
+  step that can compare per-row hidden states.
+  The query-row count now matches vLLM: the config's block_size is the
+  total block (anchor plus masks), so the draft proposes `block_size - 1`
+  masks with `block_size` query rows (the README's block size 8 means 7
+  draft tokens); this also removes the conv position wrap on the last row.
+  Acceptance is unchanged (2 of 35 over 5 steps).
 
 ## Next (in order)
 

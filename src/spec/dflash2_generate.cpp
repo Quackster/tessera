@@ -51,7 +51,13 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   }
   const std::size_t hidden = config->hidden_dim;
   const std::size_t vocab = draft_config->vocab_size;
-  std::size_t block = draft_config->block_size;
+  // vLLM's draft block holds `1 + num_speculative_tokens` query rows: one
+  // anchor plus the mask rows. The config's block_size is that total, so the
+  // mask count is one less (the README's block size 8 means 7 draft tokens).
+  std::size_t block = draft_config->block_size - 1;
+  if (block == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
   if (options.draft_tokens > 0 && options.draft_tokens < block) {
     block = options.draft_tokens;
   }
