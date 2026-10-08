@@ -230,6 +230,12 @@ These are hard rules, set by the project owner:
       27B target and the draft for every value of a sweep.
     - When you only need a small value, do not load a full model to get it. Use
       `TESSERA_TEST_*` paths that point at the model you need.
+    - Run a model server in the foreground. A full serve (vLLM, or the radiance
+      container that compiles gfx1201 kernels and loads the 27B target plus the
+      draft) holds tens of GB of device and host memory for the whole run.
+      Backgrounding it and polling it from other commands has crashed the
+      workstation. Start it, then wait; do not run anything else until it exits
+      and its memory is freed.
     - Keep reference and diagnostic Python scripts memory-light. Load one
       tensor at a time, keep float32 (never float64), and never `.float()` or
       copy a whole multi-GB checkpoint at once. A script that materializes the

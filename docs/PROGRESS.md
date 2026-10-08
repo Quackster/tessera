@@ -1159,6 +1159,59 @@ through RADV GFX1201, rocm through the system ROCm).
   the `fc` orientation fix confirms the port itself is correct. Temporary
   dumps removed; 255/255 ctest.
 
+- 2026-10-08: **DFlash2 acceptance is a real draft-quality bug, pinned to
+  the aux hidden.** On a realistic 128-token generation the C++ accepts 21
+  of 742 draft tokens (about 0.2 per step); radiance's drafter on the same
+  checkpoint reaches 0.807 first-position top-1 and about 1.9 accepted per
+  block (`paroquant/RESULTS.md`), so the gap is real and not a short-prompt
+  fixture. Verified this session against radiance's own code: the draft
+  forward matches `train_drafter.py` (correlation 0.99976); the query
+  embeddings are byte-exact with the target `embed_tokens`; the capture
+  layers are 5/19/33/47/61 (radiance's README, and the C++ matches); the
+  block is `block_size - 1` mask rows plus one anchor row (query rows 8),
+  matching vLLM's `num_query_per_req = 1 + num_speculative_tokens`; and the
+  grouped-conv `block_size`, the non-causal draft mask, the grouped dynamic
+  conv, the candidate selector and the context `rms(fc(aux), hidden_norm)`
+  all match vLLM's `qwen3_dflash2.py` / `qwen3_dflash.py`. The C++ draft
+  hidden is finite and stable (absmax about 31). Therefore the only
+  remaining input is the aux hidden **values** (the C++ target hidden at the
+  capture layers), not the draft math.
+  Blocked on an independent target reference. The local vLLM install cannot
+  load the target: `vllm/model_executor/models/qwen3_5.py` needs
+  `libnvrtc.so.13`, which is absent on this AMD box, and its bundled
+  torchcodec is a CUDA build that fails to load. Radiance's serving target
+  (`Qwen3.8-27B-PARO-MXFP4-ft`, bf16 `Qwen3.8-27B-bf16`) is not on this
+  machine. `paroquant/RESULTS.md` records a known "drafter/target mismatch":
+  the drafter self-distills on one served target's hidden, so a different
+  target shifts the distribution. The next step is a host reference of the
+  target's first six layers (embed .. layer 5), or running radiance's ROCm
+  vLLM container, to compare the C++ aux against vLLM's.
+
+- 2026-10-08: **DFlash2 reference measured; the gap is pinned to the target
+  hidden.** This machine already runs the reference serve as a docker
+  container: `r9700-qwen3.8-mxfp4-g0a` (image `local-radiance-mxfp4:0.9.3`,
+  port 9300, GPU0, systemd unit `r9700-mxfp4.service`), serving
+  `/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken` with the DFlash2 draft
+  (`--speculative-config method=dflash, num_speculative_tokens=7`) and
+  `--attention-backend R4D`. A 128-token greedy chat generation there
+  measures **2.85 accepted/draft, 3.85 tokens/step** in 3.1 s. The C++
+  on `Qwen3.8-27B-MXFP4-MTPFP8` accepts about 0.2/step, a roughly 14x
+  gap, so the fault is in the C++ port, not the prompt.
+  The served target and the C++'s `Qwen3.8-27B-MXFP4-MTPFP8` share the
+  same weights (`model.safetensors`, `19373796656` bytes) but differ in the
+  activation quantization: the `-pertoken` config uses
+  `PerChannelMinMaxObserver` / `qscheme: per_channel` / `ch_axis: 0` on the
+  MXFP4 inputs, while `MTPFP8` uses `PerTensorMinMaxObserver` /
+  `per_tensor`. vLLM applies that activation quantization in the forward,
+  and the drafter was trained on the served target's hidden (the capture
+  stores the aux as e4m3 with a per-token scale), so the C++ aux, which
+  runs bf16 activations and applies neither observer, is the prime suspect
+  for the 14x gap.
+  GPU0 is held by the production `r9700-qwen3.8-mxfp4-g0a`; a second full
+  27B load (the radiance container) started beside it crashed the
+  workstation. GPU1/`:9301` (`g1a`) is intentionally stopped. AGENTS rule 20
+  now says to run a model server in the foreground and not background it.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
