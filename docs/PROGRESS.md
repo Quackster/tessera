@@ -983,8 +983,14 @@ through RADV GFX1201, rocm through the system ROCm).
   memory-map the checkpoint instead of `ReadFile` (removed an 18.6 s copy
   and the 18 GB anonymous allocation); vectorize the bulk BF16-to-F32
   conversion; upload the F32 tensor without an extra copy; skip the second
-  fp4 copy when there is no reorder. Decode is still about 2.3 s/token on
-  the scalar `gemm_mxfp4` kernel (item 3).
+  fp4 copy when there is no reorder.
+  Decode is still about 2.6 s/token, against 1.1 s/token for the same
+  model in GGUF, so the gap is the MXFP4 GEMM. It is not the E2M1 decode
+  or the byte loads: a nibble lookup table and 32-bit word loads (eight
+  nibbles per load) did not change the time. The scalar kernel launches one
+  thread per output with a long serial k loop, so it runs at low occupancy.
+  The fix is a tiled or split-K GEMV with a deterministic reduction
+  (item 3).
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are

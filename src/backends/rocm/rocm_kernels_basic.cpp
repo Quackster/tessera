@@ -187,21 +187,11 @@ __host__ __device__ float E8M0ToFloatDev(std::uint8_t scale) {
       std::ldexp(1.0, static_cast<int>(scale) - 127));
 }
 
-// OCP MX E2M1 nibble to fp32 (device port of F4E2M1ToFloat).
-__host__ __device__ float F4E2M1ToFloatDev(std::uint8_t nibble) {
-  const std::uint32_t sign = (nibble >> 3) & 1;
-  const std::uint32_t exp = (nibble >> 1) & 0x3;
-  const std::uint32_t mant = nibble & 1;
-  float value;
-  if (exp == 0) {
-    value = static_cast<float>(mant) * 0.5f;
-  } else {
-    // E2M1 has no NaN/inf; exponent 3 with mantissa 1 is 6.0.
-    value = (1.0f + static_cast<float>(mant) / 2.0f) *
-            std::ldexp(1.0f, static_cast<int>(exp) - 1);
-  }
-  return sign != 0 ? -value : value;
-}
+// OCP MX E2M1 nibble values (port of the core F4E2M1ToFloat). A table
+// lookup avoids the branch and the ldexp in the hot loop.
+__device__ const float kE2M1Dev[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
 // bf16 -> fp32 on the device: shift the 16 bits into the high half.
 __device__ float Bf16ToFloatDev(unsigned short bits) {
@@ -313,15 +303,17 @@ __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
   const unsigned long long row_a = idx / n;
   const unsigned long long row_w = idx % n;
   const unsigned long long blocks = k / 32;
+  const float* a_row = a + row_a * k;
   float acc = 0.0f;
   for (unsigned long long b = 0; b < blocks; ++b) {
     const float scale = E8M0ToFloatDev(s[row_w * blocks + b]);
-    for (unsigned long long l = 0; l < 32; ++l) {
-      const unsigned long long t = b * 32 + l;
-      const std::uint8_t packed = w[(row_w * k + t) / 2];
-      const std::uint8_t nibble =
-          (t % 2 == 0) ? (packed & 0xF) : (packed >> 4);
-      acc = fmaf(a[row_a * k + t], scale * F4E2M1ToFloatDev(nibble), acc);
+    const unsigned long long base = b * 32;
+    const unsigned long long w_base = row_w * k + base;
+    // Two nibbles share one byte, so step by two.
+    for (unsigned long long l = 0; l < 32; l += 2) {
+      const std::uint8_t packed = w[(w_base + l) / 2];
+      acc = fmaf(a_row[base + l], scale * kE2M1Dev[packed & 0xF], acc);
+      acc = fmaf(a_row[base + l + 1], scale * kE2M1Dev[packed >> 4], acc);
     }
   }
   c[idx] = acc;
