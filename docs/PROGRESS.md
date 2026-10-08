@@ -922,11 +922,14 @@ through RADV GFX1201, rocm through the system ROCm).
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are
-   done (see the Done entry). The draft accepts about 0 to 15 percent, so
-   speculation is slower than greedy despite correct output. The context
-   width does not lift acceptance, so the draft block is the suspect:
-   check its layer order (the residual add and the grouped conv wrapping
-   attention and the MLP) against the reference.
+   done (see the Done entry). Note: DFlash2 has a slower boot (it loads
+   the 5-layer draft) and each step costs more than one greedy step, so it
+   is only a win at a high enough acceptance; the target is steady-state
+   tokens/s, not the first few tokens. Measure tokens/s over a long
+   generation. The draft currently accepts about 0 to 15 percent, so the
+   draft block is the suspect: check its layer order against the reference
+   and the mask/candidate setup. The context width does not lift
+   acceptance.
 1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.

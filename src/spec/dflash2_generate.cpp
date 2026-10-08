@@ -124,7 +124,6 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   if (auto pushed = push_capture(); !pushed) {
     return std::unexpected(pushed.error());
   }
-  std::uint64_t anchor = prompt.size() - 1;
   std::vector<std::uint32_t> produced;
   produced.reserve(options.max_tokens);
   std::size_t proposed = 0;
@@ -141,7 +140,6 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (!current) {
       return std::unexpected(current.error());
     }
-    ++anchor;
     if (auto pushed = push_capture(); !pushed) {
       return std::unexpected(pushed.error());
     }
@@ -161,9 +159,11 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (!mask) {
       return std::unexpected(mask.error());
     }
-    const std::uint64_t pos_base = anchor + 1 - ctx;
+    // The draft block uses block-local positions: the context occupies
+    // 0..ctx-1 and the mask queries ctx..ctx+block-1, which preserves the
+    // relative distances the attention mask and RoPE expect.
     auto run = drafter->Run(backend, **mask, **aux, *output->device, **head_gemm,
-                            **logits, block, ctx, pos_base, vocab,
+                            **logits, block, ctx, /*pos_base=*/0, vocab,
                             draft_hidden->get());
     if (!run) {
       return std::unexpected(run.error());
