@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -104,6 +106,28 @@ class Architecture {
       const core::DecodeCache& cache) const = 0;
   virtual void DraftTruncate(core::DecodeCache& cache,
                              std::size_t rows) const = 0;
+
+  // Parse a JSON model definition (an MXFP4 directory's config.json) into
+  // the transformer hyper-parameters. The GGUF path parses GGUF metadata
+  // instead and never calls this. The default returns UnsupportedFeature;
+  // a module overrides it when the directory format carries its config.
+  [[nodiscard]] virtual std::expected<TransformerConfig, StatusCode>
+  ParseConfigJson(std::string_view json) const {
+    (void)json;
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+
+  // Map a checkpoint tensor name to the internal name this module looks
+  // up (for example a HuggingFace safetensors name to a "blk.N.*" name),
+  // or nullopt to ignore the tensor. `config` is the parsed model config,
+  // so the module can place draft blocks after the trunk layers. The
+  // default returns the name unchanged, for formats that already use the
+  // internal names (GGUF).
+  [[nodiscard]] virtual std::optional<std::string> MapWeightName(
+      std::string_view name, const TransformerConfig& config) const {
+    (void)config;
+    return std::string(name);
+  }
 };
 
 // Build the architecture module for `arch`, or nullptr when no module is

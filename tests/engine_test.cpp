@@ -2,13 +2,17 @@
 
 #include <cstdlib>
 
+#include <optional>
 #include <random>
 #include <random>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/decode.hpp"
 #include "core/sampling.hpp"
 #include "test_helpers.hpp"
+#include "tessera/architecture.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/image.hpp"
@@ -385,6 +389,93 @@ TEST(EngineTest, LoadMxFp4Rank5Tensor) {
   EXPECT_EQ(patch->shape.rank, 5u);
   EXPECT_EQ(patch->shape.dims[0], 2u);
   EXPECT_EQ(patch->shape.dims[4], 4u);
+}
+
+// The Qwen3.5 module parses a HuggingFace MXFP4 config.json into the
+// generic TransformerConfig.
+TEST(EngineTest, Qwen35ModuleParsesMxFp4Config) {
+  auto module = tessera::CreateArchitecture("qwen3_5");
+  ASSERT_NE(module, nullptr);
+  const std::string json = R"({
+    "model_type": "qwen3_5",
+    "text_config": {
+      "hidden_size": 5120,
+      "num_hidden_layers": 64,
+      "num_attention_heads": 24,
+      "num_key_value_heads": 4,
+      "head_dim": 256,
+      "intermediate_size": 17408,
+      "vocab_size": 248320,
+      "rms_norm_eps": 1e-6,
+      "full_attention_interval": 4,
+      "partial_rotary_factor": 0.25,
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 48,
+      "linear_value_head_dim": 128,
+      "rope_parameters": {"rope_theta": 10000000.0, "mrope_section": [11, 11, 10]}
+    }
+  })";
+  auto config = module->ParseConfigJson(json);
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_EQ(config->layers, 64u);
+  EXPECT_EQ(config->hidden_dim, 5120u);
+  EXPECT_EQ(config->ffn_dim, 17408u);
+  EXPECT_EQ(config->vocab_size, 248320u);
+  EXPECT_EQ(config->attention.heads, 24u);
+  EXPECT_EQ(config->attention.kv_heads, 4u);
+  EXPECT_EQ(config->attention.head_dim, 256u);
+  EXPECT_EQ(config->attention.rope_dim, 64u);
+  EXPECT_DOUBLE_EQ(config->attention.rope_theta, 10000000.0);
+  EXPECT_TRUE(config->hybrid);
+  EXPECT_EQ(config->ssm.conv_kernel, 4u);
+  EXPECT_EQ(config->ssm.state_size, 128u);
+  EXPECT_EQ(config->ssm.group_count, 16u);
+  EXPECT_EQ(config->ssm.time_step_rank, 48u);
+  EXPECT_EQ(config->ssm.inner_size, 6144u);
+  EXPECT_EQ(config->full_attention_interval, 4u);
+  ASSERT_EQ(config->rope_sections.size(), 3u);
+  EXPECT_EQ(config->rope_sections[0], 11u);
+
+  auto bad = module->ParseConfigJson("{}");
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error(), StatusCode::MalformedFile);
+}
+
+// The Qwen3.5 module maps HuggingFace MXFP4 tensor names to the internal
+// names, and ignores vision and unknown tensors.
+TEST(EngineTest, Qwen35ModuleMapsMxFp4WeightNames) {
+  auto module = tessera::CreateArchitecture("Qwen3_5ForConditionalGeneration");
+  ASSERT_NE(module, nullptr);
+  TransformerConfig config;
+  config.layers = 64;
+  const auto mapped = [&](std::string_view name) {
+    return module->MapWeightName(name, config);
+  };
+  EXPECT_EQ(mapped("lm_head.weight"),
+            std::optional<std::string>("output.weight"));
+  EXPECT_EQ(mapped("model.language_model.embed_tokens.weight"),
+            std::optional<std::string>("token_embd.weight"));
+  EXPECT_EQ(mapped("model.language_model.norm.weight"),
+            std::optional<std::string>("output_norm.weight"));
+  EXPECT_EQ(
+      mapped("model.language_model.layers.7.linear_attn.in_proj_qkv.weight"),
+      std::optional<std::string>("blk.7.attn_qkv.weight"));
+  EXPECT_EQ(mapped("model.language_model.layers.3.self_attn.o_proj.weight"),
+            std::optional<std::string>("blk.3.attn_output.weight"));
+  EXPECT_EQ(mapped("model.language_model.layers.0.mlp.down_proj.weight"),
+            std::optional<std::string>("blk.0.ffn_down.weight"));
+  EXPECT_EQ(mapped("model.language_model.layers.0.linear_attn.A_log"),
+            std::optional<std::string>("blk.0.ssm_a"));
+  EXPECT_EQ(mapped("mtp.fc.weight"),
+            std::optional<std::string>("blk.64.nextn.eh_proj.weight"));
+  EXPECT_EQ(mapped("mtp.layers.0.self_attn.q_proj.weight"),
+            std::optional<std::string>("blk.64.attn_q.weight"));
+  EXPECT_EQ(mapped("mtp.norm.weight"),
+            std::optional<std::string>("blk.64.nextn.shared_head_norm.weight"));
+  EXPECT_FALSE(mapped("model.visual.patch_embed.proj.weight").has_value());
+  EXPECT_FALSE(mapped("totally.unknown").has_value());
 }
 
 TEST(EngineTest, LoadModelMissingFile) {

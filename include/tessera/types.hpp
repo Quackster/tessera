@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <limits>
 #include <stdexcept>
@@ -177,6 +178,55 @@ struct AttentionParams {
   std::size_t head_dim = 0;
   std::size_t rope_dim = 0;
   double rope_theta = 10000.0;
+};
+
+// Recurrent linear-attention dimensions of a hybrid model definition.
+// They size the fused qkv/gate projections, the causal conv1d and the
+// recurrent state; generic kernels take them as launch data, never as
+// per-model branches.
+struct SsmParams {
+  std::size_t conv_kernel = 0;     // causal conv1d width over the mix
+  std::size_t state_size = 0;      // recurrent state dim per head
+  std::size_t group_count = 0;     // key heads sharing a value group
+  std::size_t time_step_rank = 0;  // value heads (gate rank)
+  std::size_t inner_size = 0;      // fused qkv/gate projection width
+};
+
+// Transformer hyper-parameters from the model definition. The decode
+// loop sizes every launch from these; no code branches on the
+// architecture.
+struct TransformerConfig {
+  AttentionParams attention;
+  std::size_t layers = 0;  // trunk blocks (excludes MTP draft blocks)
+  std::size_t hidden_dim = 0;
+  std::size_t ffn_dim = 0;
+  std::size_t vocab_size = 0;
+  double norm_eps = 1e-5;
+  // True for hybrid attention/SSM definitions (recurrent linear layers
+  // interleaved with full attention). The vanilla decode path rejects
+  // these as UnsupportedFeature until the recurrent kernels land.
+  bool hybrid = false;
+  // SSM dimensions, valid only when hybrid is true.
+  SsmParams ssm;
+  // Trunk layer l is full attention iff (l + 1) % interval == 0.
+  // Zero means every layer is full attention (vanilla).
+  std::size_t full_attention_interval = 0;
+  // True when trunk layer l runs full attention (never recurrent for
+  // vanilla configs, where the interval is zero).
+  //
+  // Usage:
+  //   if (config.IsFullAttentionLayer(l)) { /* GQA path */ }
+  [[nodiscard]] bool IsFullAttentionLayer(std::size_t layer) const {
+    if (!hybrid || full_attention_interval == 0) {
+      return true;
+    }
+    return (layer + 1) % full_attention_interval == 0;
+  }
+  // mRoPE section pair counts (temporal, height, width[, pad]) from the
+  // model definition. Empty when the file carries no section array;
+  // hybrid definitions require it (the mrope built-in takes the counts
+  // as launch scalars).
+  std::vector<std::uint64_t> rope_sections;
 };
 
 // Dense tensor shape, at most 4 dimensions, row-major.

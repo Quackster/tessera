@@ -19,6 +19,8 @@ add_library(tessera STATIC
     src/models/qwen3_5/trunk.cpp
     src/models/qwen3_5/trunk_batch.cpp
     src/models/qwen3_5/mtp.cpp
+    src/models/qwen3_5/config.cpp
+    src/models/qwen3_5/weights.cpp
     src/core/engine.cpp
     src/core/model.cpp
     src/core/files.cpp

@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -61,6 +63,12 @@ class Qwen35Architecture final : public Architecture {
       const core::DecodeCache& cache) const override;
   void DraftTruncate(core::DecodeCache& cache,
                      std::size_t rows) const override;
+
+  [[nodiscard]] std::expected<TransformerConfig, StatusCode> ParseConfigJson(
+      std::string_view json) const override;
+
+  [[nodiscard]] std::optional<std::string> MapWeightName(
+      std::string_view name, const TransformerConfig& config) const override;
 };
 
 // Build the module (registered for general.architecture "qwen35").
