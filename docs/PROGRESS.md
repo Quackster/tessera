@@ -1325,6 +1325,18 @@ through RADV GFX1201, rocm through the system ROCm).
   per-block `E8M0ToFloatDev` (a software `ldexp` on device) is the next
   suspect and the next item 3 lever.
 
+- 2026-10-08: **E8M0 scale decode by bit cast (item 3).** `E8M0ToFloatDev`
+  called `ldexp` once per MXFP4 block. Since the value is 2^(scale - 127),
+  the fp32 exponent field is `scale`, so the bits are `scale << 23`
+  (`scale == 0`, 2^-127, stays on ldexp because it is subnormal, so the
+  device still matches the core host `E8M0ToFloat` exactly). Results are
+  bit-identical, `ctest` is 258/258, and the 27B MXFP4 decode drops from
+  652 to 599 ms/token with the same tokens. The MXFP4 path is still about
+  2x the GGUF decode (280 ms/token); the separate, strided scale-array
+  read is the likely next cost. The remaining item 3 work (scale-array
+  access, a larger-batch prefill measurement, and the same vectorization
+  on the other quant GEMVs) continues.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load

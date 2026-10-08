@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
 namespace tessera::backends::rocm {
@@ -72,11 +73,20 @@ inline __host__ __device__ void GetScaleMinDev(
   }
 }
 
-// OCP MX E8M0 scale byte to fp32 (device port of the core
-// E8M0ToFloat). Inline so every kernel TU carries its own copy.
+// OCP MX E8M0 scale byte to fp32, 2^(scale - 127) (device port of the
+// core E8M0ToFloat). The fp32 exponent field equals `scale`, so the bits
+// are `scale << 23`; that is cheaper than the software `ldexp` the GPU
+// would otherwise call. Only `scale == 0` differs (2^-127 is subnormal),
+// so that one value keeps ldexp. Inline so every kernel TU carries its
+// own copy.
 inline __host__ __device__ float E8M0ToFloatDev(std::uint8_t scale) {
-  return static_cast<float>(
-      std::ldexp(1.0, static_cast<int>(scale) - 127));
+  if (scale == 0) {
+    return static_cast<float>(std::ldexp(1.0, -127));
+  }
+  const int bits = static_cast<int>(scale) << 23;
+  float value;
+  memcpy(&value, &bits, sizeof(value));
+  return value;
 }
 
 // OCP MX E2M1 nibble values (port of the core F4E2M1ToFloat). A table
