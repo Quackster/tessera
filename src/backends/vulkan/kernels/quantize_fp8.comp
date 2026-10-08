@@ -1,0 +1,89 @@
+#version 450
+
+// One thread per row.
+layout(local_size_x = 256) in;
+
+// "quantize_fp8" contract: buffer 0 is the fp32 rows x cols data,
+// quantized and dequantized in place to OCP FP8 E4M3; buffer 1 one fp32
+// scale per row. Scalars: rows v[0], cols v[2].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer Data { float data[]; };
+layout(set = 0, binding = 1) buffer Scale { float scale[]; };
+
+// fp32 -> OCP FP8 E4M3 byte, round to nearest even (port of the core
+// Fp32ToFp8E4M3Bits). NaN and values above 448 saturate to the all-ones
+// byte.
+uint fp8_e4m3_bits(float value) {
+  uint bits = floatBitsToUint(value);
+  uint sign = bits >> 31;
+  if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+    return (sign << 7) | 0x7Fu;
+  }
+  float a = abs(value);
+  if (a == 0.0) {
+    return sign << 7;
+  }
+  if (a > 448.0) {
+    return (sign << 7) | 0x7Fu;
+  }
+  int e = 0;
+  float frac = frexp(a, e);
+  int field = e + 6;
+  if (field < 1) {
+    int mant = int(roundEven(a * 512.0));
+    mant = min(mant, 7);
+    return (sign << 7) | uint(mant);
+  }
+  int mant = int(roundEven((frac * 2.0 - 1.0) * 8.0));
+  if (mant == 8) {
+    mant = 0;
+    ++field;
+  }
+  field = min(field, 15);
+  if (field == 15 && mant > 6) {
+    mant = 6;
+  }
+  return (sign << 7) | (uint(field) << 3) | uint(mant);
+}
+
+// OCP FP8 E4M3 byte -> fp32 (port of the core Fp8E4M3ToFloat).
+float fp8_e4m3_value(uint bits) {
+  uint sign = bits >> 7;
+  uint exp = (bits >> 3) & 0xFu;
+  uint mant = bits & 0x7u;
+  float value;
+  if (exp == 0u) {
+    value = float(mant) * exp2(-9.0);
+  } else if (exp == 15u) {
+    if (mant == 7u) {
+      return sqrt(-1.0);  // NaN
+    }
+    value = (1.0 + float(mant) / 8.0) * 256.0;
+  } else {
+    value = (1.0 + float(mant) / 8.0) * exp2(float(int(exp) - 7));
+  }
+  return sign != 0u ? -value : value;
+}
+
+void main() {
+  uint r = gl_GlobalInvocationID.x;
+  uint rows = pc.v[0];
+  uint cols = pc.v[2];
+  if (r >= rows) {
+    return;
+  }
+  uint base = r * cols;
+  float amax = 0.0;
+  for (uint c = 0; c < cols; ++c) {
+    amax = max(amax, abs(data[base + c]));
+  }
+  float s = max(amax / 448.0, 1.0 / (448.0 * 512.0));
+  scale[r] = s;
+  for (uint c = 0; c < cols; ++c) {
+    uint bits = fp8_e4m3_bits(data[base + c] / s);
+    data[base + c] = fp8_e4m3_value(bits) * s;
+  }
+}

@@ -33,6 +33,8 @@
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
+#include "models/qwen3_5/internal.hpp"
+#include "models/qwen3_5/state.hpp"
 #include "test_helpers.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/types.hpp"
@@ -4796,15 +4798,16 @@ TEST(BackendTest, DraftFuseMatchesRef) {
   auto aux_b = up(aux), fc_b = up(fc);
   auto scratch_b = backend->AllocateBuffer(kRows * kN * kFeatures * 4,
                                             MemoryKind::Device);
+  auto scale_b = backend->AllocateBuffer(kRows * 4, MemoryKind::Device);
   auto out_b = backend->AllocateBuffer(kRows * kHidden * 4, MemoryKind::Device);
-  ASSERT_TRUE(scratch_b && out_b);
+  ASSERT_TRUE(scratch_b && scale_b && out_b);
   auto gemm = backend->LoadKernel("gemm_f32", {});
   auto concat = backend->LoadKernel("concat_features", {});
-  ASSERT_TRUE(gemm.has_value() && concat.has_value());
-  auto device = tessera::spec::DraftFuseDevice(*backend, **gemm, **concat,
-                                               **scratch_b, *aux_b, *fc_b,
-                                               **out_b, kN, kRows, kFeatures,
-                                               kHidden);
+  auto quantize = backend->LoadKernel("quantize_fp8", {});
+  ASSERT_TRUE(gemm.has_value() && concat.has_value() && quantize.has_value());
+  auto device = tessera::spec::DraftFuseDevice(
+      *backend, **gemm, **concat, **quantize, **scratch_b, **scale_b, *aux_b,
+      *fc_b, **out_b, kN, kRows, kFeatures, kHidden);
   ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
   backend->Synchronize();
   std::vector<float> got(kRows * kHidden);
@@ -5067,11 +5070,13 @@ TEST(BackendTest, DraftBlockMatchesRef) {
   auto silu = backend->LoadKernel("silu_mul", {});
   auto add = backend->LoadKernel("add", {});
   auto concat = backend->LoadKernel("concat_features", {});
-  ASSERT_TRUE(rms && gemm && conv && rope && attn && silu && add && concat);
+  auto quantize = backend->LoadKernel("quantize_fp8", {});
+  ASSERT_TRUE(rms && gemm && conv && rope && attn && silu && add && concat &&
+              quantize);
   auto device = tessera::spec::DraftBlockDevice(
       *backend, **rms, **gemm, **gemm, **conv, **rope, **attn, **silu, **add,
-      **concat, *mask_b, *aux_b, *fc_b, dev_layers, *fnormal_b, *outw_b,
-      **logits_b,
+      **concat, **quantize, *mask_b, *aux_b, *fc_b, dev_layers, *fnormal_b,
+      *outw_b, **logits_b,
       kRows, kCtx, kHidden, kN, kFeatures, kVocab, kHeads, kKvHeads, kHeadDim,
       kFfn, kTaps, kGroup, kBlock, kWindow, 0, kTheta, kEps);
   ASSERT_TRUE(device.has_value()) << tessera::ToString(device.error());
@@ -5310,6 +5315,125 @@ TEST(BackendTest, QuantizeQ8MatchesRef) {
   for (std::size_t r = 0; r < kRows; ++r) {
     EXPECT_FLOAT_EQ(got_scale[r], ref_scale[r]);
   }
+}
+
+// Device: the per-token FP8 E4M3 quantize-dequantize (the W4A8 activation
+// QDQ) matches the host reference in place.
+TEST(BackendTest, QuantizeFp8MatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(107);
+  constexpr std::size_t kRows = 2, kCols = 6;
+  std::vector<float> in(kRows * kCols);
+  for (auto& v : in) v = DrawValue(rng);
+  auto data_buf = backend->AllocateBuffer(in.size() * 4, MemoryKind::Device);
+  auto scale_buf = backend->AllocateBuffer(kRows * 4, MemoryKind::Device);
+  ASSERT_TRUE(data_buf && scale_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **data_buf, std::span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(in.data()),
+                                  in.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("quantize_fp8", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kRows + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*data_buf).get(), (*scale_buf).get()};
+  launch.scalars = {kRows, kCols};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<float> got(kRows * kCols), got_scale(kRows);
+  backend->CopyD2H(**data_buf, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  backend->CopyD2H(**scale_buf, reinterpret_cast<std::byte*>(got_scale.data()),
+                   got_scale.size() * 4);
+  std::vector<float> ref = in;
+  std::vector<float> ref_scale(kRows);
+  ASSERT_TRUE(core::QuantizeFp8Ref(std::span<float>(ref),
+                                   std::span<float>(ref_scale), kRows, kCols)
+                  .has_value());
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    EXPECT_FLOAT_EQ(got[i], ref[i]) << "element " << i;
+  }
+  for (std::size_t r = 0; r < kRows; ++r) {
+    EXPECT_FLOAT_EQ(got_scale[r], ref_scale[r]);
+  }
+}
+
+// Host: the FP8 per-token QDQ reproduces representable values exactly, and
+// a zero row uses the smallest dynamic scale.
+TEST(BackendTest, QuantizeFp8RoundTrip) {
+  constexpr std::size_t kRows = 2, kCols = 4;
+  std::vector<float> data = {448.0f, -448.0f, 224.0f, 0.0f,
+                             0.0f, 0.0f, 0.0f, 0.0f};
+  std::vector<float> scale(kRows);
+  ASSERT_TRUE(core::QuantizeFp8Ref(std::span<float>(data),
+                                   std::span<float>(scale), kRows, kCols)
+                  .has_value());
+  EXPECT_FLOAT_EQ(data[0], 448.0f);
+  EXPECT_FLOAT_EQ(data[1], -448.0f);
+  EXPECT_FLOAT_EQ(data[2], 224.0f);
+  EXPECT_FLOAT_EQ(data[3], 0.0f);
+  EXPECT_FLOAT_EQ(scale[0], 1.0f);
+  EXPECT_FLOAT_EQ(scale[1], core::kFp8E4M3MinScale);
+}
+
+// Device: the W4A8 target projection quantizes an MXFP4 activation in
+// place only when TESSERA_MXFP4_W4A8 is set; other dtypes are untouched.
+TEST(BackendTest, QuantizeMxFp4InputGatedByEnv) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(108);
+  constexpr std::size_t kRows = 2, kCols = 4;
+  std::vector<float> in(kRows * kCols);
+  for (auto& v : in) v = DrawValue(rng);
+  const auto upload = [&](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  tessera::models::qwen3_5::Qwen35State h;
+  std::vector<float> got(kRows * kCols);
+  // Disabled by default: the buffer is unchanged.
+  unsetenv("TESSERA_MXFP4_W4A8");
+  auto plain = upload(in);
+  ASSERT_TRUE(tessera::models::qwen3_5::QuantizeMxFp4Input(
+                  *backend, h, DType::F4E2M1, *plain, kRows, kCols)
+                  .has_value());
+  backend->Synchronize();
+  backend->CopyD2H(*plain, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  EXPECT_EQ(got, in);
+  // A non-MXFP4 dtype is never touched, even when enabled.
+  setenv("TESSERA_MXFP4_W4A8", "1", 1);
+  auto other = upload(in);
+  ASSERT_TRUE(tessera::models::qwen3_5::QuantizeMxFp4Input(
+                  *backend, h, DType::Q4K, *other, kRows, kCols)
+                  .has_value());
+  backend->Synchronize();
+  backend->CopyD2H(*other, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  EXPECT_EQ(got, in);
+  // Enabled with an MXFP4 dtype: the buffer becomes the per-token FP8 QDQ.
+  auto quantized = upload(in);
+  ASSERT_TRUE(tessera::models::qwen3_5::QuantizeMxFp4Input(
+                  *backend, h, DType::F4E2M1, *quantized, kRows, kCols)
+                  .has_value());
+  backend->Synchronize();
+  backend->CopyD2H(*quantized, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  std::vector<float> ref = in;
+  std::vector<float> scale(kRows);
+  ASSERT_TRUE(core::QuantizeFp8Ref(std::span<float>(ref),
+                                   std::span<float>(scale), kRows, kCols)
+                  .has_value());
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    EXPECT_FLOAT_EQ(got[i], ref[i]);
+  }
+  unsetenv("TESSERA_MXFP4_W4A8");
 }
 
 // Device: int8 keys/values attention matches the host reference.

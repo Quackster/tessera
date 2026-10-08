@@ -234,6 +234,9 @@ __global__ void RepeatHeadsKernel(const float* in, float* out,
 __global__ void QuantizeQ8Kernel(const float* in, unsigned int* packed,
                                  float* scale, unsigned long long rows,
                                  unsigned long long cols);
+__global__ void QuantizeFp8Kernel(float* data, float* scale,
+                                  unsigned long long rows,
+                                  unsigned long long cols);
 __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
                                   const unsigned char* v, const float* ks,
                                   const float* vs, float* out,

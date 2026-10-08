@@ -46,6 +46,10 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Kernel> rmsnorm_gated_kernel;
   std::unique_ptr<Kernel> cast_kernel;
   std::unique_ptr<Kernel> quant_kernel;
+  // Per-token FP8 E4M3 QDQ of an MXFP4 linear's activation (the served
+  // W4A8 contract) and its per-row scale scratch, grown on demand.
+  std::unique_ptr<Kernel> fp8_quant_kernel;
+  std::unique_ptr<Buffer> fp8_scale;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;

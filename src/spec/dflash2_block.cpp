@@ -52,6 +52,7 @@ std::expected<void, StatusCode> DraftBlockDevice(
     const Kernel& head_gemm, const Kernel& conv, const Kernel& rope,
     const Kernel& attention,
     const Kernel& silu, const Kernel& add, const Kernel& concat,
+    const Kernel& quantize,
     const Buffer& mask_embeds, const Buffer& aux, const Buffer& fc_w,
     const std::vector<DraftLayerBuffers>& layers, const Buffer& final_norm,
     const Buffer& output_w, Buffer& logits, std::size_t rows, std::size_t ctx,
@@ -64,12 +65,14 @@ std::expected<void, StatusCode> DraftBlockDevice(
   auto fused = backend.AllocateBuffer(ctx * hidden_dim * 4, MemoryKind::Device);
   auto concat_scratch =
       backend.AllocateBuffer(ctx * n * features * 4, MemoryKind::Device);
+  auto qscale = backend.AllocateBuffer(ctx * 4, MemoryKind::Device);
   auto hidden = backend.AllocateBuffer(rows * hidden_dim * 4, MemoryKind::Device);
-  if (!fused || !concat_scratch || !hidden) {
+  if (!fused || !concat_scratch || !qscale || !hidden) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
-  auto fuse = DraftFuseDevice(backend, gemm, concat, **concat_scratch, aux,
-                              fc_w, **fused, n, ctx, features, hidden_dim);
+  auto fuse = DraftFuseDevice(backend, gemm, concat, quantize, **concat_scratch,
+                              **qscale, aux, fc_w, **fused, n, ctx, features,
+                              hidden_dim);
   if (!fuse) {
     return std::unexpected(fuse.error());
   }

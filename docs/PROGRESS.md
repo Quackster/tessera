@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 229/229 on both builds.
+`ctest` passes 268/268 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -1517,8 +1517,53 @@ through RADV GFX1201, rocm through the system ROCm).
   architecture's `MapWeightName` already renames the `mtp.*` tensors to
   `blk.<trunk>.nextn.*`. New `EngineTest.LoadMxFp4Fp8MtpHeadDequantizes`
   pins the dequant. `HybridDecodeTest.MtpDraftWhenModelProvided` now
-  passes on the MXFP4 target (866 tensors, was 858), so MTP speculation
-  is available there.
+  passes on the MXFP4 target (866 tensors, was 858), and
+  `HybridDecodeTest.SpeculativeMatchesGreedyOnModel` passes there too
+  (the MTP speculative output equals plain greedy), so MTP speculation is
+  both available and output-preserving on the MXFP4 target.
+
+- 2026-10-08: **The served Qwen target is W4A8, not W4A4 (corrects the
+  deferred DFlash2 hypothesis).** The reference launcher
+  (`Quackster/vllm-gfx1201-launchers` @ `4d1ccbf`, `startup-qwen3.8-27b-vllm.sh`
+  and its README) describes the Qwen3.8-27B target as "native MXFP4
+  (W4A8)" and runs `RadianceMxfp4W4A8LinearKernel` / `radiance_mxfp4_fp8.hip`
+  (an "fp8-WMMA W4A8 GEMM", boot log `304/304 on our kernel`). So the
+  served activation quantization is **fp8 E4M3 (8-bit)**, not MXFP4 E2M1
+  (4-bit). The deferred DFlash2 W4A4 experiment in `stash@{0}` quantizes
+  the activation to E2M1 with an E8M0 block scale, which is the wrong
+  activation format; a correct revisit would match the server's W4A8 fp8
+  activation quant applied to the MXFP4 linear inputs, which is also why
+  the stashed ROCm kernel made decode about 34x slower (it quantized in
+  the per-output inner loop). The checkpoint's own
+  `quantization_config.global_quant_config.input_tensors` still says
+  `dtype: fp4` (Quark metadata), but the runtime serves fp8 activations.
+  The MTP head from the same pipeline is confirmed fp8 (`fp8_mtp.py`),
+  consistent with W4A8.
+
+- 2026-10-08: **FP8 activation QDQ, and a negative DFlash2 W4A8 result
+  (268/268 `ctest` on both builds).** New generic `quantize_fp8` built-in
+  on Vulkan (GLSL) and ROCm (HIP): per-token quantize-dequantize to OCP FP8
+  E4M3 with `scale = max(amax/448, 1/(448*512))` and round-to-nearest-even,
+  the `dynamic_per_token_scaled_fp8_quant` contract (confirmed against
+  radiance's `radiance_mxfp4.py`). Host reference `core::QuantizeFp8Ref`,
+  contract and arg check, and `BackendTest.QuantizeFp8*` /
+  `QuantizeMxFp4InputGatedByEnv` tests. The DFlash2 drafter now quantizes
+  the concatenated target hidden to E4M3 per token before `fc`
+  (`dflash2_fuse`), exactly the representation the training capture stores
+  (`radiance_dflash_capture.py`), so the drafter runs on the input it was
+  trained for. `ProjectBatch` moved to `models/qwen3_5/project.cpp` and now
+  unifies the single and batched projections; with `TESSERA_MXFP4_W4A8=1`
+  it also QDQ's each MXFP4 linear activation in place (the served target's
+  W4A8). Measurement on `EngineTest.DFlash2MatchesGreedyOnModel`
+  (5-token prompt, 8 tokens): aux QDQ alone 3 of 35; target W4A8 0 of 49.
+  The fixture is the one PROGRESS already flags as noisy (its range is 0 to
+  3 of 35), so this is not evidence that W4A8 hurts, but it is not a fix
+  either. W4A8 also costs about 2.5x decode (1105 ms/token against 428 with
+  it off), so it is off by default pending a long (128-token) generation
+  measurement; the default MXFP4 output is unchanged and still matches the
+  GGUF. The remaining suspect stays the aux hidden values from a different
+  source (the served target also uses an fp8 KV cache and R4D fp8
+  attention).
 
 ## Next (in order)
 
@@ -1570,10 +1615,12 @@ through RADV GFX1201, rocm through the system ROCm).
 
 0. **DFlash2 (DEFERRED 2026-10-08)**: runs end to end
    (`Engine::GenerateDraft`, CLI `--draft`) and output equals greedy.
-   Deferred: the W4A4 activation-quant candidate is implemented but the
-   ROCm kernel decodes at about 17.7 s/token, so acceptance could not be
-   measured (see the latest Done entry). Resume only after an activation
-   quant that runs at the baseline decode rate, or another root cause.
+   Deferred: the fp8 W4A8 activation quant is implemented (`quantize_fp8`,
+   default off, `TESSERA_MXFP4_W4A8=1`); turning it on did not raise
+   acceptance on the noisy 5-token fixture and costs about 2.5x decode.
+   Next: measure on a 128-token generation, and try the other differences
+   to the served target (fp8 KV cache, R4D fp8 attention) before more
+   quant work.
    Batching and the draft context width are
    done (see the Done entry). Corrected 2026-10-08: the draft block is
    NOT NaN and NOT unstable. The forward is faithful to radiance's

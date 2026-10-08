@@ -73,6 +73,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"concat_features", reinterpret_cast<void*>(&ConcatFeaturesKernel)},
     {"cast_f32_f16", reinterpret_cast<void*>(&CastF32F16Kernel)},
     {"quantize_q8", reinterpret_cast<void*>(&QuantizeQ8Kernel)},
+    {"quantize_fp8", reinterpret_cast<void*>(&QuantizeFp8Kernel)},
     {"attention_q8", reinterpret_cast<void*>(&AttentionQ8Kernel)},
     {"quantize_q4", reinterpret_cast<void*>(&QuantizeQ4Kernel)},
     {"attention_q4", reinterpret_cast<void*>(&AttentionQ4Kernel)},

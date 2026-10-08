@@ -258,6 +258,11 @@ class Kernel {
 // 4-bit output (rows x cols/2 bytes, eight per uint), buffer 2 one fp32
 // scale per row; scalars rows and cols (cols a multiple of 8). One thread
 // per row.
+// "quantize_fp8": buffer 0 is the fp32 rows x cols data quantized and
+// dequantized in place to OCP FP8 E4M3, buffer 1 one fp32 scale per row;
+// scalars rows and cols. The per-row scale is max(amax/448, 1/(448*512))
+// with round-to-nearest-even, the W4A8 activation the served MXFP4 target
+// feeds its linear layers. One thread per row.
 // "attention_q4": like attention_q8 but keys/values are symmetric 4-bit.
 // "cast_f32_f16": buffer 0 is In (fp32, n elements), buffer 1 the
 // output (fp16, n elements, two per uint); scalar n (must be even). The
@@ -581,6 +586,14 @@ class Kernel {
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
         launch.scalars[1] % 8 != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "quantize_fp8") {
+    if (launch.buffers.size() != 2 || launch.scalars.size() != 2) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

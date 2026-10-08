@@ -185,6 +185,77 @@ __host__ __device__ float Fp8E4M3ToFloatDev(std::uint8_t bits) {
   return sign != 0 ? -value : value;
 }
 
+// fp32 -> OCP FP8 E4M3 byte, round to nearest even (device port of the
+// core Fp32ToFp8E4M3Bits). NaN and values above 448 saturate to the
+// all-ones byte.
+__device__ std::uint8_t Fp8E4M3FromFloatDev(float value) {
+  unsigned int bits;
+  memcpy(&bits, &value, sizeof(bits));
+  const unsigned int sign = bits >> 31;
+  if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
+    return static_cast<std::uint8_t>((sign << 7) | 0x7Fu);
+  }
+  const float a = value < 0.0f ? -value : value;
+  if (a == 0.0f) {
+    return static_cast<std::uint8_t>(sign << 7);
+  }
+  if (a > 448.0f) {
+    return static_cast<std::uint8_t>((sign << 7) | 0x7Fu);
+  }
+  int e = 0;
+  const float frac = frexpf(a, &e);
+  int field = e + 6;
+  long long mant;
+  if (field < 1) {
+    mant = llrintf(a * 512.0f);
+    if (mant > 7) {
+      mant = 7;
+    }
+    return static_cast<std::uint8_t>((sign << 7) | static_cast<unsigned int>(mant));
+  }
+  mant = llrintf((frac * 2.0f - 1.0f) * 8.0f);
+  if (mant == 8) {
+    mant = 0;
+    ++field;
+  }
+  if (field > 15) {
+    field = 15;
+  }
+  if (field == 15 && mant > 6) {
+    mant = 6;
+  }
+  return static_cast<std::uint8_t>(
+      (sign << 7) | (static_cast<unsigned int>(field) << 3) |
+      static_cast<unsigned int>(mant));
+}
+
+// Built-in "quantize_fp8": one thread per row; quantize-dequantize the
+// row in place to OCP FP8 E4M3 with the dynamic per-token W4A8 scale.
+__global__ void QuantizeFp8Kernel(float* data, float* scale,
+                                  unsigned long long rows,
+                                  unsigned long long cols) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  const unsigned long long base = r * cols;
+  float amax = 0.0f;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    amax = fmaxf(amax, fabsf(data[base + c]));
+  }
+  float s = amax / 448.0f;
+  const float min_s = 1.0f / (448.0f * 512.0f);
+  if (s < min_s) {
+    s = min_s;
+  }
+  scale[r] = s;
+  for (unsigned long long c = 0; c < cols; ++c) {
+    const std::uint8_t bits = Fp8E4M3FromFloatDev(data[base + c] / s);
+    data[base + c] = Fp8E4M3ToFloatDev(bits) * s;
+  }
+}
+
 // E8M0ToFloatDev and kE2M1Dev (the MXFP4 codec) now live in
 // rocm_kernels.hpp so the batched MXFP4 kernel in this translation unit
 // and any other share one definition.

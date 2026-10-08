@@ -33,13 +33,14 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in one batched forward. A zero `max_tokens` fills the remaining context. Generation stops at the model's declared stop tokens (GGUF `tokenizer.ggml.eos_token_id`, HuggingFace `eos_token_id`) and does not emit them; callers add stops through `GenerateOptions::stop_tokens`. Runtime options: `--context`, `--tokens`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`) or 4-bit (`--kv-q4`) KV cache. |
 | Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Host reference check. Per backend tolerance. |
+| Activation quant | Done | Per-token FP8 E4M3 quantize-dequantize (`quantize_fp8`) on Vulkan and ROCm, the W4A8 activation contract. The DFlash2 drafter input uses it. The served target's W4A8 linear activation is opt-in (`TESSERA_MXFP4_W4A8=1`). |
 | Attention and RoPE | Done | GQA path driven by model data; tiled O(n*d) attention (one workgroup per query/head, online softmax). RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. The 27B hybrid path generates coherent text. |
 | Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. The causal conv1d, SiLU and q/k/v split run on the device (`conv1d_state`). |
 | Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculation run end to end; output equals greedy. Multi-token drafts are scored in one batched target forward. |
 | MXFP4 path | Partial | Tensor map parsing. FP8 and MXFP4 kernels. HuggingFace config, weight name map, value-head reorder and tokenizer; the Qwen 3.8 27B MXFP4 target loads, tokenizes and decodes end to end. |
-| DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). Output equals greedy. |
+| DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). The concatenated target hidden is quantized per token to FP8 E4M3 before `fc`, matching the drafter training data. Output equals greedy. Acceptance is still low. |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
 | MoE, MLP, norms | Partial | RMSNorm, sigmoid-gate, add, silu_mul and the f32/bf16/Q4_K embedding gather kernels are done. The gated MLP runs as gemm plus silu_mul plus gemm on the device. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
 

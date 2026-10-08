@@ -99,27 +99,6 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
   return {};
 }
 
-std::expected<void, StatusCode> ProjectBatch(
-    Backend& backend, Qwen35State& h, DType dtype, const Buffer& a,
-    const Buffer& w, Buffer& out, std::size_t m, std::size_t n,
-    std::size_t k) {
-  if (m > 1 && !detail::GemmTiledKernelName(dtype).empty()) {
-    auto tiled = detail::GemmTiledFor(backend, h.gemm_tiled, dtype);
-    if (tiled) {
-      return detail::ProjectTiledDevice(backend, **tiled, a, w, out, m, n, k);
-    }
-    if (tiled.error() != StatusCode::UnsupportedFeature) {
-      return std::unexpected(tiled.error());
-    }
-    // The backend has no tiled kernel for this dtype; use the GEMV one.
-  }
-  auto gemm = detail::GemmFor(backend, h.gemms, dtype);
-  if (!gemm) {
-    return std::unexpected(gemm.error());
-  }
-  return detail::ProjectDevice(backend, **gemm, a, w, out, m, n, k);
-}
-
 // Batched gated MLP over `rows` rows of h.batch->x in place.
 std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
                                             const Model& model,

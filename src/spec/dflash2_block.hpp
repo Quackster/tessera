@@ -34,13 +34,16 @@ namespace tessera::spec {
     std::uint64_t pos_base, double theta, float eps, bool causal = true);
 
 // Device version. All kernels are built-ins: gemm (gemm_f32), conv
-// (dflash_conv), rmsnorm, rope, attention, silu (silu_mul), add and
-// concat (concat_features). Scratch is allocated internally.
+// (dflash_conv), rmsnorm, rope, attention, silu (silu_mul), add,
+// concat (concat_features) and quantize (quantize_fp8, the per-token
+// activation QDQ the drafter was trained on). Scratch is allocated
+// internally.
 [[nodiscard]] std::expected<void, StatusCode> DraftBlockDevice(
     Backend& backend, const Kernel& rmsnorm, const Kernel& gemm,
     const Kernel& head_gemm, const Kernel& conv, const Kernel& rope,
     const Kernel& attention,
     const Kernel& silu, const Kernel& add, const Kernel& concat,
+    const Kernel& quantize,
     const Buffer& mask_embeds, const Buffer& aux, const Buffer& fc_w,
     const std::vector<DraftLayerBuffers>& layers, const Buffer& final_norm,
     const Buffer& output_w, Buffer& logits, std::size_t rows,

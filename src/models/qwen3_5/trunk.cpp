@@ -29,12 +29,10 @@ using detail::DeltaStepHeadsDevice;
 using detail::DownloadF32;
 using detail::DownloadF32Cached;
 using detail::GatherEmbedding;
-using detail::GemmFor;
 using detail::L2NormDevice;
 using detail::MropeDevice;
 using detail::NeedWeight;
 using detail::NeedWeightAny;
-using detail::ProjectDevice;
 using detail::QGateSplitDevice;
 using detail::RepeatHeadsDevice;
 using detail::RmsNormDevice;
@@ -131,22 +129,16 @@ std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
   if (!mlp_norm || !fg || !fu || !fd) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto gemm_fgate = GemmFor(backend, h.gemms, (*fg)->manifest.dtype);
-  auto gemm_fup = GemmFor(backend, h.gemms, (*fu)->manifest.dtype);
-  auto gemm_fdown = GemmFor(backend, h.gemms, (*fd)->manifest.dtype);
-  if (!gemm_fgate || !gemm_fup || !gemm_fdown) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*mlp_norm)->device,
                      *h.xn, 1, cfg.hidden_dim, cfg.norm_eps) ||
-      !ProjectDevice(backend, *(*gemm_fgate), *h.xn, *(*fg)->device, *h.fgate,
-                     1, cfg.ffn_dim, cfg.hidden_dim) ||
-      !ProjectDevice(backend, *(*gemm_fup), *h.xn, *(*fu)->device, *h.fup, 1,
-                     cfg.ffn_dim, cfg.hidden_dim) ||
+      !ProjectBatch(backend, h, (*fg)->manifest.dtype, *h.xn, *(*fg)->device,
+                    *h.fgate, 1, cfg.ffn_dim, cfg.hidden_dim) ||
+      !ProjectBatch(backend, h, (*fu)->manifest.dtype, *h.xn, *(*fu)->device,
+                    *h.fup, 1, cfg.ffn_dim, cfg.hidden_dim) ||
       !SiluMulDevice(backend, *h.silu_mul_kernel, *h.fgate, *h.fup, *h.fmlp,
                      cfg.ffn_dim) ||
-      !ProjectDevice(backend, *(*gemm_fdown), *h.fmlp, *(*fd)->device, *h.proj,
-                     1, cfg.hidden_dim, cfg.ffn_dim) ||
+      !ProjectBatch(backend, h, (*fd)->manifest.dtype, *h.fmlp, *(*fd)->device,
+                    *h.proj, 1, cfg.hidden_dim, cfg.ffn_dim) ||
       !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, cfg.hidden_dim)) {
     return std::unexpected(StatusCode::DeviceError);
   }
@@ -177,23 +169,16 @@ std::expected<void, StatusCode> RunFullBlock(
   if (!norm || !wq || !wk || !wv || !wo || !q_norm || !k_norm) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto gemm_q = GemmFor(backend, h.gemms, (*wq)->manifest.dtype);
-  auto gemm_k = GemmFor(backend, h.gemms, (*wk)->manifest.dtype);
-  auto gemm_v = GemmFor(backend, h.gemms, (*wv)->manifest.dtype);
-  auto gemm_o = GemmFor(backend, h.gemms, (*wo)->manifest.dtype);
-  if (!gemm_q || !gemm_k || !gemm_v || !gemm_o) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*norm)->device, *h.xn,
                      1, hidden, cfg.norm_eps) ||
-      !ProjectDevice(backend, *(*gemm_q), *h.xn, *(*wq)->device, *h.fused, 1,
-                     heads * head_dim * 2, hidden) ||
+      !ProjectBatch(backend, h, (*wq)->manifest.dtype, *h.xn, *(*wq)->device,
+                    *h.fused, 1, heads * head_dim * 2, hidden) ||
       !QGateSplitDevice(backend, *h.qgate_split_kernel, *h.fused, *h.q, *h.gate,
                         heads, head_dim) ||
-      !ProjectDevice(backend, *(*gemm_k), *h.xn, *(*wk)->device, *h.kf, 1,
-                     kv_dim, hidden) ||
-      !ProjectDevice(backend, *(*gemm_v), *h.xn, *(*wv)->device, *h.vf, 1,
-                     kv_dim, hidden) ||
+      !ProjectBatch(backend, h, (*wk)->manifest.dtype, *h.xn, *(*wk)->device,
+                    *h.kf, 1, kv_dim, hidden) ||
+      !ProjectBatch(backend, h, (*wv)->manifest.dtype, *h.xn, *(*wv)->device,
+                    *h.vf, 1, kv_dim, hidden) ||
       !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.q, *(*q_norm)->device, *h.q,
                      heads, head_dim, cfg.norm_eps) ||
       !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.kf, *(*k_norm)->device,
@@ -228,8 +213,8 @@ std::expected<void, StatusCode> RunFullBlock(
   if (!attention_ok ||
       !SigmoidGateDevice(backend, *h.sigmoid_gate_kernel, *h.attn, *h.gate,
                          *h.attn, heads * head_dim) ||
-      !ProjectDevice(backend, *(*gemm_o), *h.attn, *(*wo)->device, *h.proj, 1,
-                     hidden, heads * head_dim) ||
+      !ProjectBatch(backend, h, (*wo)->manifest.dtype, *h.attn, *(*wo)->device,
+                    *h.proj, 1, hidden, heads * head_dim) ||
       !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, hidden)) {
     return std::unexpected(StatusCode::DeviceError);
   }
@@ -465,22 +450,16 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
         !w_norm || !w_out) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    auto gemm_qkv = GemmFor(backend, h.gemms, (*w_qkv)->manifest.dtype);
-    auto gemm_gate = GemmFor(backend, h.gemms, (*w_gate)->manifest.dtype);
-    auto gemm_alpha = GemmFor(backend, h.gemms, (*w_alpha)->manifest.dtype);
-    auto gemm_beta = GemmFor(backend, h.gemms, (*w_beta)->manifest.dtype);
-    auto gemm_out = GemmFor(backend, h.gemms, (*w_out)->manifest.dtype);
-    if (!gemm_qkv || !gemm_gate || !gemm_alpha || !gemm_beta || !gemm_out) {
-      return std::unexpected(StatusCode::UnsupportedFeature);
-    }
-    if (!ProjectDevice(backend, *(*gemm_qkv), *h.xn, *(*w_qkv)->device, *h.qkv,
-                       1, g.conv_dim, hidden) ||
-        !ProjectDevice(backend, *(*gemm_gate), *h.xn, *(*w_gate)->device, *h.z,
-                       1, g.value_dim, hidden) ||
-        !ProjectDevice(backend, *(*gemm_beta), *h.xn, *(*w_beta)->device,
-                       *h.beta_raw, 1, g.num_v_heads, hidden) ||
-        !ProjectDevice(backend, *(*gemm_alpha), *h.xn, *(*w_alpha)->device,
-                       *h.alpha_raw, 1, g.num_v_heads, hidden) ||
+    if (!ProjectBatch(backend, h, (*w_qkv)->manifest.dtype, *h.xn,
+                      *(*w_qkv)->device, *h.qkv, 1, g.conv_dim, hidden) ||
+        !ProjectBatch(backend, h, (*w_gate)->manifest.dtype, *h.xn,
+                      *(*w_gate)->device, *h.z, 1, g.value_dim, hidden) ||
+        !ProjectBatch(backend, h, (*w_beta)->manifest.dtype, *h.xn,
+                      *(*w_beta)->device, *h.beta_raw, 1, g.num_v_heads,
+                      hidden) ||
+        !ProjectBatch(backend, h, (*w_alpha)->manifest.dtype, *h.xn,
+                      *(*w_alpha)->device, *h.alpha_raw, 1, g.num_v_heads,
+                      hidden) ||
         !SsmGateDevice(backend, *h.ssm_gate_kernel, *(*w_a)->device,
                        *(*w_dt)->device, *h.alpha_raw, *h.beta_raw, *h.alpha,
                        *h.beta, g.num_v_heads)) {
@@ -507,8 +486,8 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
         !RmsNormGatedDevice(backend, *h.rmsnorm_gated_kernel, *h.core,
                             *(*w_norm)->device, *h.z, *h.out, g.num_v_heads,
                             g.head_v_dim, cfg.norm_eps) ||
-        !ProjectDevice(backend, *(*gemm_out), *h.out, *(*w_out)->device,
-                       *h.proj, 1, hidden, g.value_dim) ||
+        !ProjectBatch(backend, h, (*w_out)->manifest.dtype, *h.out,
+                      *(*w_out)->device, *h.proj, 1, hidden, g.value_dim) ||
         !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, hidden)) {
       return std::unexpected(StatusCode::DeviceError);
     }
@@ -554,14 +533,10 @@ std::expected<std::vector<float>, StatusCode> Qwen35Architecture::Logits(
   if (!out_norm || !output) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto gemm_out = GemmFor(backend, h.gemms, (*output)->manifest.dtype);
-  if (!gemm_out) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
                      *h.xn, 1, hidden, cfg.norm_eps) ||
-      !ProjectDevice(backend, *(*gemm_out), *h.xn, *(*output)->device,
-                     *h.logits, 1, cfg.vocab_size, hidden)) {
+      !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
+                    *(*output)->device, *h.logits, 1, cfg.vocab_size, hidden)) {
     return std::unexpected(StatusCode::DeviceError);
   }
   backend.Synchronize();

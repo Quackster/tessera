@@ -49,6 +49,24 @@ constexpr std::size_t kQ4KScaleBytes = 12;
 [[nodiscard]] std::expected<void, StatusCode> CastF32F16Ref(
     std::span<const float> in, std::span<std::byte> out);
 
+// The OCP FP8 E4M3 maximum magnitude, the scale target vLLM's dynamic
+// per-token fp8 quantization divides the row absmax by.
+inline constexpr float kFp8E4M3Max = 448.0f;
+
+// The smallest dynamic per-token fp8 scale (1 / (448 * 512)); a row whose
+// absmax is below this still uses it, matching vLLM scaled_fp8_quant.
+inline constexpr float kFp8E4M3MinScale = 1.0f / (kFp8E4M3Max * 512.0f);
+
+// Host reference for the "quantize_fp8" built-in: quantize-dequantize
+// each row of `data` in place to OCP FP8 E4M3 with a dynamic per-token
+// scale max(amax/448, 1/(448*512)) and round-to-nearest-even, so the
+// result reproduces the W4A8 activation the served MXFP4 target feeds its
+// linear layers. `scale` receives one fp32 per row. rows and cols must be
+// non-zero and `data`/`scale` sized rows*cols / rows.
+[[nodiscard]] std::expected<void, StatusCode> QuantizeFp8Ref(
+    std::span<float> data, std::span<float> scale, std::size_t rows,
+    std::size_t cols);
+
 // Decode a bfloat16 (little-endian) to fp32. bf16 shares the fp32
 // exponent field, so the conversion is exact.
 [[nodiscard]] float Bf16ToFloat(std::uint16_t bits);

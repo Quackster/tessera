@@ -177,6 +177,29 @@ std::expected<void, StatusCode> QuantizeQ4Ref(std::span<const float> in,
   return {};
 }
 
+std::expected<void, StatusCode> QuantizeFp8Ref(std::span<float> data,
+                                              std::span<float> scale,
+                                              std::size_t rows,
+                                              std::size_t cols) {
+  if (rows == 0 || cols == 0 || data.size() != rows * cols ||
+      scale.size() != rows) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    float amax = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      amax = std::max(amax, std::abs(data[r * cols + c]));
+    }
+    const float s = std::max(amax / kFp8E4M3Max, kFp8E4M3MinScale);
+    scale[r] = s;
+    for (std::size_t c = 0; c < cols; ++c) {
+      const std::uint8_t bits = Fp32ToFp8E4M3Bits(data[r * cols + c] / s);
+      data[r * cols + c] = Fp8E4M3ToFloat(bits) * s;
+    }
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> CastF32F16Ref(std::span<const float> in,
                                               std::span<std::byte> out) {
   if (in.size() % 2 != 0 || out.size() != in.size() * 2) {

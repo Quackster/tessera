@@ -52,6 +52,7 @@ class DFlash2Drafter {
   std::unique_ptr<Kernel> silu_;
   std::unique_ptr<Kernel> add_;
   std::unique_ptr<Kernel> concat_;
+  std::unique_ptr<Kernel> quantize_;
 };
 
 }  // namespace tessera::spec

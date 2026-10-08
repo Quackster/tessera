@@ -29,6 +29,7 @@ std::expected<DFlash2Drafter, StatusCode> DFlash2Drafter::Create(
       {&drafter.conv_, "dflash_conv"}, {&drafter.rope_, "rope"},
       {&drafter.attention_, "attention"}, {&drafter.silu_, "silu_mul"},
       {&drafter.add_, "add"},          {&drafter.concat_, "concat_features"},
+      {&drafter.quantize_, "quantize_fp8"},
   };
   for (const auto& [slot, name] : kernels) {
     const StatusCode status = load(*slot, name);
@@ -50,7 +51,7 @@ std::expected<void, StatusCode> DFlash2Drafter::Run(
   // them; the head uses `head_gemm` for the target's quantized shared head.
   return DraftBlockDevice(
       backend, *rmsnorm_, *gemm_, head_gemm, *conv_, *rope_, *attention_,
-      *silu_, *add_, *concat_, mask_embeds, aux, *store_.Weights().fc,
+      *silu_, *add_, *concat_, *quantize_, mask_embeds, aux, *store_.Weights().fc,
       store_.Weights().layers, *store_.Weights().final_norm, output_w, logits,
       rows, ctx, config_.hidden_size, n, config_.hidden_size, vocab,
       config_.num_heads, config_.num_kv_heads, config_.head_dim,
