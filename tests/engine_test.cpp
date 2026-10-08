@@ -1164,8 +1164,8 @@ TEST(EngineTest, DFlash2MatchesGreedyOnModel) {
   auto model = engine->LoadModel(ModelOptions{target, 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
-  options.max_tokens = 4;
-  options.first_token = 0;
+  options.max_tokens = 8;
+  options.prompt_tokens = {760, 6511, 314, 9338, 369};
   auto greedy = engine->Generate(**model, options);
   ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());
   auto spec = engine->GenerateDraft(**model, options, draft);

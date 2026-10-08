@@ -979,6 +979,18 @@ through RADV GFX1201, rocm through the system ROCm).
   path is output preserving: `EngineTest.DFlash2MatchesGreedyOnModel`
   still passes.
 
+- 2026-10-08: DFlash2 acceptance investigation. `EngineTest.DFlash2MatchesGreedyOnModel`
+  now runs a realistic 5-token prompt for 8 tokens (it used a single-token
+  prompt, which gave the misleading 0 of 24). Acceptance is still only 2 to
+  3 of 40 draft tokens (about 6 percent). Two suspects are ruled out: the
+  candidate selector (bypassing it and taking the unary top-1 gives the
+  same rate) and the draft context window (`TESSERA_DFLASH2_CTX` of 1, 8
+  and 32 all agree). So the raw draft mask-row logits are wrong, and the
+  fault is in the draft forward or the aux hidden capture. Next: compare
+  the draft's first-mask logits against the target's at the same position,
+  and check the aux capture point (layer output vs input) and the fuse/fc
+  and grouped-conv order against vLLM.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
