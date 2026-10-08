@@ -166,11 +166,37 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
     DestroyResources();
     return std::unexpected(FromVkResult(result));
   }
+  VkCommandBufferAllocateInfo command_info{};
+  command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  command_info.commandPool = pool_;
+  command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  command_info.commandBufferCount = 1;
+  result = vkAllocateCommandBuffers(device, &command_info, &command_);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkAllocateCommandBuffers failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    DestroyResources();
+    return std::unexpected(FromVkResult(result));
+  }
+  VkFenceCreateInfo fence_info{};
+  fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+  result = vkCreateFence(device, &fence_info, nullptr, &fence_);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkCreateFence failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    DestroyResources();
+    return std::unexpected(FromVkResult(result));
+  }
   ready_ = true;
   return {};
 }
 
 void VulkanCompute::DestroyResources() {
+  if (fence_ != VK_NULL_HANDLE) {
+    vkDestroyFence(device_, fence_, nullptr);
+    fence_ = VK_NULL_HANDLE;
+  }
+  command_ = VK_NULL_HANDLE;  // freed with the command pool
   if (descriptor_pool_ != VK_NULL_HANDLE) {
     vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
     descriptor_pool_ = VK_NULL_HANDLE;
@@ -276,30 +302,23 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   if (!ready_) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  VkCommandBufferAllocateInfo alloc_info{};
-  alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-  alloc_info.commandPool = pool_;
-  alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  alloc_info.commandBufferCount = 1;
-  VkCommandBuffer command = VK_NULL_HANDLE;
-  auto result = vkAllocateCommandBuffers(device_, &alloc_info, &command);
+  auto result = vkResetCommandBuffer(command_, 0);
   if (result != VK_SUCCESS) {
     LogError(std::string("kernel ") + kernel.name +
-             ": vkAllocateCommandBuffers failed (" +
+             ": vkResetCommandBuffer failed (" +
              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
   VkCommandBufferBeginInfo begin_info{};
   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  result = vkBeginCommandBuffer(command, &begin_info);
+  result = vkBeginCommandBuffer(command_, &begin_info);
   if (result != VK_SUCCESS) {
-    vkFreeCommandBuffers(device_, pool_, 1, &command);
     LogError(std::string("kernel ") + kernel.name +
              ": vkBeginCommandBuffer failed (" +
              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
-  vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+  vkCmdBindPipeline(command_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
   VkDescriptorSetAllocateInfo set_alloc{};
   set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   set_alloc.descriptorPool = descriptor_pool_;
@@ -308,7 +327,6 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   VkDescriptorSet set = VK_NULL_HANDLE;
   result = vkAllocateDescriptorSets(device_, &set_alloc, &set);
   if (result != VK_SUCCESS) {
-    vkFreeCommandBuffers(device_, pool_, 1, &command);
     LogError(std::string("kernel ") + kernel.name +
              ": vkAllocateDescriptorSets failed (" +
              std::to_string(static_cast<int>(result)) +
@@ -347,43 +365,36 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   std::memset(push_constants, 0, kPushConstantBytes);
   std::memcpy(push_constants, launch.scalars.data(),
               launch.scalars.size() * sizeof(std::uint64_t));
-  vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                    kPushConstantBytes, push_constants);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout_,
-                         0, 1, &set, 0, nullptr);
-  vkCmdDispatch(command, launch.grid_x, launch.grid_y, launch.grid_z);
-  result = vkEndCommandBuffer(command);
+  vkCmdPushConstants(command_, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                     kPushConstantBytes, push_constants);
+  vkCmdBindDescriptorSets(command_, VK_PIPELINE_BIND_POINT_COMPUTE, layout_,
+                          0, 1, &set, 0, nullptr);
+  vkCmdDispatch(command_, launch.grid_x, launch.grid_y, launch.grid_z);
+  result = vkEndCommandBuffer(command_);
   if (result != VK_SUCCESS) {
     vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
-    vkFreeCommandBuffers(device_, pool_, 1, &command);
     LogError(std::string("kernel ") + kernel.name +
              ": vkEndCommandBuffer failed (" +
              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
-  VkFence fence = VK_NULL_HANDLE;
-  VkFenceCreateInfo fence_info{};
-  fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-  result = vkCreateFence(device_, &fence_info, nullptr, &fence);
+  result = vkResetFences(device_, 1, &fence_);
   if (result != VK_SUCCESS) {
     vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
-    vkFreeCommandBuffers(device_, pool_, 1, &command);
     LogError(std::string("kernel ") + kernel.name +
-             ": vkCreateFence failed (" +
+             ": vkResetFences failed (" +
              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
   VkSubmitInfo submit_info{};
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.commandBufferCount = 1;
-  submit_info.pCommandBuffers = &command;
-  result = vkQueueSubmit(queue_, 1, &submit_info, fence);
+  submit_info.pCommandBuffers = &command_;
+  result = vkQueueSubmit(queue_, 1, &submit_info, fence_);
   if (result == VK_SUCCESS) {
-    result = vkWaitForFences(device_, 1, &fence, VK_TRUE, kFenceTimeoutNs);
+    result = vkWaitForFences(device_, 1, &fence_, VK_TRUE, kFenceTimeoutNs);
   }
-  vkDestroyFence(device_, fence, nullptr);
   vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
-  vkFreeCommandBuffers(device_, pool_, 1, &command);
   if (result == VK_TIMEOUT) {
     LogError(std::string("kernel ") + kernel.name +
              " fence wait timed out after 30 s; the device is hung or the "

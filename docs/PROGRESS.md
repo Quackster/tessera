@@ -966,19 +966,23 @@ through RADV GFX1201, rocm through the system ROCm).
 
 ## Next (in order)
 
-- **PERF (urgent, do first)**: make MXFP4 inference fast. Targets: the
-  whole load under 60 s (not counting prefill or decode), and 35 to 40
-  tokens/s decode without MTP. Count the decode rate on generation only:
-  the model load is a one-time cost and is not part of tokens/s. The load
-  reads the
+- **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
+  under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.
+  Count the decode rate on generation only: the model load is a one-time
+  cost and is not part of tokens/s.
+  Deferred for now, because the speed is gated by the outstanding to-do
+  items, not by one knob. The causal conv still runs on the host and costs
+  about five transfers per linear layer (item 1), the norms and SiLU still
+  run on the host (item 2), and the GEMM throughput is item 3. Each of
+  those adds synchronous submit-and-fence round-trips or host work. Land
+  them first, then re-measure and do the remaining PERF work.
+  Context: the load reads the
   19 GB safetensors, dequantizes and packs every fp4 blob, and converts
   large BF16 tensors to F32 (the `lm_head` alone becomes a 5 GB F32
   matrix). The reference runtime loads the same file in 8 s because it
   keeps fp4 and dequantizes in the kernel. Measure on
-  `EngineTest.MxFp4GeneratesWhenProvided` (128 s total today) and
-  `EngineTest.DFlash2MatchesGreedyOnModel` (370 s before the load fix).
-  Then keep reducing the load. Improve the MXFP4 GEMM throughput (item 3)
-  for decode separately.
+  `EngineTest.MxFp4GeneratesWhenProvided` and
+  `EngineTest.DFlash2MatchesGreedyOnModel`.
   Progress: the load is about 54 s now, under the 60 s target, and
   `EngineTest.MxFp4GeneratesWhenProvided` fell from 287 s to 68 s. The
   changes: pack blob||scales in one allocation (appending reallocated the
@@ -996,9 +1000,16 @@ through RADV GFX1201, rocm through the system ROCm).
   so it read the wrong word offset. `rmsnorm` now uses one workgroup per
   row with a shared-memory reduction instead of one thread per row (the
   old form serialized a 5120-element row on a single thread). The
-  remaining cost is still the scalar GEMV (one thread per output, long
-  serial k loop, low occupancy); the fix is a tiled or split-K GEMV with a
-  deterministic reduction (item 3).
+  remaining cost is no longer the GEMV arithmetic. A per-kernel pass put
+  the total fence wait at about 1.4 s over the run (gemm_mxfp4 870 ms) while
+  decode alone is about 3.2 s, so most of a token is the per-op submit and
+  fence round-trip: on the order of 700 copies and 500 kernel launches per
+  forward, each blocking on its own fence. Reusing the command buffer and
+  fence in `LaunchKernel` did not change the time, so it is the latency of
+  the synchronous submit, not the allocation. The fixes are to batch a
+  step's ops into one command buffer and wait once, and to remove ops (the
+  host conv still costs about five transfers per linear layer, item 1). A
+  tiled or split-K GEMV would then help the remaining kernel time.
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are

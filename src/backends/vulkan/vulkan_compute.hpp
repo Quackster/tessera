@@ -73,6 +73,10 @@ class VulkanCompute {
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
   VkCommandPool pool_ = VK_NULL_HANDLE;
+  // Reused across launches: the API is synchronous, so at most one launch
+  // is in flight and the command buffer and fence can be reset.
+  VkCommandBuffer command_ = VK_NULL_HANDLE;
+  VkFence fence_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
