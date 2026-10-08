@@ -711,6 +711,7 @@ constexpr std::size_t kGemmTileRows = 8;
 inline std::string_view GemmTiledKernelName(DType dtype) {
   switch (dtype) {
     case DType::Q4K: return "gemm_q4k_batched";
+    case DType::F4E2M1: return "gemm_mxfp4_batched";
     default: return {};
   }
 }

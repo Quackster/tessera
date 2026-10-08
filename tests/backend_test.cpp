@@ -1463,6 +1463,91 @@ TEST(BackendTest, GemmQ4KBatchedMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
+// Device: the tiled batched MXFP4 GEMM (weight blocks dequantized once per
+// 8-row tile) matches the reference, including a row count that is not a
+// multiple of the tile.
+TEST(BackendTest, GemmMxFp4BatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_mxfp4_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled MXFP4 kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(2026);
+  constexpr std::size_t kM = 10;
+  constexpr std::size_t kN = 32;
+  constexpr std::size_t kK = 64;
+  constexpr float kGrid[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                              2.0f, 3.0f, 4.0f, 6.0f};
+  std::vector<float> a(kM * kK);
+  std::vector<std::byte> w(kN * kK / 2, std::byte{0});
+  std::vector<std::byte> s(kN * kK / 32);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  for (std::size_t j = 0; j < kN; ++j) {
+    for (std::size_t b = 0; b < kK / 32; ++b) {
+      s[j * (kK / 32) + b] = static_cast<std::byte>(125 + (j + b) % 5);
+      for (std::size_t l = 0; l < 32; ++l) {
+        const std::size_t t = b * 32 + l;
+        const std::uint8_t nib = core::Fp32ToF4E2M1Nibble(
+            kGrid[(j + t) % 8] * (t % 3 == 0 ? -1.0f : 1.0f));
+        const std::size_t at = (j * kK + t) / 2;
+        std::uint8_t packed = static_cast<std::uint8_t>(w[at]);
+        if (t % 2 == 0) {
+          packed = static_cast<std::uint8_t>((packed & 0xF0) | nib);
+        } else {
+          packed = static_cast<std::uint8_t>((packed & 0x0F) | (nib << 4));
+        }
+        w[at] = static_cast<std::byte>(packed);
+      }
+    }
+  }
+  std::vector<std::byte> packed = w;
+  packed.insert(packed.end(), s.begin(), s.end());
+
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value());
+  auto w_buf = backend->AllocateBuffer(packed.size(), MemoryKind::Device);
+  ASSERT_TRUE(w_buf.has_value());
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(a.data()),
+                                           a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(packed)).has_value());
+
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmMxFp4Ref(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<const std::byte>(s), std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+    max_rel = std::max(max_rel,
+                       std::abs(got[i] - ref[i]) / std::max(1.0f, std::abs(ref[i])));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
 // Per backend attention tolerance (same shape as the GEMM table).
 struct AttentionTolerance {
   float abs = 0.0f;

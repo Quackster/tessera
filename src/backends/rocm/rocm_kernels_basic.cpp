@@ -297,18 +297,72 @@ __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
   const unsigned long long blocks = k / 32;
   const float* a_row = a + row_a * k;
   float acc = 0.0f;
+  // A 32-bit word holds eight nibbles. Row starts (row_w * k) and block
+  // starts (b * 32) are multiples of 32 elements, so the byte offset is a
+  // multiple of 16 and every word load is aligned.
+  const unsigned int* words = reinterpret_cast<const unsigned int*>(w);
   for (unsigned long long b = 0; b < blocks; ++b) {
     const float scale = E8M0ToFloatDev(s[row_w * blocks + b]);
     const unsigned long long base = b * 32;
-    const unsigned long long w_base = row_w * k + base;
-    // Two nibbles share one byte, so step by two.
-    for (unsigned long long l = 0; l < 32; l += 2) {
-      const std::uint8_t packed = w[(w_base + l) / 2];
-      acc = fmaf(a_row[base + l], scale * kE2M1Dev[packed & 0xF], acc);
-      acc = fmaf(a_row[base + l + 1], scale * kE2M1Dev[packed >> 4], acc);
+    // Element index / 8 gives the word index.
+    const unsigned long long word_base = (row_w * k + base) / 8;
+    for (unsigned long long q = 0; q < 4; ++q) {
+      unsigned int bits = words[word_base + q];
+      for (unsigned long long j = 0; j < 8; ++j) {
+        acc = fmaf(a_row[base + q * 8 + j], scale * kE2M1Dev[bits & 15u], acc);
+        bits >>= 4;
+      }
     }
   }
   c[idx] = acc;
+}
+
+// Built-in "gemm_mxfp4_batched": tiled C = A x dequant(W)^T for a batch.
+// One workgroup handles 8 activation rows x one weight column; the 32
+// MXFP4 elements of a block (and its E8M0 scale) are dequantized once
+// into shared memory and reused across the 8 rows. Buffers and scalars
+// match gemm_mxfp4 (m, n, k, k a multiple of 32); grid_x is
+// ceil(m / 8) * n, block_x is 256. The dot runs elements 0..31 in
+// order, the gemm_mxfp4 accumulation order. Threads 8..255 still help
+// dequantize but write no output.
+__global__ void GemmMxFp4BatchedKernel(const float* a, const unsigned char* w,
+                                       float* c, unsigned long long m,
+                                       unsigned long long n,
+                                       unsigned long long k) {
+  const unsigned long long wg =
+      static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long tid =
+      static_cast<unsigned long long>(threadIdx.x);
+  const unsigned long long tm = wg / n;
+  const unsigned long long row_w = wg % n;
+  const unsigned long long base_row = tm * 8;
+  const bool dot_valid = tid < 8 && base_row + tid < m;
+  const unsigned long long row_a = base_row + tid;
+  const unsigned long long blocks = k / 32;
+  const unsigned char* s = w + (n * k) / 2;
+  __shared__ float wq[32];
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    if (tid < 32) {
+      const unsigned long long e = tid;
+      const std::uint8_t packed = w[(row_w * k + b * 32 + e) / 2];
+      const std::uint8_t nib = (e & 1) != 0 ? (packed >> 4) : (packed & 0xF);
+      const float scale = E8M0ToFloatDev(s[row_w * blocks + b]);
+      wq[e] = scale * kE2M1Dev[nib];
+    }
+    __syncthreads();
+    if (dot_valid) {
+      const float* ar = a + row_a * k + b * 32;
+      for (unsigned long long l = 0; l < 32; l += 2) {
+        acc = fmaf(ar[l], wq[l], acc);
+        acc = fmaf(ar[l + 1], wq[l + 1], acc);
+      }
+    }
+    __syncthreads();
+  }
+  if (dot_valid) {
+    c[row_a * n + row_w] = acc;
+  }
 }
 // Built-in "rmsnorm": row-wise RMS norm over rows x cols fp32. One block
 // per row; the row sum reduces across the block so a single-row decode

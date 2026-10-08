@@ -1,0 +1,79 @@
+#version 450
+
+// Tiled batched MXFP4 GEMM: one workgroup handles 8 activation rows x one
+// weight column; the 32 MXFP4 elements of a block and its E8M0 scale are
+// dequantized once into shared memory and reused across the 8 rows. The
+// dot runs elements 0..31 in order, the gemm_mxfp4 accumulation order.
+// Dispatch is ceil(m / 8) * n workgroups of 256.
+layout(local_size_x = 256) in;
+
+// "gemm_mxfp4_batched" contract (tessera API): buffers and scalars match
+// gemm_mxfp4 (m, n, k, k a multiple of 32). Scalars are 64-bit, so field
+// m lives at pc.v[0], n at pc.v[2], k at pc.v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) buffer C {
+  float c[];
+};
+
+// Byte `offset` of the packed weight buffer viewed as uint words.
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+// OCP MX E2M1 nibble values (port of the core F4E2M1ToFloat).
+const float kE2M1[16] = float[16](
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+
+shared float wq[32];
+
+void main() {
+  uint wg = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  uint tm = wg / n;
+  uint row_w = wg % n;
+  uint base_row = tm * 8u;
+  bool dot_valid = tid < 8u && base_row + tid < m;
+  uint row_a = base_row + tid;
+  uint blocks = k / 32u;
+  uint scale_base = (n * k) >> 1;
+  uint w_base = row_w * k;
+  float acc = 0.0;
+  for (uint b = 0u; b < blocks; ++b) {
+    if (tid < 32u) {
+      uint e = tid;
+      // Two elements share one blob byte; the even element is the low
+      // nibble.
+      uint byte = wbyte((w_base + b * 32u + e) >> 1u);
+      uint packed = byte >> ((e & 1u) * 4u);
+      float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
+      wq[e] = scale * kE2M1[packed & 15u];
+    }
+    barrier();
+    if (dot_valid) {
+      uint ab = row_a * k + b * 32u;
+      for (uint l = 0u; l < 32u; l += 2u) {
+        acc += a[ab + l] * wq[l];
+        acc += a[ab + l + 1u] * wq[l + 1u];
+      }
+    }
+    barrier();
+  }
+  if (dot_valid) {
+    c[row_a * n + row_w] = acc;
+  }
+}

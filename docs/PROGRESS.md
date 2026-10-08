@@ -1296,6 +1296,35 @@ through RADV GFX1201, rocm through the system ROCm).
   longer skips) and the full suite is 257/257 on both builds. The MXFP4
   tiled kernel and the vectorized reads are still to do.
 
+- 2026-10-08: **Tiled batched MXFP4 GEMM (item 3).** `gemm_mxfp4_batched`
+  on both backends: one workgroup handles 8 activation rows x one weight
+  column, the 32 MXFP4 elements and E8M0 scale of a block are
+  dequantized once into shared memory and reused across the rows, and the
+  dot runs elements 0..31 in the `gemm_mxfp4` order. Registered as the
+  tiled kernel for F4E2M1, so the batch path picks it through
+  `ProjectBatch`. `BackendTest.GemmMxFp4BatchedMatchesRef` covers a
+  non-multiple-of-8 row count on both backends (the Vulkan port's first
+  version read the element index instead of the blob byte index and
+  produced 152 absolute error; fixed and green). 258/258 `ctest` on
+  vulkan and rocm. On the real 27B MXFP4 target a Release build now
+  prefills 5 tokens in 1839 ms and decodes at 669 ms/token, and emits
+  `11751, 13, 198, 760`, the same tokens as the GGUF target. This also
+  pins the earlier confusion: the repeated `89307` token and the 7.7
+  s/token run were the W4A4 experiment plus the `-O0` build, both since
+  set aside (W4A4 is in `stash@{0}`). The vectorized byte reads and a
+  larger-batch prefill measurement remain.
+
+- 2026-10-08: **Vectorized MXFP4 weight reads (item 3b, ROCm).** The
+  `gemm_mxfp4` GEMV read one byte (two nibbles) per load; it now reads
+  one `unsigned int` (eight nibbles) per load, matching the Vulkan
+  kernel. The row and block byte offsets are multiples of 16 elements,
+  so every word load is aligned. Results are bit-identical (same
+  element order); `BackendTest.GemmMxFp4*` still pass. The measured
+  effect is small: the 27B MXFP4 decode is 652 ms/token against 669
+  ms/token before, so the read width is not the MXFP4 bottleneck. The
+  per-block `E8M0ToFloatDev` (a software `ldexp` on device) is the next
+  suspect and the next item 3 lever.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load

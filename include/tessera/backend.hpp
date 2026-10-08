@@ -395,7 +395,8 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
   }
-  if (kernel.Id() == "gemm_mxfp4") {
+  if (kernel.Id() == "gemm_mxfp4" ||
+      kernel.Id() == "gemm_mxfp4_batched") {
     if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
       return StatusCode::InvalidArgument;
     }
