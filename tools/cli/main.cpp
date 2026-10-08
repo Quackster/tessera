@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -328,6 +329,7 @@ int main(int argc, char** argv) {
       gen.prompt_tokens = *ids;
     }
     std::expected<std::vector<std::uint32_t>, tessera::StatusCode> generated;
+    bool streamed_output = false;
     if (!image_path.empty()) {
       {
         const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
@@ -394,6 +396,40 @@ int main(int argc, char** argv) {
       gen.prompt_tokens = prompt;
       generated = engine.GenerateMultimodal(loaded, gen, *embeddings, count,
                                             image_token);
+    } else if (draft_path.empty() && !speculate) {
+      // Stream plain greedy decode so each output token reaches the
+      // console as it is generated. A blocking Generate would return
+      // only after every step (by default the whole remaining context),
+      // which looks hung after the prefill line.
+      std::vector<std::uint32_t> streamed_ids;
+      const tessera::Tokenizer* stream_tokenizer = loaded.GetTokenizer();
+      if (!quiet) {
+        const std::size_t budget = loaded.EffectiveMaxTokens(
+            gen.prompt_tokens.size(), gen.max_tokens);
+        log.Info("cli", "generating up to " + std::to_string(budget) +
+                            " token(s); streaming output below");
+      }
+      auto count =
+          engine.GenerateStreaming(loaded, gen, [&](std::uint32_t token) {
+            streamed_ids.push_back(token);
+            if (stream_tokenizer != nullptr) {
+              auto piece = stream_tokenizer->Decode(
+                  std::span<const std::uint32_t>(&token, 1));
+              if (piece) {
+                std::fwrite(piece->data(), 1, piece->size(), stdout);
+                std::fflush(stdout);
+              }
+            }
+            return true;
+          });
+      if (!count) {
+        generated = std::unexpected(count.error());
+      } else {
+        std::fputc('\n', stdout);
+        std::fflush(stdout);
+        generated = std::move(streamed_ids);
+        streamed_output = true;
+      }
     } else {
       generated =
           draft_path.empty()
@@ -417,6 +453,11 @@ int main(int argc, char** argv) {
         log.Info("cli", "input text: " + *input_text);
       }
       if (output_text) {
+        if (!streamed_output) {
+          std::fwrite(output_text->data(), 1, output_text->size(), stdout);
+          std::fputc('\n', stdout);
+          std::fflush(stdout);
+        }
         // Split the Qwen thinking block (if any) from the response.
         const std::string close_marker = "</think>";
         const std::size_t close = output_text->find(close_marker);

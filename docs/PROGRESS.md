@@ -1061,6 +1061,19 @@ through RADV GFX1201, rocm through the system ROCm).
   The MXFP4 target (E2M1) is unchanged (`The capital of France is` still
   gives ` Paris.`). 250/250 ctest on vulkan and rocm.
 
+- 2026-10-08: **CLI streams output tokens.** `tessera-cli run` used the
+  blocking `Engine::Generate`, which returns only after every decode
+  step. The default fills the remaining context (about 4000 tokens),
+  so the console showed the prefill line and then nothing for a long
+  time. The plain text path now uses `Engine::GenerateStreaming` and
+  writes each decoded token to stdout at once with a flush. It also
+  logs the planned token budget before the stream starts. The other
+  paths (speculative, draft, multimodal) still run to completion and
+  then write the full decoded text to stdout. A new
+  `EngineTest.GenerateStreamingEmitsIncrementally` test pins the
+  streaming contract: the streamed ids match `Generate`, and a false
+  return stops the run. 251/251 ctest on vulkan.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load

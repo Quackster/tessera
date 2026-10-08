@@ -322,6 +322,47 @@ TEST(EngineTest, GenerateWithPromptTokensPrefills) {
   EXPECT_EQ(*ids, *again);
 }
 
+// GenerateStreaming emits one callback per produced token, matches the
+// blocking Generate sequence, and stops early when asked. The CLI
+// streams through this so output tokens reach the console at once.
+TEST(EngineTest, GenerateStreamingEmitsIncrementally) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("streaming.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions options;
+  options.first_token = 0;
+  options.max_tokens = 4;
+  auto blocked = engine->Generate(**model, options);
+  ASSERT_TRUE(blocked.has_value()) << tessera::ToString(blocked.error());
+  ASSERT_EQ(blocked->size(), 4u);
+  std::vector<std::uint32_t> streamed;
+  auto count = engine->GenerateStreaming(
+      **model, options, [&](std::uint32_t token) {
+        streamed.push_back(token);
+        return true;
+      });
+  ASSERT_TRUE(count.has_value()) << tessera::ToString(count.error());
+  EXPECT_EQ(*count, 4u);
+  EXPECT_EQ(streamed, *blocked);
+  // Early stop after two tokens reports the produced prefix only.
+  std::vector<std::uint32_t> prefix;
+  auto partial = engine->GenerateStreaming(
+      **model, options, [&](std::uint32_t token) {
+        if (prefix.size() >= 2) {
+          return false;
+        }
+        prefix.push_back(token);
+        return true;
+      });
+  ASSERT_TRUE(partial.has_value()) << tessera::ToString(partial.error());
+  EXPECT_EQ(*partial, 2u);
+  ASSERT_EQ(prefix.size(), 2u);
+  EXPECT_EQ(prefix[0], (*blocked)[0]);
+  EXPECT_EQ(prefix[1], (*blocked)[1]);
+}
+
 TEST(EngineTest, RealModelLoadPathWhenProvided) {
   const char* raw = std::getenv("TESSERA_TEST_MODEL");
   if (raw == nullptr) {
