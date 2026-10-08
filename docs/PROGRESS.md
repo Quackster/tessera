@@ -977,6 +977,18 @@ through RADV GFX1201, rocm through the system ROCm).
    blob and its E8M0 scale (today they are two tensors). Until that lands
    the acceptance is only measurable against the GGUF target, which is
    the wrong target (its aux hidden states differ from the MXFP4 ones).
+
+   The MXFP4 checkpoint also stores the SSM value heads in a different
+   order than the internal (GGUF) layout, and `A_log` in log space. The
+   GGUF order is a deterministic permutation of the MXFP4 order: HF
+   value head `p` (`p = f + 3*kh`) goes to internal row
+   `16*(p%3) + p//3` (verified against `blk.0.ssm_dt.bias` and
+   `blk.0.ssm_alpha.weight`, correlation 0.99). So the MXFP4 loader must
+   apply a value-head reorder to `dt_bias`, `A_log` (then `-exp` to the
+   internal F32 `ssm_a`), `in_proj_a/b`, `in_proj_z`, the value block of
+   `in_proj_qkv` and `conv1d`, and the input of `ssm_out`. This is
+   architecture specific and belongs in the Qwen3.5 module (a new
+   Architecture transform hook), not in core.
 1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.

@@ -478,6 +478,59 @@ TEST(EngineTest, Qwen35ModuleMapsMxFp4WeightNames) {
   EXPECT_FALSE(mapped("totally.unknown").has_value());
 }
 
+// The Qwen3.5 module reports the MXFP4 value-head permutation and the
+// A_log -> F32 -exp conversion for the linear-attention tensors.
+TEST(EngineTest, Qwen35ModuleConvertsMxFp4ValueLayout) {
+  auto module = tessera::CreateArchitecture("qwen35");
+  ASSERT_NE(module, nullptr);
+  TransformerConfig config;
+  config.hidden_dim = 5120;
+  config.ssm.state_size = 128;
+  config.ssm.group_count = 16;
+  config.ssm.time_step_rank = 48;
+  config.ssm.inner_size = 6144;
+  const auto convert = [&](std::string_view name) {
+    return module->ConvertWeight(name, config);
+  };
+
+  auto dt = convert("blk.0.ssm_dt.bias");
+  ASSERT_TRUE(dt.has_value());
+  ASSERT_EQ(dt->src.size(), 48u);
+  EXPECT_EQ(dt->src[0], 0u);
+  EXPECT_EQ(dt->src[1], 3u);
+  EXPECT_EQ(dt->src[16], 1u);
+  EXPECT_FALSE(dt->inner);
+  EXPECT_FALSE(dt->exp_negate);
+
+  auto a = convert("blk.0.ssm_a");
+  ASSERT_TRUE(a.has_value());
+  EXPECT_TRUE(a->exp_negate);
+  EXPECT_EQ(a->src[1], 3u);
+
+  auto gate = convert("blk.0.attn_gate.weight");
+  ASSERT_TRUE(gate.has_value());
+  ASSERT_EQ(gate->src.size(), 6144u);
+  EXPECT_EQ(gate->src[0], 0u);
+  EXPECT_EQ(gate->src[127], 127u);
+  EXPECT_EQ(gate->src[128], 384u);  // head 1 -> checkpoint head 3
+
+  auto qkv = convert("blk.0.attn_qkv.weight");
+  ASSERT_TRUE(qkv.has_value());
+  ASSERT_EQ(qkv->src.size(), 10240u);
+  EXPECT_EQ(qkv->src[0], 0u);       // q block identity
+  EXPECT_EQ(qkv->src[4095], 4095u);
+  EXPECT_EQ(qkv->src[4096], 4096u);  // value head 0
+  EXPECT_EQ(qkv->src[4096 + 128], 4480u);  // value head 1 -> checkpoint 3
+
+  auto out = convert("blk.0.ssm_out.weight");
+  ASSERT_TRUE(out.has_value());
+  EXPECT_TRUE(out->inner);
+  ASSERT_EQ(out->src.size(), 6144u);
+
+  EXPECT_FALSE(convert("blk.0.attn_norm.weight").has_value());
+  EXPECT_FALSE(convert("output.weight").has_value());
+}
+
 TEST(EngineTest, LoadModelMissingFile) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);

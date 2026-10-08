@@ -44,6 +44,18 @@ struct DraftVerification {
   std::vector<float> logits;
 };
 
+// A value-layout conversion for a checkpoint whose tensor layout differs
+// from the internal layout (for example the MXFP4 value-head order). `src`
+// maps internal index i to checkpoint index src[i] along the value
+// dimension (empty means no permutation); `inner` selects the contiguous
+// dimension instead of the outer one. `exp_negate` turns log-space values
+// (A_log) into the internal -exp form with F32 output.
+struct WeightConversion {
+  std::vector<std::size_t> src;
+  bool inner = false;
+  bool exp_negate = false;
+};
+
 class Architecture {
  public:
   virtual ~Architecture() = default;
@@ -127,6 +139,17 @@ class Architecture {
       std::string_view name, const TransformerConfig& config) const {
     (void)config;
     return std::string(name);
+  }
+
+  // Value-layout conversion for one internal tensor, or nullopt when the
+  // bytes are already internal. The loader applies the permutation at the
+  // element level (blob and scale together for MXFP4) and the exp_negate
+  // transform to F32. The default returns nullopt.
+  [[nodiscard]] virtual std::optional<WeightConversion> ConvertWeight(
+      std::string_view internal_name, const TransformerConfig& config) const {
+    (void)internal_name;
+    (void)config;
+    return std::nullopt;
   }
 };
 

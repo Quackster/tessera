@@ -69,6 +69,10 @@ class Qwen35Architecture final : public Architecture {
 
   [[nodiscard]] std::optional<std::string> MapWeightName(
       std::string_view name, const TransformerConfig& config) const override;
+
+  [[nodiscard]] std::optional<WeightConversion> ConvertWeight(
+      std::string_view internal_name,
+      const TransformerConfig& config) const override;
 };
 
 // Build the module (registered for general.architecture "qwen35").
