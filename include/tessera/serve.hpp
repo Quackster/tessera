@@ -17,8 +17,9 @@ struct ServeOptions {
   // Interface to bind (dotted IPv4 literal).
   std::string host = "127.0.0.1";
   std::uint16_t port = 8080;
-  // Default completion length when a request omits max_tokens.
-  std::size_t default_max_tokens = 256;
+  // Default completion length when a request omits max_tokens. Zero
+  // fills the remaining context (see Model::EffectiveMaxTokens).
+  std::size_t default_max_tokens = 0;
   // Accepted API keys. Empty means no authentication. /health and
   // /metrics stay public.
   std::vector<std::string> api_keys;

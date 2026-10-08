@@ -20,9 +20,6 @@ namespace tessera::spec {
 std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     Backend& backend, Model& target, const GenerateOptions& options,
     const std::string& draft_path, const log::Diagnostics* log) {
-  if (options.max_tokens == 0) {
-    return std::vector<std::uint32_t>{};
-  }
   auto config = target.Config();
   if (!config || !config->hybrid) {
     return std::unexpected(StatusCode::UnsupportedFeature);
@@ -102,6 +99,12 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
   }
+  // A zero count fills the remaining context.
+  const std::size_t max_tokens =
+      target.EffectiveMaxTokens(prompt.size(), options.max_tokens);
+  if (max_tokens == 0) {
+    return std::vector<std::uint32_t>{};
+  }
   for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
     auto forward = core::DecodeForward(backend, target, cache, prompt[i]);
     if (!forward) {
@@ -132,14 +135,14 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     return std::unexpected(pushed.error());
   }
   std::vector<std::uint32_t> produced;
-  produced.reserve(options.max_tokens);
+  produced.reserve(max_tokens);
   std::size_t proposed = 0;
   std::size_t accepted = 0;
   std::size_t steps = 0;
   std::uint32_t next = core::detail::ArgMax(*first);
-  while (produced.size() < options.max_tokens) {
+  while (produced.size() < max_tokens) {
     produced.push_back(next);
-    if (produced.size() >= options.max_tokens) {
+    if (produced.size() >= max_tokens) {
       break;
     }
     auto current = core::DecodeLogits(backend, target, cache, next,
@@ -271,7 +274,7 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     proposed += draft_tokens.size();
     accepted += verify->accepted;
     for (std::size_t i = 0; i < verify->accepted; ++i) {
-      if (produced.size() >= options.max_tokens) {
+      if (produced.size() >= max_tokens) {
         break;
       }
       produced.push_back(draft_tokens[i]);

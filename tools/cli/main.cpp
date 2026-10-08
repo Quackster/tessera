@@ -38,8 +38,8 @@ void PrintUsage() {
                "  --context <n>     maximum context length (default %zu)\n"
                "  --gpu <n>         GPU index to use (default 0, the first)\n"
                "  --draft-block <n> draft block tokens (default %zu)\n"
-               "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
-               "  --tokens <n>      run n greedy decode steps\n"
+  "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
+  "  --tokens <n>      decode steps (default: fill the context)\n"
                "  --speculate       verify MTP drafts instead of plain greedy\n"
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
@@ -261,9 +261,9 @@ int main(int argc, char** argv) {
     }
     return kExitOk;
   }
-  if (tokens > 0) {
+  if (!prompt_text.empty() || !image_path.empty() || tokens > 0) {
     tessera::GenerateOptions gen;
-    gen.max_tokens = tokens;
+    gen.max_tokens = tokens;  // Zero fills the remaining context.
     gen.sample = sample;
     gen.sampling = sampling;
     gen.seed = seed;

@@ -41,7 +41,8 @@ struct SamplingOptions {
 
 // Options for Engine::Generate.
 struct GenerateOptions {
-  // Decode steps to run; 0 produces no tokens.
+  // Decode steps to run; 0 fills the remaining context (see
+  // Model::EffectiveMaxTokens) instead of producing no tokens.
   std::size_t max_tokens = 0;
   // The first token fed to the decoder when prompt_tokens is empty.
   std::uint32_t first_token = 0;
@@ -86,8 +87,9 @@ class Engine {
 
   // Greedy single-token generation on the non-speculative (reference
   // baseline) path: run `options.max_tokens` decode steps from
-  // `options.first_token` and return the produced token ids. An empty
-  // request returns an empty vector. MalformedFile/UnsupportedFeature
+  // `options.first_token` and return the produced token ids. A zero
+  // count fills the remaining context; a prompt that already fills it
+  // returns an empty vector. MalformedFile/UnsupportedFeature
   // when the model config cannot drive the decoder.
   //
   // Usage:

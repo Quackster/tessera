@@ -562,6 +562,16 @@ std::size_t Model::MaxContextLength() const {
   return options_.max_context_length;
 }
 
+std::size_t Model::EffectiveMaxTokens(std::size_t prompt_size,
+                                      std::size_t requested) const {
+  if (requested > 0) {
+    return requested;
+  }
+  return options_.max_context_length > prompt_size
+             ? options_.max_context_length - prompt_size
+             : 0;
+}
+
 std::string_view Model::Name() const {
   return name_;
 }

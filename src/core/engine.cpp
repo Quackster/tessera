@@ -73,9 +73,6 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
                            std::span<const float> image_embeddings,
                            std::size_t image_tokens,
                            std::uint32_t image_token_id) {
-  if (options.max_tokens == 0) {
-    return std::vector<std::uint32_t>{};
-  }
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -94,6 +91,12 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
+  }
+  // A zero count fills the remaining context.
+  const std::size_t max_tokens =
+      model.EffectiveMaxTokens(prompt.size(), options.max_tokens);
+  if (max_tokens == 0) {
+    return std::vector<std::uint32_t>{};
   }
   if (options.progress_every > 0) {
     diagnostics_.Info("engine", std::string("multimodal prefill: ") +
@@ -144,7 +147,7 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
   }
   std::vector<float> current = std::move(*first);
   std::vector<std::uint32_t> produced;
-  produced.reserve(options.max_tokens);
+  produced.reserve(max_tokens);
   std::mt19937_64 rng(options.seed);
   std::vector<std::uint32_t> history = prompt;
   const auto pick = [&](std::span<const float> logits) {
@@ -153,9 +156,9 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
                : core::detail::ArgMax(logits);
   };
   std::uint32_t next = pick(current);
-  while (produced.size() < options.max_tokens) {
+  while (produced.size() < max_tokens) {
     produced.push_back(next);
-    if (produced.size() >= options.max_tokens) {
+    if (produced.size() >= max_tokens) {
       break;
     }
     history.push_back(next);
@@ -186,9 +189,6 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Engine::GenerateDraft(
 
 std::expected<std::vector<std::uint32_t>, StatusCode>
 Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
-  if (options.max_tokens == 0) {
-    return std::vector<std::uint32_t>{};
-  }
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -204,6 +204,12 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
   }
+  // A zero count fills the remaining context.
+  const std::size_t max_tokens =
+      model.EffectiveMaxTokens(prompt.size(), options.max_tokens);
+  if (max_tokens == 0) {
+    return std::vector<std::uint32_t>{};
+  }
   std::vector<float> hidden;
   std::vector<float> current;
   auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden);
@@ -214,16 +220,16 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
   }
   current = std::move(*logits);
   std::vector<std::uint32_t> produced;
-  produced.reserve(options.max_tokens);
+  produced.reserve(max_tokens);
   const Architecture* arch = model.Arch();
   std::uint64_t pos = prompt.size();
   std::uint32_t next = core::detail::ArgMax(current);
   // Number of MTP tokens to draft before one batched verification forward.
   const std::size_t block =
       options.draft_tokens > 0 ? options.draft_tokens : kDefaultMtpBlock;
-  while (produced.size() < options.max_tokens) {
+  while (produced.size() < max_tokens) {
     produced.push_back(next);
-    if (produced.size() >= options.max_tokens) {
+    if (produced.size() >= max_tokens) {
       break;
     }
     // Advance the target cache by the token just emitted; `current`/`hidden`
@@ -281,11 +287,11 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     }
     for (std::size_t i = 0; i < verify->accepted; ++i) {
       produced.push_back(drafts[i]);
-      if (produced.size() >= options.max_tokens) {
+      if (produced.size() >= max_tokens) {
         break;
       }
     }
-    if (produced.size() >= options.max_tokens) {
+    if (produced.size() >= max_tokens) {
       break;
     }
     current = std::move(verify->logits);
@@ -327,9 +333,6 @@ std::expected<void, StatusCode> Engine::AttachSpeculative(
 std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
     Model& model, const GenerateOptions& options,
     const std::function<bool(std::uint32_t)>& on_token) {
-  if (options.max_tokens == 0) {
-    return 0;
-  }
   const auto started = std::chrono::steady_clock::now();
   const auto elapsed_ms = [&started]() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -351,6 +354,12 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
+  }
+  // A zero count fills the remaining context.
+  const std::size_t max_tokens =
+      model.EffectiveMaxTokens(prompt.size(), options.max_tokens);
+  if (max_tokens == 0) {
+    return 0;
   }
   // Prefill: only the last prompt token needs logits, so every earlier
   // token runs the block forward without the vocab-sized output head.
@@ -381,12 +390,12 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   };
   std::uint32_t next = pick(*first_logits);
   std::size_t produced = 0;
-  for (std::size_t step = 0; step < options.max_tokens; ++step) {
+  for (std::size_t step = 0; step < max_tokens; ++step) {
     if (!on_token(next)) {
       break;
     }
     ++produced;
-    if (step + 1 == options.max_tokens) {
+    if (step + 1 == max_tokens) {
       break;
     }
     history.push_back(next);

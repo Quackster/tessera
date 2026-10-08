@@ -30,7 +30,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. |
 | DFlash2 | Partial | Draft forward built: grouped dynamic convolution, sliding attention, candidate selector and target-hidden fusion. The real draft loads and runs one block. |
 | CLI | Partial | Loads model, prints summary, generates tokens (`--tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). Text prompts need a tokenizer. |
-| Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in one batched forward. Runtime options: `--context`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`) or 4-bit (`--kv-q4`) KV cache. |
+| Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in one batched forward. A zero `max_tokens` fills the remaining context. Runtime options: `--context`, `--tokens`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`) or 4-bit (`--kv-q4`) KV cache. |
 | Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Host reference check. Per backend tolerance. |
 | Attention and RoPE | Done | GQA path driven by model data; tiled O(n*d) attention (one workgroup per query/head, online softmax). RoPE kernel verified by read back on both backends. |
@@ -94,7 +94,61 @@ CLI example:
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --draft ~/models/Qwen3.8-27B-DFlash2-FP8
 ```
 
-The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count and total elements. With `--tokens N` it runs N greedy decode steps from `--prompt` and prints the token ids.
+The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count and total elements. With `--tokens N` it runs N greedy decode steps from `--prompt-text` and prints the token ids.
+
+## Usage
+
+Simple text prompt with the CLI:
+
+```sh
+./cmake-build-vulkan/tessera-cli run \
+  --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --prompt-text "Explain gravity in one sentence." \
+  --tokens 64
+```
+
+`--tokens` is optional. Without it the run fills the remaining context.
+
+The CLI applies the model chat template by default. It uses the raw text with `--no-chat`. String prompts need a model with a tokenizer. Today only GGUF provides one. MXFP4 decodes from token ids through the C++ API, with or without the DFlash2 draft, but it has no tokenizer yet so the CLI and the HTTP server refuse string prompts for it.
+
+C++ API with a text prompt:
+
+```cpp
+#include "tessera/engine.hpp"
+
+auto engine = tessera::Engine::Create({});
+if (!engine) return 1;
+auto model = (*engine)->LoadModel(
+    tessera::ModelOptions{"~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf"});
+if (!model) return 1;
+
+const tessera::Tokenizer* tokenizer = (*model)->GetTokenizer();
+auto prompt = (*model)->ChatPrompt("Explain gravity in one sentence.");
+auto ids = tokenizer->Encode(prompt ? *prompt : "Explain gravity in one sentence.");
+
+tessera::GenerateOptions options;
+options.max_tokens = 64;  // Optional. Zero fills the remaining context.
+options.prompt_tokens = *ids;
+auto generated = (*engine)->Generate(**model, options);
+if (!generated) return 1;
+auto text = tokenizer->Decode(*generated);
+```
+
+HTTP API with the server:
+
+```sh
+./cmake-build-vulkan/tessera-cli serve \
+  --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --port 8080
+curl -X POST http://127.0.0.1:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Explain gravity in one sentence.", "max_tokens": 64}'
+curl http://127.0.0.1:8080/health
+```
+
+`max_tokens` is optional. Without it the server fills the remaining context.
+
+With `--api-key` set, requests need `Authorization: Bearer <key>`. `GET /health` and `GET /metrics` stay public.
 
 ## Build and test
 

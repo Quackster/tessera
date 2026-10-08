@@ -61,6 +61,16 @@ class Model {
   [[nodiscard]] const Buffer* FindWeight(std::string_view name) const;
   [[nodiscard]] const std::string& Path() const;
   [[nodiscard]] std::size_t MaxContextLength() const;
+  // New tokens to generate for `requested` after a prompt of
+  // `prompt_size` tokens. An explicit count passes through unchanged.
+  // Zero means no explicit count: fill the remaining context
+  // (MaxContextLength minus `prompt_size`, saturating at zero).
+  //
+  // Usage:
+  //   const std::size_t max_tokens = model.EffectiveMaxTokens(
+  //       prompt.size(), options.max_tokens);
+  [[nodiscard]] std::size_t EffectiveMaxTokens(std::size_t prompt_size,
+                                              std::size_t requested) const;
   // Model name from the file metadata when present ("" otherwise).
   [[nodiscard]] std::string_view Name() const;
   // Attention parameters from the model definition, for sizing kernel

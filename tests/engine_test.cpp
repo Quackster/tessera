@@ -276,9 +276,30 @@ TEST(EngineTest, GenerateTinyModelGreedy) {
   auto again = engine->Generate(**model, GenerateOptions{4, 0});
   ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
   EXPECT_EQ(*ids, *again);
-  auto none = engine->Generate(**model, GenerateOptions{0, 0});
-  ASSERT_TRUE(none.has_value()) << tessera::ToString(none.error());
-  EXPECT_TRUE(none->empty());
+}
+
+// A zero max_tokens fills the remaining context: context minus prompt,
+// saturating at zero when the prompt already fills it.
+TEST(EngineTest, GenerateZeroMaxTokensFillsContext) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("generate_fill.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 6});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  // No prompt tokens: the fallback first token leaves 5 of 6 free.
+  auto filled = engine->Generate(**model, GenerateOptions{0, 0});
+  ASSERT_TRUE(filled.has_value()) << tessera::ToString(filled.error());
+  EXPECT_EQ(filled->size(), 5u);
+  // An explicit count still passes through unchanged.
+  auto four = engine->Generate(**model, GenerateOptions{4, 0});
+  ASSERT_TRUE(four.has_value()) << tessera::ToString(four.error());
+  EXPECT_EQ(four->size(), 4u);
+  // A prompt past the context produces nothing instead of underflowing.
+  GenerateOptions full;
+  full.prompt_tokens = {0, 1, 2, 3, 4, 5, 6, 7};
+  auto capped = engine->Generate(**model, full);
+  ASSERT_TRUE(capped.has_value()) << tessera::ToString(capped.error());
+  EXPECT_TRUE(capped->empty());
 }
 
 // A multi-token prompt prefills through the forward-only path (all but the
