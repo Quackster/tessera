@@ -926,10 +926,12 @@ through RADV GFX1201, rocm through the system ROCm).
    the 5-layer draft) and each step costs more than one greedy step, so it
    is only a win at a high enough acceptance; the target is steady-state
    tokens/s, not the first few tokens. Measure tokens/s over a long
-   generation. The draft currently accepts about 0 to 15 percent, so the
-   draft block is the suspect: check its layer order against the reference
-   and the mask/candidate setup. The context width does not lift
-   acceptance.
+   generation. Measured on the 27B over 32 tokens: greedy 0.86 s/token,
+   DFlash2 about 4.8 s/token (acceptance 5 of 108) even at steady state,
+   so the draft quality, not the boot, is the blocker. The draft accepts
+   about 0 to 15 percent; the draft block is the suspect: check its layer
+   order against the reference and the mask/candidate setup. The context
+   width does not lift acceptance.
 1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
