@@ -964,6 +964,21 @@ through RADV GFX1201, rocm through the system ROCm).
   element-wise tensor dump, which showed the loader's embedding and
   value-head reorder match the GGUF at correlation 0.99.
 
+- 2026-10-08: linear-attention conv on the device (item 1, 246/246
+  `ctest` on both builds). A new `conv1d_state` built-in (Vulkan and ROCm)
+  assembles the window from the fresh qkv and the history, convolves with
+  the reversed tap order, applies the SiLU, writes the q/k/v split
+  directly, and shifts the history in place. The history for each linear
+  layer now lives in the device buffer `Qwen35State::LinearState::conv_hist`;
+  the batched rollback snapshots it with a device copy instead of a host
+  copy. Both trunk paths call the kernel, so the host `conv_hist`,
+  `conv_mixed` and the five per-layer transfers are gone. A
+  device-vs-reference test covers the kernel. Decode fell from 789 ms/token
+  to 513 ms/token on the MXFP4 target, and the GGUF from 1100 ms/token to
+  492 ms/token, with the same tokens (`11751, 13, 198, 760`). The batched
+  path is output preserving: `EngineTest.DFlash2MatchesGreedyOnModel`
+  still passes.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -971,11 +986,11 @@ through RADV GFX1201, rocm through the system ROCm).
   Count the decode rate on generation only: the model load is a one-time
   cost and is not part of tokens/s.
   Deferred for now, because the speed is gated by the outstanding to-do
-  items, not by one knob. The causal conv still runs on the host and costs
-  about five transfers per linear layer (item 1), the norms and SiLU still
-  run on the host (item 2), and the GEMM throughput is item 3. Each of
-  those adds synchronous submit-and-fence round-trips or host work. Land
-  them first, then re-measure and do the remaining PERF work.
+  items, not by one knob. The causal conv is now on the device (done), but
+  the norms and SiLU still run on the host (item 2) and the GEMM throughput
+  is item 3. Each of those adds synchronous submit-and-fence round-trips or
+  host work. Land them first, then re-measure and do the remaining PERF
+  work.
   Context: the load reads the
   19 GB safetensors, dequantizes and packs every fp4 blob, and converts
   large BF16 tensors to F32 (the `lm_head` alone becomes a 5 GB F32
@@ -1007,8 +1022,9 @@ through RADV GFX1201, rocm through the system ROCm).
   forward, each blocking on its own fence. Reusing the command buffer and
   fence in `LaunchKernel` did not change the time, so it is the latency of
   the synchronous submit, not the allocation. The fixes are to batch a
-  step's ops into one command buffer and wait once, and to remove ops (the
-  host conv still costs about five transfers per linear layer, item 1). A
+  step's ops into one command buffer and wait once, and to remove ops. The
+  device conv (done) removed the per-layer host round-trip and took decode
+  from 789 ms to 513 ms/token (and the GGUF from 1100 ms to 492 ms). A
   tiled or split-K GEMV would then help the remaining kernel time.
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
@@ -1091,13 +1107,9 @@ through RADV GFX1201, rocm through the system ROCm).
     first: the file carries 248044 entries plus 33 added tokens, while
     the GGUF target reports a 248320 vocabulary, so check the MXFP4
     output head width against the tokenizer size before wiring it up.
-1. **Hybrid SSM device path**: the recurrent causal conv1d still runs
-   on the host in both trunk paths. The single-token and the batched
-   trunk download the fused qkv, run `Conv1dStepRef` on the host and
-   upload the mixed result, with a host round-trip per step. The rest of
-   the gated-delta path (delta step, L2 norm, gated RMSNorm) is on the
-   device. Move the conv and the fused-qkv staging to a device kernel so
-   the linear-attention layer stays on the device.
+- **Hybrid SSM device path (done)**: the causal conv1d, the SiLU and the
+  q/k/v split now run on the device (`conv1d_state`), with the history in
+  `linear[l].conv_hist`, in both trunk paths. See the Done entry.
 2. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.

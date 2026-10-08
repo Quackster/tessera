@@ -643,6 +643,44 @@ __global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
   y[c] = acc;
 }
 
+// Built-in "conv1d_state": current-step causal depthwise conv with the
+// history kept on the device, the SiLU and the q/k/v split. One thread
+// per channel. W is in checkpoint tap order (tap 0 oldest), the history
+// is newest first.
+__global__ void Conv1dStateKernel(const float* qkv, const float* w,
+                                  float* hist, float* q, float* k, float* v,
+                                  unsigned long long conv_dim,
+                                  unsigned long long width,
+                                  unsigned long long key_dim,
+                                  unsigned long long qkv_offset) {
+  const unsigned long long c =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (c >= conv_dim) {
+    return;
+  }
+  const unsigned long long stride = width - 1;
+  const unsigned long long hbase = c * stride;
+  const float current = qkv[qkv_offset + c];
+  float acc = w[c * width + (width - 1)] * current;
+  for (unsigned long long i = 1; i < width; ++i) {
+    acc = fmaf(w[c * width + (width - 1 - i)], hist[hbase + (i - 1)], acc);
+  }
+  const float out = acc / (1.0f + expf(-acc));
+  if (c < key_dim) {
+    q[c] = out;
+  } else if (c < 2 * key_dim) {
+    k[c - key_dim] = out;
+  } else {
+    v[c - 2 * key_dim] = out;
+  }
+  if (width > 1) {
+    for (unsigned long long i = stride; i > 1; --i) {
+      hist[hbase + (i - 1)] = hist[hbase + (i - 2)];
+    }
+    hist[hbase] = current;
+  }
+}
+
 // Built-in "dflash_conv": DFlash2 grouped dynamic convolution. One
 // thread per output element.
 __global__ void DflashConvKernel(const float* x, const float* delta,

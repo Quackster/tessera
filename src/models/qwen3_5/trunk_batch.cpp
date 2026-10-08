@@ -21,6 +21,7 @@ using detail::AddDevice;
 using detail::AppendKv;
 using detail::AttentionDevice;
 using detail::AttentionQuantDevice;
+using detail::Conv1dStateDevice;
 using detail::DeltaStepHeadsDevice;
 using detail::DownloadF32;
 using detail::DownloadF32Cached;
@@ -92,10 +93,10 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
   b->conv_hist_hist.resize(cfg.layers);
   for (std::size_t l = 0; l < cfg.layers; ++l) {
     if (!cfg.IsFullAttentionLayer(l)) {
-      if (!alloc(b->state_hist[l], (rows + 1) * state_len)) {
+      if (!alloc(b->state_hist[l], (rows + 1) * state_len) ||
+          !alloc(b->conv_hist_hist[l], (rows + 1) * hist_len)) {
         return std::unexpected(StatusCode::OutOfMemory);
       }
-      b->conv_hist_hist[l].assign((rows + 1) * hist_len, 0.0f);
     }
   }
   h.batch = std::move(b);
@@ -281,69 +282,25 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
                      *b.beta, g.num_v_heads, rows)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  std::vector<float> qkv(rows * g.conv_dim);
-  if (!backend.CopyD2H(*b.qkv, reinterpret_cast<std::byte*>(qkv.data()),
-                       qkv.size() * 4)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  auto conv_w = DownloadF32Cached(backend, h.host_weights,
-                                  base + "ssm_conv1d.weight",
-                                  *(*w_conv)->device);
-  if (!conv_w) {
-    return std::unexpected(conv_w.error());
-  }
   const float q_scale = 1.0 / std::sqrt(static_cast<double>(g.head_k_dim));
   const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
   const std::size_t hist_len = g.conv_dim * (g.width - 1);
-  // Snapshot the state before the block (slot 0); each token appends its
-  // post-token state to slot t+1 so a verification can roll back.
+  // Snapshot the state and the conv history before the block (slot 0);
+  // each token appends its post-token state to slot t+1 so a verification
+  // can roll back.
   if (!backend.CopyD2D(*h.linear[layer].state, 0, *b.state_hist[layer], 0,
-                       state_len * 4)) {
+                       state_len * 4) ||
+      !backend.CopyD2D(*h.linear[layer].conv_hist, 0,
+                       *b.conv_hist_hist[layer], 0, hist_len * 4)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  std::copy(h.conv_hist[layer].begin(), h.conv_hist[layer].end(),
-            b.conv_hist_hist[layer].begin());
   for (std::size_t t = 0; t < rows; ++t) {
-    const float* row = qkv.data() + t * g.conv_dim;
-    std::vector<float> xr(g.conv_dim * g.width);
-    for (std::size_t c = 0; c < g.conv_dim; ++c) {
-      xr[c * g.width] = row[c];
-      for (std::size_t i = 1; i < g.width; ++i) {
-        xr[c * g.width + i] =
-            h.conv_hist[layer][c * (g.width - 1) + (i - 1)];
-      }
-    }
-    std::vector<float> mixed(g.conv_dim);
-    std::vector<float> rev_w((*conv_w)->size());
-    for (std::size_t c = 0; c < g.conv_dim; ++c) {
-      for (std::size_t i = 0; i < g.width; ++i) {
-        rev_w[c * g.width + i] = (**conv_w)[c * g.width + (g.width - 1 - i)];
-      }
-    }
-    auto conv = Conv1dStepRef(std::span<const float>(xr),
-                              std::span<const float>(rev_w),
-                              std::span<float>(mixed), g.conv_dim, g.width);
-    if (!conv) {
-      return std::unexpected(conv.error());
-    }
-    for (float& value : mixed) {
-      value = value / (1.0f + std::exp(-value));
-    }
-    for (std::size_t c = 0; c < g.conv_dim; ++c) {
-      for (std::size_t i = g.width - 1; i > 1; --i) {
-        h.conv_hist[layer][c * (g.width - 1) + (i - 1)] =
-            h.conv_hist[layer][c * (g.width - 1) + (i - 2)];
-      }
-      if (g.width > 1) {
-        h.conv_hist[layer][c * (g.width - 1)] = row[c];
-      }
-    }
-    if (!UploadF32(backend, *h.conv_mixed, mixed) ||
-        !backend.CopyD2D(*h.conv_mixed, 0, *h.q_l, 0, g.key_dim * 4) ||
-        !backend.CopyD2D(*h.conv_mixed, g.key_dim * 4, *h.k_l, 0,
-                         g.key_dim * 4) ||
-        !backend.CopyD2D(*h.conv_mixed, 2 * g.key_dim * 4, *h.v_l, 0,
-                         g.value_dim * 4) ||
+    // The causal conv, SiLU and q/k/v split run on the device; the
+    // history lives in linear[layer].conv_hist and the kernel shifts it.
+    if (!Conv1dStateDevice(backend, *h.conv1d_state_kernel, *b.qkv,
+                           *(*w_conv)->device, *h.linear[layer].conv_hist,
+                           *h.q_l, *h.k_l, *h.v_l, g.conv_dim, g.width,
+                           g.key_dim, t * g.conv_dim) ||
         !L2NormDevice(backend, *h.l2norm_kernel, *h.q_l, *h.q_l, g.num_k_heads,
                       g.head_k_dim, 1e-6f, q_scale) ||
         !L2NormDevice(backend, *h.l2norm_kernel, *h.k_l, *h.k_l, g.num_k_heads,
@@ -375,8 +332,11 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
                          state_len * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    std::copy(h.conv_hist[layer].begin(), h.conv_hist[layer].end(),
-              b.conv_hist_hist[layer].begin() + (t + 1) * hist_len);
+    if (!backend.CopyD2D(*h.linear[layer].conv_hist, 0,
+                         *b.conv_hist_hist[layer], (t + 1) * hist_len * 4,
+                         hist_len * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
   }
   if (!ProjectDevice(backend, *(*gemm_out), *b.out, *(*w_out)->device, *b.proj,
                      rows, hidden, g.value_dim) ||
@@ -590,10 +550,11 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
                            *h.linear[l].state, 0, state_len * 4)) {
         return std::unexpected(StatusCode::DeviceError);
       }
-      std::copy(h.batch->conv_hist_hist[l].begin() + accepted * hist_len,
-                h.batch->conv_hist_hist[l].begin() +
-                    (accepted + 1) * hist_len,
-                h.conv_hist[l].begin());
+      if (!backend.CopyD2D(*h.batch->conv_hist_hist[l],
+                           accepted * hist_len * 4, *h.linear[l].conv_hist, 0,
+                           hist_len * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
     }
   }
   if (hidden_out != nullptr && accepted > 0) {

@@ -2981,6 +2981,94 @@ TEST(BackendTest, Conv1dStepDeviceMatchesRef) {
   }
 }
 
+// Device: the "conv1d_state" kernel (window from qkv + history, reversed
+// taps, SiLU, q/k/v split, in-place history shift) matches a host
+// reference.
+TEST(BackendTest, Conv1dStateDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(96);
+  constexpr std::size_t kConvDim = 8;
+  constexpr std::size_t kKeyDim = 2;
+  constexpr std::size_t kValueDim = kConvDim - 2 * kKeyDim;
+  constexpr std::size_t kWidth = 3;
+  constexpr std::size_t kHist = kConvDim * (kWidth - 1);
+  std::vector<float> qkv(kConvDim), w(kConvDim * kWidth), hist(kHist);
+  for (auto& v : qkv) v = DrawValue(rng);
+  for (auto& v : w) v = DrawValue(rng);
+  for (auto& v : hist) v = DrawValue(rng);
+  auto qkv_buf = backend->AllocateBuffer(qkv.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size() * 4, MemoryKind::Device);
+  auto hist_buf = backend->AllocateBuffer(hist.size() * 4, MemoryKind::Device);
+  auto q_buf = backend->AllocateBuffer(kKeyDim * 4, MemoryKind::Device);
+  auto k_buf = backend->AllocateBuffer(kKeyDim * 4, MemoryKind::Device);
+  auto v_buf = backend->AllocateBuffer(kValueDim * 4, MemoryKind::Device);
+  ASSERT_TRUE(qkv_buf && w_buf && hist_buf && q_buf && k_buf && v_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(qkv_buf, qkv).has_value());
+  ASSERT_TRUE(upload(w_buf, w).has_value());
+  ASSERT_TRUE(upload(hist_buf, hist).has_value());
+  auto kernel = backend->LoadKernel("conv1d_state", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kConvDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*qkv_buf).get(), (*w_buf).get(), (*hist_buf).get(),
+                    (*q_buf).get(), (*k_buf).get(), (*v_buf).get()};
+  launch.scalars = {kConvDim, kWidth, kKeyDim, 0};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  const auto download = [&backend](auto& buf, std::vector<float>& out) {
+    std::vector<std::byte> raw(out.size() * 4);
+    if (!backend->CopyD2H(**buf, raw.data(), raw.size()).has_value()) {
+      return false;
+    }
+    std::memcpy(out.data(), raw.data(), raw.size());
+    return true;
+  };
+  std::vector<float> got_q(kKeyDim), got_k(kKeyDim), got_v(kValueDim),
+      got_hist(kHist);
+  ASSERT_TRUE(download(q_buf, got_q));
+  ASSERT_TRUE(download(k_buf, got_k));
+  ASSERT_TRUE(download(v_buf, got_v));
+  ASSERT_TRUE(download(hist_buf, got_hist));
+
+  std::vector<float> ref_q(kKeyDim), ref_k(kKeyDim), ref_v(kValueDim);
+  std::vector<float> ref_hist = hist;
+  for (std::size_t c = 0; c < kConvDim; ++c) {
+    const std::size_t base = c * (kWidth - 1);
+    float acc = w[c * kWidth + (kWidth - 1)] * qkv[c];
+    for (std::size_t i = 1; i < kWidth; ++i) {
+      acc += w[c * kWidth + (kWidth - 1 - i)] * hist[base + (i - 1)];
+    }
+    const float result = acc / (1.0f + std::exp(-acc));
+    if (c < kKeyDim) {
+      ref_q[c] = result;
+    } else if (c < 2 * kKeyDim) {
+      ref_k[c - kKeyDim] = result;
+    } else {
+      ref_v[c - 2 * kKeyDim] = result;
+    }
+    for (std::size_t i = kWidth - 1; i > 1; --i) {
+      ref_hist[base + (i - 1)] = hist[base + (i - 2)];
+    }
+    ref_hist[base] = qkv[c];
+  }
+  for (std::size_t i = 0; i < kKeyDim; ++i) {
+    EXPECT_NEAR(got_q[i], ref_q[i], 1e-5f);
+    EXPECT_NEAR(got_k[i], ref_k[i], 1e-5f);
+  }
+  for (std::size_t i = 0; i < kValueDim; ++i) {
+    EXPECT_NEAR(got_v[i], ref_v[i], 1e-5f);
+  }
+  for (std::size_t i = 0; i < kHist; ++i) {
+    EXPECT_NEAR(got_hist[i], ref_hist[i], 1e-5f);
+  }
+}
+
 // Device: attention with several query rows (m > 1) matches the reference.
 TEST(BackendTest, AttentionBatchedMatchesRef) {
   std::unique_ptr<Backend> backend;

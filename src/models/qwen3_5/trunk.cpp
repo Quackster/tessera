@@ -22,6 +22,7 @@ using core::DecodeCache;
 using detail::AddDevice;
 using detail::AppendKv;
 using detail::AttentionDevice;
+using detail::Conv1dStateDevice;
 using detail::DeltaStepHeadsDevice;
 using detail::DownloadF32;
 using detail::DownloadF32Cached;
@@ -67,7 +68,7 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
       !make(h.fmlp, cfg.ffn_dim) || !make(h.qkv, g.conv_dim) ||
       !make(h.z, g.value_dim) || !make(h.alpha_raw, g.num_v_heads) ||
       !make(h.beta_raw, g.num_v_heads) || !make(h.alpha, g.num_v_heads) ||
-      !make(h.beta, g.num_v_heads) || !make(h.conv_mixed, g.conv_dim) ||
+      !make(h.beta, g.num_v_heads) ||
       !make(h.q_l, g.key_dim) || !make(h.k_l, g.key_dim) ||
       !make(h.q_exp, g.num_v_heads * g.head_k_dim) ||
       !make(h.k_exp, g.num_v_heads * g.head_k_dim) ||
@@ -83,14 +84,22 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
   h.pos = std::move(*pos);
   h.full.resize(cfg.layers);
   h.linear.resize(cfg.layers);
-  h.conv_hist.assign(cfg.layers, {});
   const std::size_t hist_len = g.conv_dim * (g.width - 1);
   const std::size_t state_len =
       g.num_v_heads * g.head_k_dim * g.head_v_dim;
   std::vector<float> zeros;
   for (std::size_t l = 0; l < cfg.layers; ++l) {
     if (!cfg.IsFullAttentionLayer(l)) {
-      h.conv_hist[l].assign(hist_len, 0.0f);
+      // The conv history lives on the device; the kernel shifts it.
+      auto conv = alloc(hist_len * 4);
+      if (!conv) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      zeros.assign(hist_len, 0.0f);
+      if (!UploadF32(backend, **conv, zeros)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      h.linear[l].conv_hist = std::move(*conv);
       auto state = alloc(state_len * 4);
       if (!state) {
         return std::unexpected(StatusCode::OutOfMemory);
@@ -252,7 +261,8 @@ std::expected<void, StatusCode> EnsureHybridReady(
         !load(h.l2norm_kernel, "l2norm") ||
         !load(h.ssm_gate_kernel, "ssm_gate") ||
         !load(h.delta_step_heads_kernel, "delta_step_heads") ||
-        !load(h.rmsnorm_gated_kernel, "rmsnorm_gated")) {
+        !load(h.rmsnorm_gated_kernel, "rmsnorm_gated") ||
+        !load(h.conv1d_state_kernel, "conv1d_state")) {
       return std::unexpected(StatusCode::DeviceError);
     }
     auto scratch = InitScratch(backend, cfg, h, g);
@@ -431,63 +441,11 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
                        *h.beta, g.num_v_heads)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    // The causal conv runs on the host: download the fused qkv, convolve
-    // with the cached history, then upload the mixed result.
-    std::vector<float> qkv(g.conv_dim);
-    auto qkv_down = backend.CopyD2H(*h.qkv,
-                                    reinterpret_cast<std::byte*>(qkv.data()),
-                                    qkv.size() * 4);
-    if (!qkv_down) {
-      return std::unexpected(qkv_down.error());
-    }
-    auto conv_w = DownloadF32Cached(backend, h.host_weights,
-                                    base + "ssm_conv1d.weight",
-                                    *(*w_conv)->device);
-    if (!conv_w) {
-      return std::unexpected(conv_w.error());
-    }
-    std::vector<float> xr(g.conv_dim * g.width);
-    for (std::size_t c = 0; c < g.conv_dim; ++c) {
-      xr[c * g.width] = qkv[c];
-      for (std::size_t i = 1; i < g.width; ++i) {
-        xr[c * g.width + i] = h.conv_hist[l][c * (g.width - 1) + (i - 1)];
-      }
-    }
-    std::vector<float> mixed(g.conv_dim);
-    // The checkpoint conv weight is PyTorch nn.Conv1d order (tap 0 is the
-    // oldest sample); the step reference uses tap 0 as the current sample,
-    // so reverse the taps.
-    std::vector<float> rev_w((*conv_w)->size());
-    for (std::size_t c = 0; c < g.conv_dim; ++c) {
-      for (std::size_t t = 0; t < g.width; ++t) {
-        rev_w[c * g.width + t] =
-            (**conv_w)[c * g.width + (g.width - 1 - t)];
-      }
-    }
-    auto conv = Conv1dStepRef(std::span<const float>(xr),
-                              std::span<const float>(rev_w),
-                              std::span<float>(mixed), g.conv_dim, g.width);
-    if (!conv) {
-      return std::unexpected(conv.error());
-    }
-    for (float& value : mixed) {
-      value = value / (1.0f + std::exp(-value));
-    }
-    for (std::size_t c = 0; c < g.conv_dim; ++c) {
-      for (std::size_t i = g.width - 1; i > 1; --i) {
-        h.conv_hist[l][c * (g.width - 1) + (i - 1)] =
-            h.conv_hist[l][c * (g.width - 1) + (i - 2)];
-      }
-      if (g.width > 1) {
-        h.conv_hist[l][c * (g.width - 1)] = qkv[c];
-      }
-    }
-    if (!UploadF32(backend, *h.conv_mixed, mixed) ||
-        !backend.CopyD2D(*h.conv_mixed, 0, *h.q_l, 0, g.key_dim * 4) ||
-        !backend.CopyD2D(*h.conv_mixed, g.key_dim * 4, *h.k_l, 0,
-                         g.key_dim * 4) ||
-        !backend.CopyD2D(*h.conv_mixed, 2 * g.key_dim * 4, *h.v_l, 0,
-                         g.value_dim * 4) ||
+    // The causal conv, SiLU and q/k/v split run on the device; the
+    // history lives in linear[l].conv_hist and the kernel shifts it.
+    if (!Conv1dStateDevice(backend, *h.conv1d_state_kernel, *h.qkv,
+                           *(*w_conv)->device, *h.linear[l].conv_hist, *h.q_l,
+                           *h.k_l, *h.v_l, g.conv_dim, g.width, g.key_dim) ||
         !L2NormDevice(backend, *h.l2norm_kernel, *h.q_l, *h.q_l, g.num_k_heads,
                       g.head_k_dim, 1e-6f,
                       1.0 / std::sqrt(static_cast<double>(g.head_k_dim))) ||

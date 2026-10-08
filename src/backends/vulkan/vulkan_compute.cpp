@@ -51,6 +51,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"rmsnorm_gated", kRmsnormGatedSpirV, sizeof(kRmsnormGatedSpirV)},
     {"conv1d", kConv1dSpirV, sizeof(kConv1dSpirV)},
     {"conv1d_step", kConv1dStepSpirV, sizeof(kConv1dStepSpirV)},
+    {"conv1d_state", kConv1dStateSpirV, sizeof(kConv1dStateSpirV)},
     {"dflash_conv", kDflashConvSpirV, sizeof(kDflashConvSpirV)},
     {"selector_edge_score", kSelectorEdgeScoreSpirV, sizeof(kSelectorEdgeScoreSpirV)},
     {"concat_features", kConcatFeaturesSpirV, sizeof(kConcatFeaturesSpirV)},

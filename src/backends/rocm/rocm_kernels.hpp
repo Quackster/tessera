@@ -243,6 +243,14 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
 __global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
                                  unsigned long long channels,
                                  unsigned long long width);
+// Current-step causal depthwise conv with an on-device history, the SiLU
+// and the q/k/v split (the Vulkan "conv1d_state" contract).
+__global__ void Conv1dStateKernel(const float* qkv, const float* w,
+                                  float* hist, float* q, float* k, float* v,
+                                  unsigned long long conv_dim,
+                                  unsigned long long width,
+                                  unsigned long long key_dim,
+                                  unsigned long long qkv_offset);
 __global__ void SsmGateKernel(const float* a_log, const float* dt,
                               const float* alpha_raw, const float* beta_raw,
                               float* alpha, float* beta,

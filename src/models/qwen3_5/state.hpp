@@ -22,9 +22,9 @@ struct Qwen35BatchScratch {
   std::unique_ptr<Buffer> fgate, fup, fmlp;
   std::unique_ptr<Buffer> qkv, z, alpha_raw, beta_raw, alpha, beta, out;
   // Per linear layer: capacity device-state snapshots (capacity x state)
-  // and the matching host conv histories.
+  // and the matching device conv-history snapshots.
   std::vector<std::unique_ptr<Buffer>> state_hist;
-  std::vector<std::vector<float>> conv_hist_hist;
+  std::vector<std::unique_ptr<Buffer>> conv_hist_hist;
 };
 
 // The Qwen3.5 decode state: the loaded kernels, scratch device buffers,
@@ -38,7 +38,7 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Kernel> qgate_split_kernel;
   std::unique_ptr<Kernel> mrope_kernel;
   std::unique_ptr<Kernel> attention_kernel;
-  std::unique_ptr<Kernel> conv1d_step_kernel;
+  std::unique_ptr<Kernel> conv1d_state_kernel;
   std::unique_ptr<Kernel> repeat_heads_kernel;
   std::unique_ptr<Kernel> l2norm_kernel;
   std::unique_ptr<Kernel> ssm_gate_kernel;
@@ -54,13 +54,10 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> fused, q, gate, kf, vf, attn;
   std::unique_ptr<Buffer> fgate, fup, fmlp;
   std::unique_ptr<Buffer> qkv, z, alpha_raw, beta_raw, alpha, beta;
-  std::unique_ptr<Buffer> conv_mixed;
   std::unique_ptr<Buffer> q_l, k_l;
   std::unique_ptr<Buffer> q_exp, k_exp, v_l, core, out;
   // MTP head scratch (fused embedding+hidden, hidden norms).
   std::unique_ptr<Buffer> mtp_fused, mtp_h;
-  // Per linear layer, the conv input history on the host (oldest first).
-  std::vector<std::vector<float>> conv_hist;
   struct FullKv {
     std::unique_ptr<Buffer> k;
     std::unique_ptr<Buffer> v;

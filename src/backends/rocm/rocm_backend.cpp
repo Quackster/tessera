@@ -61,6 +61,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"add", reinterpret_cast<void*>(&AddKernel)},
     {"repeat_heads", reinterpret_cast<void*>(&RepeatHeadsKernel)},
     {"conv1d_step", reinterpret_cast<void*>(&Conv1dStepKernel)},
+    {"conv1d_state", reinterpret_cast<void*>(&Conv1dStateKernel)},
     {"dflash_conv", reinterpret_cast<void*>(&DflashConvKernel)},
     {"selector_edge_score", reinterpret_cast<void*>(&SelectorEdgeScoreKernel)},
     {"concat_features", reinterpret_cast<void*>(&ConcatFeaturesKernel)},
