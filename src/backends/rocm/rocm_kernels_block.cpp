@@ -32,7 +32,11 @@ __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
     const float d = Fp16ToFloatDev(d_bits);
     const float dm = Fp16ToFloatDev(dm_bits);
     const unsigned char* scales = base + 4;
-    const unsigned char* qs = base + 16;
+    // The 128 nibble bytes start at base + 16; the block is 144 bytes so
+    // base is 16-byte aligned and the word loads are aligned. Read four
+    // bytes (eight nibbles) per load instead of one byte (two).
+    const unsigned int* qwords =
+        reinterpret_cast<const unsigned int*>(base + 16);
     for (unsigned long long grp = 0; grp < 4; ++grp) {
       std::uint8_t sc0, mn0, sc1, mn1;
       GetScaleMinDev(2 * grp, scales, &sc0, &mn0);
@@ -41,12 +45,17 @@ __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
       const float o0 = dm * static_cast<float>(mn0);
       const float a1 = d * static_cast<float>(sc1);
       const float o1 = dm * static_cast<float>(mn1);
-      for (unsigned long long l = 0; l < 32; ++l) {
-        const std::uint8_t q = qs[32 * grp + l];
-        const unsigned long long t = b * 256 + grp * 64 + l;
-        acc += a[row_a * k + t] * (a0 * static_cast<float>(q & 15) - o0);
-        acc += a[row_a * k + t + 32] *
-               (a1 * static_cast<float>(q >> 4) - o1);
+      for (unsigned long long w32 = 0; w32 < 8; ++w32) {
+        unsigned int word = qwords[grp * 8 + w32];
+        for (unsigned long long kk = 0; kk < 4; ++kk) {
+          const std::uint8_t q = static_cast<std::uint8_t>(word & 0xFFu);
+          word >>= 8;
+          const unsigned long long l = w32 * 4 + kk;
+          const unsigned long long t = b * 256 + grp * 64 + l;
+          acc += a[row_a * k + t] * (a0 * static_cast<float>(q & 15) - o0);
+          acc += a[row_a * k + t + 32] *
+                 (a1 * static_cast<float>(q >> 4) - o1);
+        }
       }
     }
   }

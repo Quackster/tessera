@@ -1333,9 +1333,25 @@ through RADV GFX1201, rocm through the system ROCm).
   bit-identical, `ctest` is 258/258, and the 27B MXFP4 decode drops from
   652 to 599 ms/token with the same tokens. The MXFP4 path is still about
   2x the GGUF decode (280 ms/token); the separate, strided scale-array
-  read is the likely next cost. The remaining item 3 work (scale-array
+  read is   the likely next cost. The remaining item 3 work (scale-array
   access, a larger-batch prefill measurement, and the same vectorization
   on the other quant GEMVs) continues.
+
+- 2026-10-08: **Wide Q4_K nibble reads and the item 3 cost picture.**
+  `gemm_q4k` on ROCm now reads the 128 nibble bytes of a block as eight
+  aligned `unsigned int` words (four bytes, eight nibbles per load)
+  instead of one byte (two). Results are bit-identical and `ctest` is
+  258/258, but the 27B GGUF decode is unchanged (284 ms/token against 280
+  ms/token). Two more targeted experiments were run and reverted because
+  they did not help: reading the MXFP4 E8M0 scales as if transposed
+  (perfectly coalesced access, same 599 ms/token) shows the strided scale
+  read is not the cost, and keeping the 248k-vocab head BF16 (`gemm_bf16`
+  rather than the F32 conversion) did not change the decode either. The
+  GGUF runs at about 57 GB/s of the roughly 16 GB of weights per step, far
+  below the memory bandwidth, so the per-thread weight-row reads (one
+  thread reads a whole row, uncoalesced across the warp) are the remaining
+  item 3 lever; that is a GEMV redesign, not a micro-optimization. The
+  tiled kernels already fix the batched case.
 
 ## Next (in order)
 
