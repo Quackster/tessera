@@ -966,22 +966,25 @@ through RADV GFX1201, rocm through the system ROCm).
 
 ## Next (in order)
 
-- **PERF (urgent, do first)**: `EngineTest.DFlash2MatchesGreedyOnModel`
-  on the MXFP4 target takes 370 s (6 min 10 s) and it should take
-  seconds. The time is the 19 GB target load plus the scalar `gemm_mxfp4`
-  kernel (about 1.4 s/token here, 2.5 s/token in the longer run), not the
-  draft. The load parses the safetensors, dequantizes and packs every fp4
-  blob, and converts large BF16 tensors to F32 (the `lm_head` alone becomes
-  a 5 GB F32 matrix); the reference runtime loads the same file in 8 s
-  because it keeps fp4 and dequantizes in the kernel. Fix the load path
-  and the MXFP4 GEMM throughput, then re-measure this test's wall time.
-  This is the same work as item 3, pulled forward.
-  Progress: packing blob||scales in one allocation (instead of appending,
-  which reallocated the whole blob each time) and copying the value-head
-  reorder in runs cut the load build from 236 s to 52 s and the MXFP4
-  generation test from 287 s to 128 s. The remaining build cost is the
-  plain BF16-to-F32 conversion (34 s, mostly the 5 GB `lm_head`); decode is
-  still about 2.5 s/token on the scalar `gemm_mxfp4` kernel.
+- **PERF (urgent, do first)**: make the MXFP4 model load fast. Target: the
+  whole load under 60 s, not counting prefill or decode. The load reads the
+  19 GB safetensors, dequantizes and packs every fp4 blob, and converts
+  large BF16 tensors to F32 (the `lm_head` alone becomes a 5 GB F32
+  matrix). The reference runtime loads the same file in 8 s because it
+  keeps fp4 and dequantizes in the kernel. Measure on
+  `EngineTest.MxFp4GeneratesWhenProvided` (128 s total today) and
+  `EngineTest.DFlash2MatchesGreedyOnModel` (370 s before the load fix).
+  Then keep reducing the load. Improve the MXFP4 GEMM throughput (item 3)
+  for decode separately.
+  Progress: the load is about 54 s now, under the 60 s target, and
+  `EngineTest.MxFp4GeneratesWhenProvided` fell from 287 s to 68 s. The
+  changes: pack blob||scales in one allocation (appending reallocated the
+  whole blob for every tensor, 180 s); copy the value-head reorder in runs;
+  memory-map the checkpoint instead of `ReadFile` (removed an 18.6 s copy
+  and the 18 GB anonymous allocation); vectorize the bulk BF16-to-F32
+  conversion; upload the F32 tensor without an extra copy; skip the second
+  fp4 copy when there is no reorder. Decode is still about 2.3 s/token on
+  the scalar `gemm_mxfp4` kernel (item 3).
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are

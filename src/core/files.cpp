@@ -1,6 +1,12 @@
 #include "core/files.hpp"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <fstream>
+#include <utility>
 
 namespace tessera::core {
 
@@ -50,6 +56,58 @@ std::expected<void, StatusCode> WriteFile(
     return std::unexpected(StatusCode::MalformedFile);
   }
   return {};
+}
+
+MappedFile::MappedFile(MappedFile&& other) noexcept
+    : data_(other.data_), size_(other.size_) {
+  other.data_ = nullptr;
+  other.size_ = 0;
+}
+
+MappedFile& MappedFile::operator=(MappedFile&& other) noexcept {
+  if (this != &other) {
+    Reset();
+    data_ = other.data_;
+    size_ = other.size_;
+    other.data_ = nullptr;
+    other.size_ = 0;
+  }
+  return *this;
+}
+
+MappedFile::~MappedFile() { Reset(); }
+
+void MappedFile::Reset() {
+  if (data_ != nullptr) {
+    ::munmap(const_cast<std::byte*>(data_), size_);
+    data_ = nullptr;
+    size_ = 0;
+  }
+}
+
+std::expected<MappedFile, StatusCode> MappedFile::Open(
+    const std::filesystem::path& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return std::unexpected(StatusCode::FileNotFound);
+  }
+  struct stat info {};
+  if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+    ::close(fd);
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  MappedFile result;
+  result.size_ = static_cast<std::size_t>(info.st_size);
+  if (result.size_ != 0) {
+    void* address = ::mmap(nullptr, result.size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (address == MAP_FAILED) {
+      ::close(fd);
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    result.data_ = static_cast<const std::byte*>(address);
+  }
+  ::close(fd);
+  return result;
 }
 
 }  // namespace tessera::core

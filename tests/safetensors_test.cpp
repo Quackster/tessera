@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <utility>
+
+#include "core/files.hpp"
 #include "core/loaders/safetensors.hpp"
 #include "test_helpers.hpp"
 
@@ -188,4 +191,23 @@ TEST(SafetensorsTest, RejectsDirectoryWithBrokenWeight) {
   auto layout = InspectMxFp4Directory(dir);
   ASSERT_FALSE(layout.has_value());
   EXPECT_EQ(layout.error(), StatusCode::MalformedFile);
+}
+
+TEST(SafetensorsTest, MappedFileReadsBytesAndMoves) {
+  auto dir = FreshTempDir("tessera_tests_mapped");
+  auto path = dir / "blob.bin";
+  WriteBytes(path, {std::byte{'a'}, std::byte{'b'}, std::byte{'c'}});
+  auto mapped = tessera::core::MappedFile::Open(path);
+  ASSERT_TRUE(mapped.has_value()) << tessera::ToString(mapped.error());
+  auto bytes = mapped->bytes();
+  ASSERT_EQ(bytes.size(), 3u);
+  EXPECT_EQ(static_cast<char>(bytes[0]), 'a');
+  EXPECT_EQ(static_cast<char>(bytes[2]), 'c');
+  // A move transfers the mapping and leaves the source empty.
+  auto moved = std::move(*mapped);
+  EXPECT_EQ(moved.bytes().size(), 3u);
+  EXPECT_EQ(mapped->bytes().size(), 0u);
+  auto missing = tessera::core::MappedFile::Open(dir / "absent.bin");
+  ASSERT_FALSE(missing.has_value());
+  EXPECT_EQ(missing.error(), StatusCode::FileNotFound);
 }

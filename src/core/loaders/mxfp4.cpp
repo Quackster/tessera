@@ -1,5 +1,6 @@
 #include "core/loaders/mxfp4.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -211,9 +212,13 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
       std::span<const std::byte> scale_bytes =
           file.subspan(scale->second->begin,
                        scale->second->end - scale->second->begin);
-      std::vector<std::byte> blob(payload.begin(), payload.end());
-      std::vector<std::byte> scales(scale_bytes.begin(), scale_bytes.end());
+      // Pack blob||scales in one allocation. Appending to a blob vector
+      // reallocates the whole blob and turned a 27B load into minutes; a
+      // second copy is skipped for the tensors with no reorder.
+      std::vector<std::byte> packed;
       if (conversion) {
+        std::vector<std::byte> blob(payload.begin(), payload.end());
+        std::vector<std::byte> scales(scale_bytes.begin(), scale_bytes.end());
         auto permuted_blob = PermuteValue(blob, rows, cols, Lane::Blob, 0,
                                           conversion->inner, conversion->src);
         if (!permuted_blob) {
@@ -227,12 +232,15 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
         }
         blob = std::move(*permuted_blob);
         scales = std::move(*permuted_scales);
+        packed.resize(blob.size() + scales.size());
+        std::memcpy(packed.data(), blob.data(), blob.size());
+        std::memcpy(packed.data() + blob.size(), scales.data(), scales.size());
+      } else {
+        packed.resize(payload.size() + scale_bytes.size());
+        std::memcpy(packed.data(), payload.data(), payload.size());
+        std::memcpy(packed.data() + payload.size(), scale_bytes.data(),
+                    scale_bytes.size());
       }
-      // Pack blob||scales in one allocation. Appending to `blob` reallocates
-      // the whole blob and turned a 27B load into minutes.
-      std::vector<std::byte> packed(blob.size() + scales.size());
-      std::memcpy(packed.data(), blob.data(), blob.size());
-      std::memcpy(packed.data() + blob.size(), scales.data(), scales.size());
       auto buffer = Upload(backend, packed);
       if (!buffer) {
         return std::unexpected(buffer.error());
@@ -256,30 +264,45 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
         device = std::move(*buffer);
       } else {
         std::vector<float> values(rows * cols);
-        for (std::size_t i = 0; i < values.size(); ++i) {
-          values[i] = ReadPlain(tensor.entry.dtype, payload.data() + i * elem_bytes);
-          if (conversion && conversion->exp_negate) {
-            values[i] = -std::exp(values[i]);
+        if (!conversion && tensor.entry.dtype == DType::BF16) {
+          // Bulk bf16 -> f32: a wider load per element lets the compiler
+          // vectorize. The per-element ReadPlain call does not, and the
+          // 5 GB lm_head alone then takes half a minute.
+          const std::uint16_t* src =
+              reinterpret_cast<const std::uint16_t*>(payload.data());
+          for (std::size_t i = 0; i < values.size(); ++i) {
+            values[i] =
+                std::bit_cast<float>(static_cast<std::uint32_t>(src[i]) << 16);
           }
-          if (conversion && conversion->add_one) {
-            values[i] += 1.0f;
+        } else if (!conversion && tensor.entry.dtype == DType::F32) {
+          std::memcpy(values.data(), payload.data(), values.size() * 4);
+        } else {
+          for (std::size_t i = 0; i < values.size(); ++i) {
+            values[i] =
+                ReadPlain(tensor.entry.dtype, payload.data() + i * elem_bytes);
+            if (conversion && conversion->exp_negate) {
+              values[i] = -std::exp(values[i]);
+            }
+            if (conversion && conversion->add_one) {
+              values[i] += 1.0f;
+            }
           }
         }
         std::span<const std::byte> f32_bytes(
             reinterpret_cast<const std::byte*>(values.data()),
             values.size() * 4);
-        std::vector<std::byte> bytes;
+        std::span<const std::byte> out_bytes = f32_bytes;
+        std::vector<std::byte> permuted_bytes;
         if (conversion && !conversion->src.empty()) {
           auto permuted = PermuteValue(f32_bytes, rows, cols, Lane::Plain, 4,
                                        conversion->inner, conversion->src);
           if (!permuted) {
             return std::unexpected(permuted.error());
           }
-          bytes = std::move(*permuted);
-        } else {
-          bytes.assign(f32_bytes.begin(), f32_bytes.end());
+          permuted_bytes = std::move(*permuted);
+          out_bytes = permuted_bytes;
         }
-        auto buffer = Upload(backend, bytes);
+        auto buffer = Upload(backend, out_bytes);
         if (!buffer) {
           return std::unexpected(buffer.error());
         }

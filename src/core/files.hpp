@@ -21,4 +21,29 @@ namespace tessera::core {
 [[nodiscard]] std::expected<void, StatusCode> WriteFile(
     const std::filesystem::path& path, std::span<const std::byte> data);
 
+// A read-only memory map of a whole file. It avoids the copy and the
+// anonymous allocation of ReadFile, which matters for a multi-gigabyte
+// checkpoint. Move-only; the mapping stays valid until destruction.
+class MappedFile {
+ public:
+  MappedFile() = default;
+  MappedFile(const MappedFile&) = delete;
+  MappedFile& operator=(const MappedFile&) = delete;
+  MappedFile(MappedFile&& other) noexcept;
+  MappedFile& operator=(MappedFile&& other) noexcept;
+  ~MappedFile();
+
+  [[nodiscard]] static std::expected<MappedFile, StatusCode> Open(
+      const std::filesystem::path& path);
+
+  [[nodiscard]] std::span<const std::byte> bytes() const {
+    return std::span<const std::byte>(data_, size_);
+  }
+
+ private:
+  void Reset();
+  const std::byte* data_ = nullptr;
+  std::size_t size_ = 0;
+};
+
 }  // namespace tessera::core

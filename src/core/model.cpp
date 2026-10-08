@@ -466,12 +466,12 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!layout) {
       return std::unexpected(layout.error());
     }
-    auto bytes = core::ReadFile(layout->weights_path);
-    if (!bytes) {
-      return std::unexpected(bytes.error());
+    auto mapped = core::MappedFile::Open(layout->weights_path);
+    if (!mapped) {
+      return std::unexpected(mapped.error());
     }
-    auto parsed =
-        core::ParseSafetensorsMap(std::span<const std::byte>(*bytes));
+    const std::span<const std::byte> file_bytes = mapped->bytes();
+    auto parsed = core::ParseSafetensorsMap(file_bytes);
     if (!parsed) {
       return std::unexpected(parsed.error());
     }
@@ -492,8 +492,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
           return std::unexpected(config.error());
         }
         auto weights = core::BuildMxFp4Weights(
-            backend, std::span<const std::byte>(*bytes), *parsed, *module,
-            *config);
+            backend, file_bytes, *parsed, *module, *config);
         if (!weights) {
           return std::unexpected(weights.error());
         }
@@ -520,8 +519,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       offsets.push_back(tensor.begin);
     }
     // Map offsets count from the file start, so the base is zero.
-    auto weights = UploadWeights(backend, tensors, offsets, 0,
-                                 std::span<const std::byte>(*bytes));
+    auto weights = UploadWeights(backend, tensors, offsets, 0, file_bytes);
     if (!weights) {
       return std::unexpected(weights.error());
     }
