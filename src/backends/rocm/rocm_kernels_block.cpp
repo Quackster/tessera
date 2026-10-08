@@ -141,6 +141,13 @@ __global__ void GemmQ5KKernel(const float* a, const unsigned char* w,
     std::memcpy(&dm_bits, base + 2, 2);
     d = Fp16ToFloatDev(d_bits);
     dmin = Fp16ToFloatDev(dm_bits);
+    // The 32 low-nibble bytes of each group and the 32 high-bit bytes
+    // start at 4-byte-aligned offsets (the block is 176 bytes), so read
+    // them as words (four bytes per load) instead of one byte.
+    const unsigned int* lows =
+        reinterpret_cast<const unsigned int*>(base + 48);
+    const unsigned int* highs =
+        reinterpret_cast<const unsigned int*>(base + 16);
     unsigned int u1 = 1;
     unsigned int u2 = 2;
     for (unsigned long long g = 0; g < 4; ++g) {
@@ -151,14 +158,25 @@ __global__ void GemmQ5KKernel(const float* a, const unsigned char* w,
       const float o1 = dmin * mn0;
       const float d2 = d * sc1;
       const float o2 = dmin * mn1;
-      for (unsigned long long l = 0; l < 32; ++l) {
-        const unsigned long long t = b * 256 + g * 64 + l;
-        const unsigned char low = base[48 + g * 32 + l];
-        const unsigned char high = base[16 + l];
-        acc = fmaf(a[row_a * k + t],
-                   d1 * ((low & 15) + (high & u1 ? 16 : 0)) - o1, acc);
-        acc = fmaf(a[row_a * k + t + 32],
-                   d2 * ((low >> 4) + (high & u2 ? 16 : 0)) - o2, acc);
+      for (unsigned long long w32 = 0; w32 < 8; ++w32) {
+        unsigned int low_word = lows[g * 8 + w32];
+        unsigned int high_word = highs[w32];
+        for (unsigned long long kk = 0; kk < 4; ++kk) {
+          const unsigned int l = static_cast<unsigned int>(w32 * 4 + kk);
+          const unsigned int low = low_word & 0xFFu;
+          const unsigned int high = high_word & 0xFFu;
+          low_word >>= 8;
+          high_word >>= 8;
+          const unsigned long long t = b * 256 + g * 64 + l;
+          acc = fmaf(a[row_a * k + t],
+                     d1 * static_cast<float>((low & 15) +
+                                             ((high & u1) ? 16 : 0)) - o1,
+                     acc);
+          acc = fmaf(a[row_a * k + t + 32],
+                     d2 * static_cast<float>((low >> 4) +
+                                             ((high & u2) ? 16 : 0)) - o2,
+                     acc);
+        }
       }
       u1 <<= 2;
       u2 <<= 2;

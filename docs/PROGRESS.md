@@ -1412,6 +1412,37 @@ through RADV GFX1201, rocm through the system ROCm).
   across runs and the 5-token prefill 805 to 1004 ms, so run-to-run noise
   exceeds any tiling effect at this batch size. The remaining item 3 work
   is the m = 1 decode GEMV, not the tiling.
+
+- 2026-10-08: **Wide reads on the remaining hot GEMVs, and an attention
+  OOB fix (item 3b).** The ROCm `gemm_q5k` now reads the 32 low-nibble
+  bytes and the 32 high-bit bytes of each group as words (eight loads per
+  group instead of 64 byte loads), and `gemm_iq4xs` reads the 16 nibble
+  bytes of a sub-block as four words. Both are bit-identical and their
+  device tests pass. `gemm_q6k` is left byte-wise: its 210-byte block is
+  not 4-byte aligned, so word loads would be misaligned. The Vulkan
+  `gemm_q5k`/`gemm_iq4xs` already extracted bytes from words. Also fixed a
+  real out-of-bounds read in the attention kernel (ROCm and Vulkan): the
+  value-accumulation loop read `v[vb + e]` for every lane `e` up to the
+  256-thread workgroup even when `head_dim < 256` (the vision tests use
+  `head_dim = 4`); only lanes below `head_dim` have an output element, so
+  the loop is now guarded. 264/264 `ctest` on vulkan and rocm.
+
+- 2026-10-08: **ROCm `VisionStackMatchesRef` is intermittently flaky.**
+  The vision stack device test fails roughly 40% of runs on ROCm with an
+  absolute error of order 1 to 3, and passes the rest; it passes when run
+  alone repeatedly in some sessions and fails in others, and it is not
+  reproducible with the vision block or non-causal attention tests run
+  alone (20/20 each). It is not caused by the attention out-of-bounds fix
+  above (the flake predates it and persists). Treat a single failure as
+  environmental until it is reproduced in isolation; the Vulkan path is
+  stable. This is the only known flaky test.
+
+- 2026-10-08: **Item 7 deepstack is not needed for the target.** The
+  Qwen3.8 vision config sets `deepstack_visual_indexes` to the empty list,
+  so the Qwen3VL deepstack multi-level feature injection has nothing to
+  inject and the single merged embedding the vision encoder already
+  produces is correct. Item 7's remaining work is only the image-prefill
+  attention speed, which is the same GEMM/attention work as item 3.
 - 2026-10-08: **Per-kernel profile of the GGUF decode (item 3).**
   `rocprofv3 --kernel-trace` on `EngineTest.GgufGeneratesWhenProvided`
   (27B GGUF, 5-token prefill plus 4 decode tokens) ranks the kernels by
@@ -1627,8 +1658,10 @@ through RADV GFX1201, rocm through the system ROCm).
 7. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, image-embedding injection, the CLI wiring and the
    `<|image_pad|>` placeholder default are done
-   (`Engine::GenerateMultimodal`). Still to do: deepstack feature
-   injection and the image prefill speed (attention kernel).
+   (`Engine::GenerateMultimodal`). Deepstack feature injection is not
+   needed: the Qwen3.8 target's `deepstack_visual_indexes` is empty. The
+   only remaining work is the image-prefill attention speed (the same
+   GEMM/attention cost as item 3).
 
 8. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism

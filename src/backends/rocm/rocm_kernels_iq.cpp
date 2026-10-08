@@ -65,12 +65,22 @@ __global__ void GemmIq4XsKernel(const float* a, const unsigned char* w,
       const int ls = ((packed >> (4 * (ib % 2))) & 15) |
                      (((scales_h >> (2 * ib)) & 3) << 4);
       const float dl = d * (ls - 32);
-      for (unsigned long long j = 0; j < 16; ++j) {
-        const unsigned char q = base[8 + ib * 16 + j];
-        const unsigned long long t = b * 256 + ib * 32 + j;
-        acc = fmaf(a[row_a * k + t], dl * kIq4NlValuesDev[q & 15], acc);
-        acc = fmaf(a[row_a * k + t + 16], dl * kIq4NlValuesDev[q >> 4],
-                   acc);
+      // The 16 nibble bytes of a sub-block are 4-byte aligned (the block
+      // is 136 bytes), so read them as four words instead of one byte.
+      const unsigned int* nibbles = reinterpret_cast<const unsigned int*>(
+          base + 8 + ib * 16);
+      for (unsigned long long w32 = 0; w32 < 4; ++w32) {
+        unsigned int word = nibbles[w32];
+        for (unsigned long long kk = 0; kk < 4; ++kk) {
+          const unsigned int j =
+              static_cast<unsigned int>(w32 * 4 + kk);
+          const unsigned int q = word & 0xFFu;
+          word >>= 8;
+          const unsigned long long t = b * 256 + ib * 32 + j;
+          acc = fmaf(a[row_a * k + t], dl * kIq4NlValuesDev[q & 15], acc);
+          acc = fmaf(a[row_a * k + t + 16], dl * kIq4NlValuesDev[q >> 4],
+                     acc);
+        }
       }
     }
   }

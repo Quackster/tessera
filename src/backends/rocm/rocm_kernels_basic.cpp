@@ -139,13 +139,17 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     }
     __syncthreads();
     float a = 0.0f;
-    for (unsigned long long t = 0; t < kTile; ++t) {
-      const unsigned long long j = tile + t;
-      if (j > last) {
-        break;
+    // Only lanes below head_dim have an output element; the others read
+    // past the value row if they run this loop, so guard it.
+    if (e < head_dim) {
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        const unsigned long long j = tile + t;
+        if (j > last) {
+          break;
+        }
+        const unsigned long long vb = (j * kv_heads + kv) * head_dim;
+        a = fmaf(wt[t], vat(vb + e), a);
       }
-      const unsigned long long vb = (j * kv_heads + kv) * head_dim;
-      a = fmaf(wt[t], vat(vb + e), a);
     }
     acc = fmaf(corr, acc, a);
     run_sum = fmaf(corr, run_sum, l);

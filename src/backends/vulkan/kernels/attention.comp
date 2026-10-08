@@ -123,13 +123,17 @@ void main() {
     }
     barrier();
     float a = 0.0;
-    for (uint t = 0; t < kTile; ++t) {
-      uint j = tile + t;
-      if (j > last) {
-        break;
+    // Only lanes below head_dim have an output element; the others would
+    // read past the value row, so guard the loop.
+    if (e < head_dim) {
+      for (uint t = 0; t < kTile; ++t) {
+        uint j = tile + t;
+        if (j > last) {
+          break;
+        }
+        uint vb = (j * kv_heads + kv) * head_dim;
+        a = fma(wt[t], load_v(vb + e, kv_f16), a);
       }
-      uint vb = (j * kv_heads + kv) * head_dim;
-      a = fma(wt[t], load_v(vb + e, kv_f16), a);
     }
     acc = fma(corr, acc, a);
     run_sum = fma(corr, run_sum, l);
