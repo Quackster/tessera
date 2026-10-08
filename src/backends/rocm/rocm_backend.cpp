@@ -293,23 +293,24 @@ class RocmBackend final : public Backend {
     std::memset(scalar_values, 0, sizeof(scalar_values));
     std::memcpy(scalar_values, launch.scalars.data(),
                 launch.scalars.size() * sizeof(std::uint64_t));
-    // Arg pointers must outlive the launch call, so they are set after
-    // buffer_pointers has finished growing (no reallocation in between).
-    std::vector<void*> buffer_pointers;
-    buffer_pointers.reserve(kMaxBoundBuffers);
+    // Fixed-size stack storage: ValidateLaunch already bounds the counts,
+    // and this keeps the per-launch CPU cost off the heap (the decode
+    // submits on the order of 500 launches per token).
+    void* buffer_pointers[kMaxBoundBuffers];
+    std::size_t buffer_count = 0;
     for (const auto* buffer : launch.buffers) {
       if (buffer == nullptr) {
         return std::unexpected(StatusCode::InvalidArgument);
       }
-      buffer_pointers.push_back(buffer->Handle());
+      buffer_pointers[buffer_count++] = buffer->Handle();
     }
-    std::vector<void*> arg_pointers;
-    arg_pointers.reserve(kMaxBoundBuffers + kMaxScalars);
-    for (std::size_t i = 0; i < buffer_pointers.size(); ++i) {
-      arg_pointers.push_back(&buffer_pointers[i]);
+    void* arg_pointers[kMaxBoundBuffers + kMaxScalars];
+    std::size_t arg_count = 0;
+    for (std::size_t i = 0; i < buffer_count; ++i) {
+      arg_pointers[arg_count++] = &buffer_pointers[i];
     }
     for (std::size_t i = 0; i < launch.scalars.size(); ++i) {
-      arg_pointers.push_back(&scalar_values[i]);
+      arg_pointers[arg_count++] = &scalar_values[i];
     }
     hipLaunchConfig_t config{};
     config.gridDim = dim3(launch.grid_x, launch.grid_y, launch.grid_z);
@@ -317,7 +318,7 @@ class RocmBackend final : public Backend {
     config.dynamicSmemBytes = 0;
     config.stream = nullptr;
     auto error = hipLaunchKernelExC(
-        &config, kBuiltInKernels[index].function, arg_pointers.data());
+        &config, kBuiltInKernels[index].function, arg_pointers);
     if (error != hipSuccess) {
       LogError(std::string("kernel ") + std::string(kernel.Id()) +
                " launch failed (" + HipErrorName(error) + ")");

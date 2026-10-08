@@ -1460,6 +1460,21 @@ through RADV GFX1201, rocm through the system ROCm).
   IQ4_XS for the batched prefill, and (b) the same wide-read/vectorized
   treatment on those GEMVs. The coalesced Q4_K kernel above does not show
   up because its decode contribution is small.
+  A second lever the profile implies: the kernel time is only part of the
+  decode wall. Four decode tokens are about 1.24 s wall while the profiled
+  kernel time for that span is well under it, and the single decode path
+  already does exactly one `Synchronize` plus one tiny D2H per token (in
+  `Qwen35Architecture::Logits`). So a large share of the per-token time is
+  the CPU cost of submitting on the order of 500 kernel launches, each of
+  which heap-allocates two pointer vectors in `Backend::LaunchKernel`.
+  The ROCm `LaunchKernel` now uses fixed-size stack arrays instead (the
+  counts are already bounded by `ValidateLaunch`), so it no longer
+  allocates; `ctest` is 264/264. The 27B GGUF decode still measures 359
+  ms/token this run, i.e. within the 310 to 359 ms/token run-to-run band,
+  so the allocation removal is not separately measurable. `KernelLaunch`
+  itself still builds two `std::vector`s per call in the launch helpers,
+  so a fully allocation-free launch would need fixed arrays in that public
+  type next.
 
 - 2026-10-08: **GPU-only device tests.** The vulkan backend listed the
   llvmpipe CPU rasterizer as `gpu 2`, so `--gpu 2` or `TESSERA_TEST_GPU=2`
