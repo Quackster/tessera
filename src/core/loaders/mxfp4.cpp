@@ -118,14 +118,28 @@ std::expected<std::vector<std::byte>, StatusCode> PermuteValue(
   if (src.size() != cols) {
     return std::unexpected(StatusCode::MalformedFile);
   }
+  // The value-head reorder moves whole blocks (many consecutive units), so
+  // copy maximal runs of consecutive source units. A per-unit memcpy here
+  // costs seconds on a 27B checkpoint.
   for (std::size_t r = 0; r < rows; ++r) {
-    for (std::size_t u = 0; u < units; ++u) {
+    std::byte* dst = out.data() + r * row_bytes;
+    const std::byte* base = in.data() + r * row_bytes;
+    std::size_t u = 0;
+    while (u < units) {
       const std::size_t s = LaneSource(lane, src, u);
       if (s >= units) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      std::memcpy(out.data() + r * row_bytes + u * per,
-                  in.data() + r * row_bytes + s * per, per);
+      std::size_t run = 1;
+      while (u + run < units) {
+        const std::size_t ns = LaneSource(lane, src, u + run);
+        if (ns != s + run || ns >= units) {
+          break;
+        }
+        ++run;
+      }
+      std::memcpy(dst + u * per, base + s * per, run * per);
+      u += run;
     }
   }
   return out;
@@ -214,8 +228,12 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
         blob = std::move(*permuted_blob);
         scales = std::move(*permuted_scales);
       }
-      blob.insert(blob.end(), scales.begin(), scales.end());
-      auto buffer = Upload(backend, blob);
+      // Pack blob||scales in one allocation. Appending to `blob` reallocates
+      // the whole blob and turned a 27B load into minutes.
+      std::vector<std::byte> packed(blob.size() + scales.size());
+      std::memcpy(packed.data(), blob.data(), blob.size());
+      std::memcpy(packed.data() + blob.size(), scales.data(), scales.size());
+      auto buffer = Upload(backend, packed);
       if (!buffer) {
         return std::unexpected(buffer.error());
       }

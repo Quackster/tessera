@@ -976,6 +976,12 @@ through RADV GFX1201, rocm through the system ROCm).
   because it keeps fp4 and dequantizes in the kernel. Fix the load path
   and the MXFP4 GEMM throughput, then re-measure this test's wall time.
   This is the same work as item 3, pulled forward.
+  Progress: packing blob||scales in one allocation (instead of appending,
+  which reallocated the whole blob each time) and copying the value-head
+  reorder in runs cut the load build from 236 s to 52 s and the MXFP4
+  generation test from 287 s to 128 s. The remaining build cost is the
+  plain BF16-to-F32 conversion (34 s, mostly the 5 GB `lm_head`); decode is
+  still about 2.5 s/token on the scalar `gemm_mxfp4` kernel.
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are
