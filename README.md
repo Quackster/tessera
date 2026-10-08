@@ -16,6 +16,9 @@ Tessera is a C++20 LLM inference engine. It runs open weight models on GPU. It h
 
 First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and without DFlash2 speculative decoding.
 
+**Why AMD (ROCm) and Vulkan only?**
+The project author tests with a 7900 XTX and two R9700 cards. There is no recent NVIDIA GPU in the lab. The last NVIDIA GPU used here was a 1080 Ti. Backend support follows hardware available for testing.
+
 ## Features
 
 | Area | State | Detail |
