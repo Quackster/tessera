@@ -107,9 +107,8 @@ __global__ void GemmFp8Kernel(const float* a, const unsigned char* w,
                               unsigned long long m, unsigned long long n,
                               unsigned long long k);
 __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
-                                const unsigned char* s, float* c,
-                                unsigned long long m, unsigned long long n,
-                                unsigned long long k);
+                                float* c, unsigned long long m,
+                                unsigned long long n, unsigned long long k);
 __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);

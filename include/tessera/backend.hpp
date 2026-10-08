@@ -168,11 +168,11 @@ class Kernel {
 // weights W (n x k bytes), buffer 2 one fp32 scale per row of W,
 // buffer 3 the output C (fp32, m x n); scalars are m, n, k. The
 // dispatch is ceil(m * n / 256) workgroups of 256.
-// "gemm_mxfp4": buffer 0 is A (fp32, m x k), buffer 1 the MXFP4
-// weights W (n x k/2 bytes, two E2M1 nibbles per byte), buffer 2 the
-// E8M0 scales (n x k/32 bytes), buffer 3 the output C (fp32, m x n);
-// scalars are m, n, k with k a positive multiple of 32. The dispatch
-// is ceil(m * n / 256) workgroups of 256.
+// "gemm_mxfp4": buffer 0 is A (fp32, m x k), buffer 1 the packed MXFP4
+// weights W (n x k/2 blob bytes, two E2M1 nibbles per byte, followed by
+// the n x k/32 E8M0 scale bytes at offset n*k/2), buffer 2 the output C
+// (fp32, m x n); scalars are m, n, k with k a positive multiple of 32.
+// The dispatch is ceil(m * n / 256) workgroups of 256.
 // "gemm_q5k", "gemm_q6k", "gemm_q3k", "gemm_iq4nl", "gemm_iq4xs",
 // "gemm_iq3s", "gemm_q80": buffer 0 is A (fp32, m x k), buffer 1 the
 // quantized weights W, buffer 2 the output C (fp32, m x n); scalars
@@ -375,7 +375,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "gemm_mxfp4") {
-    if (launch.buffers.size() != 4 || launch.scalars.size() != 3) {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t k = launch.scalars[2];

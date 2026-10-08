@@ -5,11 +5,11 @@
 layout(local_size_x = 256) in;
 
 // "gemm_mxfp4" contract (tessera API): buffer 0 is A (fp32, m x k),
-// buffer 1 the MXFP4 weights W (n x k/2 bytes, two E2M1 nibbles per
-// byte, low nibble first), buffer 2 the E8M0 scales (n x k/32
-// bytes), buffer 3 the output C (fp32, m x n). Scalars are 64-bit,
-// so field k lives at pc.v[2k]: m v[0], n v[2], k v[4] (a positive
-// multiple of 32).
+// buffer 1 the packed MXFP4 weights W (n x k/2 blob bytes followed by
+// the n x k/32 E8M0 scale bytes, two E2M1 nibbles per byte, low nibble
+// first), buffer 2 the output C (fp32, m x n). The scale bytes start at
+// offset n*k/2 in W. Scalars are 64-bit, so field k lives at pc.v[2k]:
+// m v[0], n v[2], k v[4] (a positive multiple of 32).
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -22,21 +22,13 @@ layout(set = 0, binding = 1) buffer W {
   uint w[];
 };
 
-layout(set = 0, binding = 2) buffer S {
-  uint s[];
-};
-
-layout(set = 0, binding = 3) buffer C {
+layout(set = 0, binding = 2) buffer C {
   float c[];
 };
 
-// Byte `offset` of a byte buffer viewed as uint words.
+// Byte `offset` of the packed weight buffer viewed as uint words.
 uint wbyte(uint offset) {
   return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
-}
-
-uint sbyte(uint offset) {
-  return (s[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
 }
 
 // OCP MX E2M1 nibble to fp32 (port of the core F4E2M1ToFloat).
@@ -66,9 +58,10 @@ void main() {
   uint row_a = idx / n;
   uint row_w = idx % n;
   uint blocks = k / 32;
+  uint scale_base = (n * k) >> 1;
   float acc = 0.0;
   for (uint b = 0; b < blocks; ++b) {
-    float scale = exp2(float(sbyte(row_w * blocks + b)) - 127.0);
+    float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
     for (uint l = 0; l < 32; ++l) {
       uint t = b * 32 + l;
       uint packed = wbyte((row_w * k + t) >> 1);

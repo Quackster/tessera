@@ -268,12 +268,13 @@ TEST(BackendTest, GemmMxFp4DeviceMatchesRef) {
       }
     }
   }
+  // The device kernel takes the packed weight: blob bytes then scales.
+  std::vector<std::byte> packed = w;
+  packed.insert(packed.end(), s.begin(), s.end());
   auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
-  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
-  auto s_buf = backend->AllocateBuffer(s.size(), MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(packed.size(), MemoryKind::Device);
   auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
-  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() &&
-              s_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
   const auto upload = [&backend](auto& buf, const auto& data,
                                  std::size_t elem) {
     return backend->CopyH2D(
@@ -282,16 +283,14 @@ TEST(BackendTest, GemmMxFp4DeviceMatchesRef) {
                    data.size() * elem));
   };
   ASSERT_TRUE(upload(a_buf, a, 4).has_value());
-  ASSERT_TRUE(upload(w_buf, w, 1).has_value());
-  ASSERT_TRUE(upload(s_buf, s, 1).has_value());
+  ASSERT_TRUE(upload(w_buf, packed, 1).has_value());
 
   auto kernel = backend->LoadKernel("gemm_mxfp4", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
   launch.grid_x = (kM * kN + 255) / 256;
   launch.block_x = 256;
-  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*s_buf).get(),
-                    (*c_buf).get()};
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
   launch.scalars = {kM, kN, kK};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
@@ -781,15 +780,13 @@ TEST(BackendTest, FpGemmRejectsBadContract) {
   ASSERT_TRUE(mxfp4.has_value()) << tessera::ToString(mxfp4.error());
   const std::vector<const tessera::Buffer*> three_buffers{
       nullptr, nullptr, nullptr};
-  const std::vector<const tessera::Buffer*> four_buffers{
-      nullptr, nullptr, nullptr, nullptr};
   tessera::KernelLaunch launch;
   launch.buffers = three_buffers;
   launch.scalars = {1, 4, 64};
   auto short_buffers = backend->LaunchKernel(**fp8, launch);
   ASSERT_FALSE(short_buffers.has_value());
   EXPECT_EQ(short_buffers.error(), StatusCode::InvalidArgument);
-  launch.buffers = four_buffers;
+  launch.buffers = three_buffers;
   launch.scalars = {1, 4, 100};
   auto bad_k = backend->LaunchKernel(**mxfp4, launch);
   ASSERT_FALSE(bad_k.has_value());

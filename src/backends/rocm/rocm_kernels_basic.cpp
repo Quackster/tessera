@@ -299,16 +299,18 @@ __global__ void GemmFp8BlockKernel(const float* a, const unsigned char* w,
 
 // Built-in "gemm_mxfp4": C = A x W'^T with fp32 sequential
 // accumulation; W' dequantizes MXFP4 nibbles (low nibble first) with
-// one E8M0 scale byte per 32 elements. k is a multiple of 32.
+// one E8M0 scale byte per 32 elements. `w` packs the n x k/2 blob bytes
+// followed by the n x k/32 scale bytes (the scale starts at n*k/2). k is
+// a multiple of 32.
 __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
-                                const unsigned char* s, float* c,
-                                unsigned long long m, unsigned long long n,
-                                unsigned long long k) {
+                                float* c, unsigned long long m,
+                                unsigned long long n, unsigned long long k) {
   unsigned long long idx =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= m * n) {
     return;
   }
+  const unsigned char* s = w + (n * k) / 2;
   const unsigned long long row_a = idx / n;
   const unsigned long long row_w = idx % n;
   const unsigned long long blocks = k / 32;
