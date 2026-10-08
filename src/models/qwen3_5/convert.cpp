@@ -33,6 +33,17 @@ std::string_view LayerTail(std::string_view name) {
 
 std::optional<WeightConversion> Qwen35Architecture::ConvertWeight(
     std::string_view internal_name, const TransformerConfig& config) const {
+  // Qwen3.5 uses the Gemma RMSNorm, whose effective gain is 1 + weight:
+  // the checkpoint stores the offset. The gated SSM norm (ssm_norm) and all
+  // the linear weights have no offset.
+  const std::string_view tail = LayerTail(internal_name);
+  if (tail == "attn_norm.weight" || tail == "post_attention_norm.weight" ||
+      tail == "attn_q_norm.weight" || tail == "attn_k_norm.weight" ||
+      internal_name == "output_norm.weight") {
+    WeightConversion conversion;
+    conversion.add_one = true;
+    return conversion;
+  }
   const std::size_t heads = config.ssm.time_step_rank;
   const std::size_t keys = config.ssm.group_count;
   const std::size_t state = config.ssm.state_size;
@@ -57,7 +68,6 @@ std::optional<WeightConversion> Qwen35Architecture::ConvertWeight(
       conversion.src[offset + i] = offset + head_src(head) * block + within;
     }
   };
-  const std::string_view tail = LayerTail(internal_name);
   if (tail == "ssm_a") {
     WeightConversion conversion;
     conversion.exp_negate = true;

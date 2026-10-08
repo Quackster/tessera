@@ -49,11 +49,14 @@ struct DraftVerification {
 // maps internal index i to checkpoint index src[i] along the value
 // dimension (empty means no permutation); `inner` selects the contiguous
 // dimension instead of the outer one. `exp_negate` turns log-space values
-// (A_log) into the internal -exp form with F32 output.
+// (A_log) into the internal -exp form with F32 output. `add_one` adds 1 to
+// each value, for checkpoints that store a unit-offset norm weight (the
+// Gemma RMSNorm convention: the effective gain is 1 + weight).
 struct WeightConversion {
   std::vector<std::size_t> src;
   bool inner = false;
   bool exp_negate = false;
+  bool add_one = false;
 };
 
 class Architecture {

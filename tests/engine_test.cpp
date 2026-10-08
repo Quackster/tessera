@@ -398,6 +398,92 @@ TEST(EngineTest, GgufGeneratesWhenProvided) {
   }
 }
 
+// Print a tensor's dequantized fp32 statistics for cross-target
+// comparison (set TESSERA_DUMP_MODEL and TESSERA_DUMP_TENSOR).
+TEST(EngineTest, DumpTensorWhenProvided) {
+  const char* path = std::getenv("TESSERA_DUMP_MODEL");
+  const char* name = std::getenv("TESSERA_DUMP_TENSOR");
+  if (path == nullptr || name == nullptr) {
+    GTEST_SKIP() << "TESSERA_DUMP_MODEL / TESSERA_DUMP_TENSOR not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{path, 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const auto dump = [&](const tessera::DeviceTensor& w) {
+    const std::size_t numel = w.manifest.shape.Numel();
+    std::vector<std::byte> raw(w.device->Size());
+    if (!engine->Owner().CopyD2H(*w.device, raw.data(), raw.size()).has_value()) {
+      std::fprintf(stderr, "dump %s ERROR copy\n", w.manifest.name.c_str());
+      return;
+    }
+    std::vector<float> f32(numel);
+    if (w.manifest.dtype == tessera::DType::F4E2M1) {
+      const std::size_t blob = numel / 2;
+      for (std::size_t i = 0; i < numel; ++i) {
+        const std::uint8_t byte = static_cast<std::uint8_t>(raw[i / 2]);
+        const std::uint8_t nib = (i % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+        const std::uint8_t scale =
+            static_cast<std::uint8_t>(raw[blob + i / 32]);
+        f32[i] = tessera::core::E8M0ToFloat(scale) *
+                 tessera::core::F4E2M1ToFloat(nib);
+      }
+    } else if (w.manifest.dtype == tessera::DType::F32) {
+      std::memcpy(f32.data(), raw.data(), numel * 4);
+    } else if (w.manifest.dtype == tessera::DType::BF16) {
+      for (std::size_t i = 0; i < numel; ++i) {
+        std::uint16_t half = 0;
+        std::memcpy(&half, raw.data() + i * 2, 2);
+        const std::uint32_t bits = static_cast<std::uint32_t>(half) << 16;
+        std::memcpy(&f32[i], &bits, 4);
+      }
+    } else {
+      auto status = tessera::core::DequantizeBlocks(w.manifest.dtype, raw, f32);
+      if (!status.has_value()) {
+        std::fprintf(stderr, "dump %s ERROR dequant %s\n",
+                     w.manifest.name.c_str(),
+                     tessera::ToString(status.error()).data());
+        return;
+      }
+    }
+    if (const char* out = std::getenv("TESSERA_DUMP_OUT"); out != nullptr) {
+      std::FILE* file = std::fopen(out, "wb");
+      if (file != nullptr) {
+        const std::uint64_t rank = w.manifest.shape.rank;
+        std::fwrite(&rank, sizeof(rank), 1, file);
+        for (std::size_t d = 0; d < rank; ++d) {
+          const std::uint64_t dim = w.manifest.shape.dims[d];
+          std::fwrite(&dim, sizeof(dim), 1, file);
+        }
+        std::fwrite(f32.data(), sizeof(float), numel, file);
+        std::fclose(file);
+      }
+    }
+    double absmean = 0.0;
+    double sq = 0.0;
+    const std::size_t sample = std::min<std::size_t>(numel, 1u << 20);
+    for (std::size_t i = 0; i < sample; ++i) {
+      absmean += std::abs(f32[i]);
+      sq += static_cast<double>(f32[i]) * f32[i];
+    }
+    absmean /= static_cast<double>(sample);
+    std::fprintf(stderr, "dump %s absmean=%.6f rms=%.6f\n",
+                 w.manifest.name.c_str(), absmean,
+                 std::sqrt(sq / static_cast<double>(sample)));
+  };
+  if (name[0] == '\0') {
+    for (const auto& candidate : (*model)->Weights()) {
+      std::fprintf(stderr, "name %s\n", candidate.manifest.name.c_str());
+    }
+    return;
+  }
+  for (const auto& candidate : (*model)->Weights()) {
+    if (candidate.manifest.name == name || std::string_view(name) == "*") {
+      dump(candidate);
+    }
+  }
+}
+
 TEST(EngineTest, LoadMxFp4BlobAndScalePair) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
@@ -598,7 +684,18 @@ TEST(EngineTest, Qwen35ModuleConvertsMxFp4ValueLayout) {
   EXPECT_TRUE(out->inner);
   ASSERT_EQ(out->src.size(), 6144u);
 
-  EXPECT_FALSE(convert("blk.0.attn_norm.weight").has_value());
+  // The Gemma RMSNorm stores the unit offset: the norm tensors add 1.
+  const auto norm = convert("blk.0.attn_norm.weight");
+  ASSERT_TRUE(norm.has_value());
+  EXPECT_TRUE(norm->add_one);
+  const auto q_norm = convert("blk.0.attn_q_norm.weight");
+  ASSERT_TRUE(q_norm.has_value());
+  EXPECT_TRUE(q_norm->add_one);
+  const auto out_norm = convert("output_norm.weight");
+  ASSERT_TRUE(out_norm.has_value());
+  EXPECT_TRUE(out_norm->add_one);
+  // The gated SSM norm keeps the plain weight.
+  EXPECT_FALSE(convert("blk.0.ssm_norm.weight").has_value());
   EXPECT_FALSE(convert("output.weight").has_value());
 }
 

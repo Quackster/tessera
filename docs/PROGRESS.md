@@ -950,6 +950,20 @@ through RADV GFX1201, rocm through the system ROCm).
   against the GGUF (`dt_bias`, `ssm_a`, `alpha`, `beta`, `conv1d` value
   block reorder), so the divergence is elsewhere (item 0).
 
+- 2026-10-08: MXFP4 coherent output (Gemma RMSNorm unit offset). Qwen3.5
+  uses `GemmaRMSNorm`, whose gain is `1 + weight` (vLLM aliases it as
+  `Qwen3_5RMSNorm` in `qwen3_5.py`). The GGUF stores the offset already
+  applied, but the HuggingFace checkpoint stores the offset, so the plain
+  `x * w` kernel left every norm off by one and the residual diverged from
+  layer 0 (the "layer 7 explosion" was a downstream symptom, not a bug).
+  `WeightConversion` gained `add_one`; the Qwen3.5 module sets it for
+  `attn_norm`, `post_attention_norm`, `attn_q_norm`, `attn_k_norm` and
+  `output_norm`. The gated SSM `ssm_norm` and the GGUF path are unchanged.
+  The MXFP4 target now matches the GGUF greedy continuation token for token
+  and passes 244/244 `ctest` on both builds. Verified with the new
+  element-wise tensor dump, which showed the loader's embedding and
+  value-head reorder match the GGUF at correlation 0.99.
+
 ## Next (in order)
 
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
@@ -988,10 +1002,29 @@ through RADV GFX1201, rocm through the system ROCm).
    `in_proj_z`, the value block of `in_proj_qkv`/`conv1d` and the input
    of `ssm_out` all reorder); the loader packs each F4E2M1 blob with its
    E8M0 scale. Acceptance can now be measured against the correct target.
-   Two gaps remain: the MXFP4 GEMM is very slow (about 23 s/token on the
-   27B, versus 0.9 s/token for the GGUF; the `gemm_mxfp4` kernel needs
-   item 3 work), and the HF tokenizer is not parsed yet (use
-   `--prompt-ids`). The `gemm_mxfp4` kernel now reads the scale from the
+   The garbled output was the Gemma RMSNorm unit offset. Qwen3.5 uses
+   `GemmaRMSNorm`, whose effective gain is `1 + weight`
+   (`vllm/model_executor/layers/layernorm.py` and
+   `vllm/model_executor/models/qwen3_5.py`, which aliases it as
+   `Qwen3_5RMSNorm`). The GGUF bakes the offset into its norm tensors, so
+   the plain `x * w` kernel was correct there, but the HF checkpoint
+   stores the offset, so every norm was off by one and the hidden state
+   diverged from the first layer. `WeightConversion` gained `add_one` and
+   the Qwen3.5 module sets it for `attn_norm`, `post_attention_norm`,
+   `attn_q_norm`, `attn_k_norm` and `output_norm` (the gated SSM `ssm_norm`
+   uses the plain weight, and the GGUF path does not run this hook, so it
+   is unchanged). With the fix the MXFP4 target is coherent and its greedy
+   continuation matches the GGUF reference token for token (`Paris` `.`
+   newline newline `The`). A per-tensor element-wise dump
+   (`EngineTest.DumpTensorWhenProvided`, env `TESSERA_DUMP_MODEL`,
+   `TESSERA_DUMP_TENSOR`, `TESSERA_DUMP_OUT`) confirmed the loader: the
+   embedding and the linear-attention value-head reorder match the GGUF to
+   correlation 0.99, so the layout and permutation are right. Acceptance
+   can now be measured against the correct target.
+   Two other gaps remain: the MXFP4 GEMM is very slow (about 2.5 s/token on
+   the 27B, versus 0.9 s/token for the GGUF; the `gemm_mxfp4` kernel needs
+   item 3 work), and the HF tokenizer is not parsed yet, so the text-only
+   CLI cannot prompt this target. The `gemm_mxfp4` kernel now reads the scale from the
     packed weight tail, so its contract, host reference and device test
     changed. Tokenizer research (vLLM and Quark): vLLM never derives the
     tokenizer from the weights. `get_tokenizer`

@@ -243,6 +243,9 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
           if (conversion && conversion->exp_negate) {
             values[i] = -std::exp(values[i]);
           }
+          if (conversion && conversion->add_one) {
+            values[i] += 1.0f;
+          }
         }
         std::span<const std::byte> f32_bytes(
             reinterpret_cast<const std::byte*>(values.data()),
