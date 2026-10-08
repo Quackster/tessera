@@ -67,12 +67,12 @@ TEST(TokenizerTest, DecodeRejectsBadId) {
   EXPECT_EQ(text.error(), StatusCode::InvalidArgument);
 }
 
-// Encode against the reference tokenizer ids (path via TESSERA_TEST_GGUF;
+// Encode against the reference tokenizer ids (path via TESSERA_TEST_MODEL;
 // never hard-coded). Decode round-trips the same text.
 TEST(TokenizerTest, RealTokenizerMatchesReference) {
-  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
   if (path == nullptr) {
-    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
   }
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);

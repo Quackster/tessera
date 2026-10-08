@@ -399,9 +399,9 @@ TEST(GgufTest, RejectsArrayCountOverflow) {
 // Opt-in validation against a real model file (path via environment,
 // never hard-coded; see AGENTS.md "Model Data").
 TEST(GgufTest, ParsesRealFileWhenProvided) {
-  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
   if (path == nullptr) {
-    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
   }
   auto file = ParseGgufFile(path);
   if (!file && file.error() == StatusCode::UnsupportedFeature) {

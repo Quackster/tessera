@@ -663,11 +663,11 @@ TEST(HybridDecodeTest, SpeculativeFallbackMatchesGreedy) {
 }
 
 // With the real MTP head the drafter runs and is verified; speculation
-// must still reproduce the greedy sequence (27B target; TESSERA_TEST_GGUF).
+// must still reproduce the greedy sequence (27B target; TESSERA_TEST_MODEL).
 TEST(HybridDecodeTest, SpeculativeMatchesGreedyOnModel) {
-  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
   if (path == nullptr) {
-    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
   }
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
@@ -706,11 +706,11 @@ TEST(HybridDecodeTest, ForwardMatchesStepState) {
 }
 
 // The MTP head drafts a token from the backbone hidden state (27B target;
-// path via TESSERA_TEST_GGUF). Deterministic across fresh caches.
+// path via TESSERA_TEST_MODEL). Deterministic across fresh caches.
 TEST(HybridDecodeTest, MtpDraftWhenModelProvided) {
-  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
   if (path == nullptr) {
-    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
   }
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);

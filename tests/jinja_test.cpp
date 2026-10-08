@@ -93,11 +93,11 @@ TEST(JinjaTest, RaiseExceptionFails) {
 }
 
 // Renders the model's own chat template and compares to the reference
-// (HF Jinja2) output; path via TESSERA_TEST_GGUF (never hard-coded).
+// (HF Jinja2) output; path via TESSERA_TEST_MODEL (never hard-coded).
 TEST(JinjaTest, RealChatTemplateMatchesReference) {
-  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
   if (path == nullptr) {
-    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
   }
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);

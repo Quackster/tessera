@@ -323,9 +323,9 @@ TEST(EngineTest, GenerateWithPromptTokensPrefills) {
 }
 
 TEST(EngineTest, RealModelLoadPathWhenProvided) {
-  const char* raw = std::getenv("TESSERA_TEST_GGUF");
+  const char* raw = std::getenv("TESSERA_TEST_MODEL");
   if (raw == nullptr) {
-    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
   }
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
@@ -378,11 +378,11 @@ TEST(EngineTest, MxFp4GeneratesWhenProvided) {
 }
 
 // Same prompt as MxFp4GeneratesWhenProvided, on the GGUF target, so the
-// per-layer trace can be compared (set TESSERA_TEST_GGUF).
+// per-layer trace can be compared (set TESSERA_TEST_MODEL).
 TEST(EngineTest, GgufGeneratesWhenProvided) {
-  const char* path = std::getenv("TESSERA_TEST_GGUF");
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
   if (path == nullptr) {
-    GTEST_SKIP() << "TESSERA_TEST_GGUF not set";
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
   }
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
@@ -1151,13 +1151,13 @@ TEST(EngineTest, SampleGenerationIsDeterministic) {
 }
 
 // The DFlash2 draft must be output preserving: speculative generation
-// equals plain greedy on the real target. Needs TESSERA_TEST_GGUF (the
+// equals plain greedy on the real target. Needs TESSERA_TEST_MODEL (the
 // target) and TESSERA_TEST_DFLASH2_DIR (the draft).
 TEST(EngineTest, DFlash2MatchesGreedyOnModel) {
-  const char* target = std::getenv("TESSERA_TEST_GGUF");
+  const char* target = std::getenv("TESSERA_TEST_MODEL");
   const char* draft = std::getenv("TESSERA_TEST_DFLASH2_DIR");
   if (target == nullptr || draft == nullptr) {
-    GTEST_SKIP() << "TESSERA_TEST_GGUF / TESSERA_TEST_DFLASH2_DIR not set";
+    GTEST_SKIP() << "TESSERA_TEST_MODEL / TESSERA_TEST_DFLASH2_DIR not set";
   }
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
