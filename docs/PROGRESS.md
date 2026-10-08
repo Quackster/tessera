@@ -966,6 +966,17 @@ through RADV GFX1201, rocm through the system ROCm).
 
 ## Next (in order)
 
+- **PERF (urgent, do first)**: `EngineTest.DFlash2MatchesGreedyOnModel`
+  on the MXFP4 target takes 370 s (6 min 10 s) and it should take
+  seconds. The time is the 19 GB target load plus the scalar `gemm_mxfp4`
+  kernel (about 1.4 s/token here, 2.5 s/token in the longer run), not the
+  draft. The load parses the safetensors, dequantizes and packs every fp4
+  blob, and converts large BF16 tensors to F32 (the `lm_head` alone becomes
+  a 5 GB F32 matrix); the reference runtime loads the same file in 8 s
+  because it keeps fp4 and dequantizes in the kernel. Fix the load path
+  and the MXFP4 GEMM throughput, then re-measure this test's wall time.
+  This is the same work as item 3, pulled forward.
+
 0. **DFlash2**: runs end to end (`Engine::GenerateDraft`, CLI `--draft`)
    and output equals greedy. Batching and the draft context width are
    done (see the Done entry). Note: DFlash2 has a slower boot (it loads
