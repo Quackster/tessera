@@ -28,7 +28,7 @@ void PrintUsage() {
   std::fprintf(stderr,
                "usage: tessera-cli run --model <path> [--draft <dir>]\n"
                "       [--context <n>] [--draft-block <n>]\n"
-               "       [--prompt <id>] [--prompt-text <str>] [--tokens <n>]\n"
+               "       --prompt-text <str> [--tokens <n>]\n"
                "       tessera-cli serve --model <path> [--host <ip>] "
                "[--port <n>]\n"
                "       tessera-cli --list-gpus\n"
@@ -38,17 +38,12 @@ void PrintUsage() {
                "  --context <n>     maximum context length (default %zu)\n"
                "  --gpu <n>         GPU index to use (default 0, the first)\n"
                "  --draft-block <n> draft block tokens (default %zu)\n"
-               "  --prompt <id>     first token id for generation (default 0)\n"
-               "  --prompt-ids <a,b> comma-separated prompt token ids\n"
                "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
-               "  --mtp <id>        print the MTP draft after this token id\n"
-               "  --tokens <n>      run n greedy decode steps and print them\n"
+               "  --tokens <n>      run n greedy decode steps\n"
                "  --speculate       verify MTP drafts instead of plain greedy\n"
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
-               "  --image-token <id> placeholder token id (default <|image_pad|>)\n"
-               "  --quiet           print only the generated tokens\n"
-               "  --log-tokens      log the input and output text (tokenizer)\n"
+               "  --quiet           suppress progress and info logs\n"
                "  --no-chat         do not apply the chat template\n"
                "  --sample          sample instead of greedy decode\n"
                "  --temperature <f> sampling temperature (default 0.6)\n"
@@ -99,17 +94,11 @@ int main(int argc, char** argv) {
   std::string mmproj_path;
   std::string image_path;
   std::uint32_t image_token = 0;
-  bool image_token_set = false;
   bool quiet = false;
-  bool log_tokens = false;
   bool no_chat = false;
   std::string host = "127.0.0.1";
   std::vector<std::string> api_keys;
   std::vector<std::string> allow_origins;
-  std::uint32_t prompt = 0;
-  std::vector<std::uint32_t> prompt_ids;
-  std::uint32_t mtp_token = 0;
-  bool mtp = false;
   bool speculate = false;
   tessera::SamplingOptions sampling;
   bool sample = false;
@@ -132,13 +121,8 @@ int main(int argc, char** argv) {
       mmproj_path = argv[++i];
     } else if (arg == "--image" && i + 1 < argc) {
       image_path = argv[++i];
-    } else if (arg == "--image-token" && i + 1 < argc) {
-      image_token = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      image_token_set = true;
     } else if (arg == "--quiet") {
       quiet = true;
-    } else if (arg == "--log-tokens") {
-      log_tokens = true;
     } else if (arg == "--no-chat") {
       no_chat = true;
     } else if (arg == "--api-key" && i + 1 < argc) {
@@ -155,24 +139,6 @@ int main(int argc, char** argv) {
       gpu = std::stoi(argv[++i]);
     } else if (arg == "--draft-block" && i + 1 < argc) {
       draft_block = std::stoul(argv[++i]);
-    } else if (arg == "--prompt" && i + 1 < argc) {
-      prompt = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-    } else if (arg == "--prompt-ids" && i + 1 < argc) {
-      const std::string list = argv[++i];
-      std::size_t start = 0;
-      while (start <= list.size()) {
-        const std::size_t comma = list.find(',', start);
-        const std::string part = list.substr(start, comma - start);
-        if (!part.empty()) {
-          prompt_ids.push_back(
-              static_cast<std::uint32_t>(std::stoul(part)));
-        }
-        if (comma == std::string::npos) break;
-        start = comma + 1;
-      }
-    } else if (arg == "--mtp" && i + 1 < argc) {
-      mtp_token = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      mtp = true;
     } else if (arg == "--speculate") {
       speculate = true;
     } else if (arg == "--sample") {
@@ -295,19 +261,9 @@ int main(int argc, char** argv) {
     }
     return kExitOk;
   }
-  if (mtp) {
-    auto draft = engine.MtpDraft(loaded, mtp_token);
-    if (!draft) {
-      log.Warn("cli", std::string("mtp draft failed (") +
-                          std::string(tessera::ToString(draft.error())) + ")");
-      return kExitError;
-    }
-    log.Info("cli", "mtp draft: " + std::to_string(*draft));
-  }
   if (tokens > 0) {
     tessera::GenerateOptions gen;
     gen.max_tokens = tokens;
-    gen.first_token = prompt;
     gen.sample = sample;
     gen.sampling = sampling;
     gen.seed = seed;
@@ -339,10 +295,15 @@ int main(int argc, char** argv) {
         log.Info("cli", "sampling: greedy");
       }
     }
-    if (!prompt_text.empty()) {
+    if (prompt_text.empty()) {
+      log.Warn("cli", "--prompt-text is required");
+      return kExitUsage;
+    }
+    {
       const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
       if (tokenizer == nullptr) {
-        log.Warn("cli", "this model has no tokenizer; use --prompt <id>");
+        log.Warn("cli",
+                 "this model has no tokenizer; text input is unavailable");
         return kExitError;
       }
       std::string text = prompt_text;
@@ -366,13 +327,9 @@ int main(int argc, char** argv) {
       }
       gen.prompt_tokens = *ids;
     }
-    if (!prompt_ids.empty()) {
-      gen.prompt_tokens = prompt_ids;
-    }
     std::expected<std::vector<std::uint32_t>, tessera::StatusCode> generated;
     if (!image_path.empty()) {
-      if (!image_token_set) {
-        // Default to the model's image placeholder token.
+      {
         const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
         std::optional<std::uint32_t> id;
         if (tokenizer != nullptr) {
@@ -381,7 +338,8 @@ int main(int argc, char** argv) {
         if (id.has_value()) {
           image_token = *id;
         } else {
-          log.Warn("cli", "no <|image_pad|> token; pass --image-token");
+          log.Warn("cli", "no <|image_pad|> token in this model");
+          return kExitError;
         }
       }
       if (mmproj_path.empty()) {
@@ -449,46 +407,27 @@ int main(int argc, char** argv) {
                           ")");
       return kExitError;
     }
-    if (log_tokens) {
-      const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
-      if (tokenizer == nullptr) {
-        log.Warn("cli", "--log-tokens needs a tokenizer on the model");
-      } else {
-        const std::vector<std::uint32_t> input =
-            gen.prompt_tokens.empty()
-                ? std::vector<std::uint32_t>{gen.first_token}
-                : gen.prompt_tokens;
-        auto input_text = tokenizer->Decode(input);
-        auto output_text = tokenizer->Decode(*generated);
-        if (input_text) {
-          log.Info("cli", "input text: " + *input_text);
-        }
-        if (output_text) {
-          // Split the Qwen thinking block (if any) from the response.
-          const std::string close_marker = "</think>";
-          const std::size_t close = output_text->find(close_marker);
-          if (close == std::string::npos) {
-            log.Info("cli", "output text: " + *output_text);
-          } else {
-            log.Info("cli", "thinking: " +
-                                output_text->substr(0, close));
-            log.Info("cli", "response: " +
-                                output_text->substr(close + close_marker.size()));
-          }
-        }
-      }
-    } else if (quiet) {
-      std::string ids;
-      for (std::size_t i = 0; i < generated->size(); ++i) {
-        if (i != 0) {
-          ids += ",";
-        }
-        ids += std::to_string((*generated)[i]);
-      }
-      std::printf("%s\n", ids.c_str());
+    const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
+    if (tokenizer == nullptr) {
+      log.Warn("cli", "cannot decode the output: this model has no tokenizer");
     } else {
-      log.Info("cli", std::string(speculate ? "speculative " : "generated ") +
-                          std::to_string(generated->size()) + " token(s)");
+      auto input_text = tokenizer->Decode(gen.prompt_tokens);
+      auto output_text = tokenizer->Decode(*generated);
+      if (input_text) {
+        log.Info("cli", "input text: " + *input_text);
+      }
+      if (output_text) {
+        // Split the Qwen thinking block (if any) from the response.
+        const std::string close_marker = "</think>";
+        const std::size_t close = output_text->find(close_marker);
+        if (close == std::string::npos) {
+          log.Info("cli", "output text: " + *output_text);
+        } else {
+          log.Info("cli", "thinking: " + output_text->substr(0, close));
+          log.Info("cli", "response: " +
+                              output_text->substr(close + close_marker.size()));
+        }
+      }
     }
   }
   return kExitOk;

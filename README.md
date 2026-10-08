@@ -33,9 +33,9 @@ First class targets are Qwen 3.8 27B in GGUF and Qwen 3.8 in MXFP4, with and wit
 | Attention and RoPE | Done | GQA path driven by model data; tiled O(n*d) attention (one workgroup per query/head, online softmax). RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. The 27B hybrid path generates coherent text. |
-| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. |
+| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. The recurrent causal conv1d still runs on the host (see PROGRESS item 1). |
 | Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculation run end to end; output equals greedy. Multi-token drafts are scored in one batched target forward. |
-| MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. MTP draft weights mapped. |
+| MXFP4 path | Partial | Tensor map parsing. FP8 and MXFP4 kernels. HuggingFace config, weight name map and value-head reorder; the Qwen 3.8 27B MXFP4 target loads and decodes end to end (no HuggingFace tokenizer yet). |
 | DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). Output equals greedy. |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
 | MoE, MLP, norms | Partial | RMSNorm and sigmoid-gate kernels done. MLP and embedding kernels in work. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
@@ -68,7 +68,7 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | Format | State | Detail |
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS and IQ3_S. Checks bounds. |
-| MXFP4 safetensors | Partial | Parses map and uploads weights. GEMM verified. No decode config yet. |
+| MXFP4 safetensors | Done | Parses the map, maps names, converts the value layout and packs the MXFP4 weights; config.json drives the decode config. |
 | NVFP4 MoE | Todo | Planned: MoE model support (Ornith-1.5-35B-A3B). Needs MoE routing and NVFP4 kernels. |
 | DFlash2 FP8 draft | Skeleton | Validates layout only. Decode logic is in work. |
 

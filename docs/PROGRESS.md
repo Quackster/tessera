@@ -976,16 +976,23 @@ through RADV GFX1201, rocm through the system ROCm).
    E8M0 scale. Acceptance can now be measured against the correct target.
    Two gaps remain: the MXFP4 GEMM is very slow (about 23 s/token on the
    27B, versus 0.9 s/token for the GGUF; the `gemm_mxfp4` kernel needs
-   item 2 work), and the HF tokenizer is not parsed yet (use
+   item 3 work), and the HF tokenizer is not parsed yet (use
    `--prompt-ids`). The `gemm_mxfp4` kernel now reads the scale from the
    packed weight tail, so its contract, host reference and device test
    changed.
-1. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
+1. **Hybrid SSM device path**: the recurrent causal conv1d still runs
+   on the host in both trunk paths. The single-token and the batched
+   trunk download the fused qkv, run `Conv1dStepRef` on the host and
+   upload the mixed result, with a host round-trip per step. The rest of
+   the gated-delta path (delta step, L2 norm, gated RMSNorm) is on the
+   device. Move the conv and the fused-qkv staging to a device kernel so
+   the linear-attention layer stays on the device.
+2. **MoE, MLP, RMSNorm and embedding kernels** as the Qwen 3.8
    definition needs them. The generic RMSNorm kernel is done. The
    decode loop runs projections, RoPE and attention on the device.
    Norms and SiLU still run on the host. Architecture specific behavior
    moves behind the `Architecture` module interface (see item 0).
-2. **GEMM throughput**: the model runs far below memory bandwidth
+3. **GEMM throughput**: the model runs far below memory bandwidth
    (about 20 GB/s of 16 GB weights per 0.76 s/step), so the GEMM kernels
    are bound by the per-element byte-wise weight reads, not by the
    multiply-accumulate. Two changes: (a) read and dequantize a weight
@@ -995,7 +1002,7 @@ through RADV GFX1201, rocm through the system ROCm).
    gemm_q4k/q5k/q6k/q3k/q8_0/iq4xs/iq4nl/fp8 on both backends. The
    attention_q8/attention_q4 kernels still recompute the dot product per
    output dimension.
-3. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
+4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
    `/slots`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
@@ -1004,23 +1011,23 @@ through RADV GFX1201, rocm through the system ROCm).
    queue, keep-alive, `/v1/responses`, render/derender/batch,
    `/tokenizer_info`, `/load` and LoRA, and the 501
    embedding/rerank/audio/pooling/classify/score surfaces.
-4. **Runtime options**: context size, draft-block and the GPU index
+5. **Runtime options**: context size, draft-block and the GPU index
    (`--gpu`) are CLI flags now, and the KV cache can be fp16 (`--kv-f16`)
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-5. **Prefill optimisation**: make the batched prefill faster. Each GEMM
+6. **Prefill optimisation**: make the batched prefill faster. Each GEMM
    still dequantizes each weight once per prompt row. Read each weight
    block once and reuse it across a tile of rows. Keep one sync per
    prefill and preallocate the KV caches up front. Measure prompt
    tokens per second on a text prompt and on an image prompt.
-6. **Multimodal (mmproj)**: config, weights, encoder+merger, image
+7. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, image-embedding injection, the CLI wiring and the
    `<|image_pad|>` placeholder default are done
    (`Engine::GenerateMultimodal`). Still to do: deepstack feature
    injection and the image prefill speed (attention kernel).
 
-7. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
+8. **Multi-GPU (deferred)**: today `--gpu` selects one device and there is
    one `Backend` per engine. Two researched routes: tensor parallelism
    (shard attention heads and MLP rows across GPUs with an all-reduce per
    layer; vLLM tensor parallelism, Megatron-LM TP) or layer/pipeline
