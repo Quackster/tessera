@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -163,18 +164,28 @@ ScoreTokens(Backend& backend, const Model& model,
 DecodeLogitsBatch(Backend& backend, const Model& model, DecodeCache& cache,
                   std::span<const std::uint32_t> tokens);
 
+// Per-chunk prefill progress: done_rows of total_rows committed.
+// Null disables the callback; the engine passes one that logs through
+// its diagnostics so a long prefill shows progress instead of silence.
+using PrefillProgress = std::function<void(std::size_t, std::size_t)>;
+
 // Prefill a prompt in chunk-sized batched forwards: commit every token
 // to the cache and return the logits after the last token (and its
-// hidden). `chunk_tokens` bounds one forward's scratch (0 runs one
-// forward for the whole prompt); only the last chunk scores logits.
-// The hybrid path runs one batched trunk forward per chunk with the
-// output head on the last row only; other models fall back to a
-// sequential loop.
+// hidden). `chunk_tokens` bounds one forward's scratch (0 selects the
+// whole prompt, still clamped to the work budget below); only the last
+// chunk scores logits.
+// Each chunk is also clamped to the per-launch attention work budget
+// (see detail::ClampPrefillRows), so a long prompt prefills in bounded
+// launches that stay under the driver hang timeout. The cache must be
+// empty: prefill always starts a request. The hybrid path runs one
+// batched trunk forward per chunk with the output head on the last row
+// only; other models fall back to a sequential loop.
 [[nodiscard]] std::expected<std::vector<float>, StatusCode> PrefillTokens(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens,
     std::vector<float>* hidden_out = nullptr,
-    const Buffer* embeddings = nullptr, std::size_t chunk_tokens = 0);
+    const Buffer* embeddings = nullptr, std::size_t chunk_tokens = 0,
+    const PrefillProgress* progress = nullptr);
 
 // Greedy speculative verification. Given the target's distribution at the
 // current prefix (`prefix_logits`) and a draft, feed each draft token only

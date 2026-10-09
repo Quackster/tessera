@@ -25,6 +25,60 @@
 
 namespace tessera::core::detail {
 
+// Largest full-attention work in one prefill forward, as query-key
+// pairs at the measured reference shape. On RADV GFX1201 (24 heads,
+// head dim 256) 512x8192 pairs finish one attention launch in about
+// 0.3 s, while 512x16384 pairs wedge the gfx ring and the driver
+// resets the device, which the backend reports as a sticky device
+// loss. Scale the pair budget by heads and head dim for other shapes.
+inline constexpr std::uint64_t kMaxPrefillAttnPairs = 4ull * 1024 * 1024;
+inline constexpr std::uint64_t kMaxPrefillAttnHeads = 24;
+inline constexpr std::uint64_t kMaxPrefillAttnHeadDim = 256;
+
+// Clamp one prefill chunk to the attention work budget: at most `want`
+// rows, and rows * (base + rows) * heads * head_dim within the scaled
+// budget, with at least one row so a long prompt always progresses.
+// `base` is the keys already committed before this chunk. Zero heads
+// or head dim (a config the arch path never uses) disables the clamp.
+[[nodiscard]] inline std::size_t ClampPrefillRows(std::size_t want,
+                                                  std::size_t base,
+                                                  std::size_t heads,
+                                                  std::size_t head_dim) {
+  if (want <= 1 || heads == 0 || head_dim == 0) {
+    return want;
+  }
+  const double budget =
+      static_cast<double>(kMaxPrefillAttnPairs) *
+      static_cast<double>(kMaxPrefillAttnHeads) *
+      static_cast<double>(kMaxPrefillAttnHeadDim) /
+      (static_cast<double>(heads) * static_cast<double>(head_dim));
+  const double committed = static_cast<double>(base);
+  const double fit =
+      (std::sqrt(committed * committed + 4.0 * budget) - committed) / 2.0;
+  if (fit >= static_cast<double>(want)) {
+    return want;
+  }
+  return std::max<std::size_t>(1, static_cast<std::size_t>(fit));
+}
+
+// Chunk schedule for one prefill: split `total` rows starting at
+// `base` committed keys into forwards of at most `want` rows, each
+// within the attention work budget (see ClampPrefillRows). The lens
+// sum to total and every lens is at least one row, so a long prompt
+// always progresses in bounded launches.
+[[nodiscard]] inline std::vector<std::size_t> PrefillLens(
+    std::size_t total, std::size_t want, std::size_t base, std::size_t heads,
+    std::size_t head_dim) {
+  std::vector<std::size_t> lens;
+  for (std::size_t off = 0; off < total;) {
+    const std::size_t len = ClampPrefillRows(std::min(want, total - off),
+                                             base + off, heads, head_dim);
+    lens.push_back(len);
+    off += len;
+  }
+  return lens;
+}
+
 // A required weight: missing is MalformedFile, a wrong layout is
 // UnsupportedFeature.
 [[nodiscard]] inline std::expected<const DeviceTensor*, StatusCode>

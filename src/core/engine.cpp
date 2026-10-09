@@ -35,13 +35,16 @@ namespace {
 // prefill in chunk-sized forwards without capture, and the tail runs
 // chunked with engine-owned capture buffers plus one strategy append
 // per chunk. Only a strategy without a batched append keeps the
-// per-token loop.
+// per-token loop. Every chunk stays within the per-launch attention
+// work budget (see core::detail::ClampPrefillRows); the cache is empty
+// (prefill starts a request), so the keys a chunk's last row sees end
+// at its absolute end offset. Null progress disables chunk reports.
 std::expected<void, StatusCode> PrefillCapturing(
     Backend& backend, Model& model, core::DecodeCache& cache,
     SpeculativeStrategy& strategy, std::span<const std::uint32_t> prompt,
     std::size_t chunk, const std::vector<std::size_t>& capture_layers,
     std::vector<Buffer*>& strategy_buffers, std::vector<float>& hidden_out,
-    std::vector<float>& logits_out) {
+    std::vector<float>& logits_out, const core::PrefillProgress* progress) {
   const std::size_t tail = strategy.PrefillCaptureTail();
   const std::size_t keep =
       (tail == 0 || tail >= prompt.size()) ? prompt.size() : tail;
@@ -73,11 +76,11 @@ std::expected<void, StatusCode> PrefillCapturing(
         }
         logits_out = std::move(*logits);
       } else {
-        auto step = core::DecodeForward(backend, model, cache, prompt[i],
-                                        &hidden_out, nullptr, layers_ptr,
-                                        capture_ptr);
-        if (!step) {
-          return std::unexpected(step.error());
+        auto forwarded = core::DecodeForward(backend, model, cache, prompt[i],
+                                            &hidden_out, nullptr, layers_ptr,
+                                            capture_ptr);
+        if (!forwarded) {
+          return std::unexpected(forwarded.error());
         }
       }
       auto anchored =
@@ -85,23 +88,36 @@ std::expected<void, StatusCode> PrefillCapturing(
       if (!anchored) {
         return std::unexpected(anchored.error());
       }
+      if (progress != nullptr) {
+        (*progress)(i + 1, prompt.size());
+      }
     }
     return {};
-  }
-  for (std::size_t off = 0; off < head; off += chunk) {
-    const std::size_t len = std::min(chunk, head - off);
-    auto status = arch->ForwardBatch(backend, model, cache,
-                                     prompt.subspan(off, len), nullptr,
-                                     nullptr, /*all_logits=*/false, nullptr);
-    if (!status) {
-      return std::unexpected(status.error());
-    }
   }
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
   }
   const std::size_t hidden = config->hidden_dim;
+  const std::size_t heads = config->attention.heads;
+  const std::size_t head_dim = config->attention.head_dim;
+  // One forward per chunk, each within the attention work budget. The
+  // base is the keys committed before the region (absolute offset).
+  const std::vector<std::size_t> head_lens =
+      core::detail::PrefillLens(head, chunk, /*base=*/0, heads, head_dim);
+  std::size_t off = 0;
+  for (const std::size_t len : head_lens) {
+    auto status = arch->ForwardBatch(backend, model, cache,
+                                     prompt.subspan(off, len), nullptr,
+                                     nullptr, /*all_logits=*/false, nullptr);
+    if (!status) {
+      return std::unexpected(status.error());
+    }
+    off += len;
+    if (progress != nullptr) {
+      (*progress)(off, prompt.size());
+    }
+  }
   const std::size_t rows = std::min(chunk, keep);
   std::vector<std::unique_ptr<Buffer>> cap_store;
   std::vector<Buffer*> cap_ptrs;
@@ -113,8 +129,11 @@ std::expected<void, StatusCode> PrefillCapturing(
     cap_ptrs.push_back(made->get());
     cap_store.push_back(std::move(*made));
   }
-  for (std::size_t off = head; off < prompt.size(); off += chunk) {
-    const std::size_t len = std::min(chunk, prompt.size() - off);
+  const std::vector<std::size_t> tail_lens =
+      core::detail::PrefillLens(keep, chunk, /*base=*/head, heads, head_dim);
+  std::size_t tail_done = 0;
+  for (const std::size_t len : tail_lens) {
+    const std::size_t off = head + tail_done;
     const bool last = off + len == prompt.size();
     std::vector<float> chunk_logits;
     auto status = arch->ForwardBatch(
@@ -132,6 +151,10 @@ std::expected<void, StatusCode> PrefillCapturing(
     }
     if (last) {
       logits_out = std::move(chunk_logits);
+    }
+    tail_done += len;
+    if (progress != nullptr) {
+      (*progress)(head + tail_done, prompt.size());
     }
   }
   return {};
@@ -467,10 +490,25 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   }
   std::vector<float> hidden;
   std::vector<float> first_logits;
+  // Chunk progress for a long prefill: one line per progress_every
+  // chunk reports plus the final row count, so a multi-minute prefill
+  // shows movement instead of silence. Zero disables the reports.
+  std::size_t progress_calls = 0;
+  core::PrefillProgress progress = [&](std::size_t done, std::size_t total) {
+    ++progress_calls;
+    if (done == total || progress_calls % options.progress_every == 1) {
+      diagnostics_.Info("engine", std::string("prefill: ") +
+                                      std::to_string(done) + "/" +
+                                      std::to_string(total) + " rows");
+    }
+  };
+  const core::PrefillProgress* progress_ptr =
+      options.progress_every > 0 ? &progress : nullptr;
   if (capturing) {
     auto prefilled = PrefillCapturing(*backend_, model, cache, *strategy,
                                       prompt, prefill_chunk, capture_layers,
-                                      capture_buffers, hidden, first_logits);
+                                      capture_buffers, hidden, first_logits,
+                                      progress_ptr);
     if (!prefilled) {
       diagnostics_.Warn("engine", std::string("prefill failed: ") +
                                       std::string(ToString(prefilled.error())));
@@ -478,7 +516,7 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
     }
   } else {
     auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden,
-                                      nullptr, prefill_chunk);
+                                      nullptr, prefill_chunk, progress_ptr);
     if (!logits) {
       diagnostics_.Warn("engine", std::string("prefill failed: ") +
                                       std::string(ToString(logits.error())));

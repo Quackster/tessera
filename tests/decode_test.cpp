@@ -567,6 +567,116 @@ TEST(HybridDecodeTest, ChunkedPrefillMatchesSingleForward) {
         << path << " follow-up max_abs " << next_abs;
   }
 }
+
+// ClampPrefillRows keeps one forward's attention work within budget:
+// rows * (base + rows) * heads * head_dim never exceeds the scaled
+// pair budget, the return never exceeds want, and it is maximal (one
+// more row would break the budget or hit want).
+TEST(PrefillClampTest, BoundsAttentionWork) {
+  std::mt19937_64 rng(42);
+  const double budget = static_cast<double>(
+      tessera::core::detail::kMaxPrefillAttnPairs *
+      tessera::core::detail::kMaxPrefillAttnHeads *
+      tessera::core::detail::kMaxPrefillAttnHeadDim);
+  for (int i = 0; i < 2000; ++i) {
+    const std::size_t want = 1 + rng() % 2048;
+    const std::size_t base = rng() % 230000;
+    const std::size_t heads = 1 + rng() % 64;
+    const std::size_t dim = 16 * (1 + rng() % 32);
+    const std::size_t len =
+        tessera::core::detail::ClampPrefillRows(want, base, heads, dim);
+    EXPECT_LE(len, want);
+    EXPECT_GE(len, 1u);
+    const double work = static_cast<double>(len) *
+                        static_cast<double>(base + len) *
+                        static_cast<double>(heads) * static_cast<double>(dim);
+    EXPECT_LE(work, budget * (1.0 + 1e-9));
+    if (len < want) {
+      const double more =
+          static_cast<double>(len + 1) * static_cast<double>(base + len + 1) *
+          static_cast<double>(heads) * static_cast<double>(dim);
+      EXPECT_GT(more, budget);
+    }
+  }
+}
+
+// The 76k-token prefill wedge: at 24 heads x dim 256 a 512-row chunk
+// ending at 76553 keys must shrink well under the 512x16384 launch
+// that wedged the gfx ring on RADV GFX1201.
+TEST(PrefillClampTest, ShrinksLateChunks) {
+  constexpr std::size_t kWedgedPairs = 512u * 16384u;
+  const std::size_t len =
+      tessera::core::detail::ClampPrefillRows(512, 76041, 24, 256);
+  EXPECT_LT(len, 512u);
+  EXPECT_GE(len, 1u);
+  EXPECT_LT(len * (76041u + len), kWedgedPairs);
+}
+
+// Clamp edges: empty want stays empty, one row stays one row, zero
+// heads or head dim disables the clamp, and a 220k-key prefix still
+// progresses at least one row per forward.
+TEST(PrefillClampTest, EdgeCases) {
+  EXPECT_EQ(tessera::core::detail::ClampPrefillRows(0, 0, 24, 256), 0u);
+  EXPECT_EQ(tessera::core::detail::ClampPrefillRows(1, 220000, 24, 256), 1u);
+  EXPECT_EQ(tessera::core::detail::ClampPrefillRows(512, 100, 0, 256), 512u);
+  EXPECT_EQ(tessera::core::detail::ClampPrefillRows(512, 100, 24, 0), 512u);
+  EXPECT_GE(tessera::core::detail::ClampPrefillRows(512, 220000, 24, 256),
+            1u);
+}
+
+// PrefillLens splits a prompt into budgeted chunks: the lens sum to
+// the total, every chunk holds at most want rows, and every chunk's
+// attention work (rows times end keys times heads times head dim)
+// stays within the scaled budget.
+TEST(PrefillClampTest, ScheduleSumsAndStaysInBudget) {
+  std::mt19937_64 rng(7);
+  const double budget = static_cast<double>(
+      tessera::core::detail::kMaxPrefillAttnPairs *
+      tessera::core::detail::kMaxPrefillAttnHeads *
+      tessera::core::detail::kMaxPrefillAttnHeadDim);
+  for (int i = 0; i < 200; ++i) {
+    const std::size_t total = 1 + rng() % 250000;
+    const std::size_t want = 1 + rng() % 2048;
+    const std::size_t base = rng() % 220000;
+    const std::size_t heads = 1 + rng() % 64;
+    const std::size_t dim = 16 * (1 + rng() % 32);
+    const std::vector<std::size_t> lens =
+        tessera::core::detail::PrefillLens(total, want, base, heads, dim);
+    ASSERT_FALSE(lens.empty());
+    std::size_t sum = 0;
+    std::size_t done = 0;
+    for (const std::size_t len : lens) {
+      EXPECT_LE(len, want);
+      EXPECT_GE(len, 1u);
+      const double work =
+          static_cast<double>(len) * static_cast<double>(base + done + len) *
+          static_cast<double>(heads) * static_cast<double>(dim);
+      EXPECT_LE(work, budget * (1.0 + 1e-9));
+      sum += len;
+      done += len;
+    }
+    EXPECT_EQ(sum, total);
+  }
+}
+
+// The crashed 76k prefill shape on the 27B: 512-row chunks early,
+// shrinking late chunks, every one within the measured safe launch.
+TEST(PrefillClampTest, ScheduleForCrashShape) {
+  const std::vector<std::size_t> lens =
+      tessera::core::detail::PrefillLens(76553, 512, 0, 24, 256);
+  ASSERT_GT(lens.size(), 150u);
+  EXPECT_EQ(lens.front(), 512u);
+  EXPECT_LT(lens.back(), 512u);
+  std::size_t sum = 0;
+  std::size_t done = 0;
+  for (const std::size_t len : lens) {
+    EXPECT_LE(len * (done + len), 512u * 8192u);
+    sum += len;
+    done += len;
+  }
+  EXPECT_EQ(sum, 76553u);
+}
+
 // logits and the per-layer linear state snapshots by need, not by every
 // prompt row. Prefill scores one row and never rolls back; a following
 // verification then grows the state history and still accepts the draft.

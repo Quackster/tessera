@@ -2125,6 +2125,25 @@ through RADV GFX1201, rocm through the system ROCm).
   first. Chunked prefill matches one forward on both hybrid fixtures
   (logits, hidden and the follow-up decode).
 
+- 2026-10-09: **Bounded prefill launches (302/302 `ctest` on vulkan).**
+  A 76k-token prefill at 220k context hung the GPU and the driver
+  reset the device. One attention launch per full layer covers rows
+  times keys pairs. Past about 6M pairs a single launch outruns the
+  kernel driver hang timeout. The driver reset shows as a sticky
+  device loss on every later call. `PrefillTokens` and the DFlash2
+  head and tail prefill now clamp each chunk to the attention work
+  budget (`core::detail::ClampPrefillRows`, 4M pairs at 24 heads and
+  head dim 256, scaled for other shapes). Each chunk keeps at least
+  one row, so a long prompt always progresses. The clamp lives in
+  the backend agnostic core, so both backends get it. It is verified
+  on vulkan. Three new tests pin the schedule (the budget bound, the
+  76k crash shape, edges). The engine reports chunk progress through
+  `PrefillProgress` (one line per `progress_every` chunks), so a long
+  prefill shows movement instead of silence. Full attention stays
+  quadratic: a full 220k prefill is hours of single GPU work on any
+  runtime. A FlashAttention class kernel is the remaining speed work
+  (see Next item 6).
+
 ## Next (in order)
 
 - **Speculation (seam done; acceptance fixed; speed remains).**
@@ -2333,10 +2352,13 @@ through RADV GFX1201, rocm through the system ROCm).
    pipelines kernels, the MXFP4 tiled GEMM is compute-bound (four
    partial sums), and the per-row linear-attention loop is batched
    into one launch per kernel (see the Done entries). Remaining: the
-   full-attention layers still run per layer at the prompt row count,
-   and the tiled GEMMs still dequantize each weight block once per
-   tile rather than once per prompt. Measure prompt tokens per second
-   on a text prompt and on an image prompt.
+  full-attention layers still run per layer at the prompt row count,
+  and the tiled GEMMs still dequantize each weight block once per
+  tile rather than once per prompt. Each prefill forward is now
+  clamped to the attention work budget, so a long prompt cannot wedge
+  the device (see the newest Done entry). The total work stays
+  quadratic in the prompt length. Measure prompt tokens per second
+  on a text prompt and on an image prompt.
 7. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, image-embedding injection, the CLI wiring and the
    `<|image_pad|>` placeholder default are done

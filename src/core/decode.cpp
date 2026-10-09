@@ -86,15 +86,28 @@ std::expected<std::vector<std::vector<float>>, StatusCode> ScoreTokens(
 std::expected<std::vector<float>, StatusCode> PrefillTokens(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* hidden_out,
-    const Buffer* embeddings, std::size_t chunk_tokens) {
+    const Buffer* embeddings, std::size_t chunk_tokens,
+    const PrefillProgress* progress) {
   if (tokens.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
   const Architecture* arch = model.Arch();
   if (arch != nullptr) {
-    const std::size_t chunk =
+    auto config = model.Config();
+    if (!config) {
+      return std::unexpected(config.error());
+    }
+    const std::size_t hidden = config->hidden_dim;
+    const std::size_t heads = config->attention.heads;
+    const std::size_t head_dim = config->attention.head_dim;
+    const std::size_t want =
         chunk_tokens == 0 ? tokens.size() : chunk_tokens;
-    if (chunk == 0 || tokens.size() <= chunk) {
+    // One forward per chunk, each within the attention work budget.
+    // The cache is empty (prefill starts a request), so the keys the
+    // chunk's last row sees end at off + len.
+    const std::vector<std::size_t> lens = detail::PrefillLens(
+        tokens.size(), want, /*base=*/0, heads, head_dim);
+    if (lens.size() == 1 && lens[0] == tokens.size()) {
       std::vector<float> logits;
       auto status = arch->ForwardBatch(backend, model, cache, tokens, &logits,
                                        hidden_out, /*all_logits=*/false,
@@ -102,19 +115,17 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
       if (!status) {
         return std::unexpected(status.error());
       }
+      if (progress != nullptr) {
+        (*progress)(tokens.size(), tokens.size());
+      }
       return logits;
     }
-    // Long prompt, bounded scratch: one forward per chunk, the head on
-    // the last chunk's last row only. The cache carries the state
-    // across chunks, so the result matches one forward.
-    auto config = model.Config();
-    if (!config) {
-      return std::unexpected(config.error());
-    }
-    const std::size_t hidden = config->hidden_dim;
+    // Long prompt, bounded scratch and bounded launches: one forward
+    // per chunk, the head on the last chunk's last row only. The cache
+    // carries the state across chunks, so the result matches one forward.
     std::unique_ptr<Buffer> staged;
     if (embeddings != nullptr) {
-      auto made = backend.AllocateBuffer(chunk * hidden * 4,
+      auto made = backend.AllocateBuffer(want * hidden * 4,
                                          MemoryKind::Device);
       if (!made) {
         return std::unexpected(StatusCode::OutOfMemory);
@@ -122,8 +133,8 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
       staged = std::move(*made);
     }
     std::vector<float> logits;
-    for (std::size_t off = 0; off < tokens.size(); off += chunk) {
-      const std::size_t len = std::min(chunk, tokens.size() - off);
+    std::size_t off = 0;
+    for (const std::size_t len : lens) {
       const bool last = off + len == tokens.size();
       const Buffer* chunk_emb = nullptr;
       if (staged) {
@@ -144,6 +155,10 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
       }
       if (last) {
         logits = std::move(chunk_logits);
+      }
+      off += len;
+      if (progress != nullptr) {
+        (*progress)(off, tokens.size());
       }
     }
     return logits;
