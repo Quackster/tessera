@@ -1,10 +1,12 @@
 #version 450
 
-// Tiled batched MXFP4 GEMM: one workgroup handles 8 activation rows x one
-// weight column; the 32 MXFP4 elements of a block and its E8M0 scale are
-// dequantized once into shared memory and reused across the 8 rows. The
-// dot runs elements 0..31 in order, the gemm_mxfp4 accumulation order.
-// Dispatch is ceil(m / 8) * n workgroups of 256.
+// Tiled batched MXFP4 GEMM. One workgroup covers a 32-row x 8-column output
+// tile: threads in a group share a row (eight each) and a column (four
+// each), so the activation and weight reads reuse cache. Each thread keeps
+// four partial sums (one per 8-element word of the 32-element block) so the
+// FMA chain is four deep instead of one; a single accumulator is latency
+// bound. The dot runs elements 0..31 in order, the gemm_mxfp4 order.
+// Dispatch is ceil(m / 32) * ceil(n / 8) workgroups of 256.
 layout(local_size_x = 256) in;
 
 // "gemm_mxfp4_batched" contract (tessera API): buffers and scalars match
@@ -36,44 +38,45 @@ const float kE2M1[16] = float[16](
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
 
-shared float wq[32];
-
 void main() {
-  uint wg = gl_WorkGroupID.x;
   uint tid = gl_LocalInvocationID.x;
+  uint wg = gl_WorkGroupID.x;
   uint m = pc.v[0];
   uint n = pc.v[2];
   uint k = pc.v[4];
-  uint tm = wg / n;
-  uint row_w = wg % n;
-  uint base_row = tm * 8u;
-  bool dot_valid = tid < 8u && base_row + tid < m;
-  uint row_a = base_row + tid;
+  uint col_tiles = (n + 7u) / 8u;
+  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
+  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
+  if (row_a >= m || row_w >= n) {
+    return;
+  }
   uint blocks = k / 32u;
   uint scale_base = (n * k) >> 1;
-  uint w_base = row_w * k;
-  float acc = 0.0;
+  uint ar_base = row_a * k;
+  // Word index of the weight row start: (row_w * k) elements / 8 per word.
+  uint wqr = (row_w * k) >> 3u;
+  float p0 = 0.0;
+  float p1 = 0.0;
+  float p2 = 0.0;
+  float p3 = 0.0;
   for (uint b = 0u; b < blocks; ++b) {
-    if (tid < 32u) {
-      uint e = tid;
-      // Two elements share one blob byte; the even element is the low
-      // nibble.
-      uint byte = wbyte((w_base + b * 32u + e) >> 1u);
-      uint packed = byte >> ((e & 1u) * 4u);
-      float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
-      wq[e] = scale * kE2M1[packed & 15u];
+    float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
+    uint ab = ar_base + b * 32u;
+    uint wb = wqr + b * 4u;
+    uint w0 = w[wb + 0u];
+    uint w1 = w[wb + 1u];
+    uint w2 = w[wb + 2u];
+    uint w3 = w[wb + 3u];
+    for (uint j = 0u; j < 8u; ++j) {
+      p0 = fma(a[ab + j], scale * kE2M1[w0 & 15u], p0);
+      p1 = fma(a[ab + 8u + j], scale * kE2M1[w1 & 15u], p1);
+      p2 = fma(a[ab + 16u + j], scale * kE2M1[w2 & 15u], p2);
+      p3 = fma(a[ab + 24u + j], scale * kE2M1[w3 & 15u], p3);
+      w0 >>= 4u;
+      w1 >>= 4u;
+      w2 >>= 4u;
+      w3 >>= 4u;
     }
-    barrier();
-    if (dot_valid) {
-      uint ab = row_a * k + b * 32u;
-      for (uint l = 0u; l < 32u; l += 2u) {
-        acc += a[ab + l] * wq[l];
-        acc += a[ab + l + 1u] * wq[l + 1u];
-      }
-    }
-    barrier();
   }
-  if (dot_valid) {
-    c[row_a * n + row_w] = acc;
-  }
+  c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
 }

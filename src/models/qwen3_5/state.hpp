@@ -17,10 +17,21 @@ namespace tessera::models::qwen3_5 {
 // verification can roll back to the accepted prefix.
 struct Qwen35BatchScratch {
   std::size_t capacity = 0;
+  // Rows the logits scratch holds. Prefill scores one row (the last token)
+  // and batch verify scores at most the draft block, so this stays small
+  // even when `capacity` covers a long prompt.
+  std::size_t logits_capacity = 0;
+  // Rows the per-layer linear state snapshots hold, and whether this batch
+  // writes them. Only a verification (rollback) needs them.
+  std::size_t hist_rows = 0;
+  bool snapshot_states = false;
   std::unique_ptr<Buffer> x, xn, proj, logits, pos;
   std::unique_ptr<Buffer> fused, q, gate, kf, vf, attn;
   std::unique_ptr<Buffer> fgate, fup, fmlp;
   std::unique_ptr<Buffer> qkv, z, alpha_raw, beta_raw, alpha, beta, out;
+  // Row-batched linear-attention scratch (prefill only): the conv output
+  // (q_all/k_all/v_all), the repeated q/k heads, and the delta output.
+  std::unique_ptr<Buffer> q_all, k_all, v_all, q_exp_all, k_exp_all, core_all;
   // Per linear layer: capacity device-state snapshots (capacity x state)
   // and the matching device conv-history snapshots.
   std::vector<std::unique_ptr<Buffer>> state_hist;

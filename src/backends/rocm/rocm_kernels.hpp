@@ -136,6 +136,13 @@ __global__ void GemmF32Kernel(const float* a, const float* w, float* c,
                               unsigned long long m,
                               unsigned long long n,
                               unsigned long long k);
+__global__ void GemmF32BatchedKernel(const float* a, const float* w, float* c,
+                                     unsigned long long m, unsigned long long n,
+                                     unsigned long long k);
+__global__ void GemmBf16BatchedKernel(const float* a, const unsigned short* w,
+                                      float* c, unsigned long long m,
+                                      unsigned long long n,
+                                      unsigned long long k);
 __global__ void GemmFp8Kernel(const float* a, const unsigned char* w,
                               const float* s, float* c,
                               unsigned long long m, unsigned long long n,
@@ -231,7 +238,8 @@ __global__ void AddKernel(const float* a, const float* b, float* o,
 __global__ void RepeatHeadsKernel(const float* in, float* out,
                                   unsigned long long num_v_heads,
                                   unsigned long long head_k_dim,
-                                  unsigned long long factor);
+                                  unsigned long long factor,
+                                  unsigned long long rows);
 __global__ void QuantizeQ8Kernel(const float* in, unsigned int* packed,
                                  float* scale, unsigned long long rows,
                                  unsigned long long cols);
@@ -327,7 +335,8 @@ __global__ void Conv1dStateKernel(const float* qkv, const float* w,
                                   unsigned long long conv_dim,
                                   unsigned long long width,
                                   unsigned long long key_dim,
-                                  unsigned long long qkv_offset);
+                                  unsigned long long qkv_offset,
+                                  unsigned long long rows);
 __global__ void SsmGateKernel(const float* a_log, const float* dt,
                               const float* alpha_raw, const float* beta_raw,
                               float* alpha, float* beta,
@@ -336,7 +345,7 @@ __global__ void SsmGateKernel(const float* a_log, const float* dt,
 __global__ void DeltaStepHeadsKernel(
     float* s, const float* k, const float* v, const float* q, float* o,
     const float* alpha, const float* beta, unsigned long long heads,
-    unsigned long long dk, unsigned long long dv);
+    unsigned long long dk, unsigned long long dv, unsigned long long rows);
 __global__ void SiluMulKernel(const float* g, const float* u, float* o,
                               unsigned long long n);
 // Built-in "embedding_f32"/"embedding_bf16"/"embedding_q4k": buffer 0

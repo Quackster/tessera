@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 275/275 on both builds.
+`ctest` passes 277/277 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -1851,18 +1851,153 @@ through RADV GFX1201, rocm through the system ROCm).
    greedy ~200), so the next work is decode speed, not the seam. 275/275
    `ctest` on both backends.
 
+- 2026-10-09: **Long-prompt prefill no longer exhausts memory.** A 112-token
+  prompt on the 27B MXFP4 target failed with `out_of_memory`; both GPUs were
+  idle (34 GB each), so it was tessera's own over-allocation. `AllocBatch`
+  sized two scratches by the whole batch: the logits scratch as
+  `rows * vocab_size` (112 x 248320 x 4 B = 111 GB) and, for every linear
+  layer, `(rows + 1) * state_len` recurrent-state snapshots (about 23 GB for
+  112 rows across the 48 linear layers). Prefill only scores the last token
+  and never rolls back, so `AllocBatch` now takes `logits_rows` and a
+  `need_state_hist` flag: prefill allocates one logits row and no state
+  history, and a verification (which does roll back, even for a one-token
+  draft, so it needs slot 0) grows the history and the logits to the draft
+  size on demand. `RunLinearBlockBatch` skips the per-row state/conv
+  snapshots when `Qwen35BatchScratch::snapshot_states` is false. Verified:
+  the same 112-token prompt now prefills and decodes, MTP and DFlash2 on the
+  27B still reproduce greedy (new `HybridDecodeTest.
+  BatchedPrefillThenVerifySizesScratchByNeed` pins the sizing and the
+  prefill-then-verify transition), 276/276 `ctest` on both backends. Prefill
+  itself stays slow (about 6 prompt tok/s, item 6).
+
+- 2026-10-09: **Prefill is 5.6x faster: the D2D copy was synchronous.** The
+  112-token prefill above then took 18.2 s (6 prompt tok/s). The batched
+  linear-attention block runs token by token on the host and copies the
+  per-row scale, gate and output through `Backend::CopyD2D` (about four
+  copies per row per layer, 21k for this prompt); the ROCm `CopyD2D` used a
+  synchronous `hipMemcpy`, so every copy drained the async kernel queue and
+  nothing pipelined. `CopyD2D` now uses `hipMemcpyAsync` on the null stream,
+  which stays ordered with the null-stream kernels but does not block the
+  host. The 112-token prefill drops to 3.3 s (34 prompt tok/s) and the
+  greedy/speculative decode rates are unchanged (35 ms/token). Also widened
+  the tiled MXFP4 GEMM tile from 8 to 256 rows (one 256-thread block per
+  weight row) so a prefill reads the weight matrix once instead of once per
+  eight-row tile; it is correct, but the prefill bottleneck was the copy,
+  not the GEMM, so it moved the number only slightly. 276/276 `ctest` on
+  both backends; MTP and DFlash2 on the 27B still equal greedy. The Vulkan
+  `LaunchKernel` still waits on a fence per launch (a separate, larger
+  inefficiency to fix under item 6).
+
+- 2026-10-09: **The MXFP4 tiled GEMM was latency-bound; four partial sums
+  fix it.** With the copy fix the 112-token prefill was 3.27 s and
+  `rocprofv3` put 2.35 s (76%) in `GemmMxFp4BatchedKernel`. Stubbing that
+  kernel to a no-op dropped the prefill to 0.94 s, proving it is the cost,
+  yet widening the tile (8 to 256 rows) and a 32x8 tile with cache reuse
+  changed nothing: the kernel is neither weight- nor activation-bandwidth
+  bound. Each thread accumulated the whole k into a single dependent FMA
+  chain, so it was latency bound. Now each thread keeps four independent
+  partial sums (one per 8-element word of the 32-element block) on a 32x8
+  output tile; eight partial sums regressed (the extra live registers cost
+  more occupancy than the ILP bought). The 112-token prefill drops to
+  2.18 s (51 prompt tok/s) and, because the speculative verifier scores its
+  draft with the same kernel, DFlash2 on the 27B drops from 443 to 125
+  ms/token (3 to 7 tok/s). Both backends port the change; 276/276 `ctest`;
+  DFlash2 accepts 29 of 63 and still equals greedy. (The `gemm_mxfp4` m = 1
+  decode GEMV has a shallow chain and stays memory bound, so it needs no
+  such change.)
+
+- 2026-10-09: **Tiled batched F32/BF16 GEMMs speed the DFlash2 draft and
+  verify.** Profiling a DFlash2 decode showed `GemmF32Kernel` (452 calls,
+  509 ms) and `GemmBf16Kernel` (19 calls, 387 ms) — the draft projections
+  and the shared head — both warp-per-output, so each weight row was read
+  once per draft row (m about 7). New `gemm_f32_batched`/`gemm_bf16_batched` kernels (32-row
+  x 8-column tile, four partial sums per thread, both backends) read each
+  weight row once; the DFlash2 drafter and selector load the f32 variant,
+  and `ProjectBatch` now selects the tiled F32/BF16 kernels for m > 1 so the
+  target's bf16 verify head uses one too. DFlash2 on the 27B drops from 177
+  to 136 ms/token (CLI) and 125 to 101 ms/token (test); the draft still
+  accepts 29 of 63 and equals greedy. New
+  `BackendTest.GemmBatchedF32Bf16DeviceMatchesRef`; 277/277 `ctest` on both
+  backends.
+
+- 2026-10-09: **Small batches use the GEMV, not the 32-row tile.** The
+  DFlash2 verify runs the target trunk at the draft size (about 7), where the
+  tiled MXFP4 kernel's 32-row tile leaves most rows idle and every thread
+  runs a deep k-chain. `ProjectBatch` now uses the tiled kernel only for
+  `m >= kGemmTiledMinRows` (16); smaller batches use the m = 1 GEMV, whose
+  shallow chains hide latency better. DFlash2 on the 27B drops 136 -> 128
+  ms/token; the 112-token prefill (m = 112) is unchanged at 2.16 s. 277/277
+  `ctest` on both backends.
+
+- 2026-10-09: **The per-row linear prefill loop is batched.** Prefill never
+  rolls back, so it now runs the causal conv, the two L2 norms, the head
+  repeat, the delta scan and the gated norm over all rows in one launch
+  each, instead of about eleven launches and four device-to-device copies
+  per row. The `conv1d_state`, `repeat_heads` and `delta_step_heads` kernels
+  take a `rows` scalar and advance the shared conv history / recurrent
+  state across the rows internally; `rows == 1` is the previous single-token
+  behavior, so decode and the rollback path (which needs per-row state
+  snapshots) keep the per-row loop. The 112-token prefill wall is unchanged
+  (2.16 s): the loop is GPU-work-bound on ROCm, whose launches were already
+  asynchronous, so the launch and copy reduction does not show there. It
+  should help the Vulkan backend, whose `LaunchKernel` waits on a fence per
+  launch (a follow-up). 277/277 `ctest` on both backends; DFlash2 on the 27B
+  still accepts 29 of 63 and equals greedy.
+
+- 2026-10-09: **Vulkan launches no longer wait on a fence each.**
+  `VulkanCompute::LaunchKernel` recorded one command buffer and waited its
+  fence before returning, so the GPU drained after every kernel and never
+  pipelined. It now uses a four-slot ring of command buffers, fences and
+  per-slot descriptor sets: a slot is reused only after its fence signals,
+  and its set is freed then, so the host never waits inside a step
+  (`Synchronize` drains the queue). A/B on the 27B MXFP4 (ring size 1
+  reproduces the old per-launch wait): decode 113 to 69 ms per token (8 to
+  14 tok/s) and prefill 27 to 31 prompt tok/s. 277/277 `ctest` on both
+  backends (the numerical tests exercise the descriptor and command-buffer
+  lifecycle).
+
 ## Next (in order)
 
-- **Speculation (DFlash2 done, MTP broken).** DFlash2 acceptance is fixed
-  (4.4 per step, reference 2.7 to 2.85) and the coalesced GEMVs plus the BF16
-  head cut greedy to 40 to 51 ms/token and DFlash2 to 296 ms/token on the 27B
-  MXFP4 target. Two open items: (a) DFlash2 is still about 6x slower per
-  token than greedy (draft block fp32 weights, selector, many small kernels);
-  reduce the draft step cost, then re-measure. (b) **MTP speculation accepts
-  0 of 508 draft tokens** on the MXFP4 target (output still equals greedy
-  because it falls back every step, but it is 1396 ms/token). Root-cause the
-  MTP head draft quality: it is output-preserving but worthless as a speedup
-  today. Both are item 3 work.
+- **Speculation (seam done; decode speed is the gap).** Greedy and both
+  drafters now share one loop and one `SpeculativeStrategy` seam. DFlash2
+  acceptance is fixed (4.4 per step, reference 2.7 to 2.85) and MTP is
+  output-preserving. On the 27B MXFP4 target (ROCm, GPU1, 128 tokens) greedy
+  decodes at 25 tok/s and DFlash2 at 3 tok/s, far below hipfire on the same
+  R9700 (greedy ~200, MTP 68, DFlash 123 tok/s). Next, in order: (a) target
+  decode speed — fuse the per-layer projections (QKV/QKVZA/gate_up) as
+  hipfire does and cut the per-op launch/round-trip count, since the MXFP4
+  target forward dominates both the greedy and the speculative paths; (b) the
+  DFlash2 draft step (fp32 draft weights -> bf16, cheaper selector, fewer
+  kernels); (c) root-cause the MTP head draft quality (0 of 508 accepted).
+  Measure with the new split prefill/decode tok/s logs. All item 3 work.
+  A `rocprofv3` trace (27B MXFP4, ROCm) puts the greedy decode cost in
+  `GemmMxFp4Kernel`: about 586 dispatches per token and roughly 27 of the
+  39 ms/token, i.e. about 410 GB/s against the R9700's ~640 GB/s. So the
+  first lever is that one GEMV (wider reads / multi-row / fused
+  projections), not the surrounding kernels. Follow-up: replacing the
+  per-block four 32-bit weight loads with one `uint4` load changed nothing
+  (still 39 ms/token), and a two-output-per-warp variant (reuse the loaded
+  activation, halve the grid) was slightly worse (42 ms/token), both
+  reverted. So the GEMV is neither load-instruction-bound nor
+  activation-reuse-bound; the ~410 GB/s is compute/occupancy-bound. A
+  `rocprofv3 --kernel-trace` of the greedy MXFP4 decode (ROCm, 16 tokens)
+  confirms which kernels run and that this is GPU kernel time, not launch
+  overhead: the profiler serializes dispatches and inflates the decode wall
+  from 39 to ~136 ms/token, so the ~1366 launches/token (465
+  `GemmMxFp4Kernel` plus about 900 small kernels: rmsnorm ~161, l2norm ~120,
+  repeat_heads ~120, add ~128, conv1d/rmsnorm_gated/delta_step_heads ~60
+  each, silu_mul ~64, ssm_gate ~48, mrope ~32, attention ~16,
+  qgate_split/sigmoid_gate ~16 each) are hidden when unprofiled. The same
+  trace's tiled `GemmMxFp4BatchedKernel` (496 calls, 69% of profiled kernel
+  time) is the prefill phase, not the decode. So reducing launches does not
+  cut the decode wall clock; the levers stay the GEMV bandwidth and the
+  ~15 ms/token of norms/scan/attention. The next profiling step is PMC
+  counters / roofline on the GEMV to pick between a different GEMV
+  structure (activation-stationary / WMMA) and a fused multi-buffer launch.
+  A PMC pass on the GEMV found it uses 80 VGPR per thread (high register
+  pressure for a one-accumulator GEMV, a possible occupancy limiter); the
+  derived FETCH_SIZE counter read 0 through this path, so the DRAM-vs-
+  occupancy question stays open until the raw GL2C counters are read.
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.

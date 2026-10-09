@@ -213,16 +213,17 @@ class Kernel {
 // sigmoid(beta_raw). The dispatch is ceil(rows * heads / 256) workgroups
 // of 256.
 // "delta_step_heads": buffer 0 is S (fp32, heads x dk x dv, updated in
-// place), buffers 1..4 are k (heads x dk), v (heads x dv), q (heads x
-// dk) and o (heads x dv), buffers 5 and 6 are alpha and beta (heads);
-// scalars are heads, dk, dv. One gated-delta step per head. The
+// place), buffers 1..4 are k (rows x heads x dk), v (rows x heads x dv),
+// q (rows x heads x dk) and o (rows x heads x dv), buffers 5 and 6 are
+// alpha and beta (rows x heads); scalars are heads, dk, dv, rows. The
+// rows gated-delta steps run in turn, advancing the shared state. The
 // dispatch is ceil(heads * dv / 256) workgroups of 256.
-// "repeat_heads": buffer 0 is IN (fp32, num_k_heads x head_k_dim),
-// buffer 1 the output OUT (fp32, num_v_heads x head_k_dim); scalars are
-// num_v_heads, head_k_dim and factor (num_v_heads is divisible by
-// factor; out[h] = in[h % (num_v_heads / factor)], the interleaved
-// GQA layout). The dispatch is
-// ceil(num_v_heads * head_k_dim / 256) workgroups of 256.
+// "repeat_heads": buffer 0 is IN (fp32, rows x num_k_heads x head_k_dim),
+// buffer 1 the output OUT (fp32, rows x num_v_heads x head_k_dim);
+// scalars are num_v_heads, head_k_dim, factor and rows (num_v_heads is
+// divisible by factor; out[h] = in[h % (num_v_heads / factor)], the
+// interleaved GQA layout). The dispatch is
+// ceil(rows * num_v_heads * head_k_dim / 256) workgroups of 256.
 // "add": buffers 0 and 1 are A and B (fp32, n each) and buffer 2 the
 // output O (fp32, n); scalar 0 is n. O = A + B elementwise.
 // "silu_mul": buffers are G and U (fp32, n each) and the output O
@@ -507,22 +508,23 @@ class Kernel {
     }
   }
   if (kernel.Id() == "delta_step_heads") {
-    if (launch.buffers.size() != 7 || launch.scalars.size() != 3) {
+    if (launch.buffers.size() != 7 || launch.scalars.size() != 4) {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
-        launch.scalars[2] == 0) {
+        launch.scalars[2] == 0 || launch.scalars[3] == 0) {
       return StatusCode::InvalidArgument;
     }
   }
   if (kernel.Id() == "repeat_heads") {
-    if (launch.buffers.size() != 2 || launch.scalars.size() != 3) {
+    if (launch.buffers.size() != 2 || launch.scalars.size() != 4) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t heads = launch.scalars[0];
     const std::uint64_t head_dim = launch.scalars[1];
     const std::uint64_t factor = launch.scalars[2];
-    if (heads == 0 || head_dim == 0 || factor == 0 || heads % factor != 0) {
+    if (heads == 0 || head_dim == 0 || factor == 0 || heads % factor != 0 ||
+        launch.scalars[3] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

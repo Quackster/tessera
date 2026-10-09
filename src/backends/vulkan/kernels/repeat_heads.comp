@@ -1,12 +1,13 @@
 #version 450
 
 // One thread per output element; the dispatch is
-// ceil(num_v_heads * head_k_dim / 256) workgroups.
+// ceil(rows * num_v_heads * head_k_dim / 256) workgroups.
 layout(local_size_x = 256) in;
 
-// "repeat_heads" contract: buffer 0 is IN (num_k_heads x head_k_dim),
-// buffer 1 the output OUT (num_v_heads x head_k_dim). Scalars:
-// num_v_heads v[0], head_k_dim v[2], factor v[4].
+// "repeat_heads" contract: buffer 0 is IN (rows x num_k_heads x
+// head_k_dim), buffer 1 the output OUT (rows x num_v_heads x
+// head_k_dim). Scalars: num_v_heads v[0], head_k_dim v[2], factor v[4],
+// rows v[6].
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -18,11 +19,17 @@ void main() {
   uint i = gl_GlobalInvocationID.x;
   uint heads = pc.v[0];
   uint head_dim = pc.v[2];
-  if (i >= heads * head_dim) {
+  uint factor = pc.v[4];
+  uint rows = pc.v[6];
+  uint row_stride = heads * head_dim;
+  if (i >= rows * row_stride) {
     return;
   }
-  uint factor = pc.v[4];
-  uint h = i / head_dim;
-  uint e = i % head_dim;
-  out_data[i] = in_data[(h % (heads / factor)) * head_dim + e];
+  uint row = i / row_stride;
+  uint j = i % row_stride;
+  uint h = j / head_dim;
+  uint e = j % head_dim;
+  uint k_heads = heads / factor;
+  out_data[i] =
+      in_data[row * k_heads * head_dim + (h % k_heads) * head_dim + e];
 }

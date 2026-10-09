@@ -1,0 +1,62 @@
+#version 450
+
+// Tiled batched bf16 GEMM: one workgroup covers a 32-row x 8-column output
+// tile (threads share a row and a column for cache reuse), each thread
+// keeping four partial sums so the FMA chain stays shallow. Dispatch is
+// ceil(m / 32) * ceil(n / 8) workgroups of 256.
+layout(local_size_x = 256) in;
+
+// "gemm_bf16_batched" contract (tessera API): as gemm_bf16 (m, n, k).
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) buffer C {
+  float c[];
+};
+
+// bf16 -> fp32: shift the 16 bits into the high half of an fp32 word.
+float bf16_at(uint index) {
+  uint word = w[index >> 1];
+  uint bits = (word >> ((index & 1) << 4)) & 0xFFFF;
+  return uintBitsToFloat(bits << 16);
+}
+
+void main() {
+  uint tid = gl_LocalInvocationID.x;
+  uint wg = gl_WorkGroupID.x;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  uint col_tiles = (n + 7u) / 8u;
+  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
+  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
+  if (row_a >= m || row_w >= n) {
+    return;
+  }
+  uint ab = row_a * k;
+  uint wb = row_w * k;
+  float p0 = 0.0;
+  float p1 = 0.0;
+  float p2 = 0.0;
+  float p3 = 0.0;
+  uint t = 0u;
+  for (; t + 4u <= k; t += 4u) {
+    p0 = fma(a[ab + t], bf16_at(wb + t), p0);
+    p1 = fma(a[ab + t + 1u], bf16_at(wb + t + 1u), p1);
+    p2 = fma(a[ab + t + 2u], bf16_at(wb + t + 2u), p2);
+    p3 = fma(a[ab + t + 3u], bf16_at(wb + t + 3u), p3);
+  }
+  for (; t < k; ++t) {
+    p0 = fma(a[ab + t], bf16_at(wb + t), p0);
+  }
+  c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
+}

@@ -9,6 +9,7 @@
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "models/qwen3_5/state.hpp"
 #include "spec/dflash2_mask.hpp"
 #include "test_helpers.hpp"
 #include "tessera/engine.hpp"
@@ -495,6 +496,65 @@ TEST(HybridDecodeTest, BatchedPrefillMatchesSequential) {
     }
     EXPECT_LE(hidden_abs, kPrefillConsistency)
         << path << " hidden max_abs " << hidden_abs;
+  }
+}
+
+// Regression (prefill over-allocation): the batched scratch must size the
+// logits and the per-layer linear state snapshots by need, not by every
+// prompt row. Prefill scores one row and never rolls back; a following
+// verification then grows the state history and still accepts the draft.
+// A 112-token prefill used to ask for tens of GB and fail with
+// out_of_memory.
+TEST(HybridDecodeTest, BatchedPrefillThenVerifySizesScratchByNeed) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  const std::vector<std::uint32_t> prompt = {0, 1, 0, 1, 0, 1, 0, 1};
+  const std::vector<std::string> fixtures = {
+      WriteGatedHybridFixture("need-gated.gguf").string(),
+      WriteLinearHybridFixture("need-linear.gguf").string()};
+  for (const std::string& path : fixtures) {
+    auto model = engine->LoadModel(ModelOptions{path, 1024});
+    ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+    // Sequential reference: the greedy draft after the prompt.
+    tessera::core::DecodeCache ref;
+    for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
+      ASSERT_TRUE(tessera::core::DecodeForward(engine->Owner(), **model, ref,
+                                               prompt[i])
+                      .has_value());
+    }
+    auto ref_logits = tessera::core::DecodeLogits(engine->Owner(), **model, ref,
+                                                  prompt.back());
+    ASSERT_TRUE(ref_logits.has_value()) << tessera::ToString(ref_logits.error());
+    std::vector<std::uint32_t> draft;
+    std::vector<float> lg = *ref_logits;
+    for (int i = 0; i < 3; ++i) {
+      draft.push_back(RowArgMax(lg));
+      auto nxt = tessera::core::DecodeLogits(engine->Owner(), **model, ref,
+                                             draft.back());
+      ASSERT_TRUE(nxt.has_value());
+      lg = *nxt;
+    }
+    // Batched prefill of the whole prompt.
+    tessera::core::DecodeCache cache;
+    auto prefill =
+        tessera::core::PrefillTokens(engine->Owner(), **model, cache, prompt);
+    ASSERT_TRUE(prefill.has_value()) << tessera::ToString(prefill.error());
+    {
+      auto& s = tessera::models::qwen3_5::State(cache);
+      ASSERT_NE(s.batch, nullptr) << path;
+      EXPECT_EQ(s.batch->logits_capacity, 1u) << path;
+      EXPECT_FALSE(s.batch->snapshot_states) << path;
+      EXPECT_TRUE(s.batch->state_hist.empty()) << path;
+    }
+    auto v = tessera::core::VerifyDraft(engine->Owner(), **model, cache, draft,
+                                        *prefill);
+    ASSERT_TRUE(v.has_value()) << tessera::ToString(v.error());
+    EXPECT_EQ(v->accepted, draft.size()) << path;
+    auto& s = tessera::models::qwen3_5::State(cache);
+    ASSERT_NE(s.batch, nullptr) << path;
+    EXPECT_EQ(s.batch->logits_capacity, draft.size()) << path;
+    EXPECT_TRUE(s.batch->snapshot_states) << path;
+    EXPECT_FALSE(s.batch->state_hist.empty()) << path;
   }
 }
 

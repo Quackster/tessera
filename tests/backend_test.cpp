@@ -3199,7 +3199,7 @@ TEST(BackendTest, RepeatHeadsDeviceMatchesRef) {
   launch.grid_x = (kNumV * kHeadDim + 255) / 256;
   launch.block_x = 256;
   launch.buffers = {(*in_buf).get(), (*out_buf).get()};
-  launch.scalars = {kNumV, kHeadDim, kFactor};
+  launch.scalars = {kNumV, kHeadDim, kFactor, 1};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -3216,7 +3216,7 @@ TEST(BackendTest, RepeatHeadsDeviceMatchesRef) {
     EXPECT_FLOAT_EQ(got[i], ref[i]);
   }
   // Contract: heads not divisible by factor is rejected.
-  launch.scalars = {kNumV, kHeadDim, 3};
+  launch.scalars = {kNumV, kHeadDim, 3, 1};
   auto bad = backend->LaunchKernel(**kernel, launch);
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
@@ -3323,7 +3323,7 @@ TEST(BackendTest, DeltaStepHeadsDeviceMatchesRef) {
   launch.buffers = {(*s_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*q_buf).get(), (*o_buf).get(), (*al_buf).get(),
                     (*be_buf).get()};
-  launch.scalars = {kHeads, kDk, kDv};
+  launch.scalars = {kHeads, kDk, kDv, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<float> s_ref = s;
@@ -3430,7 +3430,7 @@ TEST(BackendTest, Conv1dStateDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*qkv_buf).get(), (*w_buf).get(), (*hist_buf).get(),
                     (*q_buf).get(), (*k_buf).get(), (*v_buf).get()};
-  launch.scalars = {kConvDim, kWidth, kKeyDim, 0};
+  launch.scalars = {kConvDim, kWidth, kKeyDim, 0, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   const auto download = [&backend](auto& buf, std::vector<float>& out) {
@@ -3944,7 +3944,87 @@ TEST(BackendTest, GemmF32DeviceMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
-// Device: the bf16-weight GEMM matches the reference (the fp32 host
+// Device: the tiled batched F32/BF16 GEMMs (the DFlash2 draft and the
+// target's batch-verify head) match the host reference for m > 1,
+// including a k that is not a multiple of the four-wide inner step.
+TEST(BackendTest, GemmBatchedF32Bf16DeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97);
+  constexpr std::size_t kM = 3;
+  constexpr std::size_t kN = 4;
+  constexpr std::size_t kK = 5;
+  std::vector<float> a(kM * kK), w_f32(kN * kK);
+  for (auto& v : a) v = DrawValue(rng);
+  for (auto& v : w_f32) v = DrawValue(rng);
+  std::vector<std::byte> w_bf16(kN * kK * 2);
+  for (std::size_t i = 0; i < kN * kK; ++i) {
+    const float value = DrawValue(rng);
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint16_t bf = static_cast<std::uint16_t>(bits >> 16);
+    w_bf16[i * 2] = static_cast<std::byte>(bf & 0xFF);
+    w_bf16[i * 2 + 1] = static_cast<std::byte>((bf >> 8) & 0xFF);
+  }
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto wf_buf = backend->AllocateBuffer(w_f32.size() * 4, MemoryKind::Device);
+  auto wb_buf = backend->AllocateBuffer(w_bf16.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && wf_buf && wb_buf && c_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **a_buf,
+                  std::span<const std::byte>(
+                      reinterpret_cast<const std::byte*>(a.data()),
+                      a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(
+                  **wf_buf,
+                  std::span<const std::byte>(
+                      reinterpret_cast<const std::byte*>(w_f32.data()),
+                      w_f32.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**wb_buf, std::span<const std::byte>(w_bf16))
+                  .has_value());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  const std::pair<const char*, bool> cases[] = {
+      {"gemm_f32_batched", false}, {"gemm_bf16_batched", true}};
+  for (const auto& [name, bf16] : cases) {
+    auto kernel = backend->LoadKernel(name, {});
+    ASSERT_TRUE(kernel.has_value()) << name;
+    tessera::KernelLaunch launch;
+    launch.grid_x = tessera::core::detail::GemmGridFor(**kernel, kM, kN);
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(),
+                      bf16 ? (*wb_buf).get() : (*wf_buf).get(),
+                      (*c_buf).get()};
+    launch.scalars = {kM, kN, kK};
+    ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value()) << name;
+    backend->Synchronize();
+    std::vector<std::byte> readback(kM * kN * 4);
+    ASSERT_TRUE(backend->CopyD2H(**c_buf, readback.data(), readback.size())
+                    .has_value());
+    std::vector<float> ref(kM * kN);
+    if (bf16) {
+      ASSERT_TRUE(core::GemmBf16Ref(
+                      std::span<const float>(a),
+                      std::span<const std::byte>(w_bf16),
+                      std::span<float>(ref), kM, kN, kK)
+                      .has_value());
+    } else {
+      ASSERT_TRUE(core::GemmF32Ref(std::span<const float>(a),
+                                   std::span<const float>(w_f32),
+                                   std::span<float>(ref), kM, kN, kK)
+                      .has_value());
+    }
+    const auto* got = reinterpret_cast<const float*>(readback.data());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << name << " backend " << backend->Name() << " max_abs " << max_abs;
+  }
+}
 // reference converts the same bf16 bits).
 TEST(BackendTest, GemmBf16DeviceMatchesRef) {
   std::unique_ptr<Backend> backend;

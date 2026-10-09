@@ -209,7 +209,8 @@ These are hard rules, set by the project owner:
     Stop the run and root-cause it in the same session. Do not dismiss it as a
     bad sample and do not generate past it. Research how the reference runtimes
     handle the case (https://codeberg.org/ggz14/radiance-vllm-mxfp4 first, then
-    vLLM, llama.cpp, the model card and the HuggingFace docs), implement the
+    hipfire, then vLLM, llama.cpp, the model card and the HuggingFace docs),
+    implement the
     mechanism that prevents it, and add a regression test. This
     project finds most of its bugs by streaming prompts, so the fix is part of
     the task, not an extra.
@@ -238,9 +239,9 @@ These are hard rules, set by the project owner:
       runaway); stop and fix it instead of waiting. A GPU test that used to
       finish in under a minute but now takes five means the change made it
       slow, not that the wait is expected.
-    - Run a model server in the foreground. A full serve (vLLM, or the radiance
-      container that compiles gfx1201 kernels and loads the 27B target plus the
-      draft) holds tens of GB of device and host memory for the whole run.
+    - Run a model server in the foreground. A full serve (hipfire, vLLM, or the
+      radiance container that compiles gfx1201 kernels and loads the 27B target
+      plus the draft) holds tens of GB of device and host memory for the whole
       Backgrounding it and polling it from other commands has crashed the
       workstation. Start it, then wait; do not run anything else until it exits
       and its memory is freed.
@@ -254,7 +255,8 @@ These are hard rules, set by the project owner:
       project owner first.
 
 21. **Match the reference runtime** - the behavior contract is the served
-    reference runtime, `radiance-vllm-mxfp4` first and vLLM second. When a
+    reference runtime, `radiance-vllm-mxfp4` first, then hipfire, then vLLM.
+    When a
     tessera result differs, read the reference source, find the exact
     difference, and change tessera to match. Do not ask the project owner
     which behavior is correct and do not guess. The served target container
@@ -279,8 +281,8 @@ Repository-specific constraints on top of the hard rules:
 - Search with `rg` before assuming a behavior is missing.
 - Research model architecture online: use papers, model cards, and
   public specs for algorithm details. Prefer the reference at
-  https://codeberg.org/ggz14/radiance-vllm-mxfp4 first, then vLLM, for
-  algorithm behavior. Do not read the local llama.cpp checkout when
+  https://codeberg.org/ggz14/radiance-vllm-mxfp4 first, then hipfire, then
+  vLLM, for algorithm behavior. Do not read the local llama.cpp checkout when
   designing or porting model logic.
 - Do not encode model names into tests: a "qwen3" test is a test of the
   generic attention path fed with qwen3-shaped parameters.

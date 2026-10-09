@@ -36,7 +36,10 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_fp8", kGemmFp8SpirV, sizeof(kGemmFp8SpirV)},
     {"gemm_fp8_block", kGemmFp8BlockSpirV, sizeof(kGemmFp8BlockSpirV)},
     {"gemm_f32", kGemmF32SpirV, sizeof(kGemmF32SpirV)},
+    {"gemm_f32_batched", kGemmF32BatchedSpirV, sizeof(kGemmF32BatchedSpirV)},
     {"gemm_bf16", kGemmBf16SpirV, sizeof(kGemmBf16SpirV)},
+    {"gemm_bf16_batched", kGemmBf16BatchedSpirV,
+     sizeof(kGemmBf16BatchedSpirV)},
     {"gemm_mxfp4", kGemmMxfp4SpirV, sizeof(kGemmMxfp4SpirV)},
     {"gemm_q5k", kGemmQ5KSpirV, sizeof(kGemmQ5KSpirV)},
     {"gemm_q6k", kGemmQ6KSpirV, sizeof(kGemmQ6KSpirV)},
@@ -186,8 +189,8 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
   command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   command_info.commandPool = pool_;
   command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  command_info.commandBufferCount = 1;
-  result = vkAllocateCommandBuffers(device, &command_info, &command_);
+  command_info.commandBufferCount = static_cast<std::uint32_t>(kRing);
+  result = vkAllocateCommandBuffers(device, &command_info, commands_.data());
   if (result != VK_SUCCESS) {
     LogError(std::string("vkAllocateCommandBuffers failed (") +
              std::to_string(static_cast<int>(result)) + ")");
@@ -196,23 +199,31 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
   }
   VkFenceCreateInfo fence_info{};
   fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-  result = vkCreateFence(device, &fence_info, nullptr, &fence_);
-  if (result != VK_SUCCESS) {
-    LogError(std::string("vkCreateFence failed (") +
-             std::to_string(static_cast<int>(result)) + ")");
-    DestroyResources();
-    return std::unexpected(FromVkResult(result));
+  // Signaled so the first use of a slot does not wait.
+  fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+  for (std::size_t i = 0; i < kRing; ++i) {
+    result = vkCreateFence(device, &fence_info, nullptr, &fences_[i]);
+    if (result != VK_SUCCESS) {
+      LogError(std::string("vkCreateFence failed (") +
+               std::to_string(static_cast<int>(result)) + ")");
+      DestroyResources();
+      return std::unexpected(FromVkResult(result));
+    }
   }
   ready_ = true;
   return {};
 }
 
 void VulkanCompute::DestroyResources() {
-  if (fence_ != VK_NULL_HANDLE) {
-    vkDestroyFence(device_, fence_, nullptr);
-    fence_ = VK_NULL_HANDLE;
+  for (VkFence& f : fences_) {
+    if (f != VK_NULL_HANDLE) {
+      vkDestroyFence(device_, f, nullptr);
+      f = VK_NULL_HANDLE;
+    }
   }
-  command_ = VK_NULL_HANDLE;  // freed with the command pool
+  for (VkCommandBuffer& c : commands_) {
+    c = VK_NULL_HANDLE;  // freed with the command pool
+  }
   if (descriptor_pool_ != VK_NULL_HANDLE) {
     vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
     descriptor_pool_ = VK_NULL_HANDLE;
@@ -318,7 +329,30 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   if (!ready_) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  auto result = vkResetCommandBuffer(command_, 0);
+  const std::size_t slot = slot_;
+  slot_ = (slot_ + 1) % kRing;
+  VkFence fence = fences_[slot];
+  // Reuse the slot only after its previous submission completed; its
+  // descriptor set is freed here, once the GPU no longer reads it.
+  auto result = vkWaitForFences(device_, 1, &fence, VK_TRUE, kFenceTimeoutNs);
+  if (result == VK_TIMEOUT) {
+    LogError(std::string("kernel ") + kernel.name +
+             ": fence wait timed out after 30 s; the device is hung or the "
+             "ICD is unresponsive");
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (result != VK_SUCCESS) {
+    LogError(std::string("kernel ") + kernel.name +
+             ": vkWaitForFences failed (" +
+             std::to_string(static_cast<int>(result)) + ")");
+    return std::unexpected(FromVkResult(result));
+  }
+  if (slot_sets_[slot] != VK_NULL_HANDLE) {
+    vkFreeDescriptorSets(device_, descriptor_pool_, 1, &slot_sets_[slot]);
+    slot_sets_[slot] = VK_NULL_HANDLE;
+  }
+  const VkCommandBuffer command = commands_[slot];
+  result = vkResetCommandBuffer(command, 0);
   if (result != VK_SUCCESS) {
     LogError(std::string("kernel ") + kernel.name +
              ": vkResetCommandBuffer failed (" +
@@ -327,14 +361,14 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   }
   VkCommandBufferBeginInfo begin_info{};
   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  result = vkBeginCommandBuffer(command_, &begin_info);
+  result = vkBeginCommandBuffer(command, &begin_info);
   if (result != VK_SUCCESS) {
     LogError(std::string("kernel ") + kernel.name +
              ": vkBeginCommandBuffer failed (" +
              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
-  vkCmdBindPipeline(command_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+  vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
   VkDescriptorSetAllocateInfo set_alloc{};
   set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   set_alloc.descriptorPool = descriptor_pool_;
@@ -381,12 +415,12 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   std::memset(push_constants, 0, kPushConstantBytes);
   std::memcpy(push_constants, launch.scalars.data(),
               launch.scalars.size() * sizeof(std::uint64_t));
-  vkCmdPushConstants(command_, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+  vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      kPushConstantBytes, push_constants);
-  vkCmdBindDescriptorSets(command_, VK_PIPELINE_BIND_POINT_COMPUTE, layout_,
-                          0, 1, &set, 0, nullptr);
-  vkCmdDispatch(command_, launch.grid_x, launch.grid_y, launch.grid_z);
-  result = vkEndCommandBuffer(command_);
+  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0,
+                          1, &set, 0, nullptr);
+  vkCmdDispatch(command, launch.grid_x, launch.grid_y, launch.grid_z);
+  result = vkEndCommandBuffer(command);
   if (result != VK_SUCCESS) {
     vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
     LogError(std::string("kernel ") + kernel.name +
@@ -394,7 +428,7 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
-  result = vkResetFences(device_, 1, &fence_);
+  result = vkResetFences(device_, 1, &fence);
   if (result != VK_SUCCESS) {
     vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
     LogError(std::string("kernel ") + kernel.name +
@@ -405,24 +439,18 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   VkSubmitInfo submit_info{};
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.commandBufferCount = 1;
-  submit_info.pCommandBuffers = &command_;
-  result = vkQueueSubmit(queue_, 1, &submit_info, fence_);
-  if (result == VK_SUCCESS) {
-    result = vkWaitForFences(device_, 1, &fence_, VK_TRUE, kFenceTimeoutNs);
-  }
-  vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
-  if (result == VK_TIMEOUT) {
-    LogError(std::string("kernel ") + kernel.name +
-             " fence wait timed out after 30 s; the device is hung or the "
-             "ICD is unresponsive");
-    return std::unexpected(StatusCode::DeviceError);
-  }
+  submit_info.pCommandBuffers = &command;
+  result = vkQueueSubmit(queue_, 1, &submit_info, fence);
   if (result != VK_SUCCESS) {
+    vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
     LogError(std::string("kernel ") + kernel.name +
              " submit failed (" + std::to_string(static_cast<int>(result)) +
              ")");
     return std::unexpected(FromVkResult(result));
   }
+  // The host does not wait: the next reuse of this slot waits on the fence,
+  // and Synchronize() drains the queue at the end of a decode step.
+  slot_sets_[slot] = set;
   return {};
 }
 

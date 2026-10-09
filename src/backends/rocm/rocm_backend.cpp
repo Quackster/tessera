@@ -43,7 +43,9 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_fp8", reinterpret_cast<void*>(&GemmFp8Kernel)},
     {"gemm_fp8_block", reinterpret_cast<void*>(&GemmFp8BlockKernel)},
     {"gemm_f32", reinterpret_cast<void*>(&GemmF32Kernel)},
+    {"gemm_f32_batched", reinterpret_cast<void*>(&GemmF32BatchedKernel)},
     {"gemm_bf16", reinterpret_cast<void*>(&GemmBf16Kernel)},
+    {"gemm_bf16_batched", reinterpret_cast<void*>(&GemmBf16BatchedKernel)},
     {"gemm_mxfp4", reinterpret_cast<void*>(&GemmMxFp4Kernel)},
     {"gemm_mxfp4_batched", reinterpret_cast<void*>(&GemmMxFp4BatchedKernel)},
     {"gemm_q5k", reinterpret_cast<void*>(&GemmQ5KKernel)},
@@ -241,8 +243,14 @@ class RocmBackend final : public Backend {
     const auto* src_base =
         static_cast<const std::byte*>(src.Handle()) + src_offset;
     auto* dst_base = static_cast<std::byte*>(dst.Handle()) + dst_offset;
-    auto error =
-        hipMemcpy(dst_base, src_base, bytes, hipMemcpyDeviceToDevice);
+    // Asynchronous on the null stream: the copies and the kernels are both
+    // ordered on the null stream, so the copy still happens before the
+    // kernels that read it, but the host does not drain the queue on every
+    // call. A synchronous hipMemcpy here serialized the per-row linear
+    // prefill (about four copies per row per layer) and the state
+    // snapshots.
+    auto error = hipMemcpyAsync(dst_base, src_base, bytes,
+                                hipMemcpyDeviceToDevice, nullptr);
     if (error != hipSuccess) {
       LogError(std::string("hipMemcpy D2D of ") + std::to_string(bytes) +
                " bytes failed (" + HipErrorName(error) + ")");

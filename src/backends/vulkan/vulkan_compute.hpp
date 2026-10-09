@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -73,10 +74,15 @@ class VulkanCompute {
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
   VkCommandPool pool_ = VK_NULL_HANDLE;
-  // Reused across launches: the API is synchronous, so at most one launch
-  // is in flight and the command buffer and fence can be reset.
-  VkCommandBuffer command_ = VK_NULL_HANDLE;
-  VkFence fence_ = VK_NULL_HANDLE;
+  // Launches pipeline: each slot owns a command buffer, a fence and the
+  // descriptor set it last submitted. A slot is reused only after its fence
+  // signals, and the set is freed then, so the host does not wait on every
+  // launch (the GPU stays busy across the launches of one decode step).
+  static constexpr std::size_t kRing = 4;
+  std::array<VkCommandBuffer, kRing> commands_{};
+  std::array<VkFence, kRing> fences_{};
+  std::array<VkDescriptorSet, kRing> slot_sets_{};
+  std::size_t slot_ = 0;
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;

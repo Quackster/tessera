@@ -140,7 +140,7 @@ class DFlash2Strategy final : public SpeculativeStrategy {
     draft_hidden_ = std::move(*draft_hidden);
     sel_hidden_ = std::move(*sel_hidden);
     query_slot_ = std::move(*query);
-    auto selector_gemm = backend.LoadKernel("gemm_f32", {});
+    auto selector_gemm = backend.LoadKernel("gemm_f32_batched", {});
     auto selector_kernel = backend.LoadKernel("selector_edge_score", {});
     if (selector_gemm) {
       selector_gemm_ = std::move(*selector_gemm);

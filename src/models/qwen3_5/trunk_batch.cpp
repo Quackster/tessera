@@ -37,17 +37,17 @@ using detail::SigmoidGateDevice;
 using detail::SiluMulDevice;
 using detail::SsmGateDevice;
 
-// Allocates (or reallocates) the batched scratch for `rows` tokens.
+// Allocates (or reallocates) the batched scratch for `rows` tokens. Two
+// scratches are sized by need, not `rows`, because a long prompt must not
+// allocate their full rows: the logits scratch (prefill scores only the last
+// token) and the per-layer linear state snapshots (only a verification reads
+// them to roll back, and it ever scores at most the draft block).
 std::expected<void, StatusCode> AllocBatch(Backend& backend,
                                            const TransformerConfig& cfg,
                                            const LinearGeometry& g,
-                                           Qwen35State& h,
-                                           std::size_t rows) {
-  if (h.batch && h.batch->capacity >= rows) {
-    return {};
-  }
-  auto b = std::make_unique<Qwen35BatchScratch>();
-  b->capacity = rows;
+                                           Qwen35State& h, std::size_t rows,
+                                           std::size_t logits_rows,
+                                           bool need_state_hist) {
   auto alloc = [&backend](std::unique_ptr<Buffer>& slot,
                           std::size_t elements) -> bool {
     auto buf = backend.AllocateBuffer(elements * 4, MemoryKind::Device);
@@ -57,14 +57,46 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
     slot = std::move(*buf);
     return true;
   };
-  const std::size_t q_dim = cfg.attention.heads * cfg.attention.head_dim;
-  const std::size_t kv_dim = cfg.attention.kv_heads * cfg.attention.head_dim;
   const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
   const std::size_t hist_len = g.conv_dim * (g.width - 1);
+  const auto alloc_hist = [&](Qwen35BatchScratch& s, std::size_t hist_rows) {
+    s.state_hist.resize(cfg.layers);
+    s.conv_hist_hist.resize(cfg.layers);
+    for (std::size_t l = 0; l < cfg.layers; ++l) {
+      if (!cfg.IsFullAttentionLayer(l)) {
+        if (!alloc(s.state_hist[l], (hist_rows + 1) * state_len) ||
+            !alloc(s.conv_hist_hist[l], (hist_rows + 1) * hist_len)) {
+          return false;
+        }
+      }
+    }
+    s.hist_rows = hist_rows;
+    return true;
+  };
+  if (h.batch && h.batch->capacity >= rows) {
+    h.batch->snapshot_states = need_state_hist;
+    if (h.batch->logits_capacity < logits_rows) {
+      if (!alloc(h.batch->logits, logits_rows * cfg.vocab_size)) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      h.batch->logits_capacity = logits_rows;
+    }
+    if (need_state_hist && h.batch->hist_rows < rows &&
+        !alloc_hist(*h.batch, rows)) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    return {};
+  }
+  auto b = std::make_unique<Qwen35BatchScratch>();
+  b->capacity = rows;
+  b->logits_capacity = logits_rows;
+  b->snapshot_states = need_state_hist;
+  const std::size_t q_dim = cfg.attention.heads * cfg.attention.head_dim;
+  const std::size_t kv_dim = cfg.attention.kv_heads * cfg.attention.head_dim;
   if (!alloc(b->x, rows * cfg.hidden_dim) ||
       !alloc(b->xn, rows * cfg.hidden_dim) ||
       !alloc(b->proj, rows * cfg.hidden_dim) ||
-      !alloc(b->logits, rows * cfg.vocab_size) ||
+      !alloc(b->logits, logits_rows * cfg.vocab_size) ||
       !alloc(b->fused, rows * q_dim * 2) || !alloc(b->q, rows * q_dim) ||
       !alloc(b->gate, rows * q_dim) || !alloc(b->kf, rows * kv_dim) ||
       !alloc(b->vf, rows * kv_dim) || !alloc(b->attn, rows * q_dim) ||
@@ -77,7 +109,13 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
       !alloc(b->beta_raw, rows * g.num_v_heads) ||
       !alloc(b->alpha, rows * g.num_v_heads) ||
       !alloc(b->beta, rows * g.num_v_heads) ||
-      !alloc(b->out, rows * g.value_dim)) {
+      !alloc(b->out, rows * g.value_dim) ||
+      !alloc(b->q_all, rows * g.key_dim) ||
+      !alloc(b->k_all, rows * g.key_dim) ||
+      !alloc(b->v_all, rows * g.value_dim) ||
+      !alloc(b->q_exp_all, rows * g.num_v_heads * g.head_k_dim) ||
+      !alloc(b->k_exp_all, rows * g.num_v_heads * g.head_k_dim) ||
+      !alloc(b->core_all, rows * g.value_dim)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   auto pos = backend.AllocateBuffer(rows * 3 * 8, MemoryKind::Device);
@@ -85,15 +123,8 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
     return std::unexpected(StatusCode::OutOfMemory);
   }
   b->pos = std::move(*pos);
-  b->state_hist.resize(cfg.layers);
-  b->conv_hist_hist.resize(cfg.layers);
-  for (std::size_t l = 0; l < cfg.layers; ++l) {
-    if (!cfg.IsFullAttentionLayer(l)) {
-      if (!alloc(b->state_hist[l], (rows + 1) * state_len) ||
-          !alloc(b->conv_hist_hist[l], (rows + 1) * hist_len)) {
-        return std::unexpected(StatusCode::OutOfMemory);
-      }
-    }
+  if (need_state_hist && !alloc_hist(*b, rows)) {
+    return std::unexpected(StatusCode::OutOfMemory);
   }
   h.batch = std::move(b);
   return {};
@@ -261,15 +292,50 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
     return std::unexpected(StatusCode::DeviceError);
   }
   const float q_scale = 1.0 / std::sqrt(static_cast<double>(g.head_k_dim));
+  // Prefill never rolls back, so it batches the whole per-row linear step
+  // into one launch per kernel instead of about eleven launches per row:
+  // the conv advances the shared history across the rows, then the L2
+  // norms, head repeat, delta scan and gated norm run over all rows.
+  if (!b.snapshot_states && rows > 1) {
+    if (!Conv1dStateDevice(backend, *h.conv1d_state_kernel, *b.qkv,
+                           *(*w_conv)->device, *h.linear[layer].conv_hist,
+                           *b.q_all, *b.k_all, *b.v_all, g.conv_dim, g.width,
+                           g.key_dim, 0, rows) ||
+        !L2NormDevice(backend, *h.l2norm_kernel, *b.q_all, *b.q_all,
+                      rows * g.num_k_heads, g.head_k_dim, 1e-6f, q_scale) ||
+        !L2NormDevice(backend, *h.l2norm_kernel, *b.k_all, *b.k_all,
+                      rows * g.num_k_heads, g.head_k_dim, 1e-6f) ||
+        !RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *b.q_all,
+                           *b.q_exp_all, g.num_v_heads, g.head_k_dim, g.factor,
+                           rows) ||
+        !RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *b.k_all,
+                           *b.k_exp_all, g.num_v_heads, g.head_k_dim, g.factor,
+                           rows) ||
+        !DeltaStepHeadsDevice(backend, *h.delta_step_heads_kernel,
+                              *h.linear[layer].state, *b.k_exp_all, *b.v_all,
+                              *b.q_exp_all, *b.core_all, *b.alpha, *b.beta,
+                              g.num_v_heads, g.head_k_dim, g.head_v_dim, rows) ||
+        !RmsNormGatedDevice(backend, *h.rmsnorm_gated_kernel, *b.core_all,
+                            *(*w_norm)->device, *b.z, *b.out,
+                            rows * g.num_v_heads, g.head_v_dim, cfg.norm_eps) ||
+        !ProjectBatch(backend, h, (*w_out)->manifest.dtype, *b.out,
+                      *(*w_out)->device, *b.proj, rows, hidden, g.value_dim) ||
+        !AddDevice(backend, *h.add_kernel, *b.x, *b.proj, *b.x, rows * hidden)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    return RunFfnBatch(backend, model, cfg, h, layer, rows);
+  }
   const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
   const std::size_t hist_len = g.conv_dim * (g.width - 1);
   // Snapshot the state and the conv history before the block (slot 0);
   // each token appends its post-token state to slot t+1 so a verification
-  // can roll back.
-  if (!backend.CopyD2D(*h.linear[layer].state, 0, *b.state_hist[layer], 0,
-                       state_len * 4) ||
-      !backend.CopyD2D(*h.linear[layer].conv_hist, 0,
-                       *b.conv_hist_hist[layer], 0, hist_len * 4)) {
+  // can roll back. Prefill never rolls back, so it skips both the writes
+  // and the GB-scale allocation they would need.
+  if (b.snapshot_states &&
+      (!backend.CopyD2D(*h.linear[layer].state, 0, *b.state_hist[layer], 0,
+                        state_len * 4) ||
+       !backend.CopyD2D(*h.linear[layer].conv_hist, 0,
+                        *b.conv_hist_hist[layer], 0, hist_len * 4))) {
     return std::unexpected(StatusCode::DeviceError);
   }
   for (std::size_t t = 0; t < rows; ++t) {
@@ -305,14 +371,13 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
     }
     // Snapshot the recurrent state and conv history after this token so a
     // verification can roll back to any accepted prefix.
-    if (!backend.CopyD2D(*h.linear[layer].state, 0,
-                         *b.state_hist[layer], (t + 1) * state_len * 4,
-                         state_len * 4)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-    if (!backend.CopyD2D(*h.linear[layer].conv_hist, 0,
-                         *b.conv_hist_hist[layer], (t + 1) * hist_len * 4,
-                         hist_len * 4)) {
+    if (b.snapshot_states &&
+        (!backend.CopyD2D(*h.linear[layer].state, 0,
+                          *b.state_hist[layer], (t + 1) * state_len * 4,
+                          state_len * 4) ||
+         !backend.CopyD2D(*h.linear[layer].conv_hist, 0,
+                          *b.conv_hist_hist[layer], (t + 1) * hist_len * 4,
+                          hist_len * 4))) {
       return std::unexpected(StatusCode::DeviceError);
     }
   }
@@ -356,7 +421,12 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     return std::unexpected(ready.error());
   }
   Qwen35State& h = State(cache);
-  auto alloc = AllocBatch(backend, cfg, g, h, rows);
+  const std::size_t logits_rows = (all_logits && rows > 1) ? rows : 1;
+  // A verification may roll back to a fresh state even for a one-token
+  // draft, so it always needs the pre-block snapshot (slot 0).
+  const bool need_state_hist = all_logits;
+  auto alloc = AllocBatch(backend, cfg, g, h, rows, logits_rows,
+                          need_state_hist);
   if (!alloc) {
     return std::unexpected(alloc.error());
   }

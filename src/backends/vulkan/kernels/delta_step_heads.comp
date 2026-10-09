@@ -4,9 +4,10 @@
 layout(local_size_x = 256) in;
 
 // "delta_step_heads" contract: buffer 0 is S (heads x dk x dv, updated
-// in place); buffers 1..4 are k (heads x dk), v (heads x dv), q
-// (heads x dk) and o (heads x dv); buffers 5 and 6 are alpha and beta
-// (heads each). Scalars: heads v[0], dk v[2], dv v[4].
+// in place); buffers 1..4 are k (rows x heads x dk), v (rows x heads x
+// dv), q (rows x heads x dk) and o (rows x heads x dv); buffers 5 and 6
+// are alpha and beta (rows x heads each). Scalars: heads v[0], dk v[2],
+// dv v[4], rows v[6]. The rows steps run in turn, advancing the state.
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -24,7 +25,8 @@ void main() {
   uint heads = pc.v[0];
   uint dk = pc.v[2];
   uint dv = pc.v[4];
-  if (idx >= heads * dv) {
+  uint rows = pc.v[6];
+  if (idx >= heads * dv || rows == 0u) {
     return;
   }
   uint h = idx / dv;
@@ -32,18 +34,22 @@ void main() {
   uint s_base = h * dk * dv;
   uint k_base = h * dk;
   uint v_base = h * dv;
-  float a = alpha[h];
-  float b = beta[h];
-  float read = 0.0;
-  for (uint j = 0; j < dk; ++j) {
-    read += s[s_base + j * dv + d] * k[k_base + j];
+  for (uint t = 0u; t < rows; ++t) {
+    uint ko = t * heads * dk;
+    uint vo = t * heads * dv;
+    float a = alpha[t * heads + h];
+    float b = beta[t * heads + h];
+    float read = 0.0;
+    for (uint j = 0; j < dk; ++j) {
+      read += s[s_base + j * dv + d] * k[ko + k_base + j];
+    }
+    float total = 0.0;
+    for (uint j = 0; j < dk; ++j) {
+      float updated = a * (s[s_base + j * dv + d] - b * k[ko + k_base + j] * read) +
+                      b * v[vo + v_base + d] * k[ko + k_base + j];
+      s[s_base + j * dv + d] = updated;
+      total += updated * q[ko + k_base + j];
+    }
+    o[t * heads * dv + idx] = total;
   }
-  float total = 0.0;
-  for (uint j = 0; j < dk; ++j) {
-    float updated = a * (s[s_base + j * dv + d] - b * k[k_base + j] * read) +
-                    b * v[v_base + d] * k[k_base + j];
-    s[s_base + j * dv + d] = updated;
-    total += updated * q[k_base + j];
-  }
-  o[idx] = total;
 }

@@ -6,14 +6,16 @@ layout(local_size_x = 256) in;
 // "conv1d_state" contract: the current-step causal depthwise conv with
 // the history kept on the device, plus the SiLU and the q/k/v split. It
 // replaces the host round-trip for the linear-attention block.
-// Buffers: QKV (conv_dim, the fresh fused projection), W (conv_dim x
-// width, checkpoint tap order: tap 0 oldest), HIST (conv_dim x
-// (width-1), newest first), Q (key_dim), K (key_dim), V (value_dim).
+// Buffers: QKV (rows x conv_dim, the fresh fused projection), W (conv_dim
+// x width, checkpoint tap order: tap 0 oldest), HIST (conv_dim x
+// (width-1), newest first), Q (rows x key_dim), K (rows x key_dim), V
+// (rows x value_dim).
 // Scalars: conv_dim v[0], width v[2], key_dim v[4], qkv_offset v[6]
-// (the row offset into QKV for a batched forward; 0 otherwise).
+// (the row offset into QKV; 0 for a whole-sequence call), rows v[8].
 //   acc = sum_i W[c][width-1-i] * window[i], window[0] = QKV[off+c],
 //   window[i] = HIST[c][i-1]; out = acc * sigmoid(acc); the output goes
 //   to Q, K or V by channel block; then HIST shifts and takes QKV[off+c].
+// The rows advance the shared history in turn.
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -34,25 +36,29 @@ void main() {
   uint width = pc.v[2];
   uint key_dim = pc.v[4];
   uint offset = pc.v[6];
+  uint rows = pc.v[8];
+  uint value_dim = conv_dim - 2u * key_dim;
   uint stride = width - 1;
   uint hbase = c * stride;
-  float current = qkv[offset + c];
-  float acc = w[c * width + (width - 1)] * current;
-  for (uint i = 1; i < width; ++i) {
-    acc += w[c * width + (width - 1 - i)] * hist[hbase + (i - 1)];
-  }
-  float result = acc / (1.0 + exp(-acc));
-  if (c < key_dim) {
-    q[c] = result;
-  } else if (c < 2 * key_dim) {
-    k[c - key_dim] = result;
-  } else {
-    v[c - 2 * key_dim] = result;
-  }
-  if (width > 1) {
-    for (uint i = stride; i > 1; --i) {
-      hist[hbase + (i - 1)] = hist[hbase + (i - 2)];
+  for (uint t = 0u; t < rows; ++t) {
+    float current = qkv[offset + t * conv_dim + c];
+    float acc = w[c * width + (width - 1)] * current;
+    for (uint i = 1; i < width; ++i) {
+      acc += w[c * width + (width - 1 - i)] * hist[hbase + (i - 1)];
     }
-    hist[hbase] = current;
+    float result = acc / (1.0 + exp(-acc));
+    if (c < key_dim) {
+      q[t * key_dim + c] = result;
+    } else if (c < 2u * key_dim) {
+      k[t * key_dim + (c - key_dim)] = result;
+    } else {
+      v[t * value_dim + (c - 2u * key_dim)] = result;
+    }
+    if (width > 1) {
+      for (uint i = stride; i > 1; --i) {
+        hist[hbase + (i - 1)] = hist[hbase + (i - 2)];
+      }
+      hist[hbase] = current;
+    }
   }
 }

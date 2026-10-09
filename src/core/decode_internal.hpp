@@ -400,6 +400,10 @@ inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
       gemm.Id() == "gemm_bf16") {
     return static_cast<std::uint32_t>((m * n + 7) / 8);
   }
+  if (gemm.Id() == "gemm_f32_batched" || gemm.Id() == "gemm_bf16_batched") {
+    // 32-row x 8-column tile (GemmF32BatchedKernel / GemmBf16BatchedKernel).
+    return static_cast<std::uint32_t>(((m + 31) / 32) * ((n + 7) / 8));
+  }
   return static_cast<std::uint32_t>((m * n + 255) / 256);
 }
 
@@ -557,12 +561,12 @@ inline std::expected<void, StatusCode> Conv1dStateDevice(
     Backend& backend, const Kernel& kernel, const Buffer& qkv, const Buffer& w,
     const Buffer& hist, const Buffer& q, const Buffer& k, const Buffer& v,
     std::size_t conv_dim, std::size_t width, std::size_t key_dim,
-    std::size_t qkv_offset = 0) {
+    std::size_t qkv_offset = 0, std::size_t rows = 1) {
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>((conv_dim + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&qkv, &w, &hist, &q, &k, &v};
-  launch.scalars = {conv_dim, width, key_dim, qkv_offset};
+  launch.scalars = {conv_dim, width, key_dim, qkv_offset, rows};
   return backend.LaunchKernel(kernel, launch);
 }
 
@@ -588,12 +592,13 @@ inline std::expected<void, StatusCode> DeltaStepDevice(
 inline std::expected<void, StatusCode> DeltaStepHeadsDevice(
     Backend& backend, const Kernel& kernel, Buffer& state, const Buffer& k,
     const Buffer& v, const Buffer& q, Buffer& o, const Buffer& alpha,
-    const Buffer& beta, std::size_t heads, std::size_t dk, std::size_t dv) {
+    const Buffer& beta, std::size_t heads, std::size_t dk, std::size_t dv,
+    std::size_t rows = 1) {
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>((heads * dv + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&state, &k, &v, &q, &o, &alpha, &beta};
-  launch.scalars = {heads, dk, dv};
+  launch.scalars = {heads, dk, dv, rows};
   return backend.LaunchKernel(kernel, launch);
 }
 
@@ -658,13 +663,14 @@ inline std::expected<void, StatusCode> SsmGateDevice(
 // Expand q/k head vectors to the value heads on the device.
 inline std::expected<void, StatusCode> RepeatHeadsDevice(
     Backend& backend, const Kernel& kernel, const Buffer& in, Buffer& out,
-    std::size_t num_v_heads, std::size_t head_k_dim, std::size_t factor) {
+    std::size_t num_v_heads, std::size_t head_k_dim, std::size_t factor,
+    std::size_t rows = 1) {
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>(
-      (num_v_heads * head_k_dim + 255) / 256);
+      (rows * num_v_heads * head_k_dim + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&in, &out};
-  launch.scalars = {num_v_heads, head_k_dim, factor};
+  launch.scalars = {num_v_heads, head_k_dim, factor, rows};
   return backend.LaunchKernel(kernel, launch);
 }
 
@@ -749,6 +755,11 @@ inline std::expected<void, StatusCode> GatherEmbeddingDevice(
 // 8-row tile of the "gemm_q4k_batched" kernel).
 constexpr std::size_t kGemmTileRows = 8;
 
+// A batch smaller than this uses the m = 1 GEMV instead of the tiled kernel:
+// the tiled MXFP4 tile is 32 rows, so a draft-sized batch (about 7) leaves
+// most of the tile idle and is slower than the GEMV's shallower chains.
+constexpr std::size_t kGemmTiledMinRows = 16;
+
 // Tiled batched GEMM kernel id for a dtype, or empty when the dtype has
 // no tiled kernel (the caller uses the GEMV kernel).
 inline std::string_view GemmTiledKernelName(DType dtype) {
@@ -758,6 +769,8 @@ inline std::string_view GemmTiledKernelName(DType dtype) {
     case DType::Q6K: return "gemm_q6k_batched";
     case DType::IQ4_XS: return "gemm_iq4xs_batched";
     case DType::F4E2M1: return "gemm_mxfp4_batched";
+    case DType::F32: return "gemm_f32_batched";
+    case DType::BF16: return "gemm_bf16_batched";
     default: return {};
   }
 }
@@ -772,15 +785,24 @@ inline std::expected<Kernel*, StatusCode> GemmTiledFor(
 }
 
 // C = A x dequant(W)^T with the tiled batched kernel: each weight block
-// is dequantized once per tile and reused across kGemmTileRows rows.
-// Same buffers and scalars as ProjectDevice (m, n, k); m must be
-// positive and k a multiple of the block elements.
+// is dequantized once per tile and reused across the tile's rows. The
+// MXFP4 kernel tiles a 32-row x 8-column output block (so both the
+// activation and the weight reads reuse cache across the block); the
+// K-quant kernels tile kGemmTileRows rows per weight column. Same buffers
+// and scalars as ProjectDevice (m, n, k); m must be positive and k a
+// multiple of the block elements.
 inline std::expected<void, StatusCode> ProjectTiledDevice(
     Backend& backend, const Kernel& kernel, const Buffer& a, const Buffer& w,
     Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>(
-      ((m + kGemmTileRows - 1) / kGemmTileRows) * n);
+  if (kernel.Id() == "gemm_mxfp4_batched" ||
+      kernel.Id() == "gemm_f32_batched" ||
+      kernel.Id() == "gemm_bf16_batched") {
+    launch.grid_x = static_cast<std::uint32_t>(((m + 31) / 32) * ((n + 7) / 8));
+  } else {
+    launch.grid_x = static_cast<std::uint32_t>(
+        ((m + kGemmTileRows - 1) / kGemmTileRows) * n);
+  }
   launch.block_x = 256;
   launch.buffers = {&a, &w, &c};
   launch.scalars = {m, n, k};
