@@ -852,4 +852,34 @@ std::expected<void, StatusCode> GemmMxFp4Fp8Ref(
   return {};
 }
 
+std::expected<void, StatusCode> PermuteMxFp4ToWmma(
+    std::span<const std::byte> packed, std::span<std::byte> out,
+    std::size_t rows, std::size_t cols) {
+  if (rows == 0 || cols == 0 || rows % 16 != 0 || cols % 16 != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t bytes = rows * cols / 2;
+  if (packed.size() != bytes || out.size() != bytes) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t nt = rows / 16;
+  const std::size_t ks = cols / 16;
+  // Input byte (t, r, s, h, b) = (((t*16 + r)*ks + s)*2 + h)*4 + b.
+  // Output byte (t, r, s, h, b) = (((t*ks + s)*2 + h)*16 + r)*4 + b.
+  for (std::size_t t = 0; t < nt; ++t) {
+    for (std::size_t s = 0; s < ks; ++s) {
+      for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t r = 0; r < 16; ++r) {
+          const std::size_t in = (((t * 16 + r) * ks + s) * 2 + h) * 4;
+          const std::size_t o = (((t * ks + s) * 2 + h) * 16 + r) * 4;
+          for (std::size_t b = 0; b < 4; ++b) {
+            out[o + b] = packed[in + b];
+          }
+        }
+      }
+    }
+  }
+  return {};
+}
+
 }  // namespace tessera::core

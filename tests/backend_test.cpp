@@ -483,6 +483,43 @@ TEST(BackendTest, FpGemmRefsRejectBadArgs) {  std::vector<float> a(2 * 64, 0.5f)
 
 // Host: the MXFP4 -> fp8 fold is exact. With A = 1.0 (e4m3 0x38) and As = 1,
 // the W4A8 reference must equal the plain MXFP4 dequant sum per row.
+TEST(BackendTest, PermuteMxFp4ToWmmaMatchesFragmentOrder) {
+  constexpr std::size_t kN = 32, kK = 64;  // nt = 2, ks = 4
+  std::vector<std::byte> packed(kN * kK / 2);
+  for (std::size_t i = 0; i < packed.size(); ++i) {
+    packed[i] = static_cast<std::byte>(i & 0xFFu);
+  }
+  std::vector<std::byte> out(packed.size());
+  ASSERT_TRUE(core::PermuteMxFp4ToWmma(packed, out, kN, kK).has_value());
+  const std::size_t nt = kN / 16, ks = kK / 16;
+  // Fragment layout is [nt][ks][half][row][4]: the byte at
+  // (((t*ks+s)*2+h)*16+r)*4+b equals the checkpoint byte
+  // (((t*16+r)*ks+s)*2+h)*4+b.
+  for (std::size_t t = 0; t < nt; ++t) {
+    for (std::size_t s = 0; s < ks; ++s) {
+      for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t r = 0; r < 16; ++r) {
+          for (std::size_t b = 0; b < 4; ++b) {
+            const std::size_t in = (((t * 16 + r) * ks + s) * 2 + h) * 4 + b;
+            const std::size_t o = (((t * ks + s) * 2 + h) * 16 + r) * 4 + b;
+            ASSERT_EQ(out[o], packed[in]);
+          }
+        }
+      }
+    }
+  }
+  // A permutation: the byte multiset is unchanged.
+  std::vector<std::byte> sorted_out = out;
+  std::vector<std::byte> sorted_in = packed;
+  std::sort(sorted_out.begin(), sorted_out.end());
+  std::sort(sorted_in.begin(), sorted_in.end());
+  EXPECT_EQ(sorted_out, sorted_in);
+  // Non-multiples of 16 and short buffers are rejected.
+  EXPECT_FALSE(core::PermuteMxFp4ToWmma(packed, out, kN + 1, kK).has_value());
+  std::vector<std::byte> small(3);
+  EXPECT_FALSE(core::PermuteMxFp4ToWmma(small, small, 16, 16).has_value());
+}
+
 TEST(BackendTest, FoldMxFp4ToFp8MatchesDequant) {
   std::mt19937 rng(4242);
   constexpr std::size_t kRows = 3;

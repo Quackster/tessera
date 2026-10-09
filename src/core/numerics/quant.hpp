@@ -320,4 +320,16 @@ struct QuantBlockLayout {
     std::span<const std::byte> w_fp8, std::span<const std::byte> wref,
     std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
 
+// Rearrange packed MXFP4 nibbles (rows x cols/2 bytes, low nibble first) from
+// the checkpoint's [n-tile][row][k-step][half][4] order to the fp8-WMMA
+// fragment order [n-tile][k-step][half][row][4], so one wave's 16 rows for a
+// k-step occupy 128 contiguous bytes instead of sixteen rows cols/2 bytes
+// apart. This is the served reference's `permute_w`, the layout that lets its
+// WMMA read the weight at DRAM bandwidth. A pure byte permutation of the
+// nibble region: same bytes, no requantisation, so it cannot change numerics.
+// `rows` and `cols` must be non-zero multiples of 16.
+[[nodiscard]] std::expected<void, StatusCode> PermuteMxFp4ToWmma(
+    std::span<const std::byte> packed, std::span<std::byte> out,
+    std::size_t rows, std::size_t cols);
+
 }  // namespace tessera::core
