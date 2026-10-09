@@ -1965,6 +1965,38 @@ through RADV GFX1201, rocm through the system ROCm).
   the narrow trunk projections stay on the GEMV. DFlash2 on the 27B drops
   from 138 to 123 ms/token. 277/277 `ctest` on both backends.
 
+- 2026-10-09: **DFlash2 draft GEMM weights are stored bf16.** The draft
+  weight loader dequantized the fp8-block checkpoint to fp32 (4 bytes per
+  weight); the projection weights (q/k/v/o, the conv kernel projections,
+  gate/up/down, fc and the selector projection) now upload bf16 (2 bytes),
+  which is still more precise than the fp8 source, while the norm, conv-base
+  and codebook tensors stay fp32 (their kernels take fp32). The drafter and
+  selector use `gemm_bf16_batched`. Draft weight memory halves; DFlash2 is
+  123 -> 121 ms/token (marginal: the draft GEMMs are not the bottleneck) and
+  the 27B acceptance is unchanged (10 of 42). 30 draft/spec tests pass.
+
+- 2026-10-09: **MTP acceptance fixed (0 -> about 50%).** The MTP head is a
+  Qwen3.5 block, so its RMSNorms (`nextn.enorm`, `nextn.hnorm`,
+  `nextn.shared_head_norm`) are the Gemma form (gain `1 + weight`). The MXFP4
+  `ConvertWeight` applied the `add_one` offset only to the trunk norms
+  (`attn_norm`, `post_attention_norm`, `attn_q_norm`, `attn_k_norm`,
+  `output_norm`), so the MTP head ran with an off-by-one norm and every
+  draft was wrong: 0 accepted. Adding the three MTP norm tails to the
+  offset list fixes it. On the 27B MXFP4 the MTP now accepts 13 of 24
+  (5-token prompt) and 8 of 28 (1-token prompt), and output still equals
+  greedy. MTP decode is still slower than greedy (the per-draft MTP head and
+  the verify batch cost more than the tokens recovered), but it is no longer
+  a no-op. 277/277 `ctest` on both backends.
+
+- 2026-10-09: **MTP default chain shortened to one draft.** A longer MTP
+  chain both lowers the accept rate (a later draft in the chain is wrong more
+  often) and multiplies the per-draft MTP-head cost (each draft reads the
+  shared 2.5 GB output head). Measured on the 27B MXFP4 over 24 tokens:
+  block 1 = 21 tok/s (11 of 13 accepted), block 2 = 18 (15 of 20), block 4 =
+  15 (19 of 32). `kDefaultMtpBlock` is now 1; `--draft-block` still
+  overrides. MTP is now within about 15 percent of greedy (46 vs 39
+  ms/token). 277/277 `ctest` on both backends.
+
 ## Next (in order)
 
 - **Speculation (seam done; decode speed improved).** Greedy and both
@@ -1977,10 +2009,27 @@ through RADV GFX1201, rocm through the system ROCm).
   compute-bound instead of latency-bound, the draft projections and the
   shared bf16 head use tiled batched kernels, and the linear-attention
   prefill loop is batched. Remaining, in order: (a) the DFlash2 verifier
-  still runs the full target trunk at the draft size (m about 7), so it
-  reads each weight per row; (b) the draft forward (fp32 draft weights and a
-  per-token `quantize_fp8`); (c) the MTP head draft quality (0 of 508
-  accepted, output still greedy-preserving through the fallback). The greedy
+  still runs the full target trunk at the draft size (m about 7) and the
+  GEMV re-reads each weight row. Every alternative tried lost to the
+  row-major GEMV (123 ms/token): the 32x8 tiled kernel (137), an 8-row x
+  32-column tile matched to the small batch (132), a register-blocked variant
+  (rejected: fewer threads, lower occupancy), and a column-major warp order
+  that keeps the m rows of a column in one workgroup so they share the
+  weight read (correct, but slower at 135). So the row-major GEMV stays and
+  the verify cost is inherent to the current kernels; closing this gap needs
+  the reference's structure (a batched/fused verify kernel), not a tile
+  tweak;
+  (b) the draft forward (per-token `quantize_fp8`) — see the Done entry for
+  the bf16 draft weights;
+  (c) the MTP per-draft cost. Acceptance is fixed and the default chain is
+  now one draft, which measured 21 tok/s (85 percent accepted, within about
+  15 percent of greedy 25); see the newest Done entries. The remaining lever
+   is the per-draft MTP-head cost — each draft reads the shared 2.5 GB output
+  head to argmax one token, and the MTP head's own attention layer. The
+  per-draft host round-trip is not the bottleneck: removing the per-draft
+  `Synchronize` and the unused last-draft hidden download changed the decode
+  time by zero (46 ms/token), so the MTP step is GPU-bound on the MTP head
+  and the small-m verify. The greedy
   decode is memory-bound at about 74% of the R9700's bandwidth and the GEMV
   roofline is settled: the `rocprofv3` GL2C/MemUnitBusy counters read 0 on
   gfx1201, so the estimate is analytical, and the three structural GEMV

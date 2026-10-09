@@ -13,8 +13,12 @@ namespace tessera::spec {
 
 namespace {
 
-// MTP drafts per batched verification when the caller sets no block.
-constexpr std::size_t kDefaultMtpBlock = 4;
+// MTP drafts per batched verification when the caller sets no block. One is
+// fastest on the 27B: a longer chain both lowers the accept rate (later
+// drafts in the chain are wrong more often) and multiplies the per-draft
+// MTP-head cost, so the measured decode was 21 tok/s at block 1, 18 at 2 and
+// 15 at 4. Callers can still override with `--draft-block`.
+constexpr std::size_t kDefaultMtpBlock = 1;
 
 // Multi-token-prediction strategy. Stateless beyond the draft KV row base and
 // the anchor hidden: the MTP head lives in the target model (Qwen3.5 module).
@@ -67,10 +71,12 @@ class MtpStrategy final : public SpeculativeStrategy {
     std::uint64_t pos = anchor_pos_ + 1;
     std::size_t count = 0;
     for (std::size_t i = 0; i < block_ && i < drafts.size(); ++i) {
+      // The last draft in the step is not chained, so skip its hidden-state
+      // download: only the draft token is needed from it.
+      const bool last = (i + 1 >= block_) || (i + 1 >= drafts.size());
       std::vector<float> next_chain;
-      auto draft =
-          core::MtpDraftStep(backend, target, cache, chain, tok, pos,
-                             &next_chain);
+      auto draft = core::MtpDraftStep(backend, target, cache, chain, tok, pos,
+                                      last ? nullptr : &next_chain);
       if (!draft) {
         if (draft.error() == StatusCode::UnsupportedFeature) {
           break;
@@ -78,7 +84,9 @@ class MtpStrategy final : public SpeculativeStrategy {
         return std::unexpected(draft.error());
       }
       drafts[i] = *draft;
-      chain = std::move(next_chain);
+      if (!last) {
+        chain = std::move(next_chain);
+      }
       tok = *draft;
       ++pos;
       ++count;

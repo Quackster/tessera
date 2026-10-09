@@ -781,6 +781,17 @@ TEST(EngineTest, Qwen35ModuleConvertsMxFp4ValueLayout) {
   const auto out_norm = convert("output_norm.weight");
   ASSERT_TRUE(out_norm.has_value());
   EXPECT_TRUE(out_norm->add_one);
+  // The MTP head is a Qwen3.5 block too, so its norms also add 1; without
+  // this the MTP head ran off by one and accepted no drafts.
+  const auto mtp_enorm = convert("blk.64.nextn.enorm.weight");
+  ASSERT_TRUE(mtp_enorm.has_value());
+  EXPECT_TRUE(mtp_enorm->add_one);
+  const auto mtp_hnorm = convert("blk.64.nextn.hnorm.weight");
+  ASSERT_TRUE(mtp_hnorm.has_value());
+  EXPECT_TRUE(mtp_hnorm->add_one);
+  const auto mtp_shnorm = convert("blk.64.nextn.shared_head_norm.weight");
+  ASSERT_TRUE(mtp_shnorm.has_value());
+  EXPECT_TRUE(mtp_shnorm->add_one);
   // The gated SSM norm keeps the plain weight.
   EXPECT_FALSE(convert("blk.0.ssm_norm.weight").has_value());
   EXPECT_FALSE(convert("output.weight").has_value());

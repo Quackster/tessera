@@ -26,7 +26,7 @@ std::expected<DFlash2Drafter, StatusCode> DFlash2Drafter::Create(
   };
   const std::pair<std::unique_ptr<Kernel>*, const char*> kernels[] = {
       {&drafter.rmsnorm_, "rmsnorm"},
-      {&drafter.gemm_, "gemm_f32_batched"},
+      {&drafter.gemm_, "gemm_bf16_batched"},
       {&drafter.conv_, "dflash_conv"}, {&drafter.rope_, "rope"},
       {&drafter.attention_, "attention"}, {&drafter.silu_, "silu_mul"},
       {&drafter.add_, "add"},          {&drafter.concat_, "concat_features"},

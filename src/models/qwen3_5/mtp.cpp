@@ -112,7 +112,8 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
       }
       *mtp_hidden_out = std::move(*down);
     }
-    backend.Synchronize();
+    // No explicit synchronize: the CopyD2H below waits on the queued head
+    // kernels on both backends.
     std::vector<float> logits(cfg.vocab_size);
     auto down = backend.CopyD2H(*h.logits,
                                 reinterpret_cast<std::byte*>(logits.data()),

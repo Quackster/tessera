@@ -117,25 +117,52 @@ std::expected<DraftWeightStore, StatusCode> DraftWeightStore::Load(
     }
     return upload(*converted);
   };
+  // GEMM weights are stored bf16: the draft projections dominate the draft
+  // forward, and bf16 is more precise than the fp8 source while reading half
+  // the bytes of the fp32 the loader would otherwise upload. Norm, conv and
+  // codebook tensors keep fp32 (their kernels take fp32 weights).
+  auto bind_bf16 = [&](const std::string& name) -> const Buffer* {
+    auto converted = ToF32(index, bytes, name);
+    if (!converted) {
+      return nullptr;
+    }
+    std::vector<std::byte> bf16(converted->size() * 2);
+    for (std::size_t i = 0; i < converted->size(); ++i) {
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &(*converted)[i], sizeof(bits));
+      const std::uint16_t b =
+          static_cast<std::uint16_t>((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+      bf16[i * 2] = static_cast<std::byte>(b & 0xFF);
+      bf16[i * 2 + 1] = static_cast<std::byte>((b >> 8) & 0xFF);
+    }
+    auto buffer = backend.AllocateBuffer(bf16.size(), MemoryKind::Device);
+    if (!buffer) {
+      return nullptr;
+    }
+    backend.CopyH2D(**buffer, std::span<const std::byte>(bf16));
+    store.owned_.push_back(std::move(*buffer));
+    return store.owned_.back().get();
+  };
   store.weights_.layers.resize(config.num_layers);
   for (std::size_t layer = 0; layer < config.num_layers; ++layer) {
     const std::string prefix = "layers." + std::to_string(layer) + ".";
     DraftLayerBuffers& w = store.weights_.layers[layer];
     w.input_norm = bind(prefix + "input_layernorm.weight");
-    w.attn_conv_proj = bind(prefix + "attention_conv.kernel_projection.weight");
+    w.attn_conv_proj =
+        bind_bf16(prefix + "attention_conv.kernel_projection.weight");
     w.attn_conv_base = bind(prefix + "attention_conv.base_kernel");
-    w.q_w = bind(prefix + "self_attn.q_proj.weight");
-    w.k_w = bind(prefix + "self_attn.k_proj.weight");
-    w.v_w = bind(prefix + "self_attn.v_proj.weight");
-    w.o_w = bind(prefix + "self_attn.o_proj.weight");
+    w.q_w = bind_bf16(prefix + "self_attn.q_proj.weight");
+    w.k_w = bind_bf16(prefix + "self_attn.k_proj.weight");
+    w.v_w = bind_bf16(prefix + "self_attn.v_proj.weight");
+    w.o_w = bind_bf16(prefix + "self_attn.o_proj.weight");
     w.q_norm_w = bind(prefix + "self_attn.q_norm.weight");
     w.k_norm_w = bind(prefix + "self_attn.k_norm.weight");
     w.post_norm = bind(prefix + "post_attention_layernorm.weight");
-    w.mlp_conv_proj = bind(prefix + "mlp_conv.kernel_projection.weight");
+    w.mlp_conv_proj = bind_bf16(prefix + "mlp_conv.kernel_projection.weight");
     w.mlp_conv_base = bind(prefix + "mlp_conv.base_kernel");
-    w.gate_w = bind(prefix + "mlp.gate_proj.weight");
-    w.up_w = bind(prefix + "mlp.up_proj.weight");
-    w.down_w = bind(prefix + "mlp.down_proj.weight");
+    w.gate_w = bind_bf16(prefix + "mlp.gate_proj.weight");
+    w.up_w = bind_bf16(prefix + "mlp.up_proj.weight");
+    w.down_w = bind_bf16(prefix + "mlp.down_proj.weight");
     w.hidden_norm = nullptr;
     if (w.input_norm == nullptr || w.attn_conv_proj == nullptr ||
         w.attn_conv_base == nullptr || w.q_w == nullptr ||
@@ -148,7 +175,7 @@ std::expected<DraftWeightStore, StatusCode> DraftWeightStore::Load(
     }
   }
   store.weights_.hidden_norm = bind("hidden_norm.weight");
-  store.weights_.fc = bind("fc.weight");
+  store.weights_.fc = bind_bf16("fc.weight");
   store.weights_.final_norm = bind("norm.weight");
   for (DraftLayerBuffers& w : store.weights_.layers) {
     w.hidden_norm = store.weights_.hidden_norm;
@@ -160,7 +187,7 @@ std::expected<DraftWeightStore, StatusCode> DraftWeightStore::Load(
   // The candidate selector is optional; the drafter falls back to the
   // unary top-1 when it is absent.
   store.selector_.projection =
-      bind("candidate_selector.hidden_projection.weight");
+      bind_bf16("candidate_selector.hidden_projection.weight");
   store.selector_.predecessor = bind("candidate_selector.predecessor_codebook");
   store.selector_.successor = bind("candidate_selector.successor_codebook");
   return store;

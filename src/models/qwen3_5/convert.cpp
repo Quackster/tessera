@@ -39,7 +39,9 @@ std::optional<WeightConversion> Qwen35Architecture::ConvertWeight(
   const std::string_view tail = LayerTail(internal_name);
   if (tail == "attn_norm.weight" || tail == "post_attention_norm.weight" ||
       tail == "attn_q_norm.weight" || tail == "attn_k_norm.weight" ||
-      internal_name == "output_norm.weight") {
+      internal_name == "output_norm.weight" ||
+      tail == "nextn.enorm.weight" || tail == "nextn.hnorm.weight" ||
+      tail == "nextn.shared_head_norm.weight") {
     WeightConversion conversion;
     conversion.add_one = true;
     return conversion;
