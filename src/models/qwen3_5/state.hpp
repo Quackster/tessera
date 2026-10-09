@@ -93,6 +93,10 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> q_exp, k_exp, v_l, core, out;
   // MTP head scratch (fused embedding+hidden, hidden norms).
   std::unique_ptr<Buffer> mtp_fused, mtp_h;
+  // MTP draft argmax over the shared-head logits, computed on the device so a
+  // draft does not download the whole vocabulary.
+  std::unique_ptr<Kernel> mtp_top_k_kernel;
+  std::unique_ptr<Buffer> mtp_argmax_ids, mtp_argmax_vals;
   struct FullKv {
     std::unique_ptr<Buffer> k;
     std::unique_ptr<Buffer> v;
