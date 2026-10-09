@@ -56,7 +56,11 @@ add_library(tessera STATIC
     src/core/numerics/vision.cpp
     src/serve/http.cpp
     src/serve/chat_prompt.cpp
+    src/serve/respond.cpp
+    src/serve/render.cpp
     src/serve/server.cpp
+    src/serve/tools/tool_call.cpp
+    src/serve/tools/chat.cpp
     src/serve/jinja/value.cpp
     src/serve/jinja/jinja_parse.cpp
     src/serve/jinja/jinja_eval.cpp

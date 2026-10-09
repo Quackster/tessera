@@ -6,7 +6,9 @@
 #include <vector>
 
 #include "serve/http.hpp"
-#include "serve/jinja/jinja.hpp"
+#include "serve/render.hpp"
+#include "serve/respond.hpp"
+#include "serve/tools/chat.hpp"
 #include "core/json.hpp"
 
 namespace tessera {
@@ -16,7 +18,15 @@ namespace {
 using serve::HttpRequest;
 using core::Json;
 using serve::ResponseWriter;
-namespace jinja = tessera::serve::jinja;
+using serve::ChatWithTools;
+using serve::MaxTokensFrom;
+using serve::RenderPrompt;
+using serve::SendError;
+using serve::SendJson;
+using serve::UsageJson;
+using serve::WantsStream;
+using serve::WantsTools;
+using serve::WriteSse;
 
 std::atomic<unsigned long long> g_requests{0};
 
@@ -26,123 +36,6 @@ std::string Lower(std::string_view s) {
     out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
   }
   return out;
-}
-
-void SendJson(ResponseWriter& writer, int status, const Json& body) {
-  (void)writer.SendHeaders(status, "application/json");
-  (void)writer.Write(body.Dump());
-}
-
-void SendError(ResponseWriter& writer, int status, const std::string& message) {
-  Json obj = Json::Object();
-  obj.Set("error", Json::String(message));
-  SendJson(writer, status, obj);
-}
-
-// Convert a JSON value into a template value.
-jinja::Value ToJinja(const Json& json) {
-  switch (json.type()) {
-    case Json::Type::Null: return jinja::Value::None();
-    case Json::Type::Bool: return jinja::Value::Bool(json.AsBool());
-    case Json::Type::Number:
-      return (json.AsNumber() == static_cast<double>(
-                                     static_cast<std::int64_t>(json.AsNumber())))
-                 ? jinja::Value::Int(static_cast<std::int64_t>(json.AsNumber()))
-                 : jinja::Value::Double(json.AsNumber());
-    case Json::Type::String: return jinja::Value::Str(json.AsString());
-    case Json::Type::Array: {
-      std::vector<jinja::Value> items;
-      for (const Json& item : json.AsArray()) {
-        items.push_back(ToJinja(item));
-      }
-      return jinja::Value::List(std::move(items));
-    }
-    case Json::Type::Object: {
-      std::vector<std::pair<std::string, jinja::Value>> entries;
-      for (const auto& [key, value] : json.AsObject()) {
-        entries.emplace_back(key, ToJinja(value));
-      }
-      return jinja::Value::Map(std::move(entries));
-    }
-  }
-  return jinja::Value::None();
-}
-
-std::size_t MaxTokensFrom(const Json& body, std::size_t fallback) {
-  const Json* value = body.Find("max_tokens");
-  if (value != nullptr && value->type() == Json::Type::Number &&
-      value->AsNumber() > 0) {
-    return static_cast<std::size_t>(value->AsNumber());
-  }
-  return fallback;
-}
-
-bool WantsStream(const Json& body) {
-  const Json* value = body.Find("stream");
-  return value != nullptr && value->type() == Json::Type::Bool &&
-         value->AsBool();
-}
-
-// Render the chat template for a chat/messages request body into a
-// prompt string. Empty `error` on success.
-std::string RenderPrompt(const Model& model, const Json& body,
-                         std::string* error) {
-  const std::string tmpl(model.ChatTemplate());
-  if (tmpl.empty()) {
-    *error = "model has no chat template";
-    return {};
-  }
-  const Json* messages = body.Find("messages");
-  if (messages == nullptr || !messages->isArray()) {
-    *error = "messages must be an array";
-    return {};
-  }
-  std::vector<jinja::Value> message_items;
-  if (const Json* system = body.Find("system");
-      system != nullptr && system->isString()) {
-    message_items.push_back(jinja::Value::Map(
-        {{"role", jinja::Value::Str("system")},
-         {"content", jinja::Value::Str(system->AsString())}}));
-  }
-  for (const Json& message : messages->AsArray()) {
-    message_items.push_back(ToJinja(message));
-  }
-  std::vector<jinja::Kwarg> context;
-  context.emplace_back("messages", jinja::Value::List(std::move(message_items)));
-  context.emplace_back("add_generation_prompt", jinja::Value::Bool(true));
-  const Json* tools = body.Find("tools");
-  context.emplace_back("tools", tools == nullptr ? jinja::Value::None()
-                                                 : ToJinja(*tools));
-  if (const Json* thinking = body.Find("enable_thinking");
-      thinking != nullptr && thinking->type() == Json::Type::Bool) {
-    context.emplace_back("enable_thinking",
-                         jinja::Value::Bool(thinking->AsBool()));
-  }
-  auto rendered = jinja::Render(tmpl, context);
-  if (!rendered.ok) {
-    *error = rendered.error;
-    return {};
-  }
-  return rendered.text;
-}
-
-void WriteSse(ResponseWriter& writer, const std::string& event, const Json& data,
-              bool with_event) {
-  std::string chunk;
-  if (with_event) {
-    chunk += "event: " + event + "\n";
-  }
-  chunk += "data: " + data.Dump() + "\n\n";
-  (void)writer.Write(chunk);
-}
-
-Json UsageJson(std::size_t prompt, std::size_t completion) {
-  Json usage = Json::Object();
-  usage.Set("prompt_tokens", Json::Number(static_cast<double>(prompt)));
-  usage.Set("completion_tokens", Json::Number(static_cast<double>(completion)));
-  usage.Set("total_tokens",
-            Json::Number(static_cast<double>(prompt + completion)));
-  return usage;
 }
 
 // Shared completion core for the raw-prompt endpoint.
@@ -225,6 +118,10 @@ void Complete(Engine& engine, Model& model, const Tokenizer& tokenizer,
 void Chat(Engine& engine, Model& model, const Tokenizer& tokenizer,
           ResponseWriter& writer, const Json& body, std::size_t default_max,
           bool anthropic) {
+  if (!anthropic && WantsTools(body)) {
+    ChatWithTools(engine, model, tokenizer, writer, body, default_max);
+    return;
+  }
   std::string error;
   const std::string prompt = RenderPrompt(model, body, &error);
   if (!error.empty()) {
