@@ -1611,7 +1611,7 @@ __global__ void QuantizeFp8PackKernel(const float* in, unsigned int* packed,
 __global__ void QuantizeFp8PackRowsKernel(const float* in, unsigned int* packed,
                                           float* scale, unsigned long long rows,
                                           unsigned long long cols) {
-  __shared__ float red[256];
+  __shared__ float red[1024];
   const unsigned long long r = blockIdx.x;
   if (r >= rows) {
     return;

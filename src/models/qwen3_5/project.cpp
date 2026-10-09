@@ -114,7 +114,7 @@ std::expected<bool, StatusCode> ProjectWmma(Backend& backend, Qwen35State& h,
   }
   KernelLaunch ql;
   ql.grid_x = static_cast<std::uint32_t>(m);
-  ql.block_x = 256;
+  ql.block_x = 1024;
   ql.buffers = {&a, h.wmma_a.get(), h.wmma_as.get()};
   ql.scalars = {m, k};
   if (auto st = backend.LaunchKernel(*h.fp8_pack_kernel, ql); !st) {
