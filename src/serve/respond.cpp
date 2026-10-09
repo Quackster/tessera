@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include "tessera/serve.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera::serve {
@@ -71,6 +72,18 @@ void WriteSse(ResponseWriter& writer, const std::string& event,
   }
   chunk += "data: " + data.Dump() + "\n\n";
   (void)writer.Write(chunk);
+}
+
+std::string InjectWebDefaults(std::string_view page) {
+  constexpr std::string_view kMaxTokens = "@TESSERA_DEFAULT_MAX_TOKENS@";
+  const std::string value = std::to_string(kDefaultMaxTokens);
+  std::string out(page);
+  std::size_t pos = 0;
+  while ((pos = out.find(kMaxTokens, pos)) != std::string::npos) {
+    out.replace(pos, kMaxTokens.size(), value);
+    pos += value.size();
+  }
+  return out;
 }
 
 }  // namespace tessera::serve

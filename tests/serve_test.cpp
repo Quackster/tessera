@@ -11,10 +11,12 @@
 #include <thread>
 
 #include "serve/http.hpp"
+#include "serve/respond.hpp"
 #include "serve/session.hpp"
 #include "serve/tools/tool_call.hpp"
 #include "core/json.hpp"
 #include "tessera/log.hpp"
+#include "tessera/serve.hpp"
 
 using tessera::serve::HttpRequest;
 using tessera::core::Json;
@@ -553,6 +555,35 @@ TEST(ServeTest, ThinkStreamerMatchesPostHocSplit) {
     EXPECT_EQ(reasoning, ref_reasoning);
     EXPECT_EQ(content, before);
   }
+}
+
+// The default cap is 32k tokens: an unspecified request never
+// decodes to the end of a large context window.
+TEST(ServeTest, DefaultMaxTokensIs32k) {
+  EXPECT_EQ(tessera::kDefaultMaxTokens, 32u * 1024u);
+  EXPECT_EQ(tessera::ServeOptions{}.default_max_tokens,
+            tessera::kDefaultMaxTokens);
+  auto empty = Json::Parse(R"({})");
+  ASSERT_NE(empty, nullptr);
+  EXPECT_EQ(tessera::serve::MaxTokensFrom(*empty, 7u), 7u);
+  auto capped = Json::Parse(R"({"max_tokens":0})");
+  ASSERT_NE(capped, nullptr);
+  EXPECT_EQ(tessera::serve::MaxTokensFrom(*capped, 7u), 7u);
+  auto explicit_count = Json::Parse(R"({"max_tokens":64})");
+  ASSERT_NE(explicit_count, nullptr);
+  EXPECT_EQ(tessera::serve::MaxTokensFrom(*explicit_count, 7u), 64u);
+}
+
+// The served page carries the same default: one constant, every
+// surface. Pages without the placeholder pass through untouched.
+TEST(ServeTest, InjectWebDefaultsFillsMaxTokens) {
+  EXPECT_EQ(tessera::serve::InjectWebDefaults("no placeholders here"),
+            "no placeholders here");
+  const std::string want = "<input value=\"" +
+                           std::to_string(tessera::kDefaultMaxTokens) + "\">";
+  EXPECT_EQ(tessera::serve::InjectWebDefaults(
+                R"(<input value="@TESSERA_DEFAULT_MAX_TOKENS@">)"),
+            want);
 }
 
 // A second connection is served while the first handler still runs:

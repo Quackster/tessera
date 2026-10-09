@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 
 #include "core/json.hpp"
 #include "serve/http.hpp"
@@ -38,5 +39,9 @@ void SendGenerationError(ResponseWriter& writer, StatusCode code);
 // Append one SSE frame (`event: ...` only when `with_event`).
 void WriteSse(ResponseWriter& writer, const std::string& event,
               const core::Json& data, bool with_event);
+// Fill the web UI placeholders from the static defaults: currently
+// the max-tokens input default, so the page and the serving defaults
+// change in one place (tessera::kDefaultMaxTokens).
+[[nodiscard]] std::string InjectWebDefaults(std::string_view page);
 
 }  // namespace tessera::serve

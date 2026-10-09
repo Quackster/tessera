@@ -304,7 +304,8 @@ async function sendMessage() {
   await streamTurn('/api/sessions/' + currentId + '/chat', {
     message: text,
     stream: true,
-    max_tokens: Number($('max-tokens').value) || 512,
+    max_tokens: Number($('max-tokens').value) ||
+        Number($('max-tokens').defaultValue),
     enable_thinking: $('thinking').checked,
   }, base);
 }
@@ -319,7 +320,8 @@ async function retryTurn() {
   }
   await streamTurn('/api/sessions/' + currentId + '/retry', {
     stream: true,
-    max_tokens: Number($('max-tokens').value) || 512,
+    max_tokens: Number($('max-tokens').value) ||
+        Number($('max-tokens').defaultValue),
     enable_thinking: $('thinking').checked,
   }, base);
 }
