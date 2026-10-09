@@ -1,6 +1,7 @@
 #include "spec/dflash2_generate.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -33,6 +34,7 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   if (!drafter) {
     return std::unexpected(drafter.error());
   }
+  const auto started = std::chrono::steady_clock::now();
   const DeviceTensor* embed = nullptr;
   const DeviceTensor* output = nullptr;
   for (const DeviceTensor& weight : target.Weights()) {
@@ -316,6 +318,16 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
               "accepted " + std::to_string(accepted) + " of " +
                   std::to_string(proposed) + " draft token(s) over " +
                   std::to_string(steps) + " step(s)");
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    const std::string per_token =
+        produced.empty()
+            ? std::string()
+            : " (" + std::to_string(elapsed / produced.size()) + " ms/token)";
+    log->Info("spec dflash2", "generated " + std::to_string(produced.size()) +
+                                  " token(s) in " + std::to_string(elapsed) +
+                                  " ms" + per_token);
   }
   return produced;
 }

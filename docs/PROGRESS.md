@@ -1780,13 +1780,28 @@ through RADV GFX1201, rocm through the system ROCm).
    measurement, the Vulkan shader is covered by the device-vs-reference
    test. The one-off capture helpers were removed from the radiance repo.
 
+- 2026-10-09: **DFlash2 steady-state tokens/s measured: acceptance is fixed,
+   but the draft step is too expensive.** `GenerateDFlash2` now logs a timing
+   line (generated N tokens in X ms, Y ms/token) next to the acceptance line.
+   On the 27B MXFP4 target (ROCm, GPU1), prompt `{760,6511,314,9338,369}`,
+   128 tokens: greedy is **206 ms/token** (26.4 s) while DFlash2 accepts
+   **106 of 168 draft tokens over 24 steps (4.4 per step)** but takes
+   **949 ms/token** (121.5 s), about 4.6x slower than greedy. So the draft
+   quality is now better than the reference's 2.7 to 2.85 per step, and the
+   remaining DFlash2 work is the per-step draft cost, not quality: the draft
+   block is fp32 (about 3.6 GB of weights read per step), the selector
+   codebooks are fp32 (about 508 MB per step), and the step issues many small
+   kernels. This is item 3 (GEMM throughput) work, and it must land before
+   DFlash2 is a net win. 275/275 `ctest` on both backends.
+
 ## Next (in order)
 
 - **DFlash2 acceptance (done 2026-10-09).** The 14x gap was the two defects
-  above, not the aux. The remaining DFlash2 work is the item 0 backlog
-  (batched draft scoring, steady-state tokens/s). Re-measure tokens/s now
-  that acceptance is high: the draft is only a win when its per-step cost is
-  below the tokens it recovers.
+  above, not the aux. Acceptance is now 4.4 per step (reference 2.7 to 2.85),
+  but DFlash2 is 4.6x slower per token than greedy, so the draft step cost is
+  the open issue. Next: reduce the draft step cost (bf16/fp8 draft weights
+  instead of fp32, a cheaper selector, fewer per-step kernels), then
+  re-measure tokens/s. This folds into item 3.
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.
