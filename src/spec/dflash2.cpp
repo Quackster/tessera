@@ -94,22 +94,31 @@ class DFlash2Strategy final : public SpeculativeStrategy {
       return std::unexpected(StatusCode::MalformedFile);
     }
     query_rows_ = block_ + 1;
-    // The draft head runs at the draft block size (m about 7); use the tiled
-    // bf16 kernel, which reads the 2.5 GB head once, not the warp-per-output
-    // GEMV, which re-reads it once per row.
+    // The draft head runs at the draft block size (m about 7). Prefer the
+    // bf16 tensor-core GEMM, which reads the 2.5 GB head once, coalesced;
+    // fall back to the tiled per-output batched kernel.
     const DType head_dtype = output_->manifest.dtype;
-    const std::string_view head_tiled =
-        core::detail::GemmTiledKernelName(head_dtype);
-    std::expected<Kernel*, StatusCode> head_gemm =
-        head_tiled.empty()
-            ? core::detail::GemmFor(backend, gemms_, head_dtype)
-            : core::detail::CachedKernel(
-                  backend, gemms_, static_cast<int>(head_dtype) + 0x3000,
-                  head_tiled);
-    if (!head_gemm) {
-      return std::unexpected(head_gemm.error());
+    if (head_dtype == DType::BF16) {
+      if (auto kernel = backend.LoadKernel("gemm_bf16_wmma", {}); kernel) {
+        head_gemm_wmma_ = std::move(*kernel);
+      }
     }
-    head_gemm_ = *head_gemm;
+    if (head_gemm_wmma_ != nullptr) {
+      head_gemm_ = head_gemm_wmma_.get();
+    } else {
+      const std::string_view head_tiled =
+          core::detail::GemmTiledKernelName(head_dtype);
+      std::expected<Kernel*, StatusCode> head_gemm =
+          head_tiled.empty()
+              ? core::detail::GemmFor(backend, gemms_, head_dtype)
+              : core::detail::CachedKernel(
+                    backend, gemms_, static_cast<int>(head_dtype) + 0x3000,
+                    head_tiled);
+      if (!head_gemm) {
+        return std::unexpected(head_gemm.error());
+      }
+      head_gemm_ = *head_gemm;
+    }
     n_ = config_.target_layer_ids.size();
     rank_ = config_.selector_rank;
     topk_ = config_.selector_top_k;
@@ -461,6 +470,7 @@ class DFlash2Strategy final : public SpeculativeStrategy {
   const DeviceTensor* output_ = nullptr;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms_;
   Kernel* head_gemm_ = nullptr;
+  std::unique_ptr<Kernel> head_gemm_wmma_;
   std::unique_ptr<Kernel> selector_gemm_;
   std::unique_ptr<Kernel> selector_kernel_;
   std::unique_ptr<Kernel> top_k_kernel_;

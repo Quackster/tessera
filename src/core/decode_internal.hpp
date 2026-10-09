@@ -454,6 +454,10 @@ inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
     // One warp per weight column (GemmMxFp4RowsKernel).
     return static_cast<std::uint32_t>((n + 7) / 8);
   }
+  if (gemm.Id() == "gemm_bf16_wmma") {
+    // 64 columns per 128-thread workgroup (GemmBf16WmmaKernel).
+    return static_cast<std::uint32_t>((n + 63) / 64);
+  }
   if (gemm.Id() == "gemm_mxfp4" || gemm.Id() == "gemm_f32" ||
       gemm.Id() == "gemm_bf16") {
     return static_cast<std::uint32_t>((m * n + 7) / 8);
@@ -472,7 +476,7 @@ inline std::expected<void, StatusCode> ProjectDevice(
     Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
   KernelLaunch launch;
   launch.grid_x = GemmGridFor(gemm, m, n);
-  launch.block_x = 256;
+  launch.block_x = gemm.Id() == "gemm_bf16_wmma" ? 128 : 256;
   launch.buffers = {&a, &w, &c};
   launch.scalars = {m, n, k};
   return backend.LaunchKernel(gemm, launch);

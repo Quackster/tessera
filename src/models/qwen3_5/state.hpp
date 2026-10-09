@@ -70,8 +70,10 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Kernel> fp8_pack_kernel;
   std::unique_ptr<Kernel> mxfp4_rowref_kernel;
   std::unique_ptr<Kernel> mxfp4_wmma_kernel;
+  std::unique_ptr<Kernel> mxfp4_reduce_kernel;
   std::unique_ptr<Buffer> wmma_a;
   std::unique_ptr<Buffer> wmma_as;
+  std::unique_ptr<Buffer> wmma_part;
   std::unordered_map<const void*, std::unique_ptr<Buffer>> mxfp4_wref;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;

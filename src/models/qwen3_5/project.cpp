@@ -120,13 +120,55 @@ std::expected<bool, StatusCode> ProjectWmma(Backend& backend, Qwen35State& h,
   if (auto st = backend.LaunchKernel(*h.fp8_pack_kernel, ql); !st) {
     return std::unexpected(st.error());
   }
+  // Split-K: aim for a target workgroup count so the fp8 GEMM saturates the
+  // device on the narrow projections (n ~ 5120) where one block per 64
+  // columns leaves it latency-bound. Each split writes its K partial to its
+  // own region of a scratch buffer; a reduce kernel sums the regions into the
+  // output (no atomics, no pre-zeroing). Both bounds are overridable.
+  std::uint64_t target = 320, cap = 4;
+  if (const char* e = std::getenv("TESSERA_MXFP4_SPLIT")) {
+    target = std::strtoull(e, nullptr, 10);
+  }
+  if (const char* e = std::getenv("TESSERA_MXFP4_SPLITCAP")) {
+    cap = std::strtoull(e, nullptr, 10);
+  }
+  std::uint64_t split = (target * 64ull + n - 1) / n;
+  const std::uint64_t chunks = k / 128;
+  if (split < 1) split = 1;
+  if (split > chunks) split = chunks;
+  if (split > cap) split = cap;
+  Buffer* dst = &out;
+  if (split > 1) {
+    const std::size_t part_elems = static_cast<std::size_t>(split) * m * n;
+    if (h.wmma_part == nullptr || h.wmma_part->Size() < part_elems * 4) {
+      auto buf = backend.AllocateBuffer(part_elems * 4, MemoryKind::Device);
+      if (!buf) return std::unexpected(buf.error());
+      h.wmma_part = std::move(*buf);
+    }
+    dst = h.wmma_part.get();
+  }
   KernelLaunch wl;
   wl.grid_x = static_cast<std::uint32_t>((n + 63) / 64);
+  wl.grid_y = static_cast<std::uint32_t>(split);
   wl.block_x = 128;
-  wl.buffers = {h.wmma_a.get(), &w, h.wmma_as.get(), wref, &out};
-  wl.scalars = {m, n, k};
+  wl.buffers = {h.wmma_a.get(), &w, h.wmma_as.get(), wref, dst};
+  wl.scalars = {m, n, k, split};
   if (auto st = backend.LaunchKernel(*h.mxfp4_wmma_kernel, wl); !st) {
     return std::unexpected(st.error());
+  }
+  if (split > 1) {
+    auto rk = load(h.mxfp4_reduce_kernel, "gemm_mxfp4_wmma_reduce");
+    if (!rk) return rk;
+    if (!*rk) return false;
+    const std::uint64_t total = m * n;
+    KernelLaunch rl;
+    rl.grid_x = static_cast<std::uint32_t>((total + 255) / 256);
+    rl.block_x = 256;
+    rl.buffers = {h.wmma_part.get(), &out};
+    rl.scalars = {total, split};
+    if (auto st = backend.LaunchKernel(*h.mxfp4_reduce_kernel, rl); !st) {
+      return std::unexpected(st.error());
+    }
   }
   return true;
 }

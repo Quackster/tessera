@@ -38,6 +38,11 @@ std::expected<DFlash2Drafter, StatusCode> DFlash2Drafter::Create(
       return std::unexpected(status);
     }
   }
+  // Prefer the bf16 tensor-core GEMM for the small draft-batch rows; fall
+  // back to the per-output batched kernel where the backend lacks it.
+  if (auto kernel = backend.LoadKernel("gemm_bf16_wmma", {}); kernel) {
+    drafter.gemm_small_ = std::move(*kernel);
+  }
   drafter.config_ = config;
   return drafter;
 }
@@ -64,8 +69,10 @@ std::expected<void, StatusCode> DFlash2Drafter::AppendContext(
     v_w.push_back(layer.v_w);
     k_norm.push_back(layer.k_norm_w);
   }
+  const Kernel& gemm =
+      (gemm_small_ != nullptr && rows <= 16) ? *gemm_small_ : *gemm_;
   return DraftContextAppendDevice(
-      backend, *rmsnorm_, *gemm_, *rope_, *concat_, *quantize_, context_,
+      backend, *rmsnorm_, gemm, *rope_, *concat_, *quantize_, context_,
       captures, *store_.Weights().fc, hidden_norm, k_w, v_w, k_norm, n,
       config_.hidden_size, row_offset, rows, config_.hidden_size,
       config_.num_kv_heads, config_.head_dim, config_.rope_theta,
@@ -80,8 +87,9 @@ std::expected<void, StatusCode> DFlash2Drafter::Run(
   const std::vector<DraftContextKvView> context = DraftContextViews(context_);
   // The draft layer weights are fp32 after conversion, so gemm_f32 runs
   // them; the head uses `head_gemm` for the target's quantized shared head.
+  const Kernel& gemm = gemm_small_ != nullptr ? *gemm_small_ : *gemm_;
   return DraftBlockDevice(
-      backend, *rmsnorm_, *gemm_, head_gemm, *conv_, *rope_, *attention_,
+      backend, *rmsnorm_, gemm, head_gemm, *conv_, *rope_, *attention_,
       *silu_, *add_, *concat_, *quantize_, mask_embeds, /*aux=*/nullptr,
       /*fc_w=*/nullptr, store_.Weights().layers, *store_.Weights().final_norm,
       output_w, logits, rows, ctx, config_.hidden_size, n, config_.hidden_size,

@@ -282,6 +282,16 @@ __device__ float Bf16ToFloatDev(unsigned short bits) {
   return value;
 }
 
+// fp32 -> bf16 round-to-nearest-even, the activation precision the bf16
+// tensor-core GEMM stages.
+__device__ unsigned short Bf16FromFloatDev(float value) {
+  unsigned int bits;
+  memcpy(&bits, &value, sizeof(bits));
+  const unsigned int rounding = (bits >> 16) & 1u;
+  bits += 0x7FFFu + rounding;
+  return static_cast<unsigned short>(bits >> 16);
+}
+
 // Built-in "gemm_bf16": C = A x W^T with bf16 weights and fp32
 // sequential accumulation.
 __global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
@@ -723,7 +733,8 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
                                     const float* as,
                                     const unsigned char* wref, float* c,
                                     unsigned long long m, unsigned long long n,
-                                    unsigned long long k) {
+                                    unsigned long long k,
+                                    unsigned long long split) {
   __shared__ unsigned char sA[16 * kWmmaAstr];
   __shared__ unsigned char sW[kWmmaDwn * 16 * kWmmaAstr];
   const int tid = threadIdx.x;
@@ -740,7 +751,15 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
   for (int e = 0; e < 8; ++e) {
     acc[e] = 0.0f;
   }
-  for (unsigned long long k0 = 0; k0 < k; k0 += kWmmaDbk) {
+  // Split-K: blockIdx.y selects the K chunk range; split == 1 keeps the
+  // whole K in one block (the original behaviour).
+  const unsigned long long chunks = (k + kWmmaDbk - 1) / kWmmaDbk;
+  const unsigned long long per = (chunks + split - 1) / split;
+  const unsigned long long c0 =
+      static_cast<unsigned long long>(blockIdx.y) * per;
+  const unsigned long long c1 = (c0 + per) < chunks ? (c0 + per) : chunks;
+  for (unsigned long long ci = c0; ci < c1; ++ci) {
+    const unsigned long long k0 = ci * kWmmaDbk;
     // A tile: 16 rows x DBK bytes, vectorized stores.
     for (int u = tid; u < 16 * kWmmaDbk / 16; u += kWmmaDwn * 32) {
       const int pos = u * 16, r = pos / kWmmaDbk, col = pos % kWmmaDbk;
@@ -760,18 +779,21 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
             k0 + static_cast<unsigned long long>(cg * 16);
         const WmmaU2 wv = *reinterpret_cast<const WmmaU2*>(
             &w[(static_cast<unsigned long long>(nrc) * k + kt0) / 2]);
+        // One E8M0 scale covers this 16-wide group (a scale spans 32
+        // elements, the group starts on a 16 boundary); hoist the read.
+        const int wref_n = static_cast<int>(wref[nrc]);
+        const int sbyte =
+            wref_n - static_cast<int>(scales[static_cast<unsigned long long>(nrc) *
+                                                 blocks +
+                                             (k0 + cg * 16) / 32]);
+        const int d0 = sbyte < 0 ? 0 : (sbyte > 15 ? 15 : sbyte);
         unsigned char out[16];
 #pragma unroll
         for (int kk = 0; kk < 16; ++kk) {
           const unsigned char byte =
               reinterpret_cast<const unsigned char*>(&wv)[kk / 2];
           const unsigned char nib = (kk & 1) ? (byte >> 4) : (byte & 0xFu);
-          int d = static_cast<int>(wref[nrc]) -
-                  static_cast<int>(
-                      scales[static_cast<unsigned long long>(nrc) * blocks +
-                             (kt0 + kk) / 32]);
-          d = d < 0 ? 0 : (d > 15 ? 15 : d);
-          out[kk] = kMagDev[d][nib & 7u] | ((nib & 8u) ? 0x80u : 0u);
+          out[kk] = kMagDev[d0][nib & 7u] | ((nib & 8u) ? 0x80u : 0u);
         }
         *reinterpret_cast<WmmaU4*>(
             &sW[(wave * 16 + r) * kWmmaAstr + cg * 16]) =
@@ -798,8 +820,99 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
     const unsigned long long r = static_cast<unsigned long long>(wrow8 + j);
     const unsigned long long nn = n0 + static_cast<unsigned long long>(wcol);
     if (r < m && nn < n) {
-      c[r * n + nn] =
+      // Split-K writes each split's partial to its own region of c; the
+      // reduce kernel sums the regions into the output.
+      const unsigned long long base =
+          static_cast<unsigned long long>(blockIdx.y) * (m * n);
+      c[base + r * n + nn] =
           acc[j] * as[r] * __int_as_float(static_cast<int>(wref[nn]) << 23);
+    }
+  }
+}
+
+// Sums the split partials of GemmMxFp4WmmaKernel: c[i] = sum_p part[p*total+i].
+// One thread per output element; buffers 0 part, 1 c; scalars total, split.
+__global__ void GemmMxFp4WmmaReduceKernel(const float* part, float* c,
+                                          unsigned long long total,
+                                          unsigned long long split) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= total) {
+    return;
+  }
+  float sum = 0.0f;
+  for (unsigned long long p = 0; p < split; ++p) {
+    sum += part[p * total + i];
+  }
+  c[i] = sum;
+}
+// Built-in "gemm_bf16_wmma": bf16 tensor-core GEMM for the small-m batched
+// bf16 projections (the DFlash2 drafter and the bf16 shared head). A is fp32
+// (rounded to bf16 while it is staged), W is bf16. Reads each weight column
+// once, coalesced through shared memory, unlike the per-output
+// gemm_bf16_batched. Buffers 0 A, 1 W, 2 C; scalars m, n, k. Grid ceil(n/64),
+// block 128; m is 1..16.
+typedef short WmmaBf16A __attribute__((ext_vector_type(8)));
+constexpr int kWmmaBstr = kWmmaDbk + kWmmaPad;
+
+__global__ void GemmBf16WmmaKernel(const float* a, const unsigned short* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n, unsigned long long k) {
+  __shared__ unsigned short sA[16 * kWmmaBstr];
+  __shared__ unsigned short sW[kWmmaDwn * 16 * kWmmaBstr];
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5, lane = tid & 31;
+  const unsigned long long n0 = blockIdx.x * (kWmmaDwn * 16ull) + wave * 16ull;
+  const int acol8 = (lane >> 4) * 8;
+  WmmaFp8C acc;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    acc[e] = 0.0f;
+  }
+  for (unsigned long long k0 = 0; k0 < k; k0 += kWmmaDbk) {
+    // A tile: 16 rows x DBK, fp32 rounded to bf16.
+    for (int u = tid; u < 16 * kWmmaDbk / 8; u += kWmmaDwn * 32) {
+      const int pos = u * 8, r = pos / kWmmaDbk, col = pos % kWmmaDbk;
+      const unsigned long long ar =
+          static_cast<unsigned long long>(r) < m ? r : m - 1;
+      const float* src = &a[ar * k + k0 + col];
+      unsigned short* dst = &sA[r * kWmmaBstr + col];
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        dst[e] = Bf16FromFloatDev(src[e]);
+      }
+    }
+    // W tile: the wave's 16 columns, DBK bf16 each, already bf16 in DRAM.
+    if (n0 < n) {
+      for (int g = lane; g < 16 * (kWmmaDbk / 8); g += 32) {
+        const int r = g / (kWmmaDbk / 8), cg = g % (kWmmaDbk / 8);
+        const int nr = static_cast<int>(n0) + r;
+        const int nrc = nr < static_cast<int>(n) ? nr : static_cast<int>(n) - 1;
+        *reinterpret_cast<WmmaU4*>(&sW[(wave * 16 + r) * kWmmaBstr + cg * 8]) =
+            *reinterpret_cast<const WmmaU4*>(
+                &w[static_cast<unsigned long long>(nrc) * k + k0 + cg * 8]);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int ks = 0; ks < kWmmaDbk / 16; ++ks) {
+      WmmaBf16A af, wf;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        af[j] = sA[(lane & 15) * kWmmaBstr + ks * 16 + acol8 + j];
+        wf[j] =
+            sW[(wave * 16 + (lane & 15)) * kWmmaBstr + ks * 16 + acol8 + j];
+      }
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(af, wf, acc);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const unsigned long long r = static_cast<unsigned long long>(acol8 + j);
+    const unsigned long long nn = n0 + static_cast<unsigned long long>(lane & 15);
+    if (r < m && nn < n) {
+      c[r * n + nn] = acc[j];
     }
   }
 }

@@ -67,6 +67,7 @@ class DFlash2Drafter {
   std::size_t context_limit_ = 0;
   std::unique_ptr<Kernel> rmsnorm_;
   std::unique_ptr<Kernel> gemm_;
+  std::unique_ptr<Kernel> gemm_small_;
   std::unique_ptr<Kernel> conv_;
   std::unique_ptr<Kernel> rope_;
   std::unique_ptr<Kernel> attention_;

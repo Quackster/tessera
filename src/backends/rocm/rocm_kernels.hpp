@@ -161,7 +161,14 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
                                     const unsigned char* w, const float* as,
                                     const unsigned char* wref, float* c,
                                     unsigned long long m, unsigned long long n,
-                                    unsigned long long k);
+                                    unsigned long long k,
+                                    unsigned long long split);
+__global__ void GemmMxFp4WmmaReduceKernel(const float* part, float* c,
+                                          unsigned long long total,
+                                          unsigned long long split);
+__global__ void GemmBf16WmmaKernel(const float* a, const unsigned short* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n, unsigned long long k);
 __global__ void MxFp4RowRefKernel(const unsigned char* w, unsigned char* wref,
                                   unsigned long long n, unsigned long long k);
 __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
@@ -531,7 +533,7 @@ TEST(BackendTest, GemmMxFp4WmmaDeviceMatchesRef) {
   std::mt19937 rng(99);
   constexpr std::size_t kM = 3;
   constexpr std::size_t kN = 16;
-  constexpr std::size_t kK = 128;
+  constexpr std::size_t kK = 512;
   constexpr std::size_t kBlocks = kK / 32;
   std::vector<std::byte> w(kN * kK / 2);
   for (auto& b : w) {
@@ -580,17 +582,6 @@ TEST(BackendTest, GemmMxFp4WmmaDeviceMatchesRef) {
   if (!kernel) {
     GTEST_SKIP() << "backend has no fp8 tensor-core GEMM";
   }
-  tessera::KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((kN + 63) / 64);
-  launch.block_x = 128;
-  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*as_buf).get(),
-                    (*wref_buf).get(), (*c_buf).get()};
-  launch.scalars = {kM, kN, kK};
-  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
-  backend->Synchronize();
-  std::vector<std::byte> readback(kM * kN * 4);
-  ASSERT_TRUE(backend->CopyD2H(**c_buf, readback.data(), readback.size())
-                  .has_value());
   std::vector<float> ref(kM * kN);
   ASSERT_TRUE(core::GemmMxFp4Fp8Ref(std::span<const std::byte>(a),
                                     std::span<const float>(as),
@@ -598,19 +589,209 @@ TEST(BackendTest, GemmMxFp4WmmaDeviceMatchesRef) {
                                     std::span<const std::byte>(wref),
                                     std::span<float>(ref), kM, kN, kK)
                   .has_value());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  auto reduce = backend->LoadKernel("gemm_mxfp4_wmma_reduce", {});
+  if (!reduce) GTEST_SKIP() << "backend has no split-K reduce";
+  auto part_buf = backend->AllocateBuffer(kM * kN * 4 * 4, MemoryKind::Device);
+  ASSERT_TRUE(part_buf.has_value());
+  for (std::uint64_t split : {1ull, 4ull}) {
+    tessera::KernelLaunch launch;
+    launch.grid_x = static_cast<std::uint32_t>((kN + 63) / 64);
+    launch.grid_y = static_cast<std::uint32_t>(split);
+    launch.block_x = 128;
+    tessera::Buffer* dst = split > 1 ? part_buf->get() : c_buf->get();
+    launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*as_buf).get(),
+                      (*wref_buf).get(), dst};
+    launch.scalars = {kM, kN, kK, split};
+    ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+    if (split > 1) {
+      tessera::KernelLaunch rl;
+      rl.grid_x = static_cast<std::uint32_t>((kM * kN + 255) / 256);
+      rl.block_x = 256;
+      rl.buffers = {part_buf->get(), (*c_buf).get()};
+      rl.scalars = {kM * kN, split};
+      ASSERT_TRUE(backend->LaunchKernel(**reduce, rl).has_value());
+    }
+    backend->Synchronize();
+    std::vector<std::byte> readback(kM * kN * 4);
+    ASSERT_TRUE(backend->CopyD2H(**c_buf, readback.data(), readback.size())
+                    .has_value());
+    const auto* got = reinterpret_cast<const float*>(readback.data());
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      const float e = std::abs(got[i] - ref[i]);
+      max_abs = std::max(max_abs, e);
+      max_rel = std::max(max_rel, e / std::max(1.0f, std::abs(ref[i])));
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << "backend " << backend->Name() << " split " << split << " max_abs "
+        << max_abs;
+    EXPECT_LE(max_rel, tol.rel)
+        << "backend " << backend->Name() << " split " << split << " max_rel "
+        << max_rel;
+  }
+}
+
+TEST(BackendTest, GemmBf16WmmaDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(1234);
+  constexpr std::size_t kM = 3, kN = 16, kK = 512;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) v = -1.0f + 2.0f * static_cast<float>(rng() % 1000) / 1000.0f;
+  std::vector<unsigned short> w(kN * kK);
+  for (auto& v : w) {
+    const float f = -1.0f + 2.0f * static_cast<float>(rng() % 1000) / 1000.0f;
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    v = static_cast<unsigned short>(bits >> 16);
+  }
+  // The kernel rounds A to bf16 while staging, so round it here too.
+  auto round_bf16 = [](float f) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const std::uint32_t rounding = (bits >> 16) & 1u;
+    bits += 0x7FFFu + rounding;
+    return static_cast<unsigned short>(bits >> 16);
+  };
+  std::vector<float> a_bf16(kM * kK);
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const std::uint32_t high =
+        static_cast<std::uint32_t>(round_bf16(a[i])) << 16;
+    std::memcpy(&a_bf16[i], &high, sizeof(high));
+  }
+  std::vector<float> ref(kM * kN);
+  ASSERT_TRUE(core::GemmBf16Ref(
+                  std::span<const float>(a_bf16),
+                  std::span<const std::byte>(
+                      reinterpret_cast<const std::byte*>(w.data()),
+                      w.size() * 2),
+                  std::span<float>(ref), kM, kN, kK)
+                  .has_value());
+  auto kernel = backend->LoadKernel("gemm_bf16_wmma", {});
+  if (!kernel) GTEST_SKIP() << "backend has no bf16 tensor-core GEMM";
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size() * 2, MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && w_buf && c_buf);
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                        reinterpret_cast<const std::byte*>(a.data()),
+                                        a.size() * 4)).has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(
+                                        reinterpret_cast<const std::byte*>(w.data()),
+                                        w.size() * 2)).has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((kN + 63) / 64);
+  launch.block_x = 128;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
   const auto* got = reinterpret_cast<const float*>(readback.data());
   const FpTolerance tol = FpToleranceFor(backend->Name());
-  float max_abs = 0.0f;
-  float max_rel = 0.0f;
+  float max_abs = 0.0f, max_rel = 0.0f;
   for (std::size_t i = 0; i < ref.size(); ++i) {
     const float e = std::abs(got[i] - ref[i]);
     max_abs = std::max(max_abs, e);
     max_rel = std::max(max_rel, e / std::max(1.0f, std::abs(ref[i])));
   }
-  EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
-  EXPECT_LE(max_rel, tol.rel)
-      << "backend " << backend->Name() << " max_rel " << max_rel;
+  EXPECT_LE(max_abs, tol.abs) << "max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel) << "max_rel " << max_rel;
+}
+
+TEST(BackendTest, GemmMxFp4WmmaThroughput) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kK = 5120, kM = 8;
+  auto kernel = backend->LoadKernel("gemm_mxfp4_wmma", {});
+  if (!kernel) GTEST_SKIP() << "backend has no fp8 tensor-core GEMM";
+  constexpr int kIters = 200;
+  for (std::size_t kN : {std::size_t(5120), std::size_t(10240), std::size_t(17408)}) {
+    std::mt19937 rng(7);
+    std::vector<std::byte> w(kN * kK / 2);
+    for (auto& b : w) b = static_cast<std::byte>(rng() & 0xFF);
+    std::vector<std::byte> scales(kN * (kK / 32), std::byte(127));
+    std::vector<std::byte> wpacked = w;
+    wpacked.insert(wpacked.end(), scales.begin(), scales.end());
+    std::vector<std::byte> a(kM * kK, std::byte(0x38));
+    std::vector<float> as(kM, 1.0f);
+    auto a_buf = backend->AllocateBuffer(a.size(), MemoryKind::Device);
+    auto w_buf = backend->AllocateBuffer(wpacked.size(), MemoryKind::Device);
+    auto as_buf = backend->AllocateBuffer(kM * 4, MemoryKind::Device);
+    auto wref_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+    auto c_buf = backend->AllocateBuffer(kM * kN * 4 * 16, MemoryKind::Device);
+    ASSERT_TRUE(a_buf && w_buf && as_buf && wref_buf && c_buf);
+    ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(a)).has_value());
+    ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(wpacked)).has_value());
+    ASSERT_TRUE(backend->CopyH2D(**as_buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(as.data()), as.size() * 4)).has_value());
+    for (std::uint64_t split : {1ull, 4ull, 8ull, 12ull, 16ull}) {
+      tessera::KernelLaunch launch;
+      launch.grid_x = static_cast<std::uint32_t>((kN + 63) / 64);
+      launch.grid_y = static_cast<std::uint32_t>(split);
+      launch.block_x = 128;
+      launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*as_buf).get(),
+                        (*wref_buf).get(), (*c_buf).get()};
+      launch.scalars = {kM, kN, kK, split};
+      for (int i = 0; i < 5; ++i) ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+      backend->Synchronize();
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kIters; ++i) ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+      backend->Synchronize();
+      const auto t1 = std::chrono::steady_clock::now();
+      const double secs = std::chrono::duration<double>(t1 - t0).count();
+      const double bytes = static_cast<double>(wpacked.size()) * kIters;
+      std::printf("[wmma n=%5zu split=%llu] %.3f ms/launch, %.1f GB/s\n", kN,
+                  static_cast<unsigned long long>(split), secs * 1000.0 / kIters,
+                  bytes / secs / 1e9);
+    }
+  }
+}
+
+TEST(BackendTest, GemmMxFp4RowsAndGemvThroughput) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kN = 5120, kK = 5120, kBlocks = kK / 32;
+  std::mt19937 rng(11);
+  std::vector<std::byte> w(kN * kK / 2);
+  for (auto& b : w) b = static_cast<std::byte>(rng() & 0xFF);
+  std::vector<std::byte> scales(kN * kBlocks, std::byte(127));
+  std::vector<std::byte> wpacked = w;
+  wpacked.insert(wpacked.end(), scales.begin(), scales.end());
+  auto w_buf = backend->AllocateBuffer(wpacked.size(), MemoryKind::Device);
+  ASSERT_TRUE(w_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(wpacked)).has_value());
+  auto run = [&](const char* id, std::size_t m, std::uint32_t grid, std::uint32_t bx) {
+    std::vector<float> a(m * kK, 0.1f);
+    auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+    auto c_buf = backend->AllocateBuffer(m * kN * 4, MemoryKind::Device);
+    ASSERT_TRUE(a_buf && c_buf);
+    ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(a.data()), a.size() * 4)).has_value());
+    auto kernel = backend->LoadKernel(id, {});
+    if (!kernel) { GTEST_SKIP() << "no " << id; }
+    tessera::KernelLaunch launch;
+    launch.grid_x = grid; launch.block_x = bx;
+    launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+    launch.scalars = {m, kN, kK};
+    constexpr int kIters = 200;
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+    backend->Synchronize();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kIters; ++i) ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+    backend->Synchronize();
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    std::printf("[%s m=%zu] %.3f ms/launch, %.1f GB/s\n", id, m,
+                secs * 1000.0 / kIters, static_cast<double>(wpacked.size()) * kIters / secs / 1e9);
+  };
+  run("gemm_mxfp4_rows", 8, static_cast<std::uint32_t>((kN + 7) / 8), 256);
+  run("gemm_mxfp4_rows", 16, static_cast<std::uint32_t>((kN + 7) / 8), 256);
+  run("gemm_mxfp4", 1, static_cast<std::uint32_t>((1 * kN + 7) / 8), 256);
 }
 
 // Random weight bytes with small exact scales patched into every
