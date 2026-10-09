@@ -59,7 +59,7 @@ std::expected<void, StatusCode> ProjectBatch(
   }
   std::expected<void, StatusCode> projected = {};
   bool projected_done = false;
-  if (m >= detail::kGemmTiledMinRows &&
+  if ((m >= detail::kGemmTiledMinRows || n >= detail::kGemmTiledMinCols) &&
       !detail::GemmTiledKernelName(dtype).empty()) {
     auto tiled = detail::GemmTiledFor(backend, h.gemm_tiled, dtype);
     if (tiled) {

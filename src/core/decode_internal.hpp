@@ -760,6 +760,11 @@ constexpr std::size_t kGemmTileRows = 8;
 // most of the tile idle and is slower than the GEMV's shallower chains.
 constexpr std::size_t kGemmTiledMinRows = 16;
 
+// A very wide projection (the vocab-sized output head) uses the tiled kernel
+// even for a draft-sized batch: reading the weight matrix once beats the
+// GEMV's once-per-row re-read, which dominates when n is this large.
+constexpr std::size_t kGemmTiledMinCols = 65536;
+
 // Tiled batched GEMM kernel id for a dtype, or empty when the dtype has
 // no tiled kernel (the caller uses the GEMV kernel).
 inline std::string_view GemmTiledKernelName(DType dtype) {

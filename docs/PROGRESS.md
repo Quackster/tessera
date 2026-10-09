@@ -1956,48 +1956,38 @@ through RADV GFX1201, rocm through the system ROCm).
   backends (the numerical tests exercise the descriptor and command-buffer
   lifecycle).
 
+- 2026-10-09: **The vocab-width bf16 head uses the tiled kernel too.** The
+  16-row threshold (small batches use the shallow-chain GEMV) sent the
+  target's bf16 output head to the GEMV, which at the DFlash2 draft size
+  (m about 7) re-reads the 2.5 GB head once per row (387 ms of the decode).
+  The tiled kernel reads it once. `ProjectBatch` now also picks the tiled
+  kernel when `n >= kGemmTiledMinCols` (65536), so the head is tiled while
+  the narrow trunk projections stay on the GEMV. DFlash2 on the 27B drops
+  from 138 to 123 ms/token. 277/277 `ctest` on both backends.
+
 ## Next (in order)
 
-- **Speculation (seam done; decode speed is the gap).** Greedy and both
-  drafters now share one loop and one `SpeculativeStrategy` seam. DFlash2
+- **Speculation (seam done; decode speed improved).** Greedy and both
+  drafters share one loop and one `SpeculativeStrategy` seam. DFlash2
   acceptance is fixed (4.4 per step, reference 2.7 to 2.85) and MTP is
-  output-preserving. On the 27B MXFP4 target (ROCm, GPU1, 128 tokens) greedy
-  decodes at 25 tok/s and DFlash2 at 3 tok/s, far below hipfire on the same
-  R9700 (greedy ~200, MTP 68, DFlash 123 tok/s). Next, in order: (a) target
-  decode speed — fuse the per-layer projections (QKV/QKVZA/gate_up) as
-  hipfire does and cut the per-op launch/round-trip count, since the MXFP4
-  target forward dominates both the greedy and the speculative paths; (b) the
-  DFlash2 draft step (fp32 draft weights -> bf16, cheaper selector, fewer
-  kernels); (c) root-cause the MTP head draft quality (0 of 508 accepted).
-  Measure with the new split prefill/decode tok/s logs. All item 3 work.
-  A `rocprofv3` trace (27B MXFP4, ROCm) puts the greedy decode cost in
-  `GemmMxFp4Kernel`: about 586 dispatches per token and roughly 27 of the
-  39 ms/token, i.e. about 410 GB/s against the R9700's ~640 GB/s. So the
-  first lever is that one GEMV (wider reads / multi-row / fused
-  projections), not the surrounding kernels. Follow-up: replacing the
-  per-block four 32-bit weight loads with one `uint4` load changed nothing
-  (still 39 ms/token), and a two-output-per-warp variant (reuse the loaded
-  activation, halve the grid) was slightly worse (42 ms/token), both
-  reverted. So the GEMV is neither load-instruction-bound nor
-  activation-reuse-bound; the ~410 GB/s is compute/occupancy-bound. A
-  `rocprofv3 --kernel-trace` of the greedy MXFP4 decode (ROCm, 16 tokens)
-  confirms which kernels run and that this is GPU kernel time, not launch
-  overhead: the profiler serializes dispatches and inflates the decode wall
-  from 39 to ~136 ms/token, so the ~1366 launches/token (465
-  `GemmMxFp4Kernel` plus about 900 small kernels: rmsnorm ~161, l2norm ~120,
-  repeat_heads ~120, add ~128, conv1d/rmsnorm_gated/delta_step_heads ~60
-  each, silu_mul ~64, ssm_gate ~48, mrope ~32, attention ~16,
-  qgate_split/sigmoid_gate ~16 each) are hidden when unprofiled. The same
-  trace's tiled `GemmMxFp4BatchedKernel` (496 calls, 69% of profiled kernel
-  time) is the prefill phase, not the decode. So reducing launches does not
-  cut the decode wall clock; the levers stay the GEMV bandwidth and the
-  ~15 ms/token of norms/scan/attention. The next profiling step is PMC
-  counters / roofline on the GEMV to pick between a different GEMV
-  structure (activation-stationary / WMMA) and a fused multi-buffer launch.
-  A PMC pass on the GEMV found it uses 80 VGPR per thread (high register
-  pressure for a one-accumulator GEMV, a possible occupancy limiter); the
-  derived FETCH_SIZE counter read 0 through this path, so the DRAM-vs-
-  occupancy question stays open until the raw GL2C counters are read.
+  output-preserving. Decode speed improved substantially this session (see
+  the newest Done entries): on the 27B MXFP4 (ROCm, GPU1) the 112-token
+  prefill is 2.16 s (was 18.2 s), greedy is unchanged at 25 tok/s, and
+  DFlash2 is 8 to 10 tok/s (was 3). The MXFP4 tiled batched GEMM is
+  compute-bound instead of latency-bound, the draft projections and the
+  shared bf16 head use tiled batched kernels, and the linear-attention
+  prefill loop is batched. Remaining, in order: (a) the DFlash2 verifier
+  still runs the full target trunk at the draft size (m about 7), so it
+  reads each weight per row; (b) the draft forward (fp32 draft weights and a
+  per-token `quantize_fp8`); (c) the MTP head draft quality (0 of 508
+  accepted, output still greedy-preserving through the fallback). The greedy
+  decode is memory-bound at about 74% of the R9700's bandwidth and the GEMV
+  roofline is settled: the `rocprofv3` GL2C/MemUnitBusy counters read 0 on
+  gfx1201, so the estimate is analytical, and the three structural GEMV
+  variants tried (a single `uint4` weight load, a two-output warp, a wider
+  tile) did not beat the coalesced warp-per-output GEMV. The greedy decode
+  cost remains the one `gemm_mxfp4` GEMV (about 465 dispatches per token,
+  27 of 39 ms/token) plus about 15 ms/token of norms/scan/attention.
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.
@@ -2187,8 +2177,14 @@ through RADV GFX1201, rocm through the system ROCm).
    attention_q8/attention_q4/attention_fp8 kernels are tiled now
    (O(n * head_dim) per query/head, see the Done entry), and the
    `gemm_mxfp4` m = 1 decode runs warp-per-output with coalesced reads
-   (7.5% faster, see the Done entry). The same treatment on the Q4_K/Q5_K/
-   Q6_K/IQ4_XS decode GEMVs is still to do.
+   (7.5% faster, see the Done entry). 2026-10-09: the `gemm_mxfp4_batched`
+   kernel was latency-bound (one accumulator, a 5120-deep FMA chain);
+   four independent partial sums on a 32x8 tile made it compute-bound
+   (prefill 3.27 -> 2.18 s, DFlash2 decode 3 -> 7 tok/s), and new tiled
+   `gemm_f32_batched`/`gemm_bf16_batched` cover the DFlash2 draft and the
+   shared head, with the GEMV kept for batches below 16 rows and the
+   vocab-width head (see the Done entries). Still to do: the same wide-read
+   treatment on the Q4_K/Q5_K/Q6_K/IQ4_XS decode GEMVs.
 4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
@@ -2203,11 +2199,16 @@ through RADV GFX1201, rocm through the system ROCm).
    (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
    input and batch caps (features that do not exist yet). No hard-coded
    paths or sizes.
-6. **Prefill optimisation**: make the batched prefill faster. Each GEMM
-   still dequantizes each weight once per prompt row. Read each weight
-   block once and reuse it across a tile of rows. Keep one sync per
-   prefill and preallocate the KV caches up front. Measure prompt
-   tokens per second on a text prompt and on an image prompt.
+6. **Prefill optimisation**: the batched prefill is much faster this
+   session (112 tokens: 18.2 s to 2.16 s, 51 prompt tok/s). Done: the ROCm
+   device-to-device copy is asynchronous, the MXFP4 tiled GEMM is
+   compute-bound (a 32x8 tile with four partial sums reads the weight matrix
+   once per 32-row tile), and the per-row linear-attention loop is batched
+   into one launch per kernel (see the Done entries). Remaining: the
+   full-attention layers still run per layer at the prompt row count, and
+   the tiled GEMMs still dequantize each weight block once per 32-row tile
+   rather than once per prompt. Measure prompt tokens per second on a text
+   prompt and on an image prompt.
 7. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, image-embedding injection, the CLI wiring and the
    `<|image_pad|>` placeholder default are done
