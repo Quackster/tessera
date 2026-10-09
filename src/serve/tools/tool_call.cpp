@@ -212,6 +212,85 @@ std::vector<ToolCall> ParseToolCalls(std::string_view text,
   return calls;
 }
 
+ThinkStreamer::ThinkStreamer(bool think_expected)
+    : think_expected_(think_expected) {}
+
+namespace {
+
+// Shared leading bytes of the emitted text and the new split; the
+// delta starts after them. A closing span can only remove markup, so
+// the common prefix never un-emits words.
+std::size_t CommonPrefix(std::string_view emitted, std::string_view text) {
+  std::size_t n = 0;
+  while (n < emitted.size() && n < text.size() && emitted[n] == text[n]) {
+    ++n;
+  }
+  return n;
+}
+
+// A tail that may still grow into a think tag: a proper prefix of
+// an opener or a closer. Complete openers use the unclosed span
+// check in Push; this covers their split pieces ("<", "<t", "</" and
+// so on). Anything else (like "a < b") streams at once.
+bool IsThinkTagPrefix(std::string_view tail) {
+  constexpr std::string_view kOpen = "<think>";
+  constexpr std::string_view kClose = "</think>";
+  const auto is_prefix = [](std::string_view tag, std::string_view text) {
+    return text.size() < tag.size() &&
+           tag.substr(0, text.size()) == text;
+  };
+  return !tail.empty() &&
+         (is_prefix(kOpen, tail) || is_prefix(kClose, tail));
+}
+
+}  // namespace
+
+ThinkStreamer::Deltas ThinkStreamer::Push(std::string_view piece) {
+  raw_.append(piece);
+  if (think_expected_ && !resolved_) {
+    if (raw_.find(kThinkClose) == std::string::npos) {
+      return {};
+    }
+    resolved_ = true;
+  }
+  const ThinkSplit split = SplitThink(raw_);
+  // A trailing unclosed span may yet close: withhold it from the
+  // content so span markup never leaks and its words never stream
+  // twice (once raw, once as reasoning). The same holds for a split
+  // opener still arriving piece by piece.
+  std::string_view visible = split.text;
+  if (withhold_) {
+    const std::size_t open = split.text.rfind(kThinkOpen);
+    if (open != std::string::npos &&
+        split.text.find(kThinkClose, open) == std::string::npos) {
+      visible = std::string_view(split.text).substr(0, open);
+    } else {
+      const std::size_t bracket = split.text.rfind('<');
+      if (bracket != std::string::npos &&
+          IsThinkTagPrefix(std::string_view(split.text).substr(bracket))) {
+        visible = std::string_view(split.text).substr(0, bracket);
+      }
+    }
+  }
+  Deltas deltas;
+  // Reasoning only gains closed spans at the end; visible content can
+  // only grow past the withheld tail, so it diffs by common prefix
+  // and keeps already streamed words.
+  deltas.reasoning =
+      split.reasoning.substr(CommonPrefix(emitted_reasoning_, split.reasoning));
+  emitted_reasoning_ += deltas.reasoning;
+  deltas.content =
+      std::string(visible).substr(CommonPrefix(emitted_content_, visible));
+  emitted_content_ += deltas.content;
+  return deltas;
+}
+
+ThinkStreamer::Deltas ThinkStreamer::Finish() {
+  resolved_ = true;
+  withhold_ = false;
+  return Push({});
+}
+
 const core::Json* EffectiveTools(const core::Json& body,
                                  std::string* error) {
   const core::Json* tools = body.Find("tools");

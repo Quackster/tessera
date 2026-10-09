@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tessera chat</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+<h1>tessera chat</h1>
+<button id="new-chat" type="button">New chat</button>
+<span id="status" role="status">Ready</span>
+</header>
+<div id="layout">
+<aside>
+<label class="key-row">API key
+<input id="api-key" type="password" placeholder="none" autocomplete="off">
+</label>
+<ul id="sessions"></ul>
+</aside>
+<main>
+<div id="messages"></div>
+<div id="composer">
+<textarea id="input" rows="3" placeholder="Message the model (Enter sends, Shift+Enter adds a line)"></textarea>
+<div id="controls">
+<button id="send" type="button">Send</button>
+<button id="stop" type="button" hidden>Stop</button>
+<button id="pause" type="button" hidden>Pause</button>
+<button id="resume" type="button" hidden>Resume</button>
+<button id="retry" type="button">Retry</button>
+<label>Max tokens <input id="max-tokens" type="number" min="1" value="512"></label>
+<label><input id="thinking" type="checkbox" checked> Thinking</label>
+</div>
+<div id="error" hidden></div>
+</div>
+</main>
+</div>
+<script src="/app.js" defer></script>
+</body>
+</html>

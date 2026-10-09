@@ -5,11 +5,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <random>
 #include <string>
 #include <string_view>
 #include <thread>
 
 #include "serve/http.hpp"
+#include "serve/session.hpp"
 #include "serve/tools/tool_call.hpp"
 #include "core/json.hpp"
 #include "tessera/log.hpp"
@@ -405,4 +407,223 @@ TEST(ServeTest, NormalizeToolHistoryRejectsMalformed) {
   ASSERT_NE(tool, nullptr);
   EXPECT_FALSE(tessera::serve::NormalizeToolHistory(*tool, &out, &error));
   EXPECT_EQ(error, "tool messages need string content");
+}
+
+// Sessions create in order with default titles, list, fetch and delete.
+TEST(ServeTest, SessionStoreCrud) {
+  tessera::serve::SessionStore store;
+  auto first = store.Create({});
+  auto second = store.Create("custom");
+  EXPECT_EQ(first->Id(), "s1");
+  EXPECT_EQ(second->Id(), "s2");
+  auto infos = store.List();
+  ASSERT_EQ(infos.size(), 2u);
+  EXPECT_EQ(infos[0].id, "s1");
+  EXPECT_EQ(infos[0].title, "New chat");
+  EXPECT_EQ(infos[0].message_count, 0u);
+  EXPECT_EQ(infos[1].title, "custom");
+  auto view = store.View("s1");
+  ASSERT_TRUE(view.has_value());
+  EXPECT_EQ(view->title, "New chat");
+  EXPECT_TRUE(view->messages.empty());
+  EXPECT_FALSE(store.View("s9").has_value());
+  EXPECT_TRUE(store.Remove("s1"));
+  EXPECT_FALSE(store.Remove("s1"));
+  EXPECT_EQ(store.List().size(), 1u);
+}
+
+// History appends, trailing assistant turns pop for retry, and the
+// turn guard admits one generation at a time.
+TEST(ServeTest, SessionHistoryAndTurnGuard) {
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hi", {}, false});
+  session->Append({"assistant", "hello", "thinking", false});
+  session->Append({"assistant", "again", {}, false});
+  EXPECT_EQ(session->View().messages.size(), 3u);
+  EXPECT_EQ(session->PopTrailingAssistant(), 2u);
+  EXPECT_EQ(session->View().messages.size(), 1u);
+  EXPECT_EQ(session->PopTrailingAssistant(), 0u);
+  EXPECT_TRUE(session->TryBegin());
+  EXPECT_FALSE(session->TryBegin());
+  EXPECT_TRUE(session->PollControl());
+  session->RequestStop();
+  EXPECT_FALSE(session->PollControl());
+  session->End();
+  EXPECT_TRUE(session->TryBegin());
+  session->SetPaused(true);
+  session->RequestStop();
+  EXPECT_FALSE(session->PollControl());
+  session->End();
+  auto view = store.View(session->Id());
+  ASSERT_TRUE(view.has_value());
+  EXPECT_FALSE(view->busy);
+}
+
+// Titles come from the first user line, capped and trimmed.
+TEST(ServeTest, SessionTitleFromText) {
+  EXPECT_EQ(tessera::serve::TitleFromText("  hello there  "), "hello there");
+  EXPECT_EQ(tessera::serve::TitleFromText("first\nsecond"), "first");
+  EXPECT_EQ(tessera::serve::TitleFromText(""), "New chat");
+  EXPECT_EQ(tessera::serve::TitleFromText(std::string(100, 'x')).size(), 48u);
+}
+
+// Live think splitting: pieces across tag boundaries still divide
+// reasoning from content, and deltas concatenate exactly.
+TEST(ServeTest, ThinkStreamerSplitsLive) {
+  tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
+  std::string reasoning;
+  std::string content;
+  for (std::string_view piece : {"<th", "ink>id", "ea</th", "ink>ans", "wer"}) {
+    const auto deltas = streamer.Push(piece);
+    reasoning += deltas.reasoning;
+    content += deltas.content;
+  }
+  const auto tail = streamer.Finish();
+  reasoning += tail.reasoning;
+  content += tail.content;
+  EXPECT_EQ(reasoning, "idea");
+  EXPECT_EQ(content, "answer");
+}
+
+// Without a think-mode prompt everything streams as content.
+TEST(ServeTest, ThinkStreamerPassesPlainText) {
+  tessera::serve::ThinkStreamer streamer(/*think_expected=*/false);
+  std::string content;
+  for (std::string_view piece : {"hel", "lo"}) {
+    const auto deltas = streamer.Push(piece);
+    EXPECT_TRUE(deltas.reasoning.empty());
+    content += deltas.content;
+  }
+  const auto tail = streamer.Finish();
+  content += tail.content;
+  EXPECT_TRUE(tail.reasoning.empty());
+  EXPECT_EQ(content, "hello");
+}
+
+// An unclosed think block never strands text: Finish flushes it.
+TEST(ServeTest, ThinkStreamerFlushesUnclosedThink) {
+  tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
+  EXPECT_TRUE(streamer.Push("abc").content.empty());
+  const auto tail = streamer.Finish();
+  EXPECT_TRUE(tail.reasoning.empty());
+  EXPECT_EQ(tail.content, "abc");
+}
+
+// An unclosed span is withheld, never leaked: nothing streams until
+// it closes (or Finish flushes it), then each word lands exactly once.
+TEST(ServeTest, ThinkStreamerWithholdsUnclosedSpan) {
+  tessera::serve::ThinkStreamer streamer(/*think_expected=*/false);
+  auto first = streamer.Push("<think>abc");
+  EXPECT_TRUE(first.reasoning.empty());
+  EXPECT_TRUE(first.content.empty());
+  auto second = streamer.Push("def</think>ghi");
+  EXPECT_EQ(second.reasoning, "abcdef");
+  EXPECT_EQ(second.content, "ghi");
+  const auto tail = streamer.Finish();
+  EXPECT_TRUE(tail.reasoning.empty());
+  EXPECT_TRUE(tail.content.empty());
+}
+
+// Deltas always concatenate to the post-hoc split, whatever the
+// piece boundaries (fixed seed).
+TEST(ServeTest, ThinkStreamerMatchesPostHocSplit) {
+  const std::string text =
+      "lead <think>deep thought</think> middle <think>more</think> tail";
+  std::mt19937 rng(11);
+  for (int round = 0; round < 20; ++round) {
+    tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
+    std::string reasoning;
+    std::string content;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+      const std::size_t len = 1 + rng() % 7;
+      const auto deltas =
+          streamer.Push(std::string_view(text).substr(pos, len));
+      reasoning += deltas.reasoning;
+      content += deltas.content;
+      pos += len;
+    }
+    const auto tail = streamer.Finish();
+    reasoning += tail.reasoning;
+    content += tail.content;
+    std::string before;
+    std::string ref_reasoning;
+    tessera::serve::ParseToolCalls(text, &before, &ref_reasoning);
+    EXPECT_EQ(reasoning, ref_reasoning);
+    EXPECT_EQ(content, before);
+  }
+}
+
+// A second connection is served while the first handler still runs:
+// streaming generation never blocks control requests. The guard time
+// only bounds a regression hang, it never gates a pass.
+TEST(ServeTest, HttpServesConcurrentConnections) {
+  constexpr std::uint16_t kPort = 18102;
+  std::atomic<bool> stop{false};
+  std::atomic<bool> release{false};
+  tessera::log::Diagnostics log;
+  std::thread server([&stop, &release, &log] {
+    (void)RunHttpServer(
+        "127.0.0.1", kPort,
+        [&](const HttpRequest& request, ResponseWriter& writer) {
+          if (request.path == "/block") {
+            const auto start = std::chrono::steady_clock::now();
+            while (!release.load()) {
+              if (std::chrono::steady_clock::now() - start >
+                  std::chrono::seconds(20)) {
+                break;
+              }
+              std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+          } else if (request.path == "/release") {
+            release.store(true);
+          }
+          (void)writer.SendHeaders(200, "application/json");
+          (void)writer.Write(release.load() ? R"({"ok":true})"
+                                            : R"({"ok":false})");
+        },
+        &stop, log);
+  });
+  const auto get = [&](const char* target) {
+    int fd = -1;
+    for (int i = 0; i < 200 && fd < 0; ++i) {
+      fd = ConnectLocal(kPort);
+      if (fd < 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    if (fd < 0) {
+      return std::string();
+    }
+    const std::string request = std::string("GET ") + target +
+                                " HTTP/1.1\r\nHost: x\r\nConnection: close"
+                                "\r\n\r\n";
+    if (::send(fd, request.data(), request.size(), 0) < 0) {
+      ::close(fd);
+      return std::string();
+    }
+    std::string response;
+    char chunk[512];
+    ssize_t got = 0;
+    while ((got = ::recv(fd, chunk, sizeof(chunk), 0)) > 0) {
+      response.append(chunk, static_cast<std::size_t>(got));
+    }
+    ::close(fd);
+    return response;
+  };
+  // The server needs a moment to listen; both requests retry their
+  // connects instead of sleeping a fixed span.
+  std::string blocked;
+  std::thread waiter([&] { blocked = get("/block"); });
+  std::string released = get("/release");
+  waiter.join();
+  EXPECT_NE(released.find("\"ok\":true"), std::string::npos);
+  EXPECT_NE(blocked.find("\"ok\":true"), std::string::npos);
+  stop.store(true);
+  const int dummy = ConnectLocal(kPort);  // unblock accept
+  if (dummy >= 0) {
+    ::close(dummy);
+  }
+  server.join();
 }
