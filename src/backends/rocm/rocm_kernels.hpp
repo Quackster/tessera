@@ -227,7 +227,9 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
                                    const float* gate, float* y,
                                    unsigned long long rows,
                                    unsigned long long cols,
-                                   unsigned long long eps_bits);
+                                   unsigned long long eps_bits,
+                                   unsigned long long gbase,
+                                   unsigned long long ybase);
 __global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
                                   unsigned long long n);
 __global__ void Conv1dKernel(const float* x, const float* w, float* y,
@@ -377,7 +379,8 @@ __global__ void DeltaStepHeadsKernel(
     float* s, const float* k, const float* v, const float* q, float* o,
     const float* alpha, const float* beta, unsigned long long heads,
     unsigned long long dk, unsigned long long dv, unsigned long long rows,
-    unsigned long long sbase, unsigned long long sstride);
+    unsigned long long sbase, unsigned long long sstride,
+    unsigned long long abase);
 __global__ void SiluMulKernel(const float* g, const float* u, float* o,
                               unsigned long long n);
 // Built-in "embedding_f32"/"embedding_bf16"/"embedding_q4k": buffer 0

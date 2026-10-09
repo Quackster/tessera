@@ -203,10 +203,12 @@ class Kernel {
 // row. The dispatch is ceil(rows / 256) workgroups of 256.
 // "rmsnorm_gated": buffer 0 is X (fp32, rows x cols), buffer 1 the
 // weight W (fp32, cols), buffer 2 the gate (fp32, rows x cols),
-// buffer 3 the output Y (fp32, rows x cols); scalars are rows, cols
-// and the fp32 epsilon bits. Y = X / sqrt(mean(X^2) + eps) * W *
-// silu(gate) per row. The dispatch is ceil(rows / 256) workgroups of
-// 256.
+// buffer 3 the output Y (fp32, rows x cols); scalars are rows, cols, the
+// fp32 epsilon bits, and the element bases gbase/ybase the gate and output
+// are read and written from (zero for the plain rows x cols case, non-zero
+// to address one token's slice of a batched buffer without a copy).
+// Y = X / sqrt(mean(X^2) + eps) * W * silu(gate) per row. The dispatch is
+// ceil(rows / 256) workgroups of 256.
 // "ssm_gate": buffers are a_log, dt (fp32, heads each), alpha_raw,
 // beta_raw, alpha and beta (fp32, rows x heads); scalars are heads and
 // rows. alpha = exp(-exp(a_log) * softplus(alpha_raw + dt)), beta =
@@ -215,7 +217,7 @@ class Kernel {
 // "delta_step_heads": buffer 0 is S (fp32, heads x dk x dv), buffers 1..4 are
 // k (rows x heads x dk), v (rows x heads x dv), q (rows x heads x dk) and o
 // (rows x heads x dv), buffers 5 and 6 are alpha and beta (rows x heads);
-// scalars are heads, dk, dv, rows, sbase, sstride. The rows gated-delta steps
+// scalars are heads, dk, dv, rows, sbase, sstride, abase. The rows gated-delta steps
 // run in turn, advancing the shared state: each step reads the state at
 // sbase + head offset and writes it at sbase + sstride + head offset, so a
 // zero stride updates in place and a non-zero one appends every step to the
@@ -494,7 +496,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "rmsnorm_gated") {
-    if (launch.buffers.size() != 4 || launch.scalars.size() != 3) {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 5) {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
@@ -510,7 +512,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "delta_step_heads") {
-    if (launch.buffers.size() != 7 || launch.scalars.size() != 6) {
+    if (launch.buffers.size() != 7 || launch.scalars.size() != 7) {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||

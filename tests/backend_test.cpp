@@ -3237,7 +3237,7 @@ TEST(BackendTest, RmsNormGatedDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*x_buf).get(), (*w_buf).get(), (*gate_buf).get(),
                     (*y_buf).get()};
-  launch.scalars = {kRows, kCols, eps_bits};
+  launch.scalars = {kRows, kCols, eps_bits, 0, 0};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -3304,7 +3304,7 @@ TEST(BackendTest, LinearNormRejectsBadArgs) {
   auto bad_l2 = backend->LaunchKernel(**l2, launch);
   ASSERT_FALSE(bad_l2.has_value());
   EXPECT_EQ(bad_l2.error(), StatusCode::InvalidArgument);
-  // rmsnorm_gated wants 4 buffers and 3 scalars; zero rows rejected.
+  // rmsnorm_gated wants 4 buffers and 5 scalars; the 3-scalar launch is rejected.
   launch.buffers = four_buffers;
   auto bad_gated_contract = backend->LaunchKernel(**gated, launch);
   ASSERT_FALSE(bad_gated_contract.has_value());
@@ -3720,7 +3720,7 @@ TEST(BackendTest, DeltaStepHeadsDeviceMatchesRef) {
   launch.buffers = {(*s_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*q_buf).get(), (*o_buf).get(), (*al_buf).get(),
                     (*be_buf).get()};
-  launch.scalars = {kHeads, kDk, kDv, 1, 0, 0};
+  launch.scalars = {kHeads, kDk, kDv, 1, 0, 0, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<float> s_ref = s;

@@ -353,24 +353,18 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
                            g.num_v_heads, g.head_k_dim, g.factor) ||
         !RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *h.k_l, *h.k_exp,
                            g.num_v_heads, g.head_k_dim, g.factor) ||
-        !backend.CopyD2D(*b.alpha, t * g.num_v_heads * 4, *h.alpha, 0,
-                         g.num_v_heads * 4) ||
-        !backend.CopyD2D(*b.beta, t * g.num_v_heads * 4, *h.beta, 0,
-                         g.num_v_heads * 4) ||
         !DeltaStepHeadsDevice(
             backend, *h.delta_step_heads_kernel,
             b.snapshot_states ? *b.state_hist[layer]
                               : *h.linear[layer].state,
-            *h.k_exp, *h.v_l, *h.q_exp, *h.core, *h.alpha, *h.beta,
+            *h.k_exp, *h.v_l, *h.q_exp, *h.core, *b.alpha, *b.beta,
             g.num_v_heads, g.head_k_dim, g.head_v_dim, 1,
             b.snapshot_states ? t * state_len : 0,
-            b.snapshot_states ? state_len : 0) ||
-        !backend.CopyD2D(*b.z, t * g.value_dim * 4, *h.z, 0, g.value_dim * 4) ||
+            b.snapshot_states ? state_len : 0, t * g.num_v_heads) ||
         !RmsNormGatedDevice(backend, *h.rmsnorm_gated_kernel, *h.core,
-                            *(*w_norm)->device, *h.z, *h.out, g.num_v_heads,
-                            g.head_v_dim, cfg.norm_eps) ||
-        !backend.CopyD2D(*h.out, 0, *b.out, t * g.value_dim * 4,
-                         g.value_dim * 4)) {
+                            *(*w_norm)->device, *b.z, *b.out, g.num_v_heads,
+                            g.head_v_dim, cfg.norm_eps, t * g.value_dim,
+                            t * g.value_dim)) {
       return std::unexpected(StatusCode::DeviceError);
     }
     // The DeltaStep already wrote this token's post-state to slot t+1 of the

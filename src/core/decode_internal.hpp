@@ -592,7 +592,7 @@ inline std::expected<void, StatusCode> L2NormDevice(
 inline std::expected<void, StatusCode> RmsNormGatedDevice(
     Backend& backend, const Kernel& kernel, const Buffer& x, const Buffer& w,
     const Buffer& gate, Buffer& y, std::size_t rows, std::size_t cols,
-    double eps) {
+    double eps, std::size_t gbase = 0, std::size_t ybase = 0) {
   const float eps_f = static_cast<float>(eps);
   std::uint32_t bits = 0;
   std::memcpy(&bits, &eps_f, sizeof(bits));
@@ -600,7 +600,7 @@ inline std::expected<void, StatusCode> RmsNormGatedDevice(
   launch.grid_x = static_cast<std::uint32_t>(rows);
   launch.block_x = 1024;
   launch.buffers = {&x, &w, &gate, &y};
-  launch.scalars = {rows, cols, bits};
+  launch.scalars = {rows, cols, bits, gbase, ybase};
   return backend.LaunchKernel(kernel, launch);
 }
 
@@ -671,12 +671,13 @@ inline std::expected<void, StatusCode> DeltaStepHeadsDevice(
     Backend& backend, const Kernel& kernel, Buffer& state, const Buffer& k,
     const Buffer& v, const Buffer& q, Buffer& o, const Buffer& alpha,
     const Buffer& beta, std::size_t heads, std::size_t dk, std::size_t dv,
-    std::size_t rows = 1, std::size_t sbase = 0, std::size_t sstride = 0) {
+    std::size_t rows = 1, std::size_t sbase = 0, std::size_t sstride = 0,
+    std::size_t abase = 0) {
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>((heads * dv + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&state, &k, &v, &q, &o, &alpha, &beta};
-  launch.scalars = {heads, dk, dv, rows, sbase, sstride};
+  launch.scalars = {heads, dk, dv, rows, sbase, sstride, abase};
   return backend.LaunchKernel(kernel, launch);
 }
 

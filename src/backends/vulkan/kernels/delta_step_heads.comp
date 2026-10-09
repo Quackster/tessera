@@ -7,7 +7,7 @@ layout(local_size_x = 256) in;
 // are k (rows x heads x dk), v (rows x heads x dv), q (rows x heads x dk) and
 // o (rows x heads x dv); buffers 5 and 6 are alpha and beta (rows x heads
 // each). Scalars: heads v[0], dk v[2], dv v[4], rows v[6], sbase v[8],
-// sstride v[10]. The input state is read at sbase + s_base and the updated
+// sstride v[10], alpha/beta base v[12]. The input state is read at sbase + s_base and the updated
 // state written at sbase + sstride + s_base; a zero stride updates in place
 // and a non-zero one appends each step to the next history slot. The rows
 // steps run in turn, advancing the state.
@@ -31,6 +31,7 @@ void main() {
   uint rows = pc.v[6];
   uint sbase = pc.v[8];
   uint sstride = pc.v[10];
+  uint abase = pc.v[12];
   if (idx >= heads * dv || rows == 0u) {
     return;
   }
@@ -44,8 +45,8 @@ void main() {
   for (uint t = 0u; t < rows; ++t) {
     uint ko = t * heads * dk;
     uint vo = t * heads * dv;
-    float a = alpha[t * heads + h];
-    float b = beta[t * heads + h];
+    float a = alpha[abase + t * heads + h];
+    float b = beta[abase + t * heads + h];
     // Four partial sums keep the dk-deep read and output chains short.
     float r0 = 0.0, r1 = 0.0, r2 = 0.0, r3 = 0.0;
     uint j = 0u;

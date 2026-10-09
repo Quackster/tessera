@@ -1025,7 +1025,9 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
                                    const float* gate, float* y,
                                    unsigned long long rows,
                                    unsigned long long cols,
-                                   unsigned long long eps_bits) {
+                                   unsigned long long eps_bits,
+                                   unsigned long long gbase,
+                                   unsigned long long ybase) {
   __shared__ float red[256];
   const unsigned long long r = static_cast<unsigned long long>(blockIdx.x);
   if (r >= rows) {
@@ -1052,9 +1054,9 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
   const float mean = red[0] / static_cast<float>(cols);
   const float gain = 1.0f / sqrtf(mean + eps);
   for (unsigned long long c = tid; c < cols; c += blockDim.x) {
-    const float g = gate[base + c];
+    const float g = gate[gbase + base + c];
     const float silu = g / (1.0f + expf(-g));
-    y[base + c] = x[base + c] * gain * w[c] * silu;
+    y[ybase + base + c] = x[base + c] * gain * w[c] * silu;
   }
 }
 // Built-in "conv1d": causal depthwise convolution over channels x
@@ -1240,7 +1242,8 @@ __global__ void DeltaStepHeadsKernel(
     float* s, const float* k, const float* v, const float* q, float* o,
     const float* alpha, const float* beta, unsigned long long heads,
     unsigned long long dk, unsigned long long dv, unsigned long long rows,
-    unsigned long long sbase, unsigned long long sstride) {
+    unsigned long long sbase, unsigned long long sstride,
+    unsigned long long abase) {
   const unsigned long long idx =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= heads * dv) {
@@ -1263,8 +1266,8 @@ __global__ void DeltaStepHeadsKernel(
     const float* kt = k + t * heads * dk;
     const float* vt = v + t * heads * dv;
     const float* qt = q + t * heads * dk;
-    const float a = alpha[t * heads + h];
-    const float b = beta[t * heads + h];
+    const float a = alpha[abase + t * heads + h];
+    const float b = beta[abase + t * heads + h];
     // Four partial sums keep the dk-deep read and output chains short.
     float r0 = 0.0f;
     float r1 = 0.0f;
