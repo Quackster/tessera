@@ -787,17 +787,33 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
                                                  blocks +
                                              (k0 + cg * 16) / 32]);
         const int d0 = sbyte < 0 ? 0 : (sbyte > 15 ? 15 : sbyte);
-        unsigned char out[16];
+        // Fold the 16 nibbles to 16 fp8 bytes with three v_perm per eight
+        // nibbles (the served reference's trick) instead of a per-element
+        // kMag load. d0's row of kMagDev holds the eight magnitude bytes;
+        // the sign bit rides in each nibble's bit 3.
+        const unsigned int t0 =
+            *reinterpret_cast<const unsigned int*>(&kMagDev[d0][0]);
+        const unsigned int t1 =
+            *reinterpret_cast<const unsigned int*>(&kMagDev[d0][4]);
+        unsigned int outw[4];
 #pragma unroll
-        for (int kk = 0; kk < 16; ++kk) {
-          const unsigned char byte =
-              reinterpret_cast<const unsigned char*>(&wv)[kk / 2];
-          const unsigned char nib = (kk & 1) ? (byte >> 4) : (byte & 0xFu);
-          out[kk] = kMagDev[d0][nib & 7u] | ((nib & 8u) ? 0x80u : 0u);
+        for (int h = 0; h < 2; ++h) {
+          const unsigned int w32 =
+              reinterpret_cast<const unsigned int*>(&wv)[h];
+          const unsigned int ev = w32 & 0x0F0F0F0Fu;
+          const unsigned int od = (w32 >> 4) & 0x0F0F0F0Fu;
+          const unsigned int be =
+              __builtin_amdgcn_perm(t1, t0, ev & 0x07070707u) |
+              ((ev & 0x08080808u) << 4);
+          const unsigned int bo =
+              __builtin_amdgcn_perm(t1, t0, od & 0x07070707u) |
+              ((od & 0x08080808u) << 4);
+          outw[2 * h] = __builtin_amdgcn_perm(bo, be, 0x05010400u);
+          outw[2 * h + 1] = __builtin_amdgcn_perm(bo, be, 0x07030602u);
         }
         *reinterpret_cast<WmmaU4*>(
             &sW[(wave * 16 + r) * kWmmaAstr + cg * 16]) =
-            *reinterpret_cast<WmmaU4*>(out);
+            *reinterpret_cast<WmmaU4*>(outw);
       }
     }
     __syncthreads();

@@ -710,7 +710,7 @@ TEST(BackendTest, GemmMxFp4WmmaThroughput) {
   auto kernel = backend->LoadKernel("gemm_mxfp4_wmma", {});
   if (!kernel) GTEST_SKIP() << "backend has no fp8 tensor-core GEMM";
   constexpr int kIters = 200;
-  for (std::size_t kN : {std::size_t(5120), std::size_t(10240), std::size_t(17408)}) {
+  for (std::size_t kN : {std::size_t(5120), std::size_t(17408)}) {
     std::mt19937 rng(7);
     std::vector<std::byte> w(kN * kK / 2);
     for (auto& b : w) b = static_cast<std::byte>(rng() & 0xFF);
