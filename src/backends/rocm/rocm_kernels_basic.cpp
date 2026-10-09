@@ -615,6 +615,75 @@ __global__ void GemmMxFp4FragKernel(const float* a, const unsigned char* w,
   }
 }
 
+// Built-in "gemm_mxfp4_frag_batched": the prefill MXFP4 GEMM over the
+// fragment-order weight layout. One warp owns one n-tile (16 columns) and
+// eight activation rows; it reads the tile's 128 contiguous bytes once per
+// k-step and accumulates all eight rows, so the weight is read m/8 times, the
+// same traffic as gemm_mxfp4_batched. Buffers/scalars match gemm_mxfp4_batched
+// (a, w, c; m, n, k); k is a multiple of 16.
+__global__ void GemmMxFp4FragBatchedKernel(const float* a,
+                                           const unsigned char* w, float* c,
+                                           unsigned long long m,
+                                           unsigned long long n,
+                                           unsigned long long k) {
+  const unsigned long long warp =
+      (static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
+       threadIdx.x) /
+      32;
+  const unsigned long long lane = threadIdx.x & 31u;
+  const unsigned long long tiles = (n + 15) / 16;
+  const unsigned long long groups = (m + 7) / 8;
+  if (warp >= tiles * groups) {
+    return;
+  }
+  const unsigned long long g = warp / tiles;
+  const unsigned long long nt = warp % tiles;
+  const unsigned long long r0 = g * 8;
+  const unsigned long long n0 = nt * 16;
+  const unsigned long long ks_total = k / 16;
+  const unsigned long long blocks = k / 32;
+  const unsigned char* s = w + (n * k) / 2;
+  const unsigned long long sub = lane >> 4;
+  const unsigned long long r = lane & 15u;
+  const unsigned long long ncol = n0 + r;
+  const unsigned int* words = reinterpret_cast<const unsigned int*>(w);
+  float acc[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    acc[i] = 0.0f;
+  }
+  if (ncol < n) {
+    for (unsigned long long ks = 0; ks < ks_total; ++ks) {
+      unsigned int b = words[(nt * ks_total + ks) * 32 + sub * 16 + r];
+      const unsigned long long k0 = ks * 16 + sub * 8;
+      const float scale = E8M0ToFloatDev(s[ncol * blocks + ks / 2]);
+      float wv[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        wv[j] = scale * kE2M1Dev[b & 15u];
+        b >>= 4;
+      }
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        if (r0 + static_cast<unsigned long long>(i) < m) {
+          const float* a_row = a + (r0 + static_cast<unsigned long long>(i)) * k + k0;
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            acc[i] = fmaf(a_row[j], wv[j], acc[i]);
+          }
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float v = acc[i] + __shfl_xor(acc[i], 16);
+    if (ncol < n && sub == 0 && (r0 + static_cast<unsigned long long>(i)) < m) {
+      c[(r0 + static_cast<unsigned long long>(i)) * n + ncol] = v;
+    }
+  }
+}
+
 // Built-in "gemm_mxfp4_rows": the small-batch MXFP4 GEMV. One warp owns one
 // weight column (row_w) and accumulates every one of the m activation rows,
 // so the weight block is decoded and read once per column instead of once

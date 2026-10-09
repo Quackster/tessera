@@ -1105,6 +1105,76 @@ TEST(BackendTest, GemmMxFp4FragMatchesRowGemm) {
   }
 }
 
+// The fragment-order batched GEMM (prefill, m > 16) must reproduce the
+// row-order batched GEMM on the same bytes, so a permuted trunk still prefills.
+TEST(BackendTest, GemmMxFp4FragBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto frag = backend->LoadKernel("gemm_mxfp4_frag_batched", {});
+  if (!frag) GTEST_SKIP() << "backend has no fragment-order batched MXFP4 GEMM";
+  constexpr std::size_t kN = 32, kK = 128, kM = 20, kBlocks = kK / 32;
+  std::mt19937 rng(31);
+  std::vector<std::byte> nib(kN * kK / 2);
+  for (auto& b : nib) b = static_cast<std::byte>(rng() & 0xFF);
+  std::vector<std::byte> scales(kN * kBlocks, std::byte(127));
+  std::vector<std::byte> roworder = nib;
+  roworder.insert(roworder.end(), scales.begin(), scales.end());
+  std::vector<std::byte> fragblob(nib.size());
+  ASSERT_TRUE(core::PermuteMxFp4ToWmma(nib, fragblob, kN, kK).has_value());
+  std::vector<std::byte> fragorder = fragblob;
+  fragorder.insert(fragorder.end(), scales.begin(), scales.end());
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) v = DrawValue(rng);
+  std::vector<float> c_row(kM * kN, 0.0f), c_frag(kM * kN, 0.0f);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_row = backend->AllocateBuffer(roworder.size(), MemoryKind::Device);
+  auto w_frag = backend->AllocateBuffer(fragorder.size(), MemoryKind::Device);
+  auto c_row_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  auto c_frag_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && w_row && w_frag && c_row_buf && c_frag_buf);
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(
+                                               a.data()),
+                                           a.size() * 4)).has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_row, std::span<const std::byte>(roworder))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_frag, std::span<const std::byte>(fragorder))
+                  .has_value());
+  auto rowk = backend->LoadKernel("gemm_mxfp4_batched", {});
+  ASSERT_TRUE(rowk.has_value());
+  {
+    tessera::KernelLaunch launch;
+    launch.grid_x = static_cast<std::uint32_t>(((kM + 7) / 8) * kN);
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_row).get(), (*c_row_buf).get()};
+    launch.scalars = {kM, kN, kK};
+    ASSERT_TRUE(backend->LaunchKernel(**rowk, launch).has_value());
+  }
+  {
+    const std::size_t tiles = (kN + 15) / 16, groups = (kM + 7) / 8;
+    tessera::KernelLaunch launch;
+    launch.grid_x = static_cast<std::uint32_t>((tiles * groups + 7) / 8);
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_frag).get(), (*c_frag_buf).get()};
+    launch.scalars = {kM, kN, kK};
+    ASSERT_TRUE(backend->LaunchKernel(**frag, launch).has_value());
+  }
+  backend->Synchronize();
+  ASSERT_TRUE(backend
+                  ->CopyD2H(**c_row_buf,
+                            reinterpret_cast<std::byte*>(c_row.data()),
+                            c_row.size() * 4)
+                  .has_value());
+  ASSERT_TRUE(backend
+                  ->CopyD2H(**c_frag_buf,
+                            reinterpret_cast<std::byte*>(c_frag.data()),
+                            c_frag.size() * 4)
+                  .has_value());
+  for (std::size_t i = 0; i < c_row.size(); ++i) {
+    EXPECT_NEAR(c_row[i], c_frag[i], 1e-3f * (1.0f + std::abs(c_row[i])));
+  }
+}
+
 // Random weight bytes with small exact scales patched into every
 // block (d=2^-7, dmin=0.5 where present). Small magnitudes keep fma
 // order differences inside the tolerance; the reference and the

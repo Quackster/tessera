@@ -49,6 +49,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_mxfp4", reinterpret_cast<void*>(&GemmMxFp4Kernel)},
     {"gemm_mxfp4_frag", reinterpret_cast<void*>(&GemmMxFp4FragKernel)},
     {"gemm_mxfp4_batched", reinterpret_cast<void*>(&GemmMxFp4BatchedKernel)},
+    {"gemm_mxfp4_frag_batched",
+     reinterpret_cast<void*>(&GemmMxFp4FragBatchedKernel)},
     {"gemm_mxfp4_rows", reinterpret_cast<void*>(&GemmMxFp4RowsKernel)},
     {"gemm_mxfp4_wmma", reinterpret_cast<void*>(&GemmMxFp4WmmaKernel)},
     {"gemm_mxfp4_wmma_reduce",

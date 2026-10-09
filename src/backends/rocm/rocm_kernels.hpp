@@ -158,6 +158,11 @@ __global__ void GemmMxFp4BatchedKernel(const float* a, const unsigned char* w,
                                        float* c, unsigned long long m,
                                        unsigned long long n,
                                        unsigned long long k);
+__global__ void GemmMxFp4FragBatchedKernel(const float* a,
+                                           const unsigned char* w, float* c,
+                                           unsigned long long m,
+                                           unsigned long long n,
+                                           unsigned long long k);
 __global__ void GemmMxFp4RowsKernel(const float* a, const unsigned char* w,
                                     float* c, unsigned long long m,
                                     unsigned long long n, unsigned long long k);
