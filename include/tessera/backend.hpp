@@ -281,6 +281,10 @@ class Kernel {
 // "cast_f32_f16": buffer 0 is In (fp32, n elements), buffer 1 the
 // output (fp16, n elements, two per uint); scalar n (must be even). The
 // dispatch is ceil(n/2 / 256).
+// "round_bf16": buffer 0 is the fp32 data rounded in place to bfloat16
+// (round to nearest even), keeping fp32 storage; scalar n. This is the
+// bf16 activation rounding the served target's fused epilogues apply. The
+// dispatch is ceil(n / 256).
 // "concat_features": buffer 0 is In (fp32, n x rows x features),
 // buffer 1 the output Out (fp32, rows x n*features); scalars are n, rows
 // and features. This stacks feature vectors along the feature axis. The
@@ -627,6 +631,12 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[0] % 2 != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "round_bf16") {
+    if (launch.buffers.size() != 1 || launch.scalars.size() != 1 ||
+        launch.scalars[0] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

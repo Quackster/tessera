@@ -57,21 +57,44 @@ std::expected<void, StatusCode> ProjectBatch(
       !quantized) {
     return quantized;
   }
+  std::expected<void, StatusCode> projected = {};
+  bool projected_done = false;
   if (m > 1 && !detail::GemmTiledKernelName(dtype).empty()) {
     auto tiled = detail::GemmTiledFor(backend, h.gemm_tiled, dtype);
     if (tiled) {
-      return detail::ProjectTiledDevice(backend, **tiled, a, w, out, m, n, k);
-    }
-    if (tiled.error() != StatusCode::UnsupportedFeature) {
+      projected = detail::ProjectTiledDevice(backend, **tiled, a, w, out, m, n,
+                                             k);
+      projected_done = true;
+    } else if (tiled.error() != StatusCode::UnsupportedFeature) {
       return std::unexpected(tiled.error());
     }
-    // The backend has no tiled kernel for this dtype; use the GEMV one.
+    // The backend has no tiled kernel for this dtype; fall through to GEMV.
   }
-  auto gemm = detail::GemmFor(backend, h.gemms, dtype);
-  if (!gemm) {
-    return std::unexpected(gemm.error());
+  if (!projected_done) {
+    auto gemm = detail::GemmFor(backend, h.gemms, dtype);
+    if (!gemm) {
+      return std::unexpected(gemm.error());
+    }
+    projected = detail::ProjectDevice(backend, **gemm, a, w, out, m, n, k);
   }
-  return detail::ProjectDevice(backend, **gemm, a, w, out, m, n, k);
+  if (!projected) {
+    return projected;
+  }
+  // The served target rounds every linear output to bf16 (the GEMM C is
+  // bf16 and the fused epilogue stores a bf16 residual). Opt in for the
+  // DFlash2 aux-value match; the default fp32 path is unchanged.
+  const char* bf16 = std::getenv("TESSERA_TARGET_BF16");
+  if (bf16 != nullptr && std::atoi(bf16) != 0) {
+    if (h.bf16_kernel == nullptr) {
+      auto kernel = backend.LoadKernel("round_bf16", {});
+      if (!kernel) {
+        return std::unexpected(kernel.error());
+      }
+      h.bf16_kernel = std::move(*kernel);
+    }
+    return detail::RoundBf16Device(backend, *h.bf16_kernel, out, m * n);
+  }
+  return {};
 }
 
 }  // namespace tessera::models::qwen3_5

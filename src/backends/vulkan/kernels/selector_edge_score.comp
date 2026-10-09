@@ -46,5 +46,5 @@ void main() {
     dot += predecessor[pred_row + r] * hidden[hidden_row + r] *
            successor[succ_row + r];
   }
-  out_scores[index] = unary[pos * top_k + p] + dot;
+  out_scores[index] = unary[pos * top_k + c] + dot;
 }

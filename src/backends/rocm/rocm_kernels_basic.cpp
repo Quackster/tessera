@@ -288,6 +288,22 @@ __global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
   c[idx] = acc;
 }
 
+// Built-in "round_bf16": one thread per element; round each fp32 value to
+// bfloat16 (round to nearest even), keeping it in fp32. This is the bf16
+// activation rounding the served target's fused epilogues apply.
+__global__ void RoundBf16Kernel(float* x, unsigned long long n) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  unsigned int bits;
+  memcpy(&bits, &x[i], sizeof(bits));
+  bits += 0x7FFFu + ((bits >> 16) & 1u);
+  bits &= 0xFFFF0000u;
+  memcpy(&x[i], &bits, sizeof(bits));
+}
+
 // Built-in "gemm_f32": C = A x W^T with fp32 sequential accumulation.
 __global__ void GemmF32Kernel(const float* a, const float* w, float* c,
                               unsigned long long m, unsigned long long n,
@@ -1278,7 +1294,7 @@ __global__ void SelectorEdgeScoreKernel(
     dot = fmaf(predecessor_codebook[pred_row + r] * hidden[hidden_row + r],
                successor_codebook[succ_row + r], dot);
   }
-  out_scores[index] = unary[pos * top_k + p] + dot;
+  out_scores[index] = unary[pos * top_k + c] + dot;
 }
 
 }  // namespace tessera::backends::rocm

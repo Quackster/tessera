@@ -1,0 +1,24 @@
+#version 450
+
+// One thread per element; dispatch ceil(n / 256).
+layout(local_size_x = 256) in;
+
+// "round_bf16" contract: buffer 0 is the fp32 data rounded in place to
+// bfloat16 (round to nearest even), scalar n (v[0]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer Data { float data[]; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint n = pc.v[0];
+  if (i >= n) {
+    return;
+  }
+  uint bits = floatBitsToUint(data[i]);
+  bits += 0x7FFFu + ((bits >> 16) & 1u);
+  bits &= 0xFFFF0000u;
+  data[i] = uintBitsToFloat(bits);
+}

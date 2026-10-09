@@ -96,6 +96,23 @@ inline std::expected<std::vector<float>, StatusCode> DownloadF32(
 // reallocating the whole cache.
 constexpr std::size_t kInitialKvRows = 4;
 
+// Round an fp32 buffer (n elements) in place to bfloat16, for the served
+// target's bf16 activation epilogues.
+inline std::expected<void, StatusCode> RoundBf16Device(Backend& backend,
+                                                       const Kernel& kernel,
+                                                       Buffer& x,
+                                                       std::size_t n) {
+  if (n == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((n + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {&x};
+  launch.scalars = {n};
+  return backend.LaunchKernel(kernel, launch);
+}
+
 // Cast an fp32 buffer (n elements) to a packed fp16 buffer (n*2 bytes).
 inline std::expected<void, StatusCode> CastF16Device(
     Backend& backend, const Kernel& kernel, const Buffer& in, Buffer& out,

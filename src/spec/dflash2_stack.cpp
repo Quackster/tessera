@@ -67,7 +67,8 @@ std::expected<void, StatusCode> DraftStackDevice(
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    const Buffer* context_hidden, std::size_t ctx, bool causal) {
+    const Buffer* context_hidden, std::size_t ctx, bool causal,
+    const std::vector<DraftContextKvView>* context_kv) {
   if (rows == 0 || hidden_dim == 0 || layers.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -88,11 +89,14 @@ std::expected<void, StatusCode> DraftStackDevice(
   Buffer* in = h_a->get();
   Buffer* out_swap = h_b->get();
   for (std::size_t l = 0; l < layers.size(); ++l) {
+    const DraftContextKvView view =
+        context_kv != nullptr ? (*context_kv)[l] : DraftContextKvView{};
     auto status = DraftLayerDevice(
         backend, rmsnorm, gemm, conv, rope, attention, silu, add, *in,
         l == 0 ? nullptr : residual->get(), layers[l], *out_swap, **residual,
         rows, hidden_dim, heads, kv_heads, head_dim, ffn, taps, group_size,
-        block_size, window, pos_base, theta, eps, context_hidden, ctx, causal);
+        block_size, window, pos_base, theta, eps,
+        view.k != nullptr ? nullptr : context_hidden, ctx, causal, view);
     if (!status) {
       return std::unexpected(status.error());
     }

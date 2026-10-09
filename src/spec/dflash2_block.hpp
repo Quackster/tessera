@@ -8,6 +8,7 @@
 
 #include "tessera/backend.hpp"
 #include "tessera/types.hpp"
+#include "spec/dflash2_context.hpp"
 #include "spec/dflash2_layer.hpp"
 
 namespace tessera::spec {
@@ -38,13 +39,16 @@ namespace tessera::spec {
 // concat (concat_features) and quantize (quantize_fp8, the per-token
 // activation QDQ the drafter was trained on). Scratch is allocated
 // internally.
+// When `context_kv` is non-null the draft attends over the precomputed
+// per-layer context K/V (ctx rows) and `aux`/`fc_w` are ignored; otherwise
+// the fused context is computed from `aux` (n x ctx x features) and `fc_w`.
 [[nodiscard]] std::expected<void, StatusCode> DraftBlockDevice(
     Backend& backend, const Kernel& rmsnorm, const Kernel& gemm,
     const Kernel& head_gemm, const Kernel& conv, const Kernel& rope,
     const Kernel& attention,
     const Kernel& silu, const Kernel& add, const Kernel& concat,
     const Kernel& quantize,
-    const Buffer& mask_embeds, const Buffer& aux, const Buffer& fc_w,
+    const Buffer& mask_embeds, const Buffer* aux, const Buffer* fc_w,
     const std::vector<DraftLayerBuffers>& layers, const Buffer& final_norm,
     const Buffer& output_w, Buffer& logits, std::size_t rows,
     std::size_t ctx, std::size_t hidden_dim, std::size_t n,
@@ -52,6 +56,7 @@ namespace tessera::spec {
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    bool causal = true, Buffer* hidden_out = nullptr);
+    bool causal = true, Buffer* hidden_out = nullptr,
+    const std::vector<DraftContextKvView>* context_kv = nullptr);
 
 }  // namespace tessera::spec

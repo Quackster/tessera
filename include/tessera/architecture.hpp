@@ -88,22 +88,31 @@ class Architecture {
   // Several tokens in one batched forward, advancing the cache by all of
   // them. `logits_out` receives one vocab row per token when all_logits is
   // true, otherwise only the last row; `embedding` supplies one embedding
-  // per row when non-null.
+  // per row when non-null. `capture_layers` names the block indices whose
+  // per-row residual hidden is copied into the matching `capture` buffer
+  // (each sized rows*hidden), for a drafter that conditions on every
+  // position; nullptr skips capture.
   [[nodiscard]] virtual std::expected<void, StatusCode> ForwardBatch(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
       std::vector<float>* hidden_out, bool all_logits,
-      const Buffer* embeddings) const = 0;
+      const Buffer* embeddings,
+      const std::vector<std::size_t>* capture_layers = nullptr,
+      std::vector<Buffer*>* capture = nullptr) const = 0;
 
   // Score a draft against the target with rollback: accept the matching
   // prefix, leaving the cache at it, and return the bonus token. The
   // generic sequential verifier is in src/core; architectures override
-  // this to batch the scoring.
+  // this to batch the scoring. `capture` mirrors ForwardBatch and receives
+  // the per-row residual hidden at `capture_layers` for every scored row,
+  // so a caller can keep the hidden of each accepted position as context.
   [[nodiscard]] virtual std::expected<DraftVerification, StatusCode> Verify(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits,
-      std::vector<float>* hidden_out) const = 0;
+      std::vector<float>* hidden_out,
+      const std::vector<std::size_t>* capture_layers = nullptr,
+      std::vector<Buffer*>* capture = nullptr) const = 0;
 
   // One multi-token-prediction draft step: fuse the token embedding and
   // the backbone hidden, run the draft block and return the drafted

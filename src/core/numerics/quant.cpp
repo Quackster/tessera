@@ -228,6 +228,20 @@ std::expected<void, StatusCode> QuantizeFp8PackRef(
   return {};
 }
 
+std::expected<void, StatusCode> RoundBf16Ref(std::span<float> x) {
+  if (x.empty()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (float& value : x) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7FFFu + ((bits >> 16) & 1u);
+    bits &= 0xFFFF0000u;
+    std::memcpy(&value, &bits, sizeof(bits));
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> CastF32F16Ref(std::span<const float> in,
                                               std::span<std::byte> out) {
   if (in.size() % 2 != 0 || out.size() != in.size() * 2) {

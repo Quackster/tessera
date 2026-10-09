@@ -7,6 +7,7 @@
 
 #include "tessera/backend.hpp"
 #include "tessera/types.hpp"
+#include "spec/dflash2_context.hpp"
 
 namespace tessera::spec {
 
@@ -82,6 +83,6 @@ struct DraftLayerBuffers {
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
     const Buffer* context_hidden = nullptr, std::size_t ctx = 0,
-    bool causal = true);
+    bool causal = true, DraftContextKvView context_kv = {});
 
 }  // namespace tessera::spec

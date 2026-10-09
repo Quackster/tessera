@@ -20,14 +20,16 @@ std::expected<void, StatusCode> DraftCandidates(
   std::vector<std::uint32_t> row_ids(vocab);
   for (std::size_t r = 0; r < rows; ++r) {
     const float* row = logits.data() + r * vocab;
+    // Reset every element each row: keeping the vector at size `vocab` (rather
+    // than resizing to `top_k`) is what lets the next row rank the whole
+    // vocabulary. Sorting only the `top_k` prefix leaves the rest untouched.
     std::iota(row_ids.begin(), row_ids.end(), 0);
     const auto greater = [row](std::uint32_t a, std::uint32_t b) {
       return row[a] > row[b];
     };
     std::nth_element(row_ids.begin(), row_ids.begin() + top_k, row_ids.end(),
                      greater);
-    row_ids.resize(top_k);
-    std::sort(row_ids.begin(), row_ids.end(), greater);
+    std::sort(row_ids.begin(), row_ids.begin() + top_k, greater);
     for (std::size_t k = 0; k < top_k; ++k) {
       ids[r * top_k + k] = row_ids[k];
       unary[r * top_k + k] = row[row_ids[k]];

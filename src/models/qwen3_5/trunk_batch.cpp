@@ -331,7 +331,8 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
     std::vector<float>* hidden_out, bool all_logits,
-    const Buffer* embeddings) const {
+    const Buffer* embeddings, const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture) const {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -387,6 +388,21 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
                                   triples.size() * 8))) {
     return std::unexpected(StatusCode::DeviceError);
   }
+  // Optionally copy the per-row residual hidden after selected layers, for
+  // the DFlash2 draft's target hidden states at every scored position.
+  const auto capture_layer = [&](std::size_t layer) -> StatusCode {
+    if (capture_layers == nullptr || capture == nullptr) {
+      return StatusCode::Ok;
+    }
+    for (std::size_t i = 0; i < capture_layers->size(); ++i) {
+      if ((*capture_layers)[i] == layer &&
+          !backend.CopyD2D(*h.batch->x, 0, *(*capture)[i], 0,
+                           rows * hidden * 4)) {
+        return StatusCode::DeviceError;
+      }
+    }
+    return StatusCode::Ok;
+  };
   const std::uint64_t start = h.position;
   for (std::size_t l = 0; l < cfg.layers; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
@@ -395,11 +411,14 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
       if (!block) {
         return std::unexpected(block.error());
       }
-      continue;
+    } else {
+      auto block = RunLinearBlockBatch(backend, model, cfg, h, l, g, rows);
+      if (!block) {
+        return std::unexpected(block.error());
+      }
     }
-    auto block = RunLinearBlockBatch(backend, model, cfg, h, l, g, rows);
-    if (!block) {
-      return std::unexpected(block.error());
+    if (capture_layer(l) != StatusCode::Ok) {
+      return std::unexpected(StatusCode::DeviceError);
     }
   }
   h.position += rows;
@@ -461,7 +480,9 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
 std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const std::uint32_t> draft,
-    std::span<const float> prefix_logits, std::vector<float>* hidden_out) const {
+    std::span<const float> prefix_logits, std::vector<float>* hidden_out,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture) const {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -478,7 +499,8 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
   std::vector<float> flat;
   std::vector<float> last_hidden;
   auto status = ForwardBatch(backend, model, cache, draft, &flat, &last_hidden,
-                             /*all_logits=*/true, nullptr);
+                             /*all_logits=*/true, nullptr, capture_layers,
+                             capture);
   if (!status) {
     return std::unexpected(status.error());
   }

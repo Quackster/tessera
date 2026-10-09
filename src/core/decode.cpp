@@ -145,7 +145,9 @@ std::expected<std::vector<std::vector<float>>, StatusCode> DecodeLogitsBatch(
 std::expected<DraftVerification, StatusCode> VerifyDraft(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> draft,
-    std::span<const float> prefix_logits, std::vector<float>* hidden_out) {
+    std::span<const float> prefix_logits, std::vector<float>* hidden_out,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture) {
   if (prefix_logits.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -157,7 +159,8 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   // everything else feeds one token at a time and never over-advances.
   const Architecture* arch = model.Arch();
   if (draft.size() > 1 && arch != nullptr) {
-    return arch->Verify(backend, model, cache, draft, prefix_logits, hidden_out);
+    return arch->Verify(backend, model, cache, draft, prefix_logits, hidden_out,
+                        capture_layers, capture);
   }
   DraftVerification result;
   result.logits.assign(prefix_logits.begin(), prefix_logits.end());

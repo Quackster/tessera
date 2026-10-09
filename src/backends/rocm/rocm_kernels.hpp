@@ -127,6 +127,7 @@ __global__ void GemmFp8BlockKernel(const float* a, const unsigned char* w,
                                    unsigned long long m,
                                    unsigned long long n,
                                    unsigned long long k);
+__global__ void RoundBf16Kernel(float* x, unsigned long long n);
 __global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
                                float* c, unsigned long long m,
                                unsigned long long n,

@@ -56,6 +56,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"selector_edge_score", kSelectorEdgeScoreSpirV, sizeof(kSelectorEdgeScoreSpirV)},
     {"concat_features", kConcatFeaturesSpirV, sizeof(kConcatFeaturesSpirV)},
     {"cast_f32_f16", kCastF32F16SpirV, sizeof(kCastF32F16SpirV)},
+    {"round_bf16", kRoundBf16SpirV, sizeof(kRoundBf16SpirV)},
     {"quantize_q8", kQuantizeQ8SpirV, sizeof(kQuantizeQ8SpirV)},
     {"quantize_fp8", kQuantizeFp8SpirV, sizeof(kQuantizeFp8SpirV)},
     {"quantize_fp8_pack", kQuantizeFp8PackSpirV, sizeof(kQuantizeFp8PackSpirV)},

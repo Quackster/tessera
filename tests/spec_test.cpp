@@ -297,14 +297,21 @@ TEST(SpecDrafterTest, RunsRealDraftWhenProvided) {
     return std::move(*buffer);
   };
   auto mask = make(rows * hidden, 0.1f);
-  auto aux = make(n * ctx * hidden, 0.2f);
   auto outw = make(vocab * hidden, 0.3f);
   auto logits = backend.AllocateBuffer(rows * vocab * 4, tessera::MemoryKind::Device);
   ASSERT_TRUE(logits.has_value());
   auto head = backend.LoadKernel("gemm_f32", {});
   ASSERT_TRUE(head.has_value());
-  auto status = drafter->Run(backend, *mask, *aux, *outw, **head, **logits,
-                             rows, ctx, 0, vocab);
+  std::vector<std::unique_ptr<tessera::Buffer>> captures;
+  std::vector<const tessera::Buffer*> capture_ptrs;
+  for (std::size_t i = 0; i < n; ++i) {
+    captures.push_back(make(ctx * hidden, 0.2f));
+    capture_ptrs.push_back(captures.back().get());
+  }
+  auto appended = drafter->AppendContext(backend, capture_ptrs, ctx);
+  ASSERT_TRUE(appended.has_value()) << tessera::ToString(appended.error());
+  auto status = drafter->Run(backend, *mask, *outw, **head, **logits, rows, ctx,
+                             0, vocab);
   ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
   backend.Synchronize();
   std::vector<float> got(rows * vocab);

@@ -103,7 +103,8 @@ std::expected<void, StatusCode> DraftLayerDevice(
     std::size_t kv_heads, std::size_t head_dim, std::size_t ffn,
     std::size_t taps, std::size_t group_size, std::size_t block_size,
     std::size_t window, std::uint64_t pos_base, double theta, float eps,
-    const Buffer* context_hidden, std::size_t ctx, bool causal) {
+    const Buffer* context_hidden, std::size_t ctx, bool causal,
+    DraftContextKvView context_kv) {
   if (rows == 0 || hidden_dim == 0 || heads == 0 || kv_heads == 0 ||
       head_dim == 0 || ffn == 0 || taps == 0 || group_size == 0 ||
       block_size == 0 || hidden_dim % group_size != 0) {
@@ -157,26 +158,30 @@ std::expected<void, StatusCode> DraftLayerDevice(
   } else if (!AddDevice(backend, add, hidden, *residual, *pre, elements)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  Buffer* ctx_k = nullptr;
-  Buffer* ctx_v = nullptr;
-  if (ctx > 0) {
+  Buffer* computed_k = nullptr;
+  Buffer* computed_v = nullptr;
+  const bool have_context = context_kv.k != nullptr && context_kv.v != nullptr;
+  if (!have_context && ctx > 0) {
     if (context_hidden == nullptr || w.hidden_norm == nullptr) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
     Buffer* ctx_normed = alloc(ctx * hidden_dim);
-    ctx_k = alloc(ctx * kv_dim);
-    ctx_v = alloc(ctx * kv_dim);
-    if (ctx_normed == nullptr || ctx_k == nullptr || ctx_v == nullptr) {
+    computed_k = alloc(ctx * kv_dim);
+    computed_v = alloc(ctx * kv_dim);
+    if (ctx_normed == nullptr || computed_k == nullptr ||
+        computed_v == nullptr) {
       return std::unexpected(StatusCode::OutOfMemory);
     }
     auto context = DraftContextKvDevice(
         backend, rmsnorm, gemm, rope, *ctx_normed, *context_hidden,
-        *w.hidden_norm, *w.k_w, *w.v_w, *w.k_norm_w, *ctx_k, *ctx_v, ctx,
-        hidden_dim, kv_heads, head_dim, pos_base, theta, eps);
+        *w.hidden_norm, *w.k_w, *w.v_w, *w.k_norm_w, *computed_k, *computed_v,
+        ctx, hidden_dim, kv_heads, head_dim, pos_base, theta, eps);
     if (!context) {
       return std::unexpected(context.error());
     }
   }
+  const Buffer* ctx_k = have_context ? context_kv.k : computed_k;
+  const Buffer* ctx_v = have_context ? context_kv.v : computed_v;
   auto attn_status = DraftAttentionDevice(
       backend, rmsnorm, gemm, conv, rope, attention, *axn, *aproj, *ah1, *q,
       *k, *v, *attn, *oproj, *aside, *pre, *w.input_norm, *w.attn_conv_proj,

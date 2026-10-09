@@ -46,13 +46,17 @@ class Qwen35Architecture final : public Architecture {
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
       std::vector<float>* hidden_out, bool all_logits,
-      const Buffer* embeddings) const override;
+      const Buffer* embeddings,
+      const std::vector<std::size_t>* capture_layers,
+      std::vector<Buffer*>* capture) const override;
 
   [[nodiscard]] std::expected<DraftVerification, StatusCode> Verify(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits,
-      std::vector<float>* hidden_out) const override;
+      std::vector<float>* hidden_out,
+      const std::vector<std::size_t>* capture_layers,
+      std::vector<Buffer*>* capture) const override;
 
   [[nodiscard]] std::expected<std::uint32_t, StatusCode> Draft(
       Backend& backend, const Model& model, core::DecodeCache& cache,

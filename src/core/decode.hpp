@@ -186,6 +186,8 @@ DecodeLogitsBatch(Backend& backend, const Model& model, DecodeCache& cache,
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> draft,
     std::span<const float> prefix_logits,
-    std::vector<float>* hidden_out = nullptr);
+    std::vector<float>* hidden_out = nullptr,
+    const std::vector<std::size_t>* capture_layers = nullptr,
+    std::vector<Buffer*>* capture = nullptr);
 
 }  // namespace tessera::core

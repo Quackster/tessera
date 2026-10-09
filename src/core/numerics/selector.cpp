@@ -41,7 +41,7 @@ std::expected<void, StatusCode> SelectorEdgeScoreRef(
         for (std::size_t r = 0; r < rank; ++r) {
           dot = std::fma(pred[r] * hid[r], succ[r], dot);
         }
-        out[(pos * top_k + p) * top_k + c] = unary[cand_row + p] + dot;
+        out[(pos * top_k + p) * top_k + c] = unary[cand_row + c] + dot;
       }
     }
   }

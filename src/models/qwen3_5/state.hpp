@@ -50,6 +50,9 @@ struct Qwen35State final : core::ArchState {
   // W4A8 contract) and its per-row scale scratch, grown on demand.
   std::unique_ptr<Kernel> fp8_quant_kernel;
   std::unique_ptr<Buffer> fp8_scale;
+  // bf16 activation rounding of a projection output (the served target's
+  // fused epilogue), loaded on demand when TESSERA_TARGET_BF16 is set.
+  std::unique_ptr<Kernel> bf16_kernel;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;

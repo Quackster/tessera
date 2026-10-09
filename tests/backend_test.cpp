@@ -3600,6 +3600,41 @@ TEST(BackendTest, DflashConvDeviceMatchesRef) {
 }
 
 // Device: the DFlash2 candidate-selector edge score matches the reference.
+// The selector transition score adds the successor candidate's unary logit
+// (vLLM `_score_edges` maps `unary_logits[:, :, None]` onto the successor
+// axis), not the predecessor's. All-zero codebooks and hidden isolate the
+// unary term, so out[pos, p, c] must equal unary[pos, c] for every p.
+TEST(BackendTest, SelectorEdgeScoreUnaryIsSuccessor) {
+  constexpr std::size_t kSeq = 2;
+  constexpr std::size_t kTopK = 3;
+  constexpr std::size_t kRank = 2;
+  constexpr std::size_t kVocab = 4;
+  std::vector<float> pred(kVocab * kRank, 0.0f);
+  std::vector<float> succ(kVocab * kRank, 0.0f);
+  std::vector<float> hidden(kSeq * kRank, 0.0f);
+  std::vector<std::int32_t> cand = {0, 1, 2, 1, 2, 3};
+  std::vector<std::int32_t> anchor(kSeq, 0);
+  std::vector<float> unary = {10.0f, 20.0f, 30.0f, 40.0f, 50.0f, 60.0f};
+  std::vector<float> out(kSeq * kTopK * kTopK, 0.0f);
+  ASSERT_TRUE(core::SelectorEdgeScoreRef(
+                  std::span<const float>(pred), std::span<const float>(succ),
+                  std::span<const float>(hidden),
+                  std::span<const std::int32_t>(cand),
+                  std::span<const std::int32_t>(anchor),
+                  std::span<const float>(unary), std::span<float>(out), 1, kSeq,
+                  kTopK, kRank, kVocab)
+                  .has_value());
+  for (std::size_t pos = 0; pos < kSeq; ++pos) {
+    for (std::size_t p = 0; p < kTopK; ++p) {
+      for (std::size_t c = 0; c < kTopK; ++c) {
+        EXPECT_FLOAT_EQ(out[(pos * kTopK + p) * kTopK + c],
+                        unary[pos * kTopK + c])
+            << "pos " << pos << " p " << p << " c " << c;
+      }
+    }
+  }
+}
+
 TEST(BackendTest, SelectorEdgeScoreDeviceMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -4888,6 +4923,117 @@ TEST(BackendTest, DraftContextKvMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
+// Device: appending target hidden positions incrementally to the draft
+// context cache matches one batch fuse plus context K/V reference.
+TEST(BackendTest, DraftContextAppendMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(111);
+  constexpr std::size_t kN = 2, kFirst = 2, kSecond = 1, kTotal = 3;
+  constexpr std::size_t kHidden = 4, kKvHeads = 2, kHeadDim = 2;
+  constexpr double kTheta = 10000.0;
+  constexpr float kEps = 1e-6f;
+  const std::size_t kv_dim = kKvHeads * kHeadDim;
+  const std::size_t width = kN * kHidden;
+  auto rnd = [&rng](std::size_t n) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = DrawValue(rng);
+    return v;
+  };
+  std::vector<float> fc = rnd(kHidden * width);
+  std::vector<std::vector<float>> hnorm(kN), kp(kN), vp(kN), kn(kN), cap(kN);
+  for (std::size_t i = 0; i < kN; ++i) {
+    hnorm[i] = rnd(kHidden);
+    kp[i] = rnd(kv_dim * kHidden);
+    vp[i] = rnd(kv_dim * kHidden);
+    kn[i] = rnd(kHeadDim);
+    cap[i] = rnd(kTotal * kHidden);
+  }
+  auto upload = [&backend](const std::vector<float>& d) {
+    auto b = backend->AllocateBuffer(d.size() * 4, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(d.data()),
+                              d.size() * 4));
+    return std::move(*b);
+  };
+  auto fc_b = upload(fc);
+  std::vector<std::unique_ptr<tessera::Buffer>> hnorm_b(kN), kp_b(kN),
+      vp_b(kN), kn_b(kN);
+  std::vector<const tessera::Buffer*> hnorm_p(kN), kp_p(kN), vp_p(kN), kn_p(kN);
+  for (std::size_t i = 0; i < kN; ++i) {
+    hnorm_b[i] = upload(hnorm[i]);
+    kp_b[i] = upload(kp[i]);
+    vp_b[i] = upload(vp[i]);
+    kn_b[i] = upload(kn[i]);
+    hnorm_p[i] = hnorm_b[i].get();
+    kp_p[i] = kp_b[i].get();
+    vp_p[i] = vp_b[i].get();
+    kn_p[i] = kn_b[i].get();
+  }
+  auto rms = backend->LoadKernel("rmsnorm", {});
+  auto gemm = backend->LoadKernel("gemm_f32", {});
+  auto rope = backend->LoadKernel("rope", {});
+  auto concat = backend->LoadKernel("concat_features", {});
+  auto quantize = backend->LoadKernel("quantize_fp8", {});
+  ASSERT_TRUE(rms && gemm && rope && concat && quantize);
+  tessera::spec::DraftContextCache cache;
+  const auto append_rows = [&](std::size_t begin, std::size_t rows) {
+    std::vector<std::unique_ptr<tessera::Buffer>> parts(kN);
+    std::vector<const tessera::Buffer*> part_p(kN);
+    for (std::size_t i = 0; i < kN; ++i) {
+      std::vector<float> part(cap[i].begin() + begin * kHidden,
+                              cap[i].begin() + (begin + rows) * kHidden);
+      parts[i] = upload(part);
+      part_p[i] = parts[i].get();
+    }
+    return tessera::spec::DraftContextAppendDevice(
+        *backend, **rms, **gemm, **rope, **concat, **quantize, cache, part_p,
+        *fc_b, hnorm_p, kp_p, vp_p, kn_p, kN, kHidden, rows, kHidden, kKvHeads,
+        kHeadDim, kTheta, kEps);
+  };
+  ASSERT_TRUE(append_rows(0, kFirst).has_value());
+  ASSERT_TRUE(append_rows(kFirst, kSecond).has_value());
+  EXPECT_EQ(cache.rows, kTotal);
+  // Reference: one batch fuse over the concatenated aux, then the context
+  // K/V projection for layer 0.
+  std::vector<float> aux_ref(kN * kTotal * kHidden);
+  for (std::size_t i = 0; i < kN; ++i) {
+    for (std::size_t t = 0; t < kTotal; ++t) {
+      for (std::size_t f = 0; f < kHidden; ++f) {
+        aux_ref[(i * kTotal + t) * kHidden + f] = cap[i][t * kHidden + f];
+      }
+    }
+  }
+  std::vector<float> fused(kTotal * kHidden);
+  ASSERT_TRUE(tessera::spec::DraftFuseRef(
+                  std::span<const float>(aux_ref), std::span<const float>(fc),
+                  std::span<float>(fused), kN, kTotal, kHidden, kHidden)
+                  .has_value());
+  std::vector<float> k_ref(kTotal * kv_dim), v_ref(kTotal * kv_dim);
+  ASSERT_TRUE(tessera::spec::DraftContextKvRef(
+                  std::span<const float>(fused),
+                  std::span<const float>(hnorm[0]),
+                  std::span<const float>(kp[0]), std::span<const float>(vp[0]),
+                  std::span<const float>(kn[0]), std::span<float>(k_ref),
+                  std::span<float>(v_ref), kTotal, kHidden, kKvHeads, kHeadDim,
+                  0, kTheta, kEps)
+                  .has_value());
+  backend->Synchronize();
+  std::vector<float> k_got(kTotal * kv_dim), v_got(kTotal * kv_dim);
+  backend->CopyD2H(*cache.layers[0].k, reinterpret_cast<std::byte*>(k_got.data()),
+                   k_got.size() * 4);
+  backend->CopyD2H(*cache.layers[0].v, reinterpret_cast<std::byte*>(v_got.data()),
+                   v_got.size() * 4);
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < k_ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(k_ref[i] - k_got[i]));
+    max_abs = std::max(max_abs, std::abs(v_ref[i] - v_got[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
 // Device: the DFlash2 attention half with a context K/V prefix (queries
 // follow the context in position) matches the host reference.
 TEST(BackendTest, DraftAttentionContextMatchesRef) {
@@ -5075,7 +5221,7 @@ TEST(BackendTest, DraftBlockMatchesRef) {
               quantize);
   auto device = tessera::spec::DraftBlockDevice(
       *backend, **rms, **gemm, **gemm, **conv, **rope, **attn, **silu, **add,
-      **concat, **quantize, *mask_b, *aux_b, *fc_b, dev_layers, *fnormal_b,
+      **concat, **quantize, *mask_b, aux_b, fc_b, dev_layers, *fnormal_b,
       *outw_b, **logits_b,
       kRows, kCtx, kHidden, kN, kFeatures, kVocab, kHeads, kKvHeads, kHeadDim,
       kFfn, kTaps, kGroup, kBlock, kWindow, 0, kTheta, kEps);
@@ -5174,6 +5320,31 @@ TEST(BackendTest, DraftCandidatesTopK) {
       std::span<float>(unary), kRows, kVocab, kVocab + 1);
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), tessera::StatusCode::InvalidArgument);
+}
+
+// Host: every row ranks the whole vocabulary. A candidate id >= top_k on a
+// row after the first catches a shrinking reusable index vector (the old bug
+// left later rows searching only ids 0..top_k-1).
+TEST(BackendTest, DraftCandidatesRanksWholeVocabPerRow) {
+  constexpr std::size_t kRows = 2, kVocab = 8, kTopK = 3;
+  const std::vector<float> logits = {
+      0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.9f, 0.6f,   // row 0: top 6,7,5
+      0.7f, 0.6f, 0.1f, 0.2f, 0.0f, 0.8f, 0.3f, 0.9f};  // row 1: top 7,5,0
+  std::vector<std::uint32_t> ids(kRows * kTopK);
+  std::vector<float> unary(kRows * kTopK);
+  ASSERT_TRUE(tessera::spec::DraftCandidates(
+                  std::span<const float>(logits), std::span<std::uint32_t>(ids),
+                  std::span<float>(unary), kRows, kVocab, kTopK)
+                  .has_value());
+  EXPECT_EQ(ids[0], 6u);
+  EXPECT_EQ(ids[1], 7u);
+  EXPECT_EQ(ids[2], 5u);
+  EXPECT_EQ(ids[3], 7u);
+  EXPECT_EQ(ids[4], 5u);
+  EXPECT_EQ(ids[5], 0u);
+  for (std::size_t i = 0; i < kRows * kTopK; ++i) {
+    EXPECT_FLOAT_EQ(unary[i], logits[(i / kTopK) * kVocab + ids[i]]);
+  }
 }
 
 // Device: fp16 keys/values attention (kv_f16) matches the fp16 host
@@ -5277,6 +5448,47 @@ TEST(BackendTest, CastF32F16MatchesRef) {
 }
 
 // Device: symmetric int8 quantization matches the host reference.
+// Device: bf16 rounding (round to nearest even) matches the host reference
+// and keeps exact bf16 values unchanged.
+TEST(BackendTest, RoundBf16MatchesRef) {
+  std::vector<float> known = {1.0f, -2.5f, 0.0f, 448.0f};
+  std::vector<float> known_ref = known;
+  ASSERT_TRUE(core::RoundBf16Ref(std::span<float>(known_ref)).has_value());
+  for (std::size_t i = 0; i < known.size(); ++i) {
+    EXPECT_FLOAT_EQ(known_ref[i], known[i]);
+  }
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(112);
+  constexpr std::size_t kN = 8;
+  std::vector<float> in(kN);
+  for (auto& v : in) v = DrawValue(rng) * 4.0f;
+  std::vector<float> ref = in;
+  ASSERT_TRUE(core::RoundBf16Ref(std::span<float>(ref)).has_value());
+  auto buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(
+                  **buf, std::span<const std::byte>(
+                             reinterpret_cast<const std::byte*>(in.data()),
+                             in.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("round_bf16", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {buf->get()};
+  launch.scalars = {kN};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<float> got(kN);
+  backend->CopyD2H(**buf, reinterpret_cast<std::byte*>(got.data()),
+                   got.size() * 4);
+  for (std::size_t i = 0; i < kN; ++i) {
+    EXPECT_FLOAT_EQ(got[i], ref[i]) << "element " << i;
+  }
+}
+
 TEST(BackendTest, QuantizeQ8MatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);

@@ -63,39 +63,45 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     block = options.draft_tokens;
   }
   const std::size_t n = draft_config->target_layer_ids.size();
-  // Number of prefix target positions the draft block conditions on, not
-  // counting the anchor. vLLM's draft context is the prefix up to the
-  // anchor; the anchor itself is query 0, not context.
-  std::size_t ctx_window = 1;
+  // The draft conditions on the prefix up to the anchor, capped by the
+  // checkpoint's sliding window (vLLM's context), so a short sequence uses
+  // its whole prefix. TESSERA_DFLASH2_CTX overrides the cap for experiments;
+  // a checkpoint window of 0 means unlimited.
+  std::size_t ctx_window = draft_config->sliding_window;
   if (const char* env = std::getenv("TESSERA_DFLASH2_CTX"); env != nullptr) {
     const int v = std::atoi(env);
     if (v > 0) {
       ctx_window = static_cast<std::size_t>(v);
     }
   }
-  const std::size_t hist_window = ctx_window + 1;
+  // The cache holds the context rows plus the current anchor, so the cap is
+  // one more than the context window (0 keeps every position).
+  drafter->SetContextLimit(ctx_window == 0 ? 0 : ctx_window + 1);
   const std::size_t query_rows = block + 1;
   std::vector<std::size_t> capture_layers(draft_config->target_layer_ids.begin(),
                                           draft_config->target_layer_ids.end());
   std::vector<std::unique_ptr<Buffer>> capture_storage;
   std::vector<Buffer*> captures;
+  std::vector<std::unique_ptr<Buffer>> verify_storage;
+  std::vector<Buffer*> verify_captures;
   for (std::size_t i = 0; i < n; ++i) {
     auto buffer = backend.AllocateBuffer(hidden * 4, MemoryKind::Device);
-    if (!buffer) {
+    auto batch = backend.AllocateBuffer(block * hidden * 4, MemoryKind::Device);
+    if (!buffer || !batch) {
       return std::unexpected(StatusCode::OutOfMemory);
     }
     capture_storage.push_back(std::move(*buffer));
     captures.push_back(capture_storage.back().get());
+    verify_storage.push_back(std::move(*batch));
+    verify_captures.push_back(verify_storage.back().get());
   }
-  auto aux =
-      backend.AllocateBuffer(n * ctx_window * hidden * 4, MemoryKind::Device);
   auto logits =
       backend.AllocateBuffer(query_rows * vocab * 4, MemoryKind::Device);
   auto draft_hidden =
       backend.AllocateBuffer(query_rows * hidden * 4, MemoryKind::Device);
   auto sel_hidden =
       backend.AllocateBuffer(block * hidden * 4, MemoryKind::Device);
-  if (!aux || !logits || !draft_hidden || !sel_hidden) {
+  if (!logits || !draft_hidden || !sel_hidden) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   auto selector_gemm = backend.LoadKernel("gemm_f32", {});
@@ -113,23 +119,14 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     return std::vector<std::uint32_t>{};
   }
   std::vector<float> hidden_state;
-  std::vector<std::vector<std::vector<float>>> hist(n);
-  const auto push_capture = [&]() -> std::expected<void, StatusCode> {
-    for (std::size_t i = 0; i < n; ++i) {
-      auto down = core::detail::DownloadF32(backend, *captures[i]);
-      if (!down) {
-        return std::unexpected(down.error());
-      }
-      hist[i].push_back(std::move(*down));
-      if (hist[i].size() > hist_window) {
-        hist[i].erase(hist[i].begin());
-      }
-    }
-    return {};
+  const std::vector<const Buffer*> capture_ptrs(captures.begin(),
+                                                captures.end());
+  const auto append_capture = [&]() {
+    return drafter->AppendContext(backend, capture_ptrs, 1);
   };
-  // Capture the aux hiddens of every prompt position, not just the last.
-  // vLLM's draft context is the whole prefix up to the anchor, so the early
-  // prompt positions are context too; dropping them starves the draft.
+  // Capture the aux hidden of every prompt position: vLLM's draft context
+  // is the whole prefix up to the anchor, so the early prompt positions are
+  // context too.
   for (std::size_t i = 0; i + 1 < prompt.size(); ++i) {
     auto forward = core::DecodeForward(backend, target, cache, prompt[i],
                                        &hidden_state, nullptr, &capture_layers,
@@ -137,8 +134,8 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (!forward) {
       return std::unexpected(forward.error());
     }
-    if (auto pushed = push_capture(); !pushed) {
-      return std::unexpected(pushed.error());
+    if (auto appended = append_capture(); !appended) {
+      return std::unexpected(appended.error());
     }
   }
   auto first = core::DecodeLogits(backend, target, cache, prompt.back(),
@@ -146,8 +143,8 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
   if (!first) {
     return std::unexpected(first.error());
   }
-  if (auto pushed = push_capture(); !pushed) {
-    return std::unexpected(pushed.error());
+  if (auto appended = append_capture(); !appended) {
+    return std::unexpected(appended.error());
   }
   std::vector<std::uint32_t> produced;
   produced.reserve(max_tokens);
@@ -170,22 +167,13 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (!current) {
       return std::unexpected(current.error());
     }
-    if (auto pushed = push_capture(); !pushed) {
-      return std::unexpected(pushed.error());
+    if (auto appended = append_capture(); !appended) {
+      return std::unexpected(appended.error());
     }
-    // The anchor (bonus) is the last generated token. vLLM's draft layout is
-    // 1+N: query 0 is the anchor, queries 1..N are mask tokens, and only the
-    // mask rows predict. The context is the prefix before the anchor, so the
-    // anchor's own hidden is excluded from `aux`.
-    const std::size_t ctx = hist[0].size() - 1;
-    std::vector<float> aux_host(n * ctx * hidden);
-    for (std::size_t i = 0; i < n; ++i) {
-      for (std::size_t t = 0; t < ctx; ++t) {
-        std::copy(hist[i][t].begin(), hist[i][t].end(),
-                  aux_host.begin() + (i * ctx + t) * hidden);
-      }
-    }
-    if (!core::detail::UploadF32(backend, **aux, aux_host)) {
+    // The anchor (bonus) is the last committed token; the context is the
+    // prefix before it, so the draft uses all but the last cache row.
+    const std::size_t ctx = drafter->ContextRows() - 1;
+    if (ctx == 0) {
       return std::unexpected(StatusCode::DeviceError);
     }
     auto query = QueryEmbeddings(backend, *embed, next,
@@ -193,12 +181,11 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
     if (!query) {
       return std::unexpected(query.error());
     }
-    // Block-local positions: the context occupies 0..ctx-1 and the queries
-    // ctx..ctx+block (anchor first, then the masks), preserving the relative
-    // distances the attention mask, RoPE and grouped convolution expect.
-    auto run = drafter->Run(backend, **query, **aux, *output->device,
-                            **head_gemm, **logits, query_rows, ctx,
-                            /*pos_base=*/0, vocab, draft_hidden->get());
+    // The draft attends over the cached context (absolute positions
+    // ContextBase()..) and the query block (anchor first, then the masks).
+    auto run = drafter->Run(backend, **query, *output->device, **head_gemm,
+                            **logits, query_rows, ctx, drafter->ContextBase(),
+                            vocab, draft_hidden->get());
     if (!run) {
       return std::unexpected(run.error());
     }
@@ -286,9 +273,21 @@ std::expected<std::vector<std::uint32_t>, StatusCode> GenerateDFlash2(
       }
     }
     auto verify = core::VerifyDraft(backend, target, cache, draft_tokens,
-                                    *current, &hidden_state);
+                                    *current, &hidden_state, &capture_layers,
+                                    &verify_captures);
     if (!verify) {
       return std::unexpected(verify.error());
+    }
+    // Keep the accepted positions in the context; the rejected rows are
+    // dropped with the cache rollback.
+    if (verify->accepted > 0) {
+      const std::vector<const Buffer*> verify_ptrs(verify_captures.begin(),
+                                                   verify_captures.end());
+      if (auto appended = drafter->AppendContext(backend, verify_ptrs,
+                                                 verify->accepted);
+          !appended) {
+        return std::unexpected(appended.error());
+      }
     }
     ++steps;
     proposed += draft_tokens.size();

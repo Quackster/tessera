@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 268/268 on both builds.
+`ctest` passes 275/275 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -1662,7 +1662,131 @@ through RADV GFX1201, rocm through the system ROCm).
    improvement with the same tokens (`11751, 13, 198, 760`), so the fp32
    reassociation did not change the output. 271/271 `ctest` on both builds.
 
+- 2026-10-09: **DFlash2 device-resident draft context.** The draft now
+   conditions on the committed prefix through a device K/V cache instead of
+   one host-assembled position. `DFlash2Drafter::AppendContext` takes the
+   target hidden at every capture layer for the newly committed positions,
+   fuses it (`fc`), normalizes it (`hidden_norm`), and computes each draft
+   layer's context K/V once (k_proj/v_proj, K-norm, RoPE at the absolute
+   position), appending into a per-layer buffer that grows geometrically.
+   `DraftContextAppendDevice` does the work; a context cap
+   (`SetContextLimit`, `TESSERA_DFLASH2_CTX`) keeps only the most recent
+   rows and advances the base. `Run` reads the cache and
+   `DraftBlockDevice`/`DraftStackDevice`/`DraftLayerDevice` gained an
+   optional precomputed context K/V view, so the per-step host assembly, the
+   `UploadF32` and the O(ctx) host memory are gone. `VerifyDraft` /
+   `Architecture::Verify` / `ForwardBatch` regained the capture hooks so the
+   accepted positions' hidden is kept. The new
+   `BackendTest.DraftContextAppendMatchesRef` pins the incremental append
+   against one batch fuse plus `DraftContextKvRef`; 272/272 `ctest` on both
+   builds. Measured on the 27B MXFP4 target (ROCm, GPU1, 16 tokens): context
+   1, 8 and the checkpoint window (2048) accept 3 of 84, 2 of 91 and 1 of 98,
+   all the same within the known bimodal noise. So the context width is not
+   the acceptance blocker either; the remaining suspect is the target's
+   fused-bf16 / W4A8 activation numerics (see the urgent Next item). The
+   default context window is the checkpoint's `sliding_window` (2048, full
+   prefix for a short sequence), matching the reference.
+
+- 2026-10-09: **bf16 target activation mode (DFlash2 aux-value test).** New
+   generic "round_bf16" built-in (Vulkan and ROCm) rounds fp32 to bfloat16
+   in place (round to nearest even), with the host reference `RoundBf16Ref`
+   and `BackendTest.RoundBf16MatchesRef`. With `TESSERA_TARGET_BF16=1`,
+   `ProjectBatch` rounds every linear output to bf16, the served target's
+   bf16 GEMM output. Measured on the 27B MXFP4 target (ROCm, GPU1,
+   `TESSERA_DFLASH2_CTX=1`, 16 tokens): bf16 GEMM output plus W4A8 plus fp8
+   KV accepts 3 of 84, identical to the fp32 baseline. So the target's
+   activation precision is not the acceptance blocker either; combined with
+   the earlier runs, every target-side hypothesis (fp8 KV, W4A8, bf16, and
+   the context width) leaves acceptance unchanged, so the limit is the
+   draft's own within-block chaining (see the urgent Next item). The mode is
+   opt-in; the default fp32 path and the MXFP4/GGUF outputs are unchanged.
+   273/273 `ctest` on both builds.
+
+- 2026-10-09: **DFlash2 aux diagnostic and chat-prompt measurement.** A
+   temporary env-gated dump showed the captured target hidden is sane and
+   non-zero at every capture layer (the absmax figures in this entry were
+   from a bad dequant; the corrected values are 81, 170, 271, 221, 221 for
+   layers 5/19/33/47/61, see the newest Done entry) and the context cache is
+   populated. A real chat prompt
+   (`Explain in one paragraph why the sky is blue...`, ~30 context tokens,
+   `--tokens 32`, `--kv-fp8`) accepts 3 of 196 draft tokens over 28 steps,
+   so a longer context does not raise acceptance either. Combined with the
+   earlier runs, the draft is faithful, the aux is non-zero, and no
+   target-side knob moves acceptance, which points to the drafter/target
+   distribution mismatch the reference itself records (self-distillation on
+   the served target's hidden). See the urgent Next item.
+
+- 2026-10-09: **DFlash2 aux hidden captured from the served target and
+   diffed: it matches.** The served radiance container was run on GPU1
+   (TP=1) with `RADIANCE_DFLASH_CAPTURE_DIR` set, serving
+   `Qwen3.8-27B-MXFP4-mtpfp8-pertoken`, and its DFlash2 aux hidden was
+   captured for a fixed 96-token sequence (the "why is the sky blue" chat
+   prompt plus 64 generated tokens) as E4M3 with a per-token scale. Tessera
+   then ran the same 96 token ids through the target (`MTPFP8`) and dumped
+   its aux via the new env `TESSERA_DFLASH2_DUMP_AUX` (test
+   `EngineTest.DumpDFlash2AuxWhenProvided`, driven by
+   `TESSERA_TEST_DFLASH2_TOKENS_FILE`). The two agree well: per-layer cosine
+   0.9985 to 0.9997 (layer 5/19/33/47/61), relative L2 error 3 to 6 percent,
+   and matching magnitudes (tessera absmax 81/170/271/221/221 against the
+   reference 78/175/272/214/221). Tessera's aux data is off by at most about
+   one E4M3 quantization step: re-quantizing it exactly as the capture does
+   matches 36 to 50 percent of the reference bytes, and the post-quant
+   cosine stays 0.998 to 0.9997. So the aux hidden values are **not** the
+   cause of the 14x acceptance gap, and the earlier "aux values" hypothesis
+   is ruled out. The reference DFlash2 path was also re-read from the local
+   image (`vllm/v1/worker/gpu/spec_decode/dflash{,2}/speculator.py`,
+   `model_executor/models/qwen3_dflash{,2}.py`): the draft config sets no
+   `input_embedding_scale`, `output_multiplier` or
+   `final_logit_softcapping` (all default), so those are not differences
+   either. The gap must be in tessera's draft-input path (context K/V,
+   query/anchor positions, candidates or the selector walk). The served
+   reference reaches 2.7 to 2.85 accepted per draft; tessera stays at about
+   0.1 to 0.45. Temporary diagnostics: the radiance capture needs
+   `patch_dflash_capture.py` and the `serve-mxfp4.sh` capture mount (in
+   `~/git/radiance-vllm-mxfp4`, uncommitted); the tessera dump is env-gated.
+   The build is 273/273 on rocm.
+
+- 2026-10-09: **DFlash2 acceptance root-caused and fixed: the candidate
+   extraction shrank its own index vector.** With the aux and the draft block
+   both measured equal to the served reference, the draft path was compared
+   stage by stage against the reference plain-torch drafter on the *same*
+   captured aux. Tessera's block hidden matches the reference (cosine 0.997
+   to 0.9996), and projecting either hidden with the target head gives the
+   **same 7-of-7** correct mask-row tokens, so the unary logits were already
+   correct. Two defects remained, both downstream:
+   1. `spec::DraftCandidates` called `row_ids.resize(top_k)` on a vector
+      reused across rows. After the first row the vector held only `top_k`
+      elements, so `std::iota` filled just `0..top_k-1` and every later row
+      ranked a tiny slice of the vocabulary (ids 0..15). This is the real
+      cause of the low acceptance: only mask row 0 ever had the full vocab.
+      The fix keeps the vector at size `vocab` and sorts only the `top_k`
+      prefix. Test `BackendTest.DraftCandidatesRanksWholeVocabPerRow`.
+   2. The candidate-selector transition score added `unary[p]` (the
+      predecessor's logit) instead of `unary[c]` (the successor's), so the
+      walk ignored the unary term. The reference `_score_edges` maps
+      `unary_logits[:, :, None]` onto the successor axis. Fixed in the host
+      reference `core::SelectorEdgeScoreRef`, the ROCm kernel and the Vulkan
+      shader. Test `BackendTest.SelectorEdgeScoreUnaryIsSuccessor`. The old
+      device test compared the kernel to the (equally wrong) reference, so it
+      could not catch this; the earlier note "bypassing the selector gives
+      the same rate" was measured while `DraftCandidates` was still broken.
+   With both fixed, the diagnostic draft tokens for the fixed 96-token
+   sequence are 7 of 7 correct per step (was 0 to 1), and
+   `EngineTest.DFlash2MatchesGreedyOnModel` on the 27B MXFP4 target (prompt
+   `{760,6511,314,9338,369}`, 64 tokens) accepts **49 of 98 draft tokens over
+   14 steps (3.5 per step)** against 0.1 to 0.45 before, now at or above the
+   served reference (2.7 to 2.85). Output still equals greedy. 275/275
+   `ctest` on vulkan and rocm; the ROCm end-to-end run is the acceptance
+   measurement, the Vulkan shader is covered by the device-vs-reference
+   test. The one-off capture helpers were removed from the radiance repo.
+
 ## Next (in order)
+
+- **DFlash2 acceptance (done 2026-10-09).** The 14x gap was the two defects
+  above, not the aux. The remaining DFlash2 work is the item 0 backlog
+  (batched draft scoring, steady-state tokens/s). Re-measure tokens/s now
+  that acceptance is high: the draft is only a win when its per-step cost is
+  below the tokens it recovers.
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.
@@ -1710,8 +1834,16 @@ through RADV GFX1201, rocm through the system ROCm).
   from 789 ms to 513 ms/token (and the GGUF from 1100 ms to 492 ms). A
   tiled or split-K GEMV would then help the remaining kernel time.
 
-0. **DFlash2 (DEFERRED 2026-10-08)**: runs end to end
-   (`Engine::GenerateDraft`, CLI `--draft`) and output equals greedy.
+0. **DFlash2 (acceptance fixed 2026-10-09)**: runs end to end
+   (`Engine::GenerateDraft`, CLI `--draft`) and output equals greedy. The
+   14x acceptance gap was two defects, both fixed: `DraftCandidates` shrank
+   its reusable index vector so every mask row after the first ranked only
+   ids 0..top_k-1, and the selector transition score added the predecessor's
+   unary logit instead of the successor's (see the newest Done entry). The
+   27B MXFP4 target now accepts 3.5 per step, at or above the served 2.7 to
+   2.85. Remaining backlog: measure steady-state tokens/s (the draft is only
+   a win when a step costs less than the tokens it recovers) and, if wanted,
+   batched draft scoring. The older notes below are kept for history.
    Deferred: the fp8 W4A8 activation quant is implemented (`quantize_fp8`,
    default off, `TESSERA_MXFP4_W4A8=1`); turning it on did not raise
    acceptance on the noisy 5-token fixture and costs about 2.5x decode.

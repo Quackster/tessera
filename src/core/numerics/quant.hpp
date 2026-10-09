@@ -49,6 +49,12 @@ constexpr std::size_t kQ4KScaleBytes = 12;
 [[nodiscard]] std::expected<void, StatusCode> CastF32F16Ref(
     std::span<const float> in, std::span<std::byte> out);
 
+// Host reference for the "round_bf16" built-in: round every fp32 value in
+// `x` in place to bfloat16 (round to nearest even), keeping fp32 storage.
+// This is the bf16 activation rounding the served target's fused epilogues
+// apply. Empty input is InvalidArgument.
+[[nodiscard]] std::expected<void, StatusCode> RoundBf16Ref(std::span<float> x);
+
 // The OCP FP8 E4M3 maximum magnitude, the scale target vLLM's dynamic
 // per-token fp8 quantization divides the row absmax by.
 inline constexpr float kFp8E4M3Max = 448.0f;
