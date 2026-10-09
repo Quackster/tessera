@@ -7,6 +7,10 @@ let currentMessages = [];
 let streaming = false;
 let paused = false;
 let readerAbort = null;
+// Turn tokens: only the newest turn may draw or reset the controls,
+// so a stale turn never paints over the current view.
+let activeTurn = 0;
+let streamingId = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -54,17 +58,152 @@ function sanitizeSvg(svg) {
       .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
 }
 
-function renderFence(lang, code) {
-  const name = lang.toLowerCase();
-  if (name === 'svg') {
-    return '<div class="rendered">' + sanitizeSvg(code) + '</div>';
+// Tiny dependency-free syntax highlighter: one single-pass split on
+// a capture group, odd parts classified. Keywords, strings, comments
+// and numbers for a few language families; markup gets tag mode.
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const HIGHLIGHT_SPECS = {
+  clike: {
+    words: 'as async await break case catch class const continue debugger ' +
+        'default delete do double else enum export extends false finally ' +
+        'float for from function if implements import in instanceof int ' +
+        'interface let long new null of private protected public return ' +
+        'short static string struct super switch this throw true try ' +
+        'typeof var void while with yield',
+    line: ['//'],
+    block: [['/*', '*/']],
+    quotes: ['"', "'"],
+  },
+  python: {
+    words: 'False None True and as assert async await break case class ' +
+        'continue def del elif else except finally for from global if ' +
+        'import in is lambda match nonlocal not or pass raise return try ' +
+        'while with yield',
+    line: ['#'],
+    quotes: ['"', "'"],
+  },
+  rust: {
+    words: 'Self as async await break const continue crate dyn else enum ' +
+        'extern false fn for if impl in let loop match mod move mut pub ' +
+        'ref return self static struct super trait true type unsafe use ' +
+        'where while',
+    line: ['//'],
+    block: [['/*', '*/']],
+    quotes: ['"', "'"],
+  },
+  bash: {
+    words: 'case declare do done echo elif else esac exit export fi for ' +
+        'function if in local readonly return select test then true false ' +
+        'until while',
+    line: ['#'],
+    quotes: ['"', "'"],
+  },
+  json: {words: 'true false null', quotes: ['"']},
+};
+
+const HIGHLIGHT_ALIAS = {
+  c: 'clike', h: 'clike', 'c++': 'clike', cpp: 'clike', cc: 'clike',
+  cxx: 'clike', hpp: 'clike', cs: 'clike', java: 'clike', go: 'clike',
+  js: 'clike', ts: 'clike', typescript: 'clike', javascript: 'clike',
+  py: 'python', rs: 'rust', sh: 'bash', shell: 'bash', zsh: 'bash',
+  json: 'json', xml: 'markup', html: 'markup', svg: 'markup',
+};
+
+const highlightCache = {};
+
+function highlightSplitter(spec) {
+  const parts = [];
+  for (const [open, close] of spec.block || []) {
+    parts.push(escapeRegExp(open) + '[\\s\\S]*?' + escapeRegExp(close));
   }
-  if (name === 'html') {
+  for (const marker of spec.line || []) {
+    parts.push(escapeRegExp(marker) + '[^\\n]*');
+  }
+  for (const quote of spec.quotes || []) {
+    const q = escapeRegExp(quote);
+    parts.push(q + '(?:[^' + quote + '\\n\\\\]|\\\\.)*' + q);
+  }
+  parts.push('\\b\\d[\\w.]*\\b');
+  const words = spec.words.trim().split(/\s+/).map(escapeRegExp).join('|');
+  if (words) parts.push('\\b(?:' + words + ')\\b');
+  return new RegExp('(' + parts.join('|') + ')');
+}
+
+function highlightClass(token, spec) {
+  for (const marker of spec.line || []) {
+    if (token.startsWith(marker)) return 'com';
+  }
+  for (const [open] of spec.block || []) {
+    if (token.startsWith(open)) return 'com';
+  }
+  for (const quote of spec.quotes || []) {
+    if (token[0] === quote) return 'str';
+  }
+  if (/^\d/.test(token)) return 'num';
+  return 'kw';
+}
+
+function highlightMarkup(code) {
+  const splitter =
+      /(<!--[\s\S]*?-->|<\/?[a-zA-Z][^<>\s/]*(?=\s|\/?>)|\/?>|"(?:[^"\\\n]|\\.)*"|'[^'\n]*'|[a-zA-Z-]+(?==))/;
+  const parts = code.split(splitter);
+  let out = '';
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 0 || parts[i] === undefined) {
+      out += escapeHtml(parts[i] || '');
+      continue;
+    }
+    const token = parts[i];
+    let cls = 'attr';
+    if (token.startsWith('<!--')) cls = 'com';
+    else if (token[0] === '<' || token === '/' || token === '>' ||
+        token === '/>') cls = 'tag';
+    else if (token[0] === '"' || token[0] === "'") cls = 'str';
+    out += '<span class="tok-' + cls + '">' + escapeHtml(token) + '</span>';
+  }
+  return out;
+}
+
+function highlightCode(code, lang) {
+  const key = (lang || '').toLowerCase();
+  const canonical = HIGHLIGHT_ALIAS[key] || key;
+  if (canonical === 'markup') return highlightMarkup(code);
+  const spec = HIGHLIGHT_SPECS[canonical];
+  if (!spec) return escapeHtml(code);
+  let splitter = highlightCache[canonical];
+  if (!splitter) {
+    splitter = highlightSplitter(spec);
+    highlightCache[canonical] = splitter;
+  }
+  const parts = code.split(splitter);
+  let out = '';
+  for (let i = 0; i < parts.length; i++) {
+    out += (i % 2 === 1 && parts[i] !== undefined)
+        ? '<span class="tok-' + highlightClass(parts[i], spec) + '">' +
+          escapeHtml(parts[i]) + '</span>'
+        : escapeHtml(parts[i] || '');
+  }
+  return out;
+}
+
+function renderFence(info, code) {
+  const cut = info.search(/[:\s]/);
+  const lang = (cut < 0 ? info : info.slice(0, cut)).toLowerCase();
+  const filename = (cut < 0 ? '' : info.slice(cut + 1)).trim();
+  const head = filename
+      ? '<div class="file-name">' + escapeHtml(filename) + '</div>' : '';
+  if (lang === 'svg') {
+    return head + '<div class="rendered">' + sanitizeSvg(code) + '</div>';
+  }
+  if (lang === 'html') {
     const src = code.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-    return '<iframe class="html-frame" sandbox="allow-scripts" srcdoc="' +
+    return head + '<iframe class="html-frame" sandbox="allow-scripts" srcdoc="' +
         src + '"></iframe>';
   }
-  return '<pre><code>' + escapeHtml(code) + '</code></pre>';
+  return head + '<pre><code>' + highlightCode(code, lang) + '</code></pre>';
 }
 
 function renderInline(text) {
@@ -80,18 +219,39 @@ function renderInline(text) {
 // images embed, the rest is escaped paragraphs.
 function renderMarkdown(text) {
   const fences = [];
-  const fenced = text.replace(/```(\w*)\n([\s\S]*?)(?:```|$)/g,
-      (match, lang, code) => {
-        fences.push(renderFence(lang || 'text', code.replace(/\n$/, '')));
+  const fenced = text.replace(/```([^\n]*)\n([\s\S]*?)(?:```|$)/g,
+      (match, info, code) => {
+        fences.push(renderFence((info || '').trim(),
+            code.replace(/\n$/, '')));
         return '\u0000' + (fences.length - 1) + '\u0000';
       });
   const paras = fenced.split(/\n\n+/).map((para) => {
     if (/^\u0000\d+\u0000$/.test(para.trim())) {
       return fences[Number(para.trim().slice(1, -1))];
     }
+    const media = renderBareMedia(para.trim());
+    if (media) return media;
     return '<p>' + renderInline(para).replace(/\n/g, '<br>') + '</p>';
   });
   return paras.join('\n');
+}
+
+// A bare image/video/audio URL on its own line embeds directly.
+function renderBareMedia(line) {
+  const url = line.match(/^(https?:\/\/[^\s)]+|data:image\/[^;\s]+;base64,[^\s)]+)$/);
+  if (!url) return '';
+  const src = escapeHtml(url[1]);
+  if (/^data:image\//.test(url[1]) ||
+      /\.(png|jpe?g|gif|webp|svg)(\?\S*)?$/i.test(url[1])) {
+    return '<img src="' + src + '" loading="lazy" alt="">';
+  }
+  if (/\.(mp4|webm)(\?\S*)?$/i.test(url[1])) {
+    return '<video controls preload="none" src="' + src + '"></video>';
+  }
+  if (/\.(mp3|wav|ogg)(\?\S*)?$/i.test(url[1])) {
+    return '<audio controls preload="none" src="' + src + '"></audio>';
+  }
+  return '';
 }
 
 function messageHtml(message, thinkingOpen) {
@@ -202,7 +362,10 @@ async function openSession(id) {
 
 // Stream one turn (chat or retry) over `base` history: the user bubble
 // and an empty assistant show instantly, then live deltas fill in.
-async function streamTurn(path, payload, base) {
+// Only this turn (by token) may draw or reset the controls.
+async function streamTurn(path, payload, base, sid) {
+  const myTurn = ++activeTurn;
+  streamingId = sid;
   const key = apiKey();
   const headers = {'Content-Type': 'application/json'};
   if (key) headers['x-api-key'] = key;
@@ -216,6 +379,7 @@ async function streamTurn(path, payload, base) {
   let thinking = '';
   let content = '';
   const draw = (thinkingOpen) => {
+    if (myTurn !== activeTurn) return;
     renderMessages(base.concat([{
       role: 'assistant',
       content,
@@ -265,9 +429,11 @@ async function streamTurn(path, payload, base) {
   } catch (error) {
     if (error.name !== 'AbortError') showError(String(error));
   } finally {
+    if (myTurn !== activeTurn) return;
     streaming = false;
     paused = false;
     readerAbort = null;
+    streamingId = null;
     updateControls();
     // Authoritative state (stopped flags, usage) comes from the server.
     try {
@@ -281,6 +447,11 @@ async function sendMessage() {
   const input = $('input');
   const text = input.value.trim();
   if (!text || streaming) return;
+  // Claim the turn synchronously: a second Enter/click while the
+  // session opens must not start a duplicate generation.
+  streaming = true;
+  updateControls();
+  setStatus('Sending\u2026');
   // No session yet: open one first, the message is not lost.
   if (!currentId) {
     try {
@@ -288,6 +459,9 @@ async function sendMessage() {
       currentId = created.id;
       await refreshSessions();
     } catch (error) {
+      streaming = false;
+      updateControls();
+      setStatus('Ready');
       showError(String(error));
       return;
     }
@@ -306,7 +480,7 @@ async function sendMessage() {
     stream: true,
     max_tokens: Number($('max-tokens').value) || 512,
     enable_thinking: $('thinking').checked,
-  }, base);
+  }, base, currentId);
 }
 
 async function retryTurn() {
@@ -321,20 +495,27 @@ async function retryTurn() {
     stream: true,
     max_tokens: Number($('max-tokens').value) || 512,
     enable_thinking: $('thinking').checked,
-  }, base);
+  }, base, currentId);
+}
+
+// Controls target the live turn when one runs, else the open session.
+function controlId() {
+  return streamingId || currentId;
 }
 
 async function stopTurn() {
-  if (!currentId) return;
-  try { await api('POST', '/api/sessions/' + currentId + '/stop'); }
+  const id = controlId();
+  if (!id) return;
+  try { await api('POST', '/api/sessions/' + id + '/stop'); }
   catch (error) { showError(String(error)); }
   if (readerAbort) readerAbort.abort();
 }
 
 async function pauseTurn() {
-  if (!currentId) return;
+  const id = controlId();
+  if (!id) return;
   try {
-    await api('POST', '/api/sessions/' + currentId + '/pause');
+    await api('POST', '/api/sessions/' + id + '/pause');
     paused = true;
     updateControls();
     setStatus('Paused');
@@ -342,9 +523,10 @@ async function pauseTurn() {
 }
 
 async function resumeTurn() {
-  if (!currentId) return;
+  const id = controlId();
+  if (!id) return;
   try {
-    await api('POST', '/api/sessions/' + currentId + '/resume');
+    await api('POST', '/api/sessions/' + id + '/resume');
     paused = false;
     updateControls();
     setStatus('Generating\u2026');
