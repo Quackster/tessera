@@ -1432,6 +1432,37 @@ TEST(EngineTest, DFlash2MatchesGreedyOnModel) {
   EXPECT_EQ(*spec, *greedy);
 }
 
+// MTP speculative decode on the real model: output equals greedy, and the
+// log line reports tokens/s for both so the speculative speedup is visible.
+TEST(EngineTest, MtpDecodeOnModel) {
+  const char* target = std::getenv("TESSERA_TEST_MODEL");
+  if (target == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(ModelOptions{target, 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions options;
+  options.max_tokens = 32;
+  if (const char* tokens = std::getenv("TESSERA_MTP_TOKENS");
+      tokens != nullptr) {
+    const int value = std::atoi(tokens);
+    if (value > 0) {
+      options.max_tokens = static_cast<std::size_t>(value);
+    }
+  }
+  options.prompt_tokens = {760, 6511, 314, 9338, 369};
+  auto greedy = engine->Generate(**model, options);
+  ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());
+  auto attached =
+      engine->AttachSpeculative(tessera::CreateMtpStrategy());
+  ASSERT_TRUE(attached.has_value()) << tessera::ToString(attached.error());
+  auto spec = engine->GenerateSpeculative(**model, options);
+  ASSERT_TRUE(spec.has_value()) << tessera::ToString(spec.error());
+  EXPECT_EQ(*spec, *greedy);
+}
+
 // The vision config parser rejects a non-CLIP GGUF.
 TEST(EngineTest, VisionConfigRejectsNonClip) {
   auto path = WriteGgufFixture("notclip.gguf");
