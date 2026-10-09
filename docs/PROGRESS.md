@@ -1629,6 +1629,24 @@ through RADV GFX1201, rocm through the system ROCm).
    R4D fp8 attention), or the drafter runtime. The test now takes
    `TESSERA_DFLASH2_TOKENS` and `TESSERA_DFLASH2_KV` for these runs.
 
+- 2026-10-09: **Tiled quantized attention (item 3).** The `attention_q8`,
+   `attention_q4` and `attention_fp8` built-ins recomputed the query/key dot
+   product once per output dimension, so a query/head cost
+   O(n * head_dim^2). They now use the fp32 attention's tiled online
+   softmax: one workgroup per (query row, head), the query staged in shared
+   memory, one key scored per lane per tile, so the cost is
+   O(n * head_dim) per query/head. On ROCm one `__device__` template
+   (`AttentionQuantTiled<Kind>`) backs the three kernels; on Vulkan one
+   `attention_quant.comp` serves all three with a `kind` scalar
+   (`pc.v[14]`: 0 int8, 1 4-bit, 2 E4M3). The quantized attention contract
+   gains that scalar and `AttentionQuantDevice` reads the kind from the
+   kernel id and launches `rows * heads` workgroups. The old
+   `attention_q8.comp`/`attention_q4.comp`/`attention_fp8.comp` are
+   replaced. 271/271 `ctest` on both builds; the device-vs-reference tests
+   `BackendTest.AttentionQ8DeviceMatchesRef`,
+   `AttentionQ4DeviceMatchesRef` and `AttentionFp8DeviceMatchesRef` cover
+   the tiled paths.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -1807,9 +1825,9 @@ through RADV GFX1201, rocm through the system ROCm).
    the m = 1 decode, designed so the block header is decoded once per
    workgroup (the naive coalesced version lost to the reduction overhead).
    Tiling saves nothing at a five-row batch, so (b) is where the decode
-   time is. Applies on both backends. The
-   attention_q8/attention_q4 kernels still recompute the dot product per
-   output dimension.
+   time is. Applies on both backends. 2026-10-09: the
+   attention_q8/attention_q4/attention_fp8 kernels are tiled now
+   (O(n * head_dim) per query/head, see the Done entry).
 4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,

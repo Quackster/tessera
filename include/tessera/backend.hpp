@@ -253,7 +253,11 @@ class Kernel {
 // "attention_q8": like attention but keys and values are symmetric int8
 // (buffer 1 K, buffer 2 V), with one fp32 scale per key row (buffer 3 for
 // K, buffer 4 for V) and the fp32 output (buffer 5); scalars are m, n,
-// heads, kv_heads, head_dim, q_base and window.
+// heads, kv_heads, head_dim, q_base, window and kind. One workgroup per
+// (query row, head) runs the tiled online softmax, so the cost is
+// O(n * head_dim) per query/head. `kind` selects the K/V decode (0 int8,
+// 1 4-bit, 2 OCP FP8 E4M3); it lets one shader serve the three quantized
+// attention built-ins.
 // "quantize_q4": buffer 0 In (fp32, rows x cols), buffer 1 the packed
 // 4-bit output (rows x cols/2 bytes, eight per uint), buffer 2 one fp32
 // scale per row; scalars rows and cols (cols a multiple of 8). One thread
@@ -263,16 +267,15 @@ class Kernel {
 // scalars rows and cols. The per-row scale is max(amax/448, 1/(448*512))
 // with round-to-nearest-even, the W4A8 activation the served MXFP4 target
 // feeds its linear layers. One thread per row.
-// "attention_q4": like attention_q8 but keys/values are symmetric 4-bit.
+// "attention_q4": like attention_q8 but keys/values are symmetric 4-bit
+// (two per byte), same buffers, scalars and tiled dispatch.
 // "quantize_fp8_pack": buffer 0 is In (fp32, rows x cols), buffer 1 the
 // packed OCP FP8 E4M3 output (rows x cols bytes, four per uint), buffer 2
 // one fp32 scale per row; scalars are rows and cols (cols a multiple of
 // 4). The scale is max(amax/448, 1/(448*512)) with round-to-nearest-even,
 // the fp8 KV cache quantization. One thread per row.
-// "attention_fp8": like attention_q8 but keys and values are OCP FP8 E4M3
-// (buffer 1 K, buffer 2 V), with one fp32 scale per key row (buffer 3 for
-// K, buffer 4 for V) and the fp32 output (buffer 5); scalars are m, n,
-// heads, kv_heads, head_dim, q_base and window.
+// "attention_fp8": like attention_q8 but keys and values are OCP FP8 E4M3,
+// same buffers, scalars and tiled dispatch.
 // "cast_f32_f16": buffer 0 is In (fp32, n elements), buffer 1 the
 // output (fp16, n elements, two per uint); scalar n (must be even). The
 // dispatch is ceil(n/2 / 256).
@@ -578,14 +581,16 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
   }
-  if (kernel.Id() == "attention_q8" || kernel.Id() == "attention_fp8") {
-    if (launch.buffers.size() != 6 || launch.scalars.size() != 7) {
+  if (kernel.Id() == "attention_q8" || kernel.Id() == "attention_q4" ||
+      kernel.Id() == "attention_fp8") {
+    if (launch.buffers.size() != 6 || launch.scalars.size() != 8) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t heads = launch.scalars[2];
     const std::uint64_t kv_heads = launch.scalars[3];
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
-        kv_heads == 0 || launch.scalars[4] == 0 || heads % kv_heads != 0) {
+        kv_heads == 0 || launch.scalars[4] == 0 || heads % kv_heads != 0 ||
+        launch.scalars[7] > 2) {
       return StatusCode::InvalidArgument;
     }
   }
@@ -612,17 +617,6 @@ class Kernel {
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
         launch.scalars[1] % 4 != 0) {
-      return StatusCode::InvalidArgument;
-    }
-  }
-  if (kernel.Id() == "attention_q4") {
-    if (launch.buffers.size() != 6 || launch.scalars.size() != 7) {
-      return StatusCode::InvalidArgument;
-    }
-    const std::uint64_t heads = launch.scalars[2];
-    const std::uint64_t kv_heads = launch.scalars[3];
-    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
-        kv_heads == 0 || launch.scalars[4] == 0 || heads % kv_heads != 0) {
       return StatusCode::InvalidArgument;
     }
   }

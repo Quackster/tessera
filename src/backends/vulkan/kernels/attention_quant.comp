@@ -1,0 +1,173 @@
+#version 450
+
+// One workgroup per (query row, head); the query is staged in shared
+// memory and the tile runs an online softmax, so the dot product is
+// computed once per key: O(n * head_dim) per query/head.
+layout(local_size_x = 256) in;
+
+// "attention_q8"/"attention_q4"/"attention_fp8" contract: buffer 0 is Q
+// (fp32, m x heads*head_dim), buffer 1 K, buffer 2 V (packed quantized
+// bytes, four per uint for int8 and FP8, eight per uint for 4-bit), buffer
+// 3 one fp32 K scale per key row, buffer 4 one fp32 V scale per key row,
+// buffer 5 the output (fp32). Scalars: m v[0], n v[2], heads v[4],
+// kv_heads v[6], head_dim v[8], q_base v[10], window v[12], kind v[14]
+// (0 int8, 1 4-bit, 2 OCP FP8 E4M3).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer Q { float q[]; };
+layout(set = 0, binding = 1) buffer K { uint k[]; };
+layout(set = 0, binding = 2) buffer V { uint v[]; };
+layout(set = 0, binding = 3) buffer KS { float ks[]; };
+layout(set = 0, binding = 4) buffer VS { float vs[]; };
+layout(set = 0, binding = 5) buffer Out { float out_values[]; };
+
+shared float q_s[256];
+shared float sc[256];
+shared float wt[256];
+
+// OCP FP8 E4M3 byte -> fp32 (port of the core Fp8E4M3ToFloat).
+float fp8_e4m3_value(uint bits) {
+  uint sign = bits >> 7;
+  uint exp = (bits >> 3) & 0xFu;
+  uint mant = bits & 0x7u;
+  float value;
+  if (exp == 0u) {
+    value = float(mant) * exp2(-9.0);
+  } else if (exp == 15u) {
+    if (mant == 7u) {
+      return sqrt(-1.0);  // NaN
+    }
+    value = (1.0 + float(mant) / 8.0) * 256.0;
+  } else {
+    value = (1.0 + float(mant) / 8.0) * exp2(float(int(exp) - 7));
+  }
+  return sign != 0u ? -value : value;
+}
+
+// Decode element `idx` of a quantized K/V row with per-row scale `s`.
+float kv_at(uint kind, uint idx, float s) {
+  if (kind == 1u) {
+    uint word = k[idx >> 3];
+    int value = int((word >> ((idx & 7u) << 2u)) & 0xFu);
+    if ((value & 0x8) != 0) {
+      value -= 16;
+    }
+    return float(value) * s;
+  }
+  uint b = (k[idx >> 2] >> ((idx & 3u) << 3u)) & 0xFFu;
+  if (kind == 0u) {
+    int value = int(b);
+    if ((value & 0x80) != 0) {
+      value -= 256;
+    }
+    return float(value) * s;
+  }
+  return fp8_e4m3_value(b) * s;
+}
+
+float kv_at_v(uint kind, uint idx, float s) {
+  if (kind == 1u) {
+    uint word = v[idx >> 3];
+    int value = int((word >> ((idx & 7u) << 2u)) & 0xFu);
+    if ((value & 0x8) != 0) {
+      value -= 16;
+    }
+    return float(value) * s;
+  }
+  uint b = (v[idx >> 2] >> ((idx & 3u) << 3u)) & 0xFFu;
+  if (kind == 0u) {
+    int value = int(b);
+    if ((value & 0x80) != 0) {
+      value -= 256;
+    }
+    return float(value) * s;
+  }
+  return fp8_e4m3_value(b) * s;
+}
+
+void main() {
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint heads = pc.v[4];
+  uint kv_heads = pc.v[6];
+  uint head_dim = pc.v[8];
+  uint q_base = pc.v[10];
+  uint window = pc.v[12];
+  uint kind = pc.v[14];
+  uint g = gl_WorkGroupID.x;
+  if (g >= m * heads) {
+    return;
+  }
+  uint e = gl_LocalInvocationID.x;
+  uint i = g / heads;
+  uint h = g % heads;
+  uint kv = h / (heads / kv_heads);
+  uint pos = q_base + i;
+  uint last = pos >= n ? n - 1 : pos;
+  uint start = (window != 0u && pos + 1u > window) ? pos + 1u - window : 0u;
+  if (start > last) {
+    start = last;
+  }
+  float scale = inversesqrt(float(head_dim));
+  uint qb = (i * heads + h) * head_dim;
+  if (e < head_dim) {
+    q_s[e] = q[qb + e];
+  }
+  barrier();
+  float run_max = -1e30;
+  float run_sum = 0.0;
+  float acc = 0.0;
+  uint tile = start;
+  while (true) {
+    uint tile_last = (tile + 255u < last) ? tile + 255u : last;
+    float s = -1e30;
+    if (tile + e <= last) {
+      uint j = tile + e;
+      uint kb = (j * kv_heads + kv) * head_dim;
+      float dot = 0.0;
+      for (uint d = 0; d < head_dim; ++d) {
+        dot += q_s[d] * kv_at(kind, kb + d, ks[j]);
+      }
+      s = dot * scale;
+    }
+    sc[e] = s;
+    barrier();
+    float tmax = -1e30;
+    for (uint t = 0u; t < 256u; ++t) {
+      tmax = max(tmax, sc[t]);
+    }
+    float m_new = max(run_max, tmax);
+    float corr = exp(run_max - m_new);
+    float l = 0.0;
+    for (uint t = 0u; t < 256u; ++t) {
+      float w = exp(sc[t] - m_new);
+      wt[t] = w;
+      l += w;
+    }
+    barrier();
+    float a = 0.0;
+    if (e < head_dim) {
+      for (uint t = 0u; t < 256u; ++t) {
+        uint j = tile + t;
+        if (j > last) {
+          break;
+        }
+        uint vb = (j * kv_heads + kv) * head_dim;
+        a += wt[t] * kv_at_v(kind, vb + e, vs[j]);
+      }
+    }
+    acc = corr * acc + a;
+    run_sum = corr * run_sum + l;
+    run_max = m_new;
+    barrier();
+    if (tile_last >= last) {
+      break;
+    }
+    tile += 256u;
+  }
+  if (e < head_dim) {
+    out_values[qb + e] = acc / run_sum;
+  }
+}

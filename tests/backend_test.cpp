@@ -5475,11 +5475,11 @@ TEST(BackendTest, AttentionQ8DeviceMatchesRef) {
   auto kernel = backend->LoadKernel("attention_q8", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), ks_buf.get(),
                     vs_buf.get(), out_buf->get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(q.size() * 4);
@@ -5584,11 +5584,11 @@ TEST(BackendTest, AttentionFp8DeviceMatchesRef) {
   auto kernel = backend->LoadKernel("attention_fp8", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), ks_buf.get(),
                     vs_buf.get(), out_buf->get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 2};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(q.size() * 4);
@@ -5691,11 +5691,11 @@ TEST(BackendTest, AttentionQ4DeviceMatchesRef) {
   auto kernel = backend->LoadKernel("attention_q4", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kHeads * kDim + 255) / 256;
+  launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), ks_buf.get(),
                     vs_buf.get(), out_buf->get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(q.size() * 4);
