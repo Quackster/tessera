@@ -27,11 +27,15 @@ constexpr std::size_t kDefaultContext = 4096;
 // drafter is trained for one fixed block; a mismatched block silently
 // lowers acceptance (the DFlash2 checkpoint is trained for block 8).
 constexpr std::size_t kDefaultDraftBlock = 0;
+// 0 resolves automatically to the model context; chunking is logged
+// but not applied yet.
+constexpr std::size_t kDefaultPrefillChunk = 0;
 
 void PrintUsage() {
   std::fprintf(stderr,
                "usage: tessera-cli run --model <path> [--draft <dir>]\n"
                "       [--context <n>] [--draft-block <n>]\n"
+               "       [--prefill-chunk <n>]\n"
                "       --prompt-text <str> [--tokens <n>]\n"
                "       tessera-cli serve --model <path> [--host <ip>] "
                "[--port <n>]\n"
@@ -43,6 +47,8 @@ void PrintUsage() {
                "  --gpu <n>         GPU index to use (default 0, the first)\n"
                "  --draft-block <n> draft block tokens (0 = checkpoint "
                "default, %zu)\n"
+               "  --prefill-chunk <n> prefill tokens per forward (0 = auto, "
+               "%zu)\n"
   "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
   "  --tokens <n>      decode steps (default: fill the context)\n"
                "  --speculate       verify MTP drafts instead of plain greedy\n"
@@ -67,7 +73,7 @@ void PrintUsage() {
                "  --api-key <k>     accepted API key (repeatable; env "
                "TESSERA_API_KEY)\n"
                "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
-               kDefaultContext, kDefaultDraftBlock);
+               kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk);
 }
 
 }  // namespace
@@ -114,6 +120,7 @@ int main(int argc, char** argv) {
   std::size_t tokens = 0;
   std::size_t context = kDefaultContext;
   std::size_t draft_block = kDefaultDraftBlock;
+  std::size_t prefill_chunk = kDefaultPrefillChunk;
   int gpu = 0;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
@@ -145,6 +152,8 @@ int main(int argc, char** argv) {
       gpu = std::stoi(argv[++i]);
     } else if (arg == "--draft-block" && i + 1 < argc) {
       draft_block = std::stoul(argv[++i]);
+    } else if (arg == "--prefill-chunk" && i + 1 < argc) {
+      prefill_chunk = std::stoul(argv[++i]);
     } else if (arg == "--speculate") {
       speculate = true;
     } else if (arg == "--sample") {
@@ -194,6 +203,7 @@ int main(int argc, char** argv) {
 
   tessera::EngineOptions options;  // default stderr diagnostics sink
   options.device_index = gpu;
+  options.prefill_chunk_tokens = prefill_chunk;
   auto created = tessera::Engine::Create(options);
   if (!created) {
     std::fprintf(stderr, "cli: engine create failed (%s)\n",

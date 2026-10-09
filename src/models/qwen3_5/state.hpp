@@ -64,6 +64,15 @@ struct Qwen35State final : core::ArchState {
   // bf16 activation rounding of a projection output (the served target's
   // fused epilogue), loaded on demand when TESSERA_TARGET_BF16 is set.
   std::unique_ptr<Kernel> bf16_kernel;
+  // fp8 tensor-core MXFP4 GEMM path (TESSERA_MXFP4_WMMA): the activation
+  // packing, per-row weight reference-exponent and GEMM kernels, the A
+  // scratch, and the per-weight Wref cache.
+  std::unique_ptr<Kernel> fp8_pack_kernel;
+  std::unique_ptr<Kernel> mxfp4_rowref_kernel;
+  std::unique_ptr<Kernel> mxfp4_wmma_kernel;
+  std::unique_ptr<Buffer> wmma_a;
+  std::unique_ptr<Buffer> wmma_as;
+  std::unordered_map<const void*, std::unique_ptr<Buffer>> mxfp4_wref;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;

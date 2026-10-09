@@ -550,7 +550,8 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
 std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const std::uint32_t> draft,
-    std::span<const float> prefix_logits, std::vector<float>* hidden_out,
+    std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
+    std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
     std::vector<Buffer*>* capture) const {
   auto config = model.Config();
@@ -566,9 +567,20 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
   const std::size_t hist_len = g.conv_dim * (g.width - 1);
   Qwen35State& h = State(cache);
   const std::size_t prefix = h.position;
+  // The scored batch: [anchor, drafts...] when the anchor rides the verify,
+  // otherwise just the drafts (the prefix logits score draft[0]).
+  const std::size_t lead = anchor.has_value() ? 1 : 0;
+  std::vector<std::uint32_t> anchored;
+  std::span<const std::uint32_t> tokens = draft;
+  if (lead == 1) {
+    anchored.reserve(draft.size() + 1);
+    anchored.push_back(*anchor);
+    anchored.insert(anchored.end(), draft.begin(), draft.end());
+    tokens = anchored;
+  }
   std::vector<float> flat;
   std::vector<float> last_hidden;
-  auto status = ForwardBatch(backend, model, cache, draft, &flat, &last_hidden,
+  auto status = ForwardBatch(backend, model, cache, tokens, &flat, &last_hidden,
                              /*all_logits=*/true, nullptr, capture_layers,
                              capture);
   if (!status) {
@@ -576,20 +588,25 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
   }
   const std::size_t vocab = config->vocab_size;
   DraftVerification result;
-  std::span<const float> last(prefix_logits.begin(), prefix_logits.end());
+  std::span<const float> last =
+      lead == 1 ? std::span<const float>(flat.data(), vocab)
+                : std::span<const float>(prefix_logits.begin(),
+                                         prefix_logits.end());
   std::size_t accepted = 0;
   for (std::size_t i = 0; i < draft.size(); ++i) {
     if (detail::ArgMax(last) != draft[i]) {
       break;
     }
     ++accepted;
-    last = std::span<const float>(flat.data() + i * vocab, vocab);
+    last = std::span<const float>(flat.data() + (i + lead) * vocab, vocab);
   }
   result.accepted = accepted;
   result.logits.assign(last.begin(), last.end());
   result.next_token = detail::ArgMax(result.logits);
-  if (accepted < draft.size()) {
-    const std::size_t new_pos = prefix + accepted;
+  // Keep the anchor (when present) plus the accepted drafts; drop the rest.
+  const std::size_t committed = lead + accepted;
+  if (committed < draft.size() + lead) {
+    const std::size_t new_pos = prefix + committed;
     for (auto& kv : h.full) {
       kv.rows = new_pos;
     }
@@ -598,12 +615,12 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
       if (config->IsFullAttentionLayer(l)) {
         continue;
       }
-      if (!backend.CopyD2D(*h.batch->state_hist[l], accepted * state_len * 4,
+      if (!backend.CopyD2D(*h.batch->state_hist[l], committed * state_len * 4,
                            *h.linear[l].state, 0, state_len * 4)) {
         return std::unexpected(StatusCode::DeviceError);
       }
       if (!backend.CopyD2D(*h.batch->conv_hist_hist[l],
-                           accepted * hist_len * 4, *h.linear[l].conv_hist, 0,
+                           committed * hist_len * 4, *h.linear[l].conv_hist, 0,
                            hist_len * 4)) {
         return std::unexpected(StatusCode::DeviceError);
       }
@@ -613,8 +630,9 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     auto xh = detail::DownloadF32(backend, *h.batch->x);
     if (xh) {
       hidden_out->resize(config->hidden_dim);
-      std::copy(xh->begin() + (accepted - 1) * config->hidden_dim,
-                xh->begin() + accepted * config->hidden_dim,
+      const std::size_t row = lead == 1 ? accepted : accepted - 1;
+      std::copy(xh->begin() + row * config->hidden_dim,
+                xh->begin() + (row + 1) * config->hidden_dim,
                 hidden_out->begin());
     }
   }

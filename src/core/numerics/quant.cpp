@@ -768,4 +768,88 @@ std::expected<void, StatusCode> DequantizeBlocks(
   return {};
 }
 
+// kMag[d][n]: the e4m3 byte for E2M1 magnitude n (0, 0.5, 1, 1.5, 2, 3, 4,
+// 6) scaled by 2^-d, d = 0..15. The served reference's fold table; the
+// subnormal tail is deliberate (mlp.down reaches d=10) and exact on the
+// gfx12 fp8 WMMA path, which honours e4m3 subnormals.
+constexpr std::uint8_t kMag[16][8] = {
+    {0x00, 0x30, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c},
+    {0x00, 0x28, 0x30, 0x34, 0x38, 0x3c, 0x40, 0x44},
+    {0x00, 0x20, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c},
+    {0x00, 0x18, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34},
+    {0x00, 0x10, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c},
+    {0x00, 0x08, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24},
+    {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c},
+    {0x00, 0x02, 0x04, 0x06, 0x08, 0x0c, 0x10, 0x14},
+    {0x00, 0x01, 0x02, 0x03, 0x04, 0x06, 0x08, 0x0c},
+    {0x00, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04, 0x06},
+    {0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x02, 0x03},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+};
+
+std::expected<void, StatusCode> FoldMxFp4ToFp8(std::span<const std::byte> w,
+                                               std::span<const std::byte> scales,
+                                               std::span<std::byte> out,
+                                               std::span<std::byte> wref,
+                                               std::size_t rows,
+                                               std::size_t cols) {
+  if (rows == 0 || cols == 0 || cols % 32 != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t blocks = cols / 32;
+  if (w.size() != rows * cols / 2 || scales.size() != rows * blocks ||
+      out.size() != rows * cols || wref.size() != rows) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    std::uint8_t ref = 0;
+    for (std::size_t b = 0; b < blocks; ++b) {
+      ref = std::max(ref, static_cast<std::uint8_t>(scales[r * blocks + b]));
+    }
+    wref[r] = static_cast<std::byte>(ref);
+    for (std::size_t c = 0; c < cols; ++c) {
+      const std::uint8_t packed =
+          static_cast<std::uint8_t>(w[(r * cols + c) / 2]);
+      const std::uint8_t nib = (c % 2 == 0) ? (packed & 0xFu) : (packed >> 4);
+      int d = static_cast<int>(ref) -
+              static_cast<int>(
+                  static_cast<std::uint8_t>(scales[r * blocks + c / 32]));
+      d = std::clamp(d, 0, 15);
+      out[r * cols + c] =
+          static_cast<std::byte>(kMag[d][nib & 7u] | ((nib & 8u) ? 0x80u : 0u));
+    }
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> GemmMxFp4Fp8Ref(
+    std::span<const std::byte> a_fp8, std::span<const float> as,
+    std::span<const std::byte> w_fp8, std::span<const std::byte> wref,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k) {
+  if (m == 0 || n == 0 || k == 0 || a_fp8.size() != m * k || as.size() != m ||
+      w_fp8.size() != n * k || wref.size() != n || c.size() != m * n) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t i = 0; i < m; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      const float wscale =
+          std::exp2(static_cast<float>(
+                        static_cast<std::uint8_t>(wref[j])) -
+                    127.0f);
+      float acc = 0.0f;
+      for (std::size_t t = 0; t < k; ++t) {
+        acc = std::fma(
+            Fp8E4M3ToFloat(static_cast<std::uint8_t>(a_fp8[i * k + t])),
+            Fp8E4M3ToFloat(static_cast<std::uint8_t>(w_fp8[j * k + t])), acc);
+      }
+      c[i * n + j] = acc * as[i] * wscale;
+    }
+  }
+  return {};
+}
+
 }  // namespace tessera::core

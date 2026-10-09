@@ -1,0 +1,92 @@
+#version 450
+
+// Per-row top-k over `vocab` fp32 logits. One workgroup per output row;
+// dispatch `rows` workgroups of 256 threads. Each thread keeps a descending
+// local top-k in scratch, then the workgroup merges the sorted lists.
+layout(local_size_x = 256) in;
+
+// "top_k_rows" contract: Logits (input rows x vocab fp32), Ids (output
+// rows x top_k uint32), Vals (output rows x top_k fp32). Output row `r`
+// reads input row `row_base + r`. Scalars: rows v[0], vocab v[2], top_k
+// v[4], row_base v[6].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer Logits { float logits[]; };
+layout(set = 0, binding = 1) buffer Ids { uint ids[]; };
+layout(set = 0, binding = 2) buffer Vals { float vals[]; };
+
+shared float rv[256];
+shared uint ri[256];
+shared uint rown[256];
+
+const uint kMaxTopK = 32u;
+const float kNegInf = -3.402823466e+38;
+
+void main() {
+  uint r = gl_WorkGroupID.x;
+  uint rows = pc.v[0];
+  if (r >= rows) {
+    return;
+  }
+  uint vocab = pc.v[2];
+  uint top_k = pc.v[4];
+  uint row_base = pc.v[6];
+  if (top_k == 0u || top_k > kMaxTopK) {
+    return;
+  }
+  uint tid = gl_LocalInvocationID.x;
+  uint base = (row_base + r) * vocab;
+  float lv[32];
+  uint li[32];
+  uint count = 0u;
+  for (uint c = tid; c < vocab; c += 256u) {
+    float v = logits[base + c];
+    if (count < top_k) {
+      uint j = count;
+      while (j > 0u && lv[j - 1u] < v) {
+        lv[j] = lv[j - 1u];
+        li[j] = li[j - 1u];
+        --j;
+      }
+      lv[j] = v;
+      li[j] = c;
+      ++count;
+    } else if (v > lv[top_k - 1u]) {
+      uint j = top_k - 1u;
+      while (j > 0u && lv[j - 1u] < v) {
+        lv[j] = lv[j - 1u];
+        li[j] = li[j - 1u];
+        --j;
+      }
+      lv[j] = v;
+      li[j] = c;
+    }
+  }
+  uint head = 0u;
+  for (uint p = 0u; p < top_k; ++p) {
+    rv[tid] = (head < count) ? lv[head] : kNegInf;
+    ri[tid] = (head < count) ? li[head] : 0u;
+    rown[tid] = tid;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+      if (tid < s && rv[tid + s] > rv[tid]) {
+        rv[tid] = rv[tid + s];
+        ri[tid] = ri[tid + s];
+        rown[tid] = rown[tid + s];
+      }
+      barrier();
+    }
+    if (tid == 0u) {
+      vals[r * top_k + p] = rv[0];
+      ids[r * top_k + p] = ri[0];
+    }
+    uint owner = rown[0];
+    barrier();
+    if (tid == owner) {
+      ++head;
+    }
+    barrier();
+  }
+}

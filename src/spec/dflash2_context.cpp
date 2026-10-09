@@ -93,9 +93,9 @@ std::expected<void, StatusCode> DraftContextAppendDevice(
     const std::vector<const Buffer*>& k_w,
     const std::vector<const Buffer*>& v_w,
     const std::vector<const Buffer*>& k_norm, std::size_t n,
-    std::size_t features, std::size_t new_rows, std::size_t hidden_dim,
-    std::size_t kv_heads, std::size_t head_dim, double theta, float eps,
-    std::size_t limit) {
+    std::size_t features, std::size_t row_offset, std::size_t new_rows,
+    std::size_t hidden_dim, std::size_t kv_heads, std::size_t head_dim,
+    double theta, float eps, std::size_t limit) {
   if (n == 0 || features == 0 || new_rows == 0 || hidden_dim == 0 ||
       kv_heads == 0 || head_dim == 0 || aux.size() != n ||
       hidden_norm.size() != n || k_w.size() != n || v_w.size() != n ||
@@ -169,7 +169,8 @@ std::expected<void, StatusCode> DraftContextAppendDevice(
     return std::unexpected(StatusCode::OutOfMemory);
   }
   for (std::size_t i = 0; i < n; ++i) {
-    if (!backend.CopyD2D(*aux[i], 0, **aux_stage, i * new_rows * features * 4,
+    if (!backend.CopyD2D(*aux[i], row_offset * features * 4, **aux_stage,
+                         i * new_rows * features * 4,
                          new_rows * features * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }

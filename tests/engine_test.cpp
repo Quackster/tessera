@@ -1263,6 +1263,27 @@ TEST(EngineTest, RejectsOutOfRangeDeviceIndex) {
   EXPECT_EQ(bad.error(), StatusCode::InvalidArgument);
 }
 
+// Prefill chunk plumbing: the request value wins, then the engine
+// default, then the model context (automatic). Chunking is logged
+// but not applied yet.
+TEST(EngineTest, ResolvePrefillChunkTokens) {
+  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(0, 0, 4096), 4096u);
+  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(512, 0, 4096), 512u);
+  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(512, 256, 4096), 256u);
+  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(0, 256, 4096), 256u);
+  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(0, 0, 0), 1u);
+}
+
+// New options default to automatic (0); the engine keeps its
+// configured value for generation time.
+TEST(EngineTest, PrefillChunkDefaultsToAuto) {
+  EXPECT_EQ(EngineOptions{}.prefill_chunk_tokens, 0u);
+  EXPECT_EQ(GenerateOptions{}.prefill_chunk_tokens, 0u);
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  EXPECT_EQ(engine->PrefillChunkTokens(), 0u);
+}
+
 // Sampling: temperature 0 and top_k 1 both reduce to the argmax, the
 // draw is reproducible for a fixed seed, and the repetition penalty
 // lowers a repeated token.

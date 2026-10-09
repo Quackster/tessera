@@ -1,6 +1,7 @@
 #version 450
 
-// One thread per row.
+// One workgroup per row (shared-memory amax reduction); the dispatch is
+// `rows` workgroups of 256 via grid_x.
 layout(local_size_x = 256) in;
 
 // "quantize_fp8" contract: buffer 0 is the fp32 rows x cols data,
@@ -68,21 +69,36 @@ float fp8_e4m3_value(uint bits) {
   return sign != 0u ? -value : value;
 }
 
+shared float red[256];
+
 void main() {
-  uint r = gl_GlobalInvocationID.x;
+  // One workgroup per row, so a one-row call (the DFlash2 context hidden)
+  // uses the whole block instead of a single thread.
+  uint r = gl_WorkGroupID.x;
   uint rows = pc.v[0];
   uint cols = pc.v[2];
   if (r >= rows) {
     return;
   }
+  uint tid = gl_LocalInvocationID.x;
   uint base = r * cols;
   float amax = 0.0;
-  for (uint c = 0; c < cols; ++c) {
+  for (uint c = tid; c < cols; c += 256u) {
     amax = max(amax, abs(data[base + c]));
   }
-  float s = max(amax / 448.0, 1.0 / (448.0 * 512.0));
-  scale[r] = s;
-  for (uint c = 0; c < cols; ++c) {
+  red[tid] = amax;
+  barrier();
+  for (uint step = 128u; step > 0u; step >>= 1u) {
+    if (tid < step) {
+      red[tid] = max(red[tid], red[tid + step]);
+    }
+    barrier();
+  }
+  float s = max(red[0] / 448.0, 1.0 / (448.0 * 512.0));
+  if (tid == 0u) {
+    scale[r] = s;
+  }
+  for (uint c = tid; c < cols; c += 256u) {
     uint bits = fp8_e4m3_bits(clamp(data[base + c] / s, -448.0, 448.0));
     data[base + c] = fp8_e4m3_value(bits) * s;
   }

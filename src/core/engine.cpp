@@ -28,8 +28,11 @@ std::vector<std::uint32_t> StopSet(const Model& model,
 }
 }  // namespace
 
-Engine::Engine(std::unique_ptr<Backend> backend, log::Diagnostics diagnostics)
-    : backend_(std::move(backend)), diagnostics_(std::move(diagnostics)) {}
+Engine::Engine(std::unique_ptr<Backend> backend, log::Diagnostics diagnostics,
+               std::size_t prefill_chunk_tokens)
+    : backend_(std::move(backend)),
+      diagnostics_(std::move(diagnostics)),
+      prefill_chunk_tokens_(prefill_chunk_tokens) {}
 
 std::expected<std::unique_ptr<Engine>, StatusCode> Engine::Create(
     const EngineOptions& options) {
@@ -39,8 +42,8 @@ std::expected<std::unique_ptr<Engine>, StatusCode> Engine::Create(
     log.Error("engine", "CreateBackend returned null; the build has no backend");
     return std::unexpected(StatusCode::DeviceError);
   }
-  auto engine =
-      std::unique_ptr<Engine>(new Engine(std::move(backend), log));
+  auto engine = std::unique_ptr<Engine>(
+      new Engine(std::move(backend), log, options.prefill_chunk_tokens));
   // The backend logs through the engine's diagnostics copy.
   engine->backend_->SetDiagnostics(&engine->diagnostics_);
   engine->backend_->SetDeviceIndex(options.device_index);
@@ -110,10 +113,14 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
     return std::vector<std::uint32_t>{};
   }
   if (options.progress_every > 0) {
+    const std::size_t prefill_chunk = ResolvePrefillChunkTokens(
+        prefill_chunk_tokens_, options.prefill_chunk_tokens,
+        model.MaxContextLength());
     diagnostics_.Info("engine", std::string("multimodal prefill: ") +
                                     std::to_string(prompt.size()) +
                                     " token(s), " +
-                                    std::to_string(image_tokens) + " image");
+                                    std::to_string(image_tokens) + " image, chunk " +
+                                    std::to_string(prefill_chunk));
   }
   const std::size_t hidden = config->hidden_dim;
   auto embed = core::detail::NeedWeightAny(model, "token_embd.weight");
@@ -315,10 +322,14 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   // The prefill clock starts after strategy preparation, so a one-time draft
   // weight load is not billed to the prompt.
   const auto prefill_started = std::chrono::steady_clock::now();
+  const std::size_t prefill_chunk = ResolvePrefillChunkTokens(
+      prefill_chunk_tokens_, options.prefill_chunk_tokens,
+      model.MaxContextLength());
   if (options.progress_every > 0) {
     diagnostics_.Info("engine", std::string("prefill: ") +
                                     std::to_string(prompt.size()) +
-                                    " prompt token(s)");
+                                    " prompt token(s), chunk " +
+                                    std::to_string(prefill_chunk));
   }
   std::vector<float> hidden;
   std::vector<float> first_logits;
@@ -414,6 +425,74 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       break;
     }
     history.push_back(next);
+    // A folding strategy rides the anchor into the verify batch, so the trunk
+    // is read once per step. The drafter context already excludes this anchor:
+    // OnAnchor runs after the verify and appends the anchor it produced.
+    if (strategy != nullptr && block > 0 && strategy->FoldsAnchor()) {
+      auto count = strategy->Draft(*backend_, model, cache, {}, next, drafts);
+      if (!count) {
+        return std::unexpected(count.error());
+      }
+      if (*count <= 1) {
+        // No usable proposal: decode the anchor alone and take its greedy
+        // token. The drafter context still gains the anchor below.
+        auto logits = core::DecodeLogits(*backend_, model, cache, next, &hidden,
+                                         capture_layers_ptr, capture_ptr);
+        if (!logits) {
+          return std::unexpected(logits.error());
+        }
+        auto anchored = strategy->OnAnchor(*backend_, model, cache, next,
+                                           position, hidden);
+        if (!anchored) {
+          return std::unexpected(anchored.error());
+        }
+        next = pick(*logits);
+        ++position;
+        continue;
+      }
+      std::span<const std::uint32_t> proposal(drafts.data(), *count);
+      auto verify =
+          core::VerifyDraft(*backend_, model, cache, proposal, {}, next,
+                            /*hidden_out=*/nullptr, capture_layers_ptr,
+                            capture_ptr);
+      if (!verify) {
+        return std::unexpected(verify.error());
+      }
+      auto anchored = strategy->OnAnchor(*backend_, model, cache, next,
+                                         position, {});
+      if (!anchored) {
+        return std::unexpected(anchored.error());
+      }
+      auto committed =
+          strategy->Commit(*backend_, model, cache, verify->accepted);
+      if (!committed) {
+        return std::unexpected(committed.error());
+      }
+      spec_proposed += *count;
+      spec_accepted += verify->accepted;
+      ++spec_steps;
+      for (std::size_t i = 0; i < verify->accepted; ++i) {
+        if (produced >= max_tokens) {
+          break;
+        }
+        if (core::detail::IsStopToken(drafts[i], stops)) {
+          stopped = true;
+          break;
+        }
+        if (!on_token(drafts[i])) {
+          stopped = true;
+          break;
+        }
+        history.push_back(drafts[i]);
+        ++produced;
+      }
+      if (stopped || produced >= max_tokens) {
+        break;
+      }
+      next = verify->next_token;
+      position += 1 + verify->accepted;
+      continue;
+    }
     // Advance the target by the just-emitted token. `hidden` describes its
     // position, which the drafter chains from.
     auto logits = core::DecodeLogits(*backend_, model, cache, next, &hidden,
@@ -438,8 +517,8 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       if (*count > 0) {
         std::span<const std::uint32_t> proposal(drafts.data(), *count);
         auto verify = core::VerifyDraft(*backend_, model, cache, proposal,
-                                        *logits, &hidden, capture_layers_ptr,
-                                        capture_ptr);
+                                        *logits, std::nullopt, &hidden,
+                                        capture_layers_ptr, capture_ptr);
         if (!verify) {
           return std::unexpected(verify.error());
         }
@@ -534,6 +613,10 @@ const SpeculativeStrategy* Engine::Speculative() const {
 
 log::Diagnostics& Engine::Diagnostics() {
   return diagnostics_;
+}
+
+std::size_t Engine::PrefillChunkTokens() const {
+  return prefill_chunk_tokens_;
 }
 
 }  // namespace tessera

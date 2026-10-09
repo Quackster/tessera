@@ -1,7 +1,7 @@
 #version 450
 
-// One thread per row; the dispatch is ceil(rows / 256) workgroups
-// via grid_x.
+// One workgroup per row (shared-memory sum reduction); the dispatch is
+// `rows` workgroups of 256 via grid_x.
 layout(local_size_x = 256) in;
 
 // "l2norm" contract: buffer 0 is X (rows x cols), buffer 1 the output
@@ -19,8 +19,11 @@ layout(set = 0, binding = 1) buffer Y {
   float y[];
 };
 
+shared float red[256];
+
 void main() {
-  uint r = gl_GlobalInvocationID.x;
+  // One workgroup per row (shared-memory sum reduction).
+  uint r = gl_WorkGroupID.x;
   uint rows = pc.v[0];
   if (r >= rows) {
     return;
@@ -28,12 +31,22 @@ void main() {
   uint cols = pc.v[2];
   float eps = uintBitsToFloat(pc.v[4]);
   float scale = uintBitsToFloat(pc.v[6]);
+  uint tid = gl_LocalInvocationID.x;
+  uint base = r * cols;
   float sum = 0.0;
-  for (uint c = 0; c < cols; ++c) {
-    sum += x[r * cols + c] * x[r * cols + c];
+  for (uint c = tid; c < cols; c += 256u) {
+    sum = fma(x[base + c], x[base + c], sum);
   }
-  float gain = inversesqrt(sum + eps) * scale;
-  for (uint c = 0; c < cols; ++c) {
-    y[r * cols + c] = x[r * cols + c] * gain;
+  red[tid] = sum;
+  barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) {
+    if (tid < st) {
+      red[tid] += red[tid + st];
+    }
+    barrier();
+  }
+  float gain = scale / sqrt(red[0] + eps);
+  for (uint c = tid; c < cols; c += 256u) {
+    y[base + c] = x[base + c] * gain;
   }
 }

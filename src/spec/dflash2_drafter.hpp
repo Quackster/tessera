@@ -36,13 +36,14 @@ class DFlash2Drafter {
 
   // Append `rows` committed target positions to the device-resident draft
   // context cache. `captures` holds one device buffer per capture layer
-  // (target_layer_ids), each rows x hidden_size; each is fused (`fc`),
-  // normalized and projected to that layer's context K/V at its absolute
-  // position. The cache keeps all rows by default; SetContextLimit caps it
-  // to the most recent rows.
+  // (target_layer_ids), each rows x hidden_size; `row_offset` selects the
+  // first capture row to append and `rows` how many follow. Each row is
+  // fused (`fc`), normalized and projected to that layer's context K/V at
+  // its absolute position. The cache keeps all rows by default;
+  // SetContextLimit caps it to the most recent rows.
   [[nodiscard]] std::expected<void, StatusCode> AppendContext(
       Backend& backend, const std::vector<const Buffer*>& captures,
-      std::size_t rows);
+      std::size_t row_offset, std::size_t rows);
 
   // Cap the context to the most recent `rows` (0 keeps every position).
   void SetContextLimit(std::size_t rows) { context_limit_ = rows; }

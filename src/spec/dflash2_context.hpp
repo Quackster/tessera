@@ -89,8 +89,8 @@ struct DraftContextCache {
     const std::vector<const Buffer*>& k_w,
     const std::vector<const Buffer*>& v_w,
     const std::vector<const Buffer*>& k_norm, std::size_t n,
-    std::size_t features, std::size_t new_rows, std::size_t hidden_dim,
-    std::size_t kv_heads, std::size_t head_dim, double theta, float eps,
-    std::size_t limit = 0);
+    std::size_t features, std::size_t row_offset, std::size_t new_rows,
+    std::size_t hidden_dim, std::size_t kv_heads, std::size_t head_dim,
+    double theta, float eps, std::size_t limit = 0);
 
 }  // namespace tessera::spec

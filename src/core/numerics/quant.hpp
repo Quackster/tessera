@@ -297,4 +297,27 @@ struct QuantBlockLayout {
 [[nodiscard]] std::expected<void, StatusCode> DequantizeBlocks(
     DType dtype, std::span<const std::byte> bytes, std::span<float> out);
 
+// Fold an MXFP4 (E2M1 nibbles + one E8M0 scale per 32 elements) weight
+// tensor into OCP fp8 E4M3 with the block exponent baked into the byte: the
+// served reference's W4A8 weight contract (radiance_mxfp4_fp8.hip). Each
+// block exponent is made relative to the row's maximum, clamped to 0..15,
+// and folded through the kMag table so the W4A8 GEMM inner loop has no
+// per-block rescale. `w` holds rows x (cols/2) nibbles (low nibble first),
+// `scales` rows x (cols/32) E8M0 bytes. `out` receives rows x cols e4m3
+// bytes; `wref` receives the per-row E8M0 reference byte. Every value is
+// exact: E2M1 magnitudes are k/8 (all representable in e4m3) and the
+// exponent is a power of two.
+[[nodiscard]] std::expected<void, StatusCode> FoldMxFp4ToFp8(
+    std::span<const std::byte> w, std::span<const std::byte> scales,
+    std::span<std::byte> out, std::span<std::byte> wref, std::size_t rows,
+    std::size_t cols);
+
+// Host reference for the folded-weight W4A8 GEMM:
+//   C[m,n] = (sum_k A_fp8[m,k] * W_fp8[n,k]) * As[m] * 2^(wref[n]-127)
+// matching the fold's contract. `as` holds m per-token fp32 scales.
+[[nodiscard]] std::expected<void, StatusCode> GemmMxFp4Fp8Ref(
+    std::span<const std::byte> a_fp8, std::span<const float> as,
+    std::span<const std::byte> w_fp8, std::span<const std::byte> wref,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+
 }  // namespace tessera::core

@@ -1,7 +1,7 @@
 #version 450
 
-// One thread per row; the dispatch is ceil(rows / 256) workgroups
-// via grid_x.
+// One workgroup per row (shared-memory sum reduction); the dispatch is
+// `rows` workgroups of 256 via grid_x.
 layout(local_size_x = 256) in;
 
 // "rmsnorm_gated" contract: buffer 0 X (rows x cols), buffer 1 W
@@ -27,23 +27,36 @@ layout(set = 0, binding = 3) buffer Y {
   float y[];
 };
 
+shared float red[256];
+
 void main() {
-  uint r = gl_GlobalInvocationID.x;
+  // One workgroup per row (shared-memory sum reduction).
+  uint r = gl_WorkGroupID.x;
   uint rows = pc.v[0];
   if (r >= rows) {
     return;
   }
   uint cols = pc.v[2];
   float eps = uintBitsToFloat(pc.v[4]);
-  float mean = 0.0;
-  for (uint c = 0; c < cols; ++c) {
-    mean += x[r * cols + c] * x[r * cols + c];
+  uint tid = gl_LocalInvocationID.x;
+  uint base = r * cols;
+  float sum = 0.0;
+  for (uint c = tid; c < cols; c += 256u) {
+    sum = fma(x[base + c], x[base + c], sum);
   }
-  mean /= float(cols);
-  float gain = inversesqrt(mean + eps);
-  for (uint c = 0; c < cols; ++c) {
-    float gate = g[r * cols + c];
+  red[tid] = sum;
+  barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) {
+    if (tid < st) {
+      red[tid] += red[tid + st];
+    }
+    barrier();
+  }
+  float mean = red[0] / float(cols);
+  float gain = 1.0 / sqrt(mean + eps);
+  for (uint c = tid; c < cols; c += 256u) {
+    float gate = g[base + c];
     float silu = gate / (1.0 + exp(-gate));
-    y[r * cols + c] = x[r * cols + c] * gain * w[c] * silu;
+    y[base + c] = x[base + c] * gain * w[c] * silu;
   }
 }

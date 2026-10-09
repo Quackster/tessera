@@ -56,6 +56,16 @@ class SpeculativeStrategy {
   // Maximum draft tokens proposed per window (0 = strategy default).
   [[nodiscard]] virtual std::size_t DraftBlock() const = 0;
 
+  // True when the engine folds the per-step anchor (the just-emitted token)
+  // into the draft verification batch instead of running a separate
+  // single-token target forward for it. The verify then processes
+  // [anchor, drafts...] and the strategy reads the anchor's captured
+  // features from the verify: OnAnchor is called *after* the verify, not
+  // before Draft. False keeps the classic bonus-forward-then-draft order
+  // (MTP). A strategy that folds must propose more than one draft per step
+  // for the batch to amortize the anchor row.
+  [[nodiscard]] virtual bool FoldsAnchor() const { return false; }
+
   // Block indices whose per-position residual hidden the target must capture
   // for the drafter (empty when the drafter does not read target hidden).
   [[nodiscard]] virtual std::span<const std::size_t> CaptureLayers() const = 0;

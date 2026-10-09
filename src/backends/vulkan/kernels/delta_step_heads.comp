@@ -39,16 +39,45 @@ void main() {
     uint vo = t * heads * dv;
     float a = alpha[t * heads + h];
     float b = beta[t * heads + h];
-    float read = 0.0;
-    for (uint j = 0; j < dk; ++j) {
-      read += s[s_base + j * dv + d] * k[ko + k_base + j];
+    // Four partial sums keep the dk-deep read and output chains short.
+    float r0 = 0.0, r1 = 0.0, r2 = 0.0, r3 = 0.0;
+    uint j = 0u;
+    for (; j + 4u <= dk; j += 4u) {
+      r0 = fma(s[s_base + (j + 0u) * dv + d], k[ko + k_base + j + 0u], r0);
+      r1 = fma(s[s_base + (j + 1u) * dv + d], k[ko + k_base + j + 1u], r1);
+      r2 = fma(s[s_base + (j + 2u) * dv + d], k[ko + k_base + j + 2u], r2);
+      r3 = fma(s[s_base + (j + 3u) * dv + d], k[ko + k_base + j + 3u], r3);
     }
-    float total = 0.0;
-    for (uint j = 0; j < dk; ++j) {
+    for (; j < dk; ++j) {
+      r0 = fma(s[s_base + j * dv + d], k[ko + k_base + j], r0);
+    }
+    float read = (r0 + r1) + (r2 + r3);
+    float o0 = 0.0, o1 = 0.0, o2 = 0.0, o3 = 0.0;
+    j = 0u;
+    for (; j + 4u <= dk; j += 4u) {
+      float u0 = a * (s[s_base + (j + 0u) * dv + d] - b * k[ko + k_base + j + 0u] * read) +
+                 b * v[vo + v_base + d] * k[ko + k_base + j + 0u];
+      float u1 = a * (s[s_base + (j + 1u) * dv + d] - b * k[ko + k_base + j + 1u] * read) +
+                 b * v[vo + v_base + d] * k[ko + k_base + j + 1u];
+      float u2 = a * (s[s_base + (j + 2u) * dv + d] - b * k[ko + k_base + j + 2u] * read) +
+                 b * v[vo + v_base + d] * k[ko + k_base + j + 2u];
+      float u3 = a * (s[s_base + (j + 3u) * dv + d] - b * k[ko + k_base + j + 3u] * read) +
+                 b * v[vo + v_base + d] * k[ko + k_base + j + 3u];
+      s[s_base + (j + 0u) * dv + d] = u0;
+      s[s_base + (j + 1u) * dv + d] = u1;
+      s[s_base + (j + 2u) * dv + d] = u2;
+      s[s_base + (j + 3u) * dv + d] = u3;
+      o0 = fma(u0, q[ko + k_base + j + 0u], o0);
+      o1 = fma(u1, q[ko + k_base + j + 1u], o1);
+      o2 = fma(u2, q[ko + k_base + j + 2u], o2);
+      o3 = fma(u3, q[ko + k_base + j + 3u], o3);
+    }
+    float total = (o0 + o1) + (o2 + o3);
+    for (; j < dk; ++j) {
       float updated = a * (s[s_base + j * dv + d] - b * k[ko + k_base + j] * read) +
                       b * v[vo + v_base + d] * k[ko + k_base + j];
       s[s_base + j * dv + d] = updated;
-      total += updated * q[ko + k_base + j];
+      total = fma(updated, q[ko + k_base + j], total);
     }
     o[t * heads * dv + idx] = total;
   }

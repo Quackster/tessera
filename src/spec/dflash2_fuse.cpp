@@ -57,7 +57,7 @@ std::expected<void, StatusCode> DraftFuseDevice(
     return std::unexpected(concatenated.error());
   }
   KernelLaunch quantize_launch;
-  quantize_launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
+  quantize_launch.grid_x = static_cast<std::uint32_t>(rows);
   quantize_launch.block_x = 256;
   quantize_launch.buffers = {&scratch, &scale};
   quantize_launch.scalars = {rows, width};

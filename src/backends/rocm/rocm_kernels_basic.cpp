@@ -229,31 +229,44 @@ __device__ std::uint8_t Fp8E4M3FromFloatDev(float value) {
       static_cast<unsigned int>(mant));
 }
 
-// Built-in "quantize_fp8": one thread per row; quantize-dequantize the
-// row in place to OCP FP8 E4M3 with the dynamic per-token W4A8 scale.
+// Built-in "quantize_fp8": symmetric per-row E4M3 quantize-dequantize. One
+// workgroup per row so a one-row call (the DFlash2 context hidden) uses the
+// whole block; the dispatch is `rows` workgroups of 256.
 __global__ void QuantizeFp8Kernel(float* data, float* scale,
                                   unsigned long long rows,
                                   unsigned long long cols) {
+  __shared__ float red[256];
   const unsigned long long r =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+      static_cast<unsigned long long>(blockIdx.x);
   if (r >= rows) {
     return;
   }
+  const unsigned long long tid = threadIdx.x;
   const unsigned long long base = r * cols;
   float amax = 0.0f;
-  for (unsigned long long c = 0; c < cols; ++c) {
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
     amax = fmaxf(amax, fabsf(data[base + c]));
   }
-  float s = amax / 448.0f;
-  const float min_s = 1.0f / (448.0f * 512.0f);
-  if (s < min_s) {
-    s = min_s;
+  red[tid] = amax;
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    __syncthreads();
+    if (tid < s) {
+      red[tid] = fmaxf(red[tid], red[tid + s]);
+    }
   }
-  scale[r] = s;
-  for (unsigned long long c = 0; c < cols; ++c) {
-    const float q = fminf(fmaxf(data[base + c] / s, -448.0f), 448.0f);
+  __syncthreads();
+  float sc = red[0] / 448.0f;
+  const float min_s = 1.0f / (448.0f * 512.0f);
+  if (sc < min_s) {
+    sc = min_s;
+  }
+  if (tid == 0) {
+    scale[r] = sc;
+  }
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
+    const float q = fminf(fmaxf(data[base + c] / sc, -448.0f), 448.0f);
     const std::uint8_t bits = Fp8E4M3FromFloatDev(q);
-    data[base + c] = Fp8E4M3ToFloatDev(bits) * s;
+    data[base + c] = Fp8E4M3ToFloatDev(bits) * sc;
   }
 }
 
@@ -512,6 +525,78 @@ __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
   }
 }
 
+// Built-in "gemm_mxfp4_rows": the small-batch MXFP4 GEMV. One warp owns one
+// weight column (row_w) and accumulates every one of the m activation rows,
+// so the weight block is decoded and read once per column instead of once
+// per (row, column) as the single-row "gemm_mxfp4" does. This is the shape
+// the speculative verifier hits (m about 2 to 7), where reading the weight
+// matrix once instead of m times is the win. Grid: ceil(n / 8) workgroups
+// of 256. m must be 1..16.
+constexpr int kGemmRowsMax = 16;
+
+__global__ void GemmMxFp4RowsKernel(const float* a, const unsigned char* w,
+                                    float* c, unsigned long long m,
+                                    unsigned long long n, unsigned long long k) {
+  const unsigned long long warp =
+      (static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
+       threadIdx.x) /
+      32;
+  const unsigned long long lane = threadIdx.x & 31u;
+  if (warp >= n) {
+    return;
+  }
+  const unsigned long long row_w = warp;
+  const unsigned long long rows = m < kGemmRowsMax ? m : kGemmRowsMax;
+  const unsigned char* s = w + (n * k) / 2;
+  const unsigned long long blocks = k / 32;
+  const unsigned int* words = reinterpret_cast<const unsigned int*>(w);
+  float acc[kGemmRowsMax];
+#pragma unroll
+  for (int r = 0; r < kGemmRowsMax; ++r) {
+    acc[r] = 0.0f;
+  }
+  for (unsigned long long b = lane; b < blocks; b += 32) {
+    const float scale = E8M0ToFloatDev(s[row_w * blocks + b]);
+    const unsigned long long base = b * 32;
+    const unsigned long long word_base = (row_w * k + base) / 8;
+    float wv[32];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      unsigned int bits = words[word_base + q];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        wv[q * 8 + j] = scale * kE2M1Dev[bits & 15u];
+        bits >>= 4;
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kGemmRowsMax; ++r) {
+      if (static_cast<unsigned long long>(r) >= rows) {
+        break;
+      }
+      const float* a_row = a + static_cast<unsigned long long>(r) * k + base;
+#pragma unroll
+      for (int e = 0; e < 32; ++e) {
+        acc[r] = fmaf(a_row[e], wv[e], acc[r]);
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < kGemmRowsMax; ++r) {
+    if (static_cast<unsigned long long>(r) >= rows) {
+      break;
+    }
+    float v = acc[r];
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      v += __shfl_down(v, offset);
+    }
+    if (lane == 0) {
+      c[static_cast<unsigned long long>(r) * n + row_w] = v;
+    }
+  }
+}
+
 // Built-in "gemm_mxfp4_batched": tiled C = A x dequant(W)^T for a batch.
 // One workgroup handles 8 activation rows x one weight column; the 32
 // MXFP4 elements of a block (and its E8M0 scale) are dequantized once
@@ -572,6 +657,152 @@ __global__ void GemmMxFp4BatchedKernel(const float* a, const unsigned char* w,
   }
   c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
 }
+
+// fp8 tensor-core WMMA: C[m,n] fp32 = A_fp8[m,k] . dequant(W_mxfp4)[n,k]^T
+// with per-token As[m]. 4 waves per workgroup, each a 16x16 output tile; the
+// A and W tiles (kWmmaDbk deep) are staged in padded shared memory and the
+// fragments read from LDS (raw global fragment reads are ~10x slower). A is
+// e4m3. W is MXFP4 (n*k/2 packed nibbles then n*k/32 E8M0 scales); each
+// nibble is upconverted to e4m3 with the block exponent folded in relative to
+// the row max (the kMag table, see FoldMxFp4ToFp8), so DRAM stays 0.5 B. The
+// served reference's small-m path (radiance_mxfp4_fp8_gemm_decode). Buffers:
+// 0 A (m x k fp8), 1 W (packed MXFP4), 2 As (m f32), 3 Wref (n bytes), 4 C
+// (m x n f32); scalars m, n, k. Grid ceil(n/64), block 128.
+typedef int WmmaFp8A __attribute__((ext_vector_type(2)));
+typedef float WmmaFp8C __attribute__((ext_vector_type(8)));
+typedef unsigned int WmmaU4 __attribute__((ext_vector_type(4)));
+typedef unsigned int WmmaU2 __attribute__((ext_vector_type(2)));
+
+constexpr int kWmmaDbk = 128;
+constexpr int kWmmaPad = 16;
+constexpr int kWmmaAstr = kWmmaDbk + kWmmaPad;
+constexpr int kWmmaDwn = 4;
+
+__device__ __constant__ unsigned char kMagDev[16][8] = {
+    {0x00, 0x30, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c},
+    {0x00, 0x28, 0x30, 0x34, 0x38, 0x3c, 0x40, 0x44},
+    {0x00, 0x20, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c},
+    {0x00, 0x18, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34},
+    {0x00, 0x10, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c},
+    {0x00, 0x08, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24},
+    {0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c},
+    {0x00, 0x02, 0x04, 0x06, 0x08, 0x0c, 0x10, 0x14},
+    {0x00, 0x01, 0x02, 0x03, 0x04, 0x06, 0x08, 0x0c},
+    {0x00, 0x00, 0x01, 0x01, 0x02, 0x03, 0x04, 0x06},
+    {0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x02, 0x03},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+};
+
+// Built-in "mxfp4_row_ref": per-row max of the E8M0 block scales of a packed
+// MXFP4 weight (n*k/2 nibbles then n*k/32 scales), the Wref the fp8 GEMM
+// folds against. One thread per row. Buffers: 0 W (packed), 1 Wref (n bytes);
+// scalars n, k. Grid ceil(n/256), block 256.
+__global__ void MxFp4RowRefKernel(const unsigned char* w, unsigned char* wref,
+                                  unsigned long long n, unsigned long long k) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= n) {
+    return;
+  }
+  const unsigned char* scales = w + (n * k) / 2;
+  const unsigned long long blocks = k / 32;
+  unsigned char ref = 0;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char s = scales[r * blocks + b];
+    ref = s > ref ? s : ref;
+  }
+  wref[r] = ref;
+}
+
+__global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
+                                    const unsigned char* w,
+                                    const float* as,
+                                    const unsigned char* wref, float* c,
+                                    unsigned long long m, unsigned long long n,
+                                    unsigned long long k) {
+  __shared__ unsigned char sA[16 * kWmmaAstr];
+  __shared__ unsigned char sW[kWmmaDwn * 16 * kWmmaAstr];
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5, lane = tid & 31;
+  const unsigned long long n0 =
+      static_cast<unsigned long long>(blockIdx.x) * (kWmmaDwn * 16ull) +
+      static_cast<unsigned long long>(wave) * 16ull;
+  const unsigned char* scales = w + (n * k) / 2;
+  const unsigned long long blocks = k / 32;
+  const int acol8 = (lane >> 4) * 8;
+  const int wrow8 = (lane >> 4) * 8, wcol = lane & 15;
+  WmmaFp8C acc;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    acc[e] = 0.0f;
+  }
+  for (unsigned long long k0 = 0; k0 < k; k0 += kWmmaDbk) {
+    // A tile: 16 rows x DBK bytes, vectorized stores.
+    for (int u = tid; u < 16 * kWmmaDbk / 16; u += kWmmaDwn * 32) {
+      const int pos = u * 16, r = pos / kWmmaDbk, col = pos % kWmmaDbk;
+      const unsigned long long ar =
+          static_cast<unsigned long long>(r) < m ? r : m - 1;
+      *reinterpret_cast<WmmaU4*>(&sA[r * kWmmaAstr + col]) =
+          *reinterpret_cast<const WmmaU4*>(&a[ar * k + k0 + col]);
+    }
+    // W tile: DBK/16 groups of 16 nibbles per row, folded to 16 fp8 bytes.
+    // Each wave stages its own 16 columns (its 32 lanes cover the groups).
+    if (n0 < n) {
+      for (int g = lane; g < 16 * (kWmmaDbk / 16); g += 32) {
+        const int r = g / (kWmmaDbk / 16), cg = g % (kWmmaDbk / 16);
+        const int nr = static_cast<int>(n0) + r;
+        const int nrc = nr < static_cast<int>(n) ? nr : static_cast<int>(n) - 1;
+        const unsigned long long kt0 =
+            k0 + static_cast<unsigned long long>(cg * 16);
+        const WmmaU2 wv = *reinterpret_cast<const WmmaU2*>(
+            &w[(static_cast<unsigned long long>(nrc) * k + kt0) / 2]);
+        unsigned char out[16];
+#pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+          const unsigned char byte =
+              reinterpret_cast<const unsigned char*>(&wv)[kk / 2];
+          const unsigned char nib = (kk & 1) ? (byte >> 4) : (byte & 0xFu);
+          int d = static_cast<int>(wref[nrc]) -
+                  static_cast<int>(
+                      scales[static_cast<unsigned long long>(nrc) * blocks +
+                             (kt0 + kk) / 32]);
+          d = d < 0 ? 0 : (d > 15 ? 15 : d);
+          out[kk] = kMagDev[d][nib & 7u] | ((nib & 8u) ? 0x80u : 0u);
+        }
+        *reinterpret_cast<WmmaU4*>(
+            &sW[(wave * 16 + r) * kWmmaAstr + cg * 16]) =
+            *reinterpret_cast<WmmaU4*>(out);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int ks = 0; ks < kWmmaDbk / 16; ++ks) {
+      WmmaFp8A af, wf;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        reinterpret_cast<unsigned char*>(&af)[j] =
+            sA[(lane & 15) * kWmmaAstr + ks * 16 + acol8 + j];
+        reinterpret_cast<unsigned char*>(&wf)[j] =
+            sW[(wave * 16 + (lane & 15)) * kWmmaAstr + ks * 16 + wrow8 + j];
+      }
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af, wf, acc);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const unsigned long long r = static_cast<unsigned long long>(wrow8 + j);
+    const unsigned long long nn = n0 + static_cast<unsigned long long>(wcol);
+    if (r < m && nn < n) {
+      c[r * n + nn] =
+          acc[j] * as[r] * __int_as_float(static_cast<int>(wref[nn]) << 23);
+    }
+  }
+}
 // Built-in "rmsnorm": row-wise RMS norm over rows x cols fp32. One block
 // per row; the row sum reduces across the block so a single-row decode
 // step does not serialize the row on one thread.
@@ -619,17 +850,20 @@ __global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
   o[i] = a[i] / (1.0f + expf(-g[i]));
 }
 
-// Built-in "l2norm": row-wise L2 normalization over rows x cols fp32.
-// One thread per row with sequential accumulation.
+// Built-in "l2norm": row-wise L2 normalization over rows x cols fp32. One
+// workgroup per row (shared-memory sum reduction), dispatch `rows`
+// workgroups of 256.
 __global__ void L2NormKernel(const float* x, float* y,
                              unsigned long long rows, unsigned long long cols,
                              unsigned long long eps_bits,
                              unsigned long long scale_bits) {
-  const unsigned long long r =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  __shared__ float red[256];
+  const unsigned long long r = static_cast<unsigned long long>(blockIdx.x);
   if (r >= rows) {
     return;
   }
+  const unsigned long long tid = threadIdx.x;
+  const unsigned long long base = r * cols;
   float eps = 0.0f;
   float scale = 0.0f;
   static_assert(sizeof(eps) == 4);
@@ -638,12 +872,20 @@ __global__ void L2NormKernel(const float* x, float* y,
   std::uint32_t scale_bits32 = static_cast<std::uint32_t>(scale_bits);
   std::memcpy(&scale, &scale_bits32, 4);
   float sum = 0.0f;
-  for (unsigned long long c = 0; c < cols; ++c) {
-    sum = fmaf(x[r * cols + c], x[r * cols + c], sum);
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
+    sum = fmaf(x[base + c], x[base + c], sum);
   }
-  const float gain = scale / sqrtf(sum + eps);
-  for (unsigned long long c = 0; c < cols; ++c) {
-    y[r * cols + c] = x[r * cols + c] * gain;
+  red[tid] = sum;
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    __syncthreads();
+    if (tid < s) {
+      red[tid] += red[tid + s];
+    }
+  }
+  __syncthreads();
+  const float gain = scale / sqrtf(red[0] + eps);
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
+    y[base + c] = x[base + c] * gain;
   }
 }
 
@@ -655,25 +897,35 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
                                    unsigned long long rows,
                                    unsigned long long cols,
                                    unsigned long long eps_bits) {
-  const unsigned long long r =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  __shared__ float red[256];
+  const unsigned long long r = static_cast<unsigned long long>(blockIdx.x);
   if (r >= rows) {
     return;
   }
+  const unsigned long long tid = threadIdx.x;
+  const unsigned long long base = r * cols;
   float eps = 0.0f;
   static_assert(sizeof(eps) == 4);
   std::uint32_t bits = static_cast<std::uint32_t>(eps_bits);
   std::memcpy(&eps, &bits, 4);
-  float mean = 0.0f;
-  for (unsigned long long c = 0; c < cols; ++c) {
-    mean = fmaf(x[r * cols + c], x[r * cols + c], mean);
+  float sum = 0.0f;
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
+    sum = fmaf(x[base + c], x[base + c], sum);
   }
-  mean /= static_cast<float>(cols);
+  red[tid] = sum;
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    __syncthreads();
+    if (tid < s) {
+      red[tid] += red[tid + s];
+    }
+  }
+  __syncthreads();
+  const float mean = red[0] / static_cast<float>(cols);
   const float gain = 1.0f / sqrtf(mean + eps);
-  for (unsigned long long c = 0; c < cols; ++c) {
-    const float g = gate[r * cols + c];
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
+    const float g = gate[base + c];
     const float silu = g / (1.0f + expf(-g));
-    y[r * cols + c] = x[r * cols + c] * gain * w[c] * silu;
+    y[base + c] = x[base + c] * gain * w[c] * silu;
   }
 }
 // Built-in "conv1d": causal depthwise convolution over channels x
@@ -877,12 +1129,51 @@ __global__ void DeltaStepHeadsKernel(
     const float* qt = q + t * heads * dk;
     const float a = alpha[t * heads + h];
     const float b = beta[t * heads + h];
-    float read = 0.0f;
-    for (unsigned long long j = 0; j < dk; ++j) {
-      read = fmaf(s[s_base + j * dv + d], kt[k_base + j], read);
+    // Four partial sums keep the dk-deep read and output chains short.
+    float r0 = 0.0f;
+    float r1 = 0.0f;
+    float r2 = 0.0f;
+    float r3 = 0.0f;
+    unsigned long long j = 0;
+    for (; j + 4 <= dk; j += 4) {
+      r0 = fmaf(s[s_base + (j + 0) * dv + d], kt[k_base + j + 0], r0);
+      r1 = fmaf(s[s_base + (j + 1) * dv + d], kt[k_base + j + 1], r1);
+      r2 = fmaf(s[s_base + (j + 2) * dv + d], kt[k_base + j + 2], r2);
+      r3 = fmaf(s[s_base + (j + 3) * dv + d], kt[k_base + j + 3], r3);
     }
-    float out = 0.0f;
-    for (unsigned long long j = 0; j < dk; ++j) {
+    for (; j < dk; ++j) {
+      r0 = fmaf(s[s_base + j * dv + d], kt[k_base + j], r0);
+    }
+    const float read = (r0 + r1) + (r2 + r3);
+    float o0 = 0.0f;
+    float o1 = 0.0f;
+    float o2 = 0.0f;
+    float o3 = 0.0f;
+    j = 0;
+    for (; j + 4 <= dk; j += 4) {
+      const float u0 =
+          a * (s[s_base + (j + 0) * dv + d] - b * kt[k_base + j + 0] * read) +
+          b * vt[v_base + d] * kt[k_base + j + 0];
+      const float u1 =
+          a * (s[s_base + (j + 1) * dv + d] - b * kt[k_base + j + 1] * read) +
+          b * vt[v_base + d] * kt[k_base + j + 1];
+      const float u2 =
+          a * (s[s_base + (j + 2) * dv + d] - b * kt[k_base + j + 2] * read) +
+          b * vt[v_base + d] * kt[k_base + j + 2];
+      const float u3 =
+          a * (s[s_base + (j + 3) * dv + d] - b * kt[k_base + j + 3] * read) +
+          b * vt[v_base + d] * kt[k_base + j + 3];
+      s[s_base + (j + 0) * dv + d] = u0;
+      s[s_base + (j + 1) * dv + d] = u1;
+      s[s_base + (j + 2) * dv + d] = u2;
+      s[s_base + (j + 3) * dv + d] = u3;
+      o0 = fmaf(u0, qt[k_base + j + 0], o0);
+      o1 = fmaf(u1, qt[k_base + j + 1], o1);
+      o2 = fmaf(u2, qt[k_base + j + 2], o2);
+      o3 = fmaf(u3, qt[k_base + j + 3], o3);
+    }
+    float out = (o0 + o1) + (o2 + o3);
+    for (; j < dk; ++j) {
       const float updated =
           a * (s[s_base + j * dv + d] - b * kt[k_base + j] * read) +
           b * vt[v_base + d] * kt[k_base + j];
@@ -1183,6 +1474,53 @@ __global__ void QuantizeFp8PackKernel(const float* in, unsigned int* packed,
   }
 }
 
+// Built-in "quantize_fp8_pack_rows": as quantize_fp8_pack but one workgroup
+// per row (shared-memory amax reduction), so a few huge rows (the fp8-WMMA
+// activation) do not serialize on one thread. Buffers: 0 in (f32 rows x
+// cols), 1 packed (rows x cols/4 uint), 2 scale (rows). Scalars rows, cols
+// (a multiple of 4). Grid `rows`, block 256.
+__global__ void QuantizeFp8PackRowsKernel(const float* in, unsigned int* packed,
+                                          float* scale, unsigned long long rows,
+                                          unsigned long long cols) {
+  __shared__ float red[256];
+  const unsigned long long r = blockIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  const unsigned long long tid = threadIdx.x;
+  const unsigned long long base = r * cols;
+  float amax = 0.0f;
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
+    amax = fmaxf(amax, fabsf(in[base + c]));
+  }
+  red[tid] = amax;
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    __syncthreads();
+    if (tid < s) {
+      red[tid] = fmaxf(red[tid], red[tid + s]);
+    }
+  }
+  __syncthreads();
+  float sc = red[0] / 448.0f;
+  const float min_s = 1.0f / (448.0f * 512.0f);
+  if (sc < min_s) {
+    sc = min_s;
+  }
+  if (tid == 0) {
+    scale[r] = sc;
+  }
+  const unsigned long long words = cols / 4;
+  for (unsigned long long w = tid; w < words; w += blockDim.x) {
+    unsigned int word = 0u;
+    for (unsigned int b = 0u; b < 4u; ++b) {
+      const float q = fminf(fmaxf(in[base + w * 4 + b] / sc, -448.0f), 448.0f);
+      const std::uint8_t bits = Fp8E4M3FromFloatDev(q);
+      word |= static_cast<unsigned int>(bits) << (b * 8u);
+    }
+    packed[r * words + w] = word;
+  }
+}
+
 // Built-in "attention_fp8": GQA with OCP FP8 E4M3 keys/values.
 __global__ void AttentionFp8Kernel(const float* q, const unsigned char* k,
                                    const unsigned char* v, const float* ks,
@@ -1417,6 +1755,80 @@ __global__ void SelectorEdgeScoreKernel(
                successor_codebook[succ_row + r], dot);
   }
   out_scores[index] = unary[pos * top_k + c] + dot;
+}
+
+// Built-in "top_k_rows": per-row top-k over `vocab` fp32 logits (spec/DFlash2
+// candidate selection). One workgroup per row, 256 threads. Each thread keeps
+// a descending local top-k in scratch, then the workgroup merges the `count`
+// sorted lists with a k-way merge: each pass reduces the current head of every
+// list to the largest, records it and advances that list.
+__global__ void TopKRowsKernel(const float* logits, unsigned int* ids,
+                               float* vals, unsigned long long rows,
+                               unsigned long long vocab,
+                               unsigned long long top_k,
+                               unsigned long long row_base) {
+  constexpr unsigned long long k = 32;
+  __shared__ float rv[256];
+  __shared__ unsigned int ri[256];
+  __shared__ unsigned int rown[256];
+  const unsigned long long r = blockIdx.x;
+  if (r >= rows || top_k == 0 || top_k > k) {
+    return;
+  }
+  const unsigned long long tid = threadIdx.x;
+  const unsigned long long dim = blockDim.x;
+  const float* row = logits + (row_base + r) * vocab;
+  float lv[k];
+  unsigned int li[k];
+  unsigned long long count = 0;
+  for (unsigned long long c = tid; c < vocab; c += dim) {
+    const float v = row[c];
+    if (count < top_k) {
+      unsigned long long j = count;
+      while (j > 0 && lv[j - 1] < v) {
+        lv[j] = lv[j - 1];
+        li[j] = li[j - 1];
+        --j;
+      }
+      lv[j] = v;
+      li[j] = static_cast<unsigned int>(c);
+      ++count;
+    } else if (v > lv[top_k - 1]) {
+      unsigned long long j = top_k - 1;
+      while (j > 0 && lv[j - 1] < v) {
+        lv[j] = lv[j - 1];
+        li[j] = li[j - 1];
+        --j;
+      }
+      lv[j] = v;
+      li[j] = static_cast<unsigned int>(c);
+    }
+  }
+  unsigned long long head = 0;
+  for (unsigned long long p = 0; p < top_k; ++p) {
+    rv[tid] = (head < count) ? lv[head] : -INFINITY;
+    ri[tid] = (head < count) ? li[head] : 0u;
+    rown[tid] = static_cast<unsigned int>(tid);
+    __syncthreads();
+    for (unsigned long long s = dim / 2; s > 0; s >>= 1) {
+      if (tid < s && rv[tid + s] > rv[tid]) {
+        rv[tid] = rv[tid + s];
+        ri[tid] = ri[tid + s];
+        rown[tid] = rown[tid + s];
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      vals[r * top_k + p] = rv[0];
+      ids[r * top_k + p] = ri[0];
+    }
+    const unsigned int owner = rown[0];
+    __syncthreads();
+    if (tid == owner) {
+      ++head;
+    }
+    __syncthreads();
+  }
 }
 
 }  // namespace tessera::backends::rocm

@@ -106,10 +106,15 @@ class Architecture {
   // this to batch the scoring. `capture` mirrors ForwardBatch and receives
   // the per-row residual hidden at `capture_layers` for every scored row,
   // so a caller can keep the hidden of each accepted position as context.
+  // When `anchor` is set the anchor token is processed as the batch's first
+  // row (so its logits score `draft[0]` and its captured features are row 0
+  // of `capture`); the caller then commits the anchor plus the accepted
+  // drafts. `prefix_logits` is ignored in that case.
   [[nodiscard]] virtual std::expected<DraftVerification, StatusCode> Verify(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits,
+      std::optional<std::uint32_t> anchor,
       std::vector<float>* hidden_out,
       const std::vector<std::size_t>* capture_layers = nullptr,
       std::vector<Buffer*>* capture = nullptr) const = 0;

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <span>
 #include <string>
@@ -367,9 +368,90 @@ TEST(BackendTest, GemmMxFp4DeviceMatchesRef) {
       << "backend " << backend->Name() << " max_rel " << max_rel;
 }
 
+// Device: the small-batch rows GEMV (one warp per weight column, all m rows)
+// matches the host reference for m > 1, on both backends.
+TEST(BackendTest, GemmMxFp4RowsDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(2026);
+  constexpr std::size_t kM = 3;
+  constexpr std::size_t kN = 24;
+  constexpr std::size_t kK = 64;
+  constexpr float kGrid[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                              2.0f, 3.0f, 4.0f, 6.0f};
+  std::vector<float> a(kM * kK);
+  std::vector<std::byte> w(kN * kK / 2, std::byte{0});
+  std::vector<std::byte> s(kN * kK / 32);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  for (std::size_t j = 0; j < kN; ++j) {
+    for (std::size_t b = 0; b < kK / 32; ++b) {
+      s[j * (kK / 32) + b] = static_cast<std::byte>(125 + (j + b) % 5);
+      for (std::size_t l = 0; l < 32; ++l) {
+        const std::size_t t = b * 32 + l;
+        const std::uint8_t nib = core::Fp32ToF4E2M1Nibble(
+            kGrid[(j + t) % 8] * (t % 3 == 0 ? -1.0f : 1.0f));
+        const std::size_t at = (j * kK + t) / 2;
+        std::uint8_t packed = static_cast<std::uint8_t>(w[at]);
+        if (t % 2 == 0) {
+          packed = static_cast<std::uint8_t>((packed & 0xF0) | nib);
+        } else {
+          packed = static_cast<std::uint8_t>((packed & 0x0F) | (nib << 4));
+        }
+        w[at] = static_cast<std::byte>(packed);
+      }
+    }
+  }
+  std::vector<std::byte> packed = w;
+  packed.insert(packed.end(), s.begin(), s.end());
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(packed.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(
+                  **a_buf,
+                  std::span<const std::byte>(
+                      reinterpret_cast<const std::byte*>(a.data()),
+                      a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(packed))
+                  .has_value());
+  auto kernel = backend->LoadKernel("gemm_mxfp4_rows", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = tessera::core::detail::GemmGridFor(**kernel, kM, kN);
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**c_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kM * kN);
+  ASSERT_TRUE(core::GemmMxFp4Ref(std::span<const float>(a),
+                                 std::span<const std::byte>(w),
+                                 std::span<const std::byte>(s),
+                                 std::span<float>(ref), kM, kN, kK)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(got[i] - ref[i]);
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, e / std::max(1.0f, std::abs(ref[i])));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
+}
+
 // Host: the fp GEMM references reject malformed shapes.
-TEST(BackendTest, FpGemmRefsRejectBadArgs) {
-  std::vector<float> a(2 * 64, 0.5f);
+TEST(BackendTest, FpGemmRefsRejectBadArgs) {  std::vector<float> a(2 * 64, 0.5f);
   std::vector<std::byte> w(4 * 64, std::byte{0x40});
   std::vector<float> s(4, 1.0f);
   std::vector<float> c(2 * 4);
@@ -395,6 +477,140 @@ TEST(BackendTest, FpGemmRefsRejectBadArgs) {
       std::span<const float>(a), std::span<const std::byte>(wm),
       std::span<const std::byte>(sm), std::span<float>(c), 2, 4, 64);
   ASSERT_TRUE(ok_mx.has_value()) << tessera::ToString(ok_mx.error());
+}
+
+// Host: the MXFP4 -> fp8 fold is exact. With A = 1.0 (e4m3 0x38) and As = 1,
+// the W4A8 reference must equal the plain MXFP4 dequant sum per row.
+TEST(BackendTest, FoldMxFp4ToFp8MatchesDequant) {
+  std::mt19937 rng(4242);
+  constexpr std::size_t kRows = 3;
+  constexpr std::size_t kCols = 64;
+  constexpr std::size_t kBlocks = kCols / 32;
+  constexpr float kMag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  std::vector<std::byte> w(kRows * kCols / 2);
+  for (auto& b : w) {
+    b = static_cast<std::byte>(rng() & 0xFF);
+  }
+  std::vector<std::byte> scales(kRows * kBlocks);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    for (std::size_t b = 0; b < kBlocks; ++b) {
+      scales[r * kBlocks + b] = static_cast<std::byte>(120 + ((r + b) % 8));
+    }
+  }
+  std::vector<std::byte> wfp8(kRows * kCols);
+  std::vector<std::byte> wref(kRows);
+  auto folded = core::FoldMxFp4ToFp8(w, scales, wfp8, wref, kRows, kCols);
+  ASSERT_TRUE(folded.has_value()) << tessera::ToString(folded.error());
+  std::vector<std::byte> a(kCols, std::byte{0x38});
+  std::vector<float> as(1, 1.0f);
+  std::vector<float> c(kRows);
+  auto gemm = core::GemmMxFp4Fp8Ref(a, as, wfp8, wref, c, 1, kRows, kCols);
+  ASSERT_TRUE(gemm.has_value()) << tessera::ToString(gemm.error());
+  for (std::size_t r = 0; r < kRows; ++r) {
+    float ref = 0.0f;
+    for (std::size_t col = 0; col < kCols; ++col) {
+      const std::uint8_t packed =
+          static_cast<std::uint8_t>(w[(r * kCols + col) / 2]);
+      const std::uint8_t nib = (col % 2 == 0) ? (packed & 0xF) : (packed >> 4);
+      const float scale = std::exp2(
+          static_cast<float>(static_cast<std::uint8_t>(
+                                 scales[r * kBlocks + col / 32])) -
+          127.0f);
+      ref += kMag[nib & 7] * ((nib & 8) ? -1.0f : 1.0f) * scale;
+    }
+    EXPECT_NEAR(c[r], ref, 1e-3f * std::max(1.0f, std::abs(ref)))
+        << "row " << r;
+  }
+}
+
+// Device: the fp8 tensor-core MXFP4 GEMM matches the W4A8 host reference at
+// the small-m verify shape.
+TEST(BackendTest, GemmMxFp4WmmaDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(99);
+  constexpr std::size_t kM = 3;
+  constexpr std::size_t kN = 16;
+  constexpr std::size_t kK = 128;
+  constexpr std::size_t kBlocks = kK / 32;
+  std::vector<std::byte> w(kN * kK / 2);
+  for (auto& b : w) {
+    b = static_cast<std::byte>(rng() & 0xFF);
+  }
+  std::vector<std::byte> scales(kN * kBlocks);
+  for (std::size_t r = 0; r < kN; ++r) {
+    for (std::size_t b = 0; b < kBlocks; ++b) {
+      scales[r * kBlocks + b] = static_cast<std::byte>(125 + ((r + b) % 5));
+    }
+  }
+  std::vector<std::byte> wfp8(kN * kK);
+  std::vector<std::byte> wref(kN);
+  ASSERT_TRUE(core::FoldMxFp4ToFp8(w, scales, wfp8, wref, kN, kK).has_value());
+  // The device kernel folds MXFP4 in-kernel, so upload the packed nibbles
+  // followed by the E8M0 scales.
+  std::vector<std::byte> wpacked = w;
+  wpacked.insert(wpacked.end(), scales.begin(), scales.end());
+  std::vector<std::byte> a(kM * kK);
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    a[i] = static_cast<std::byte>(0x30 + (rng() % 8));  // 0.5..1.875
+  }
+  std::vector<float> as(kM);
+  for (auto& v : as) {
+    v = 1.0f + 0.25f * static_cast<float>(rng() % 3);
+  }
+  auto a_buf = backend->AllocateBuffer(a.size(), MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(wpacked.size(), MemoryKind::Device);
+  auto as_buf = backend->AllocateBuffer(kM * 4, MemoryKind::Device);
+  auto wref_buf = backend->AllocateBuffer(kN, MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && as_buf.has_value() &&
+              wref_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(a))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(wpacked))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**as_buf,
+                               std::span<const std::byte>(
+                                   reinterpret_cast<const std::byte*>(as.data()),
+                                   as.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**wref_buf, std::span<const std::byte>(wref))
+                  .has_value());
+  auto kernel = backend->LoadKernel("gemm_mxfp4_wmma", {});
+  if (!kernel) {
+    GTEST_SKIP() << "backend has no fp8 tensor-core GEMM";
+  }
+  tessera::KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((kN + 63) / 64);
+  launch.block_x = 128;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*as_buf).get(),
+                    (*wref_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**c_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kM * kN);
+  ASSERT_TRUE(core::GemmMxFp4Fp8Ref(std::span<const std::byte>(a),
+                                    std::span<const float>(as),
+                                    std::span<const std::byte>(wfp8),
+                                    std::span<const std::byte>(wref),
+                                    std::span<float>(ref), kM, kN, kK)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float max_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(got[i] - ref[i]);
+    max_abs = std::max(max_abs, e);
+    max_rel = std::max(max_rel, e / std::max(1.0f, std::abs(ref[i])));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(max_rel, tol.rel)
+      << "backend " << backend->Name() << " max_rel " << max_rel;
 }
 
 // Random weight bytes with small exact scales patched into every
@@ -2769,7 +2985,7 @@ TEST(BackendTest, L2NormDeviceMatchesRef) {
   auto kernel = backend->LoadKernel("l2norm", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kRows + 255) / 256;
+  launch.grid_x = kRows;
   launch.block_x = 256;
   launch.buffers = {(*x_buf).get(), (*y_buf).get()};
   launch.scalars = {kRows, kCols, eps_bits, scale_bits};
@@ -2836,7 +3052,7 @@ TEST(BackendTest, RmsNormGatedDeviceMatchesRef) {
   auto kernel = backend->LoadKernel("rmsnorm_gated", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kRows + 255) / 256;
+  launch.grid_x = kRows;
   launch.block_x = 256;
   launch.buffers = {(*x_buf).get(), (*w_buf).get(), (*gate_buf).get(),
                     (*y_buf).get()};
@@ -3712,6 +3928,69 @@ TEST(BackendTest, SelectorEdgeScoreDeviceMatchesRef) {
   }
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: per-row top-k matches a host selection, including the row_base
+// offset. Indices and values are exact (same source elements).
+TEST(BackendTest, TopKRowsDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(99);
+  constexpr std::size_t kRows = 3;
+  constexpr std::size_t kVocab = 20;
+  constexpr std::size_t kTopK = 4;
+  constexpr std::size_t kRowBase = 1;
+  std::vector<float> logits((kRows + kRowBase) * kVocab);
+  for (auto& v : logits) {
+    v = DrawValue(rng);
+  }
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto in_buf = alloc(logits.size() * 4);
+  auto ids_buf = alloc(kRows * kTopK * 4);
+  auto vals_buf = alloc(kRows * kTopK * 4);
+  ASSERT_TRUE(in_buf && ids_buf && vals_buf);
+  ASSERT_TRUE(
+      backend
+          ->CopyH2D(**in_buf,
+                    std::span<const std::byte>(
+                        reinterpret_cast<const std::byte*>(logits.data()),
+                        logits.size() * 4))
+          .has_value());
+  auto kernel = backend->LoadKernel("top_k_rows", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = kRows;
+  launch.block_x = 256;
+  launch.buffers = {(*in_buf).get(), (*ids_buf).get(), (*vals_buf).get()};
+  launch.scalars = {kRows, kVocab, kTopK, kRowBase};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> ids_readback(kRows * kTopK * 4);
+  std::vector<std::byte> vals_readback(kRows * kTopK * 4);
+  ASSERT_TRUE(backend->CopyD2H(**ids_buf, ids_readback.data(),
+                               ids_readback.size())
+                  .has_value());
+  ASSERT_TRUE(backend->CopyD2H(**vals_buf, vals_readback.data(),
+                               vals_readback.size())
+                  .has_value());
+  const auto* got_ids =
+      reinterpret_cast<const std::uint32_t*>(ids_readback.data());
+  const auto* got_vals = reinterpret_cast<const float*>(vals_readback.data());
+  for (std::size_t r = 0; r < kRows; ++r) {
+    const float* row = logits.data() + (kRowBase + r) * kVocab;
+    std::vector<std::uint32_t> order(kVocab);
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + kTopK, order.end(),
+                      [row](std::uint32_t a, std::uint32_t b) {
+                        return row[a] > row[b];
+                      });
+    for (std::size_t k = 0; k < kTopK; ++k) {
+      EXPECT_EQ(got_ids[r * kTopK + k], order[k]);
+      EXPECT_FLOAT_EQ(got_vals[r * kTopK + k], row[order[k]]);
+    }
+  }
 }
 
 // Device: sliding-window attention matches the reference; a nonzero
@@ -5068,8 +5347,8 @@ TEST(BackendTest, DraftContextAppendMatchesRef) {
     }
     return tessera::spec::DraftContextAppendDevice(
         *backend, **rms, **gemm, **rope, **concat, **quantize, cache, part_p,
-        *fc_b, hnorm_p, kp_p, vp_p, kn_p, kN, kHidden, rows, kHidden, kKvHeads,
-        kHeadDim, kTheta, kEps);
+        *fc_b, hnorm_p, kp_p, vp_p, kn_p, kN, kHidden, /*row_offset=*/0, rows,
+        kHidden, kKvHeads, kHeadDim, kTheta, kEps);
   };
   ASSERT_TRUE(append_rows(0, kFirst).has_value());
   ASSERT_TRUE(append_rows(kFirst, kSecond).has_value());
@@ -5629,7 +5908,7 @@ TEST(BackendTest, QuantizeFp8MatchesRef) {
   auto kernel = backend->LoadKernel("quantize_fp8", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kRows + 255) / 256;
+  launch.grid_x = kRows;
   launch.block_x = 256;
   launch.buffers = {(*data_buf).get(), (*scale_buf).get()};
   launch.scalars = {kRows, kCols};

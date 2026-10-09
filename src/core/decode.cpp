@@ -1,6 +1,7 @@
 #include "core/decode.hpp"
 
 #include <memory>
+#include <optional>
 
 #include "core/decode_internal.hpp"
 
@@ -145,10 +146,11 @@ std::expected<std::vector<std::vector<float>>, StatusCode> DecodeLogitsBatch(
 std::expected<DraftVerification, StatusCode> VerifyDraft(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> draft,
-    std::span<const float> prefix_logits, std::vector<float>* hidden_out,
+    std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
+    std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
     std::vector<Buffer*>* capture) {
-  if (prefix_logits.empty()) {
+  if (!anchor.has_value() && prefix_logits.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
   auto config = model.Config();
@@ -159,11 +161,23 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   // everything else feeds one token at a time and never over-advances.
   const Architecture* arch = model.Arch();
   if (draft.size() > 1 && arch != nullptr) {
-    return arch->Verify(backend, model, cache, draft, prefix_logits, hidden_out,
-                        capture_layers, capture);
+    return arch->Verify(backend, model, cache, draft, prefix_logits, anchor,
+                        hidden_out, capture_layers, capture);
   }
   DraftVerification result;
-  result.logits.assign(prefix_logits.begin(), prefix_logits.end());
+  if (anchor.has_value()) {
+    // The anchor rides as the batch's first row: it advances the cache and
+    // its logits score draft[0].
+    auto anchor_logits =
+        DecodeLogits(backend, model, cache, *anchor, nullptr, capture_layers,
+                     capture);
+    if (!anchor_logits) {
+      return std::unexpected(anchor_logits.error());
+    }
+    result.logits = std::move(*anchor_logits);
+  } else {
+    result.logits.assign(prefix_logits.begin(), prefix_logits.end());
+  }
   for (const std::uint32_t token : draft) {
     if (detail::ArgMax(result.logits) != token) {
       break;

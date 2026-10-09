@@ -308,7 +308,8 @@ TEST(SpecDrafterTest, RunsRealDraftWhenProvided) {
     captures.push_back(make(ctx * hidden, 0.2f));
     capture_ptrs.push_back(captures.back().get());
   }
-  auto appended = drafter->AppendContext(backend, capture_ptrs, ctx);
+  auto appended =
+      drafter->AppendContext(backend, capture_ptrs, /*row_offset=*/0, ctx);
   ASSERT_TRUE(appended.has_value()) << tessera::ToString(appended.error());
   auto status = drafter->Run(backend, *mask, *outw, **head, **logits, rows, ctx,
                              0, vocab);

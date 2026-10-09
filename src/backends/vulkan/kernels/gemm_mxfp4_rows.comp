@@ -1,0 +1,79 @@
+#version 450
+
+// Small-batch MXFP4 GEMV, the Vulkan twin of GemmMxFp4RowsKernel. One warp
+// owns one weight column (row_w) and accumulates every one of the m activation
+// rows, so the weight block is decoded and read once per column instead of
+// once per (row, column). Grid: ceil(n / 8) workgroups of 256. m is 1..16.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer A { float a[]; };
+layout(set = 0, binding = 1) buffer W { uint w[]; };
+layout(set = 0, binding = 2) buffer C { float c[]; };
+
+// Byte `offset` of the packed weight buffer viewed as uint words.
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+const float kE2M1[16] = float[16](
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+
+shared float red[256];
+
+void main() {
+  uint lid = gl_LocalInvocationID.x;
+  uint lane = lid & 31u;
+  uint group = lid >> 5u;
+  uint warp = (gl_WorkGroupID.x * 256u + lid) / 32u;
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  // Every thread must reach the barriers below, so an out-of-range warp stays
+  // in the loop and only skips the store.
+  bool valid = warp < n;
+  uint row_w = valid ? warp : 0u;
+  uint rows = min(m, 16u);
+  uint blocks = k / 32u;
+  uint scale_base = (n * k) >> 1u;
+  uint wbase = row_w * k;
+  float acc[16];
+  for (uint r = 0u; r < 16u; ++r) {
+    acc[r] = 0.0;
+  }
+  for (uint b = lane; b < blocks; b += 32u) {
+    float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
+    uint base = b * 32u;
+    uint word_base = (wbase + base) >> 3u;
+    float wv[32];
+    for (uint q = 0u; q < 4u; ++q) {
+      uint bits = w[word_base + q];
+      for (uint j = 0u; j < 8u; ++j) {
+        wv[q * 8u + j] = scale * kE2M1[bits & 15u];
+        bits >>= 4u;
+      }
+    }
+    for (uint r = 0u; r < rows; ++r) {
+      uint ab = r * k + base;
+      for (uint e = 0u; e < 32u; ++e) {
+        acc[r] = fma(a[ab + e], wv[e], acc[r]);
+      }
+    }
+  }
+  for (uint r = 0u; r < rows; ++r) {
+    red[lid] = acc[r];
+    barrier();
+    if (lane == 0u && valid) {
+      float sum = 0.0;
+      for (uint t = 0u; t < 32u; ++t) {
+        sum += red[group * 32u + t];
+      }
+      c[r * n + row_w] = sum;
+    }
+    barrier();
+  }
+}

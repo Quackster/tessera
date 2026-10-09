@@ -396,6 +396,10 @@ inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
   if (gemm.Id().ends_with("_row")) {
     return static_cast<std::uint32_t>(m * n);
   }
+  if (gemm.Id() == "gemm_mxfp4_rows") {
+    // One warp per weight column (GemmMxFp4RowsKernel).
+    return static_cast<std::uint32_t>((n + 7) / 8);
+  }
   if (gemm.Id() == "gemm_mxfp4" || gemm.Id() == "gemm_f32" ||
       gemm.Id() == "gemm_bf16") {
     return static_cast<std::uint32_t>((m * n + 7) / 8);
@@ -519,7 +523,7 @@ inline std::expected<void, StatusCode> L2NormDevice(
   std::memcpy(&eps_bits, &eps_f, sizeof(eps_bits));
   std::memcpy(&scale_bits, &scale_f, sizeof(scale_bits));
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
+  launch.grid_x = static_cast<std::uint32_t>(rows);
   launch.block_x = 256;
   launch.buffers = {&x, &y};
   launch.scalars = {rows, cols, eps_bits, scale_bits};
@@ -535,7 +539,7 @@ inline std::expected<void, StatusCode> RmsNormGatedDevice(
   std::uint32_t bits = 0;
   std::memcpy(&bits, &eps_f, sizeof(bits));
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((rows + 255) / 256);
+  launch.grid_x = static_cast<std::uint32_t>(rows);
   launch.block_x = 256;
   launch.buffers = {&x, &w, &gate, &y};
   launch.scalars = {rows, cols, bits};
@@ -567,6 +571,22 @@ inline std::expected<void, StatusCode> Conv1dStateDevice(
   launch.block_x = 256;
   launch.buffers = {&qkv, &w, &hist, &q, &k, &v};
   launch.scalars = {conv_dim, width, key_dim, qkv_offset, rows};
+  return backend.LaunchKernel(kernel, launch);
+}
+
+// Per-row top-k over `vocab` fp32 logits on the device. Writes the `top_k`
+// winning indices (descending by value) and their values for output rows
+// [0, rows); output row `r` reads input row `row_base + r`. One workgroup
+// per row.
+inline std::expected<void, StatusCode> TopKRowsDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& logits, Buffer& ids,
+    Buffer& vals, std::size_t rows, std::size_t vocab, std::size_t top_k,
+    std::size_t row_base = 0) {
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(rows);
+  launch.block_x = 256;
+  launch.buffers = {&logits, &ids, &vals};
+  launch.scalars = {rows, vocab, top_k, row_base};
   return backend.LaunchKernel(kernel, launch);
 }
 

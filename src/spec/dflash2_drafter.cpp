@@ -44,7 +44,7 @@ std::expected<DFlash2Drafter, StatusCode> DFlash2Drafter::Create(
 
 std::expected<void, StatusCode> DFlash2Drafter::AppendContext(
     Backend& backend, const std::vector<const Buffer*>& captures,
-    std::size_t rows) {
+    std::size_t row_offset, std::size_t rows) {
   const std::size_t n = config_.target_layer_ids.size();
   if (captures.size() != n || rows == 0) {
     return std::unexpected(StatusCode::InvalidArgument);
@@ -67,8 +67,8 @@ std::expected<void, StatusCode> DFlash2Drafter::AppendContext(
   return DraftContextAppendDevice(
       backend, *rmsnorm_, *gemm_, *rope_, *concat_, *quantize_, context_,
       captures, *store_.Weights().fc, hidden_norm, k_w, v_w, k_norm, n,
-      config_.hidden_size, rows, config_.hidden_size, config_.num_kv_heads,
-      config_.head_dim, config_.rope_theta,
+      config_.hidden_size, row_offset, rows, config_.hidden_size,
+      config_.num_kv_heads, config_.head_dim, config_.rope_theta,
       static_cast<float>(config_.rms_norm_eps), context_limit_);
 }
 

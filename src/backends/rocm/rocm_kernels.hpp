@@ -154,6 +154,16 @@ __global__ void GemmMxFp4BatchedKernel(const float* a, const unsigned char* w,
                                        float* c, unsigned long long m,
                                        unsigned long long n,
                                        unsigned long long k);
+__global__ void GemmMxFp4RowsKernel(const float* a, const unsigned char* w,
+                                    float* c, unsigned long long m,
+                                    unsigned long long n, unsigned long long k);
+__global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
+                                    const unsigned char* w, const float* as,
+                                    const unsigned char* wref, float* c,
+                                    unsigned long long m, unsigned long long n,
+                                    unsigned long long k);
+__global__ void MxFp4RowRefKernel(const unsigned char* w, unsigned char* wref,
+                                  unsigned long long n, unsigned long long k);
 __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);
@@ -259,6 +269,10 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
 __global__ void QuantizeFp8PackKernel(const float* in, unsigned int* packed,
                                       float* scale, unsigned long long rows,
                                       unsigned long long cols);
+__global__ void QuantizeFp8PackRowsKernel(const float* in,
+                                          unsigned int* packed, float* scale,
+                                          unsigned long long rows,
+                                          unsigned long long cols);
 __global__ void AttentionFp8Kernel(const float* q, const unsigned char* k,
                                    const unsigned char* v, const float* ks,
                                    const float* vs, float* out,
@@ -316,6 +330,16 @@ __global__ void SelectorEdgeScoreKernel(const float* predecessor_codebook,
                                         unsigned long long seq,
                                         unsigned long long top_k,
                                         unsigned long long rank);
+// Built-in "top_k_rows": per-row top-k over `vocab` fp32 logits, writing the
+// `top_k` winning indices (descending by value) and their values. One
+// workgroup per row: each thread keeps a descending local top-k then the
+// workgroup merges the sorted lists. Output row `r` reads input row
+// `row_base + r`.
+__global__ void TopKRowsKernel(const float* logits, unsigned int* ids,
+                               float* vals, unsigned long long rows,
+                               unsigned long long vocab,
+                               unsigned long long top_k,
+                               unsigned long long row_base);
 __global__ void DflashConvKernel(const float* x, const float* delta,
                                  const float* base, float* y,
                                  unsigned long long rows,
