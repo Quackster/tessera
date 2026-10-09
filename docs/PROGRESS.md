@@ -2086,10 +2086,29 @@ through RADV GFX1201, rocm through the system ROCm).
   thread per row, so the DFlash2's per-token FP8 QDQ of a single-row
   (~1 x 25600) context hidden ran on one thread. It now uses a workgroup per
   row with a shared-memory absmax reduction, so the whole block works.
-  Callers (`QuantizeMxFp4Input`, the DFlash2 fuse) dispatch `rows`
-  workgroups; the Vulkan shader mirrors it. DFlash2 on the 27B drops 88 -> 83
-  ms/token (CLI) and 66 -> 61 (test); acceptance unchanged (29 of 63) and
-  output equals greedy. 278/278 `ctest` on both backends.
+   Callers (`QuantizeMxFp4Input`, the DFlash2 fuse) dispatch `rows`
+   workgroups; the Vulkan shader mirrors it. DFlash2 on the 27B drops 88 -> 83
+   ms/token (CLI) and 66 -> 61 (test); acceptance unchanged (29 of 63) and
+   output equals greedy. 278/278 `ctest` on both backends.
+
+- 2026-10-09: **OpenAI tool calling on `/v1/chat/completions`
+  (286/286 `ctest` on rocm; vulkan build not run, the code is backend
+  agnostic).** New `src/serve/respond.*` (shared response helpers),
+  `src/serve/render.*` (`ToJinja` plus `RenderPrompt`, moved out of
+  `server.cpp`), `src/serve/tools/tool_call.*` (Qwen XML `<tool_call>`
+  parser, tool history normalizer) and `src/serve/tools/chat.*`
+  (tool-aware chat handler). `tools` render into the model template
+  through the existing Jinja subset (it already covers `tojson`,
+  `raise_exception`, `startswith` and `previtem`/`nextitem`); incoming
+  assistant `tool_calls` convert JSON-string arguments to objects and
+  `tool_choice: "none"` renders without tools. The handler answers
+  with OpenAI-form `tool_calls` (buffered and SSE) and strips the
+  `<think>` block from the reply content. Verified live on the 27B
+  GGUF (ROCm, GPU1): call emission, streaming deltas, a tool-result
+  turn, and clean text answers. The opencode provider wiring
+  (`tessera/qwen3.8-27b` on 127.0.0.1:8080) resolves, but live agency
+  is blocked: opencode's first prompt is about 10k tokens against the
+  4096 serve context at 11 prompt tok/s (see Next item 4).
 
 ## Next (in order)
 
