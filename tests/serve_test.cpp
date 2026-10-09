@@ -6,11 +6,13 @@
 #include <atomic>
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "serve/http.hpp"
 #include "serve/tools/tool_call.hpp"
 #include "core/json.hpp"
+#include "tessera/log.hpp"
 
 using tessera::serve::HttpRequest;
 using tessera::core::Json;
@@ -70,7 +72,8 @@ int ConnectLocal(std::uint16_t port) {
 TEST(ServeTest, HttpLoopback) {
   constexpr std::uint16_t kPort = 18099;
   std::atomic<bool> stop{false};
-  std::thread server([&stop] {
+  tessera::log::Diagnostics log;
+  std::thread server([&stop, &log] {
     (void)RunHttpServer(
         "127.0.0.1", kPort,
         [](const HttpRequest& request, ResponseWriter& writer) {
@@ -80,7 +83,7 @@ TEST(ServeTest, HttpLoopback) {
           (void)writer.SendHeaders(200, "application/json");
           (void)writer.Write(body.Dump());
         },
-        &stop);
+        &stop, log);
   });
   int fd = -1;
   for (int i = 0; i < 200 && fd < 0; ++i) {
@@ -117,7 +120,8 @@ TEST(ServeTest, HttpLoopback) {
 TEST(ServeTest, HttpStreamingChunked) {
   constexpr std::uint16_t kPort = 18100;
   std::atomic<bool> stop{false};
-  std::thread server([&stop] {
+  tessera::log::Diagnostics log;
+  std::thread server([&stop, &log] {
     (void)RunHttpServer(
         "127.0.0.1", kPort,
         [](const HttpRequest&, ResponseWriter& writer) {
@@ -125,7 +129,7 @@ TEST(ServeTest, HttpStreamingChunked) {
           (void)writer.Write("data: one\n\n");
           (void)writer.Write("data: two\n\n");
         },
-        &stop);
+        &stop, log);
   });
   int fd = -1;
   for (int i = 0; i < 200 && fd < 0; ++i) {
@@ -155,6 +159,38 @@ TEST(ServeTest, HttpStreamingChunked) {
     ::close(dummy);
   }
   server.join();
+}
+
+// Starting on a port another socket holds fails with an actionable
+// line: the call, the endpoint, the errno text and what to do next.
+TEST(ServeTest, HttpBindReportsPortInUse) {
+  constexpr std::uint16_t kPort = 18101;
+  const int blocker = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(blocker, 0);
+  sockaddr_in held{};
+  held.sin_family = AF_INET;
+  held.sin_port = htons(kPort);
+  held.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(::bind(blocker, reinterpret_cast<sockaddr*>(&held), sizeof(held)),
+            0);
+  ASSERT_EQ(::listen(blocker, 1), 0);
+
+  tessera::log::Diagnostics log;
+  std::string lines;
+  log.SetSink([&lines](tessera::log::Level, std::string_view prefix,
+                       std::string_view message) {
+    lines += std::string(prefix) + ": " + std::string(message) + "\n";
+  });
+  std::atomic<bool> stop{false};
+  const auto started = RunHttpServer(
+      "127.0.0.1", kPort, [](const HttpRequest&, ResponseWriter&) {}, &stop,
+      log);
+  ASSERT_FALSE(started.has_value());
+  EXPECT_EQ(started.error(), tessera::StatusCode::DeviceError);
+  EXPECT_NE(lines.find("bind on 127.0.0.1:18101 failed:"), std::string::npos);
+  EXPECT_NE(lines.find("Address already in use"), std::string::npos);
+  EXPECT_NE(lines.find("--port"), std::string::npos);
+  ::close(blocker);
 }
 
 // One XML tool call parses to a named call with a JSON object.

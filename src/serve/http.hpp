@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "tessera/log.hpp"
 #include "tessera/types.hpp"
 
 // Minimal blocking HTTP/1.1 server for the serving layer. One request
@@ -56,9 +57,16 @@ class ResponseWriter {
 using HttpHandler = std::function<void(const HttpRequest&, ResponseWriter&)>;
 
 // Listen on `host:port` and serve until `stop` becomes true or a fatal
-// socket error occurs. The handler runs on the accept thread.
+// socket error occurs. The handler runs on the accept thread. Logs the
+// listening endpoint once the socket is ready. Every socket failure is
+// logged through `log` with the failing call, the endpoint and the
+// errno text, and reported as DeviceError (InvalidArgument for a host
+// that is not an IPv4 literal).
+//
+// Usage:
+//   RunHttpServer("127.0.0.1", 8080, handler, &stop, engine.Diagnostics());
 [[nodiscard]] std::expected<void, StatusCode> RunHttpServer(
     const std::string& host, std::uint16_t port, const HttpHandler& handler,
-    const std::atomic<bool>* stop);
+    const std::atomic<bool>* stop, log::Diagnostics& log);
 
 }  // namespace tessera::serve

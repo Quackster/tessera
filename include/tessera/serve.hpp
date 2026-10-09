@@ -31,7 +31,9 @@ struct ServeOptions {
 // POST /v1/completions and GET /health are implemented today. POST
 // /v1/chat/completions and POST /v1/messages need the chat-template
 // renderer and return 501 until it lands. Requests are handled one at a
-// time. Returns when the server socket fails or closes.
+// time. Returns when the server socket fails or closes. The listening
+// endpoint and every socket failure (with the failing call, the
+// endpoint and the errno text) go to the engine diagnostics channel.
 //
 // Usage:
 //   Serve(*engine, *model, {.port = 8080});

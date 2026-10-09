@@ -112,6 +112,15 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
   if (max_tokens == 0) {
     return std::vector<std::uint32_t>{};
   }
+  if (prompt.size() > model.MaxContextLength()) {
+    diagnostics_.Warn("engine", std::string("prompt of ") +
+                                     std::to_string(prompt.size()) +
+                                     " token(s) exceeds the " +
+                                     std::to_string(model.MaxContextLength()) +
+                                     " token context; reject without running "
+                                     "prefill so the device stays alive");
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
   if (options.progress_every > 0) {
     const std::size_t prefill_chunk = ResolvePrefillChunkTokens(
         prefill_chunk_tokens_, options.prefill_chunk_tokens,
@@ -301,6 +310,15 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       model.EffectiveMaxTokens(prompt.size(), options.max_tokens);
   if (max_tokens == 0) {
     return 0;
+  }
+  if (prompt.size() > model.MaxContextLength()) {
+    diagnostics_.Warn("engine", std::string("prompt of ") +
+                                     std::to_string(prompt.size()) +
+                                     " token(s) exceeds the " +
+                                     std::to_string(model.MaxContextLength()) +
+                                     " token context; reject without running "
+                                     "prefill so the device stays alive");
+    return std::unexpected(StatusCode::InvalidArgument);
   }
   // The speculative strategy (null on the plain greedy path). The engine owns
   // the target and the accept rule; the strategy owns the draft.

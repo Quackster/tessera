@@ -348,6 +348,27 @@ TEST(EngineTest, GenerateZeroMaxTokensFillsContext) {
   EXPECT_TRUE(capped->empty());
 }
 
+// An explicit token count with a prompt past the context is rejected
+// before any device work: a 15k-token prompt must fail fast instead
+// of losing the device in a giant prefill.
+TEST(EngineTest, GenerateRejectsPromptBeyondContext) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("generate_toolong.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 6});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions options;
+  options.max_tokens = 4;
+  options.prompt_tokens = {0, 1, 2, 3, 4, 5, 6, 7};
+  auto rejected = engine->Generate(**model, options);
+  ASSERT_FALSE(rejected.has_value());
+  EXPECT_EQ(rejected.error(), StatusCode::InvalidArgument);
+  auto streamed = engine->GenerateStreaming(
+      **model, options, [](std::uint32_t) { return true; });
+  ASSERT_FALSE(streamed.has_value());
+  EXPECT_EQ(streamed.error(), StatusCode::InvalidArgument);
+}
+
 // A multi-token prompt prefills through the forward-only path (all but the
 // last prompt token skip the output head) and still generates.
 TEST(EngineTest, GenerateWithPromptTokensPrefills) {

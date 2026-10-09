@@ -70,7 +70,7 @@ void ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
         return true;
       });
   if (!streamed) {
-    SendError(writer, 500, "generation failed");
+    SendGenerationError(writer, streamed.error());
     return;
   }
   std::string before;
@@ -113,7 +113,10 @@ void ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
       });
   if (!streamed) {
     core::Json chunk = core::Json::Object();
-    chunk.Set("error", core::Json::String("generation failed"));
+    chunk.Set("error", core::Json::String(
+                           streamed.error() == StatusCode::InvalidArgument
+                               ? "prompt exceeds the model context window"
+                               : "generation failed"));
     WriteSse(writer, "", chunk, false);
     return;
   }
@@ -175,6 +178,10 @@ void ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
   GenerateOptions options;
   options.max_tokens = MaxTokensFrom(body, default_max);
   options.prompt_tokens = *ids;
+  if (RejectOversizePrompt(writer, ids->size(), options.max_tokens,
+                           model.MaxContextLength())) {
+    return;
+  }
   const std::string model_name(model.Name());
   if (WantsStream(body)) {
     ChatStreamed(engine, model, tokenizer, writer, model_name, options);

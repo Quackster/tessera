@@ -50,10 +50,14 @@ void Complete(Engine& engine, Model& model, const Tokenizer& tokenizer,
   GenerateOptions options;
   options.max_tokens = max_tokens;
   options.prompt_tokens = *ids;
+  if (RejectOversizePrompt(writer, ids->size(), max_tokens,
+                           model.MaxContextLength())) {
+    return;
+  }
   if (!stream) {
     auto produced = engine.Generate(model, options);
     if (!produced) {
-      SendError(writer, 500, "generation failed");
+      SendGenerationError(writer, produced.error());
       return;
     }
     auto text = tokenizer.Decode(*produced);
@@ -98,7 +102,10 @@ void Complete(Engine& engine, Model& model, const Tokenizer& tokenizer,
       });
   if (!streamed) {
     Json chunk = Json::Object();
-    chunk.Set("error", Json::String("generation failed"));
+    chunk.Set("error", Json::String(
+                           streamed.error() == StatusCode::InvalidArgument
+                               ? "prompt exceeds the model context window"
+                               : "generation failed"));
     WriteSse(writer, "", chunk, false);
   }
   Json done = Json::Object();
@@ -138,12 +145,16 @@ void Chat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   GenerateOptions options;
   options.max_tokens = max_tokens;
   options.prompt_tokens = *ids;
+  if (RejectOversizePrompt(writer, ids->size(), max_tokens,
+                           model.MaxContextLength())) {
+    return;
+  }
   const std::string model_name(model.Name());
   if (anthropic) {
     if (!stream) {
       auto produced = engine.Generate(model, options);
       if (!produced) {
-        SendError(writer, 500, "generation failed");
+        SendGenerationError(writer, produced.error());
         return;
       }
       auto text = tokenizer.Decode(*produced);
@@ -216,7 +227,7 @@ void Chat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   if (!stream) {
     auto produced = engine.Generate(model, options);
     if (!produced) {
-      SendError(writer, 500, "generation failed");
+      SendGenerationError(writer, produced.error());
       return;
     }
     auto text = tokenizer.Decode(*produced);
@@ -470,7 +481,8 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
     SendError(writer, 501, "endpoint not implemented");
   };
   std::atomic<bool> stop{false};
-  return serve::RunHttpServer(options.host, options.port, handler, &stop);
+  return serve::RunHttpServer(options.host, options.port, handler, &stop,
+                              engine.Diagnostics());
 }
 
 }  // namespace tessera

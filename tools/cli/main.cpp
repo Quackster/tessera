@@ -265,7 +265,6 @@ int main(int argc, char** argv) {
                         std::to_string(tensors[i].shape.Numel()) + "]");
   }
   if (command == "serve") {
-    log.Info("cli", "serving on " + host + ":" + std::to_string(port));
     tessera::ServeOptions serve_options;
     serve_options.host = host;
     serve_options.port = port;

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <system_error>
 
 namespace tessera::serve {
 
@@ -43,6 +44,25 @@ std::string StatusText(int status) {
     case 503: return "Service Unavailable";
     default: return "Error";
   }
+}
+
+// One actionable line: which call failed, on which endpoint, and why.
+std::string SocketFailure(std::string_view call, std::string_view endpoint,
+                          int code) {
+  return std::string(call) + " on " + std::string(endpoint) + " failed: " +
+         std::error_code(code, std::system_category()).message();
+}
+
+// What to do next for the bind failures a serve operator runs into.
+std::string BindHint(int code) {
+  if (code == EADDRINUSE) {
+    return "; another process already listens on that address. Stop it or "
+           "pass --port with a free port";
+  }
+  if (code == EADDRNOTAVAIL) {
+    return "; that address does not belong to this host";
+  }
+  return {};
 }
 
 bool WriteAll(int fd, std::string_view data) {
@@ -200,9 +220,11 @@ void ResponseWriter::Close() {
 
 std::expected<void, StatusCode> RunHttpServer(
     const std::string& host, std::uint16_t port, const HttpHandler& handler,
-    const std::atomic<bool>* stop) {
+    const std::atomic<bool>* stop, log::Diagnostics& log) {
+  const std::string endpoint = host + ":" + std::to_string(port);
   const int server = ::socket(AF_INET, SOCK_STREAM, 0);
   if (server < 0) {
+    log.Error("serve", SocketFailure("socket", endpoint, errno));
     return std::unexpected(StatusCode::DeviceError);
   }
   int one = 1;
@@ -212,26 +234,39 @@ std::expected<void, StatusCode> RunHttpServer(
   addr.sin_port = htons(port);
   if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
     ::close(server);
+    log.Error("serve", "bind on " + endpoint +
+                           " failed: the host is not an IPv4 literal");
     return std::unexpected(StatusCode::InvalidArgument);
   }
   if (::bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    const int code = errno;
     ::close(server);
+    log.Error("serve", SocketFailure("bind", endpoint, code) + BindHint(code));
     return std::unexpected(StatusCode::DeviceError);
   }
   if (::listen(server, 8) < 0) {
+    const int code = errno;
     ::close(server);
+    log.Error("serve", SocketFailure("listen", endpoint, code));
     return std::unexpected(StatusCode::DeviceError);
   }
+  log.Info("serve", "listening on " + endpoint);
   while (stop == nullptr || !stop->load()) {
     sockaddr_in peer{};
     socklen_t peer_len = sizeof(peer);
     const int client =
         ::accept(server, reinterpret_cast<sockaddr*>(&peer), &peer_len);
     if (client < 0) {
-      if (errno == EINTR) {
+      // A peer that vanishes mid-handshake is normal; a signal is not
+      // a failure. Anything else kills the listener, so say why.
+      if (errno == EINTR || errno == ECONNABORTED) {
         continue;
       }
-      break;
+      const int code = errno;
+      ::close(server);
+      log.Error("serve", SocketFailure("accept", endpoint, code) +
+                             "; the server stops accepting requests");
+      return std::unexpected(StatusCode::DeviceError);
     }
     std::string buffer;
     std::size_t header_end = std::string::npos;

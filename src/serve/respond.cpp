@@ -2,6 +2,8 @@
 
 #include <string>
 
+#include "tessera/types.hpp"
+
 namespace tessera::serve {
 
 void SendJson(ResponseWriter& writer, int status, const core::Json& body) {
@@ -40,6 +42,25 @@ bool WantsStream(const core::Json& body) {
   const core::Json* value = body.Find("stream");
   return value != nullptr && value->type() == core::Json::Type::Bool &&
          value->AsBool();
+}
+
+void SendGenerationError(ResponseWriter& writer, StatusCode code) {
+  if (code == StatusCode::InvalidArgument) {
+    SendError(writer, 400,
+              "prompt exceeds the model context window; shorten the "
+              "prompt or raise --context");
+    return;
+  }
+  SendError(writer, 500, "generation failed");
+}
+
+bool RejectOversizePrompt(ResponseWriter& writer, std::size_t prompt,
+                           std::size_t max_tokens, std::size_t context) {
+  if (max_tokens > 0 && prompt > context) {
+    SendGenerationError(writer, StatusCode::InvalidArgument);
+    return true;
+  }
+  return false;
 }
 
 void WriteSse(ResponseWriter& writer, const std::string& event,
