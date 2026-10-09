@@ -2135,6 +2135,16 @@ through RADV GFX1201, rocm through the system ROCm).
   MXFP4 (Vulkan, GPU0): the full session flow through curl, including
   pause, resume and a stopped turn persisted with its flag.
 
+- 2026-10-09: **Stop on disconnect and SIGPIPE survival (323/323
+  `ctest` on vulkan).** Every serve send used bare `send()`, so a
+  cancelled stream killed the server with SIGPIPE; surviving turns
+  also decoded into the void. Sends now use `MSG_NOSIGNAL`, and every
+  generation hook aborts when `ResponseWriter::IsPeerGone` sees the
+  close: UI stop, closed window/tab, and opencode request cancels all
+  free the device at the next token. Verified live on the 27B MXFP4
+  (Vulkan, GPU0): a hard-killed mid-stream client leaves the server
+  alive, and the next request serves in about a second.
+
 - 2026-10-09: **Default 32k completion cap (322/322 `ctest` on
   vulkan).** Requests without `max_tokens` decoded to the end of the
   context. `tessera::kDefaultMaxTokens` (32k) is now the single

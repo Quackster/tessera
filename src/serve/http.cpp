@@ -69,7 +69,10 @@ std::string BindHint(int code) {
 bool WriteAll(int fd, std::string_view data) {
   std::size_t sent = 0;
   while (sent < data.size()) {
-    const ssize_t n = ::send(fd, data.data() + sent, data.size() - sent, 0);
+    // MSG_NOSIGNAL: a cancelled stream (closed peer) reports EPIPE
+    // instead of killing the server with SIGPIPE.
+    const ssize_t n =
+        ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
     if (n <= 0) {
       return false;
     }
@@ -256,6 +259,22 @@ std::expected<void, StatusCode> ResponseWriter::Write(std::string_view data) {
     return std::unexpected(StatusCode::DeviceError);
   }
   return {};
+}
+
+bool ResponseWriter::IsPeerGone() const {
+  if (failed_) {
+    return true;
+  }
+  char probe = 0;
+  const ssize_t got =
+      ::recv(fd_, &probe, sizeof(probe), MSG_PEEK | MSG_DONTWAIT);
+  if (got == 0) {
+    return true;  // orderly shutdown
+  }
+  if (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+    return true;  // reset or dead socket
+  }
+  return false;
 }
 
 void ResponseWriter::Close() {

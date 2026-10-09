@@ -65,6 +65,9 @@ void ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
   std::string text;
   auto streamed = engine.GenerateStreaming(
       model, options, [&](std::uint32_t token) {
+        if (writer.IsPeerGone()) {
+          return false;
+        }
         auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
         text += piece ? *piece : std::string();
         return true;
@@ -112,6 +115,9 @@ void ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
   std::string text;
   auto streamed = engine.GenerateStreaming(
       model, options, [&](std::uint32_t token) {
+        if (writer.IsPeerGone()) {
+          return false;
+        }
         auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
         text += piece ? *piece : std::string();
         return true;

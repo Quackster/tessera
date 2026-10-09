@@ -586,7 +586,30 @@ TEST(ServeTest, InjectWebDefaultsFillsMaxTokens) {
             want);
 }
 
-// A second connection is served while the first handler still runs:
+// A closed peer reads as gone; a live or data-bearing one does not.
+// The polls only bound a broken kernel, they never gate a pass.
+TEST(ServeTest, PeerGoneDetectsClosedConnection) {
+  int pair[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+  tessera::serve::ResponseWriter writer(pair[0]);
+  EXPECT_FALSE(writer.IsPeerGone());
+  const auto poll_gone = [&](bool want, int tries) {
+    for (int i = 0; i < tries; ++i) {
+      if (writer.IsPeerGone() == want) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return writer.IsPeerGone() == want;
+  };
+  ASSERT_EQ(::send(pair[1], "x", 1, 0), 1);
+  EXPECT_TRUE(poll_gone(false, 200));
+  char drop = 0;
+  ASSERT_EQ(::recv(pair[0], &drop, sizeof(drop), 0), 1);
+  ::close(pair[1]);
+  EXPECT_TRUE(poll_gone(true, 200));
+  ::close(pair[0]);
+}
 // streaming generation never blocks control requests. The guard time
 // only bounds a regression hang, it never gates a pass.
 TEST(ServeTest, HttpServesConcurrentConnections) {

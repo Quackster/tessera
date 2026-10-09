@@ -60,12 +60,27 @@ void Complete(Engine& engine, Model& model, const Tokenizer& tokenizer,
     return;
   }
   if (!stream) {
-    auto produced = engine.Generate(model, options);
-    if (!produced) {
-      SendGenerationError(writer, produced.error());
+    // GenerateStreaming with a liveness hook instead of Generate:
+    // identical tokens, but a closed window aborts the turn instead
+    // of decoding into the void.
+    std::vector<std::uint32_t> produced;
+    auto streamed = engine.GenerateStreaming(
+        model, options, [&](std::uint32_t token) {
+          if (writer.IsPeerGone()) {
+            return false;
+          }
+          produced.push_back(token);
+          return true;
+        });
+    if (!streamed) {
+      // A gone peer fails here only on a real error (abort returns a
+      // count); anything else is reported when someone listens.
+      if (!writer.IsPeerGone()) {
+        SendGenerationError(writer, streamed.error());
+      }
       return;
     }
-    auto text = tokenizer.Decode(*produced);
+    auto text = tokenizer.Decode(produced);
     if (!text) {
       SendError(writer, 500, "detokenization failed");
       return;
@@ -81,7 +96,7 @@ void Complete(Engine& engine, Model& model, const Tokenizer& tokenizer,
     response.Set("object", Json::String("text_completion"));
     response.Set("model", Json::String(std::string(model.Name())));
     response.Set("choices", std::move(choices));
-    response.Set("usage", UsageJson(ids->size(), produced->size()));
+    response.Set("usage", UsageJson(ids->size(), produced.size()));
     SendJson(writer, 200, response);
     return;
   }
@@ -89,6 +104,9 @@ void Complete(Engine& engine, Model& model, const Tokenizer& tokenizer,
   std::size_t count = 0;
   auto streamed = engine.GenerateStreaming(
       model, options, [&](std::uint32_t token) {
+        if (writer.IsPeerGone()) {
+          return false;
+        }
         auto piece = tokenizer.Decode(
             std::span<const std::uint32_t>(&token, 1));
         Json choice = Json::Object();
@@ -157,12 +175,27 @@ void Chat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   const std::string model_name(model.Name());
   if (anthropic) {
     if (!stream) {
-      auto produced = engine.Generate(model, options);
-      if (!produced) {
-        SendGenerationError(writer, produced.error());
+      // GenerateStreaming with a liveness hook instead of Generate:
+      // identical tokens, but a closed window aborts the turn instead
+      // of decoding into the void.
+      std::vector<std::uint32_t> produced;
+      auto streamed = engine.GenerateStreaming(
+          model, options, [&](std::uint32_t token) {
+            if (writer.IsPeerGone()) {
+              return false;
+            }
+            produced.push_back(token);
+            return true;
+          });
+      if (!streamed) {
+        // A gone peer fails here only on a real error (abort returns a
+        // count); anything else is reported when someone listens.
+        if (!writer.IsPeerGone()) {
+          SendGenerationError(writer, streamed.error());
+        }
         return;
       }
-      auto text = tokenizer.Decode(*produced);
+      auto text = tokenizer.Decode(produced);
       Json content = Json::Array();
       Json block = Json::Object();
       block.Set("type", Json::String("text"));
@@ -171,7 +204,7 @@ void Chat(Engine& engine, Model& model, const Tokenizer& tokenizer,
       Json usage = Json::Object();
       usage.Set("input_tokens", Json::Number(static_cast<double>(ids->size())));
       usage.Set("output_tokens",
-                Json::Number(static_cast<double>(produced->size())));
+                Json::Number(static_cast<double>(produced.size())));
       Json response = Json::Object();
       response.Set("id", Json::String("msg_0"));
       response.Set("type", Json::String("message"));
@@ -201,6 +234,9 @@ void Chat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     block_start.Set("content_block", std::move(block));
     WriteSse(writer, "content_block_start", block_start, true);
     (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
+      if (writer.IsPeerGone()) {
+        return false;
+      }
       auto piece =
           tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
       Json delta = Json::Object();
@@ -230,12 +266,27 @@ void Chat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   }
   // OpenAI chat.
   if (!stream) {
-    auto produced = engine.Generate(model, options);
-    if (!produced) {
-      SendGenerationError(writer, produced.error());
+    // GenerateStreaming with a liveness hook instead of Generate:
+    // identical tokens, but a closed window aborts the turn instead
+    // of decoding into the void.
+    std::vector<std::uint32_t> produced;
+    auto streamed = engine.GenerateStreaming(
+        model, options, [&](std::uint32_t token) {
+          if (writer.IsPeerGone()) {
+            return false;
+          }
+          produced.push_back(token);
+          return true;
+        });
+    if (!streamed) {
+      // A gone peer fails here only on a real error (abort returns a
+      // count); anything else is reported when someone listens.
+      if (!writer.IsPeerGone()) {
+        SendGenerationError(writer, streamed.error());
+      }
       return;
     }
-    auto text = tokenizer.Decode(*produced);
+    auto text = tokenizer.Decode(produced);
     Json message = Json::Object();
     message.Set("role", Json::String("assistant"));
     message.Set("content", Json::String(text ? *text : std::string()));
@@ -250,12 +301,15 @@ void Chat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     response.Set("object", Json::String("chat.completion"));
     response.Set("model", Json::String(model_name));
     response.Set("choices", std::move(choices));
-    response.Set("usage", UsageJson(ids->size(), produced->size()));
+    response.Set("usage", UsageJson(ids->size(), produced.size()));
     SendJson(writer, 200, response);
     return;
   }
   (void)writer.SendHeaders(200, "text/event-stream", true);
   (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
+    if (writer.IsPeerGone()) {
+      return false;
+    }
     auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
     Json delta = Json::Object();
     delta.Set("content", Json::String(piece ? *piece : std::string()));

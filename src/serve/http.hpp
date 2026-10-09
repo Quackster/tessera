@@ -41,6 +41,11 @@ class ResponseWriter {
   [[nodiscard]] std::expected<void, StatusCode> SendHeaders(
       int status, std::string content_type, bool streaming = false);
   [[nodiscard]] std::expected<void, StatusCode> Write(std::string_view data);
+  // True when the peer went away (closed connection): a non-blocking
+  // peek sees EOF or a reset. Generation hooks poll this so a
+  // cancelled stream or a closed window aborts the turn and frees the
+  // device instead of decoding into the void.
+  [[nodiscard]] bool IsPeerGone() const;
   void Close();
 
  private:

@@ -213,6 +213,13 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
   // One decode step: stop aborts, pause blocks, deltas stream live
   // (buffered mode only accumulates into the totals below).
   auto on_token = [&](std::uint32_t token, bool live) {
+    // A closed window or cancelled request aborts first: pausing
+    // below would block the device slot on a client that never
+    // resumes. Aborts persist as stopped turns.
+    if (writer.IsPeerGone()) {
+      saw_stop = true;
+      return false;
+    }
     if (!session->PollControl()) {
       saw_stop = true;
       return false;
