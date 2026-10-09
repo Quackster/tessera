@@ -938,7 +938,7 @@ __global__ void GemmBf16WmmaKernel(const float* a, const unsigned short* w,
 __global__ void RmsnormKernel(const float* x, const float* w, float* y,
                               unsigned long long rows, unsigned long long cols,
                               unsigned long long eps_bits) {
-  __shared__ float partial[256];
+  __shared__ float partial[1024];
   const unsigned long long r = blockIdx.x;
   if (r >= rows) {
     return;
@@ -986,7 +986,7 @@ __global__ void L2NormKernel(const float* x, float* y,
                              unsigned long long rows, unsigned long long cols,
                              unsigned long long eps_bits,
                              unsigned long long scale_bits) {
-  __shared__ float red[256];
+  __shared__ float red[1024];
   const unsigned long long r = static_cast<unsigned long long>(blockIdx.x);
   if (r >= rows) {
     return;

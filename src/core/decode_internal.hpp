@@ -493,7 +493,7 @@ inline std::expected<void, StatusCode> RmsNormDevice(
   KernelLaunch launch;
   // One workgroup per row; the kernel reduces the row across the group.
   launch.grid_x = static_cast<std::uint32_t>(rows);
-  launch.block_x = 256;
+  launch.block_x = 1024;
   launch.buffers = {&x, &w, &y};
   launch.scalars = {rows, cols, bits};
   return backend.LaunchKernel(kernel, launch);
@@ -582,7 +582,7 @@ inline std::expected<void, StatusCode> L2NormDevice(
   std::memcpy(&scale_bits, &scale_f, sizeof(scale_bits));
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>(rows);
-  launch.block_x = 256;
+  launch.block_x = 1024;
   launch.buffers = {&x, &y};
   launch.scalars = {rows, cols, eps_bits, scale_bits};
   return backend.LaunchKernel(kernel, launch);
