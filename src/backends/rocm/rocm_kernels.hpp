@@ -150,19 +150,10 @@ __global__ void GemmFp8Kernel(const float* a, const unsigned char* w,
 __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
                                 float* c, unsigned long long m,
                                 unsigned long long n, unsigned long long k);
-__global__ void GemmMxFp4FragKernel(const float* a, const unsigned char* w,
-                                    float* c, unsigned long long m,
-                                    unsigned long long n, unsigned long long k,
-                                    unsigned long long split);
 __global__ void GemmMxFp4BatchedKernel(const float* a, const unsigned char* w,
                                        float* c, unsigned long long m,
                                        unsigned long long n,
                                        unsigned long long k);
-__global__ void GemmMxFp4FragBatchedKernel(const float* a,
-                                           const unsigned char* w, float* c,
-                                           unsigned long long m,
-                                           unsigned long long n,
-                                           unsigned long long k);
 __global__ void GemmMxFp4RowsKernel(const float* a, const unsigned char* w,
                                     float* c, unsigned long long m,
                                     unsigned long long n, unsigned long long k);

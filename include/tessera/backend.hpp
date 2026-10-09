@@ -428,24 +428,13 @@ class Kernel {
     }
   }
   if (kernel.Id() == "gemm_mxfp4" ||
-      kernel.Id() == "gemm_mxfp4_batched" ||
-      kernel.Id() == "gemm_mxfp4_frag_batched") {
+      kernel.Id() == "gemm_mxfp4_batched") {
     if (launch.buffers.size() != 3 || launch.scalars.size() != 3) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t k = launch.scalars[2];
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || k == 0 ||
         k % 32 != 0) {
-      return StatusCode::InvalidArgument;
-    }
-  }
-  if (kernel.Id() == "gemm_mxfp4_frag") {
-    if (launch.buffers.size() != 3 || launch.scalars.size() != 4) {
-      return StatusCode::InvalidArgument;
-    }
-    const std::uint64_t k = launch.scalars[2];
-    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || k == 0 ||
-        k % 16 != 0 || launch.scalars[3] == 0) {
       return StatusCode::InvalidArgument;
     }
   }
