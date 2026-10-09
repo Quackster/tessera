@@ -1329,6 +1329,25 @@ TEST(EngineTest, DFlash2MatchesGreedyOnModel) {
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
   options.max_tokens = 8;
+  if (const char* tokens = std::getenv("TESSERA_DFLASH2_TOKENS");
+      tokens != nullptr) {
+    const int value = std::atoi(tokens);
+    if (value > 0) {
+      options.max_tokens = static_cast<std::size_t>(value);
+    }
+  }
+  if (const char* kv = std::getenv("TESSERA_DFLASH2_KV"); kv != nullptr) {
+    const std::string_view name(kv);
+    if (name == "f16") {
+      options.kv_type = tessera::KvCacheType::F16;
+    } else if (name == "q8") {
+      options.kv_type = tessera::KvCacheType::Q8;
+    } else if (name == "q4") {
+      options.kv_type = tessera::KvCacheType::Q4;
+    } else if (name == "fp8") {
+      options.kv_type = tessera::KvCacheType::FP8;
+    }
+  }
   options.prompt_tokens = {760, 6511, 314, 9338, 369};
   auto greedy = engine->Generate(**model, options);
   ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());

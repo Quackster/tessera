@@ -1610,6 +1610,25 @@ through RADV GFX1201, rocm through the system ROCm).
    `HybridDecodeTest.Fp8KvDecodesDeterministically` test pins the fixture
    path.
 
+- 2026-10-09: **The DFlash2 acceptance gap is not the KV or activation
+   quantization.** With the fp8 KV cache available, the drafter was measured
+   against the served target's storage choices. On the 27B MXFP4 target
+   (ROCm, GPU0), 32 tokens: fp32 KV accepts 9 of 154 draft tokens and fp8 KV
+   (`TESSERA_DFLASH2_KV=fp8`) accepts an identical 9 of 154 (the same greedy
+   tokens and the same acceptance), so the KV quant is not the cause. On the
+   8-token fixture the served combination (`TESSERA_DFLASH2_KV=fp8` plus
+   `TESSERA_MXFP4_W4A8=1`) accepts 3 of 35, the same as the fp32 baseline,
+   while W4A8 alone gave 0 of 49, so the W4A8 activation quant is not the
+   cause either (the served target is now reproduced: W4A8 linears plus an
+   fp8 KV cache). Also rechecked against vLLM: `_maybe_add_hidden_state`
+   appends `hidden_states + residual` (the residual stream) at
+   `target_layer_ids + 1`, which is exactly what the C++ capture copies, so
+   the captured tensor is not the mismatch. The remaining gap to the served
+   2.85 accepted/draft is the aux hidden values from the target numerics not
+   yet reproduced (vLLM runs bf16 residuals with fused RMSNorm+quant and the
+   R4D fp8 attention), or the drafter runtime. The test now takes
+   `TESSERA_DFLASH2_TOKENS` and `TESSERA_DFLASH2_KV` for these runs.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -1668,7 +1687,12 @@ through RADV GFX1201, rocm through the system ROCm).
    quant work. 2026-10-09: the fp8 KV cache landed (`--kv-fp8`,
    `quantize_fp8_pack` + `attention_fp8`), so the served target's cache
    quant is now available for that comparison (see the Done entry). R4D fp8
-   attention remains.
+   attention remains. 2026-10-09: measured `--kv-fp8` and W4A8 against the
+   drafter; both leave acceptance unchanged (fp32 and fp8 KV both 9 of 154
+   over 32 tokens), and the captured tensor matches vLLM's
+   `hidden_states + residual`, so the gap is the target's bf16/fused-op
+   numerics or the R4D attention, not the cache or activation quant (see
+   the Done entry).
    Batching and the draft context width are
    done (see the Done entry). 2026-10-09: the full-prefix context the
    reference uses was tried and reverted; it regressed acceptance and needs
