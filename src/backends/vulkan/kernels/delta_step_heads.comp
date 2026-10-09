@@ -3,11 +3,14 @@
 // One thread per (head, state column); dispatch ceil(heads * dv / 256).
 layout(local_size_x = 256) in;
 
-// "delta_step_heads" contract: buffer 0 is S (heads x dk x dv, updated
-// in place); buffers 1..4 are k (rows x heads x dk), v (rows x heads x
-// dv), q (rows x heads x dk) and o (rows x heads x dv); buffers 5 and 6
-// are alpha and beta (rows x heads each). Scalars: heads v[0], dk v[2],
-// dv v[4], rows v[6]. The rows steps run in turn, advancing the state.
+// "delta_step_heads" contract: buffer 0 is S (heads x dk x dv); buffers 1..4
+// are k (rows x heads x dk), v (rows x heads x dv), q (rows x heads x dk) and
+// o (rows x heads x dv); buffers 5 and 6 are alpha and beta (rows x heads
+// each). Scalars: heads v[0], dk v[2], dv v[4], rows v[6], sbase v[8],
+// sstride v[10]. The input state is read at sbase + s_base and the updated
+// state written at sbase + sstride + s_base; a zero stride updates in place
+// and a non-zero one appends each step to the next history slot. The rows
+// steps run in turn, advancing the state.
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -26,12 +29,16 @@ void main() {
   uint dk = pc.v[2];
   uint dv = pc.v[4];
   uint rows = pc.v[6];
+  uint sbase = pc.v[8];
+  uint sstride = pc.v[10];
   if (idx >= heads * dv || rows == 0u) {
     return;
   }
   uint h = idx / dv;
   uint d = idx % dv;
   uint s_base = h * dk * dv;
+  uint s_rd = sbase + s_base;
+  uint s_wr = sbase + sstride + s_base;
   uint k_base = h * dk;
   uint v_base = h * dv;
   for (uint t = 0u; t < rows; ++t) {
@@ -43,30 +50,30 @@ void main() {
     float r0 = 0.0, r1 = 0.0, r2 = 0.0, r3 = 0.0;
     uint j = 0u;
     for (; j + 4u <= dk; j += 4u) {
-      r0 = fma(s[s_base + (j + 0u) * dv + d], k[ko + k_base + j + 0u], r0);
-      r1 = fma(s[s_base + (j + 1u) * dv + d], k[ko + k_base + j + 1u], r1);
-      r2 = fma(s[s_base + (j + 2u) * dv + d], k[ko + k_base + j + 2u], r2);
-      r3 = fma(s[s_base + (j + 3u) * dv + d], k[ko + k_base + j + 3u], r3);
+      r0 = fma(s[s_rd + (j + 0u) * dv + d], k[ko + k_base + j + 0u], r0);
+      r1 = fma(s[s_rd + (j + 1u) * dv + d], k[ko + k_base + j + 1u], r1);
+      r2 = fma(s[s_rd + (j + 2u) * dv + d], k[ko + k_base + j + 2u], r2);
+      r3 = fma(s[s_rd + (j + 3u) * dv + d], k[ko + k_base + j + 3u], r3);
     }
     for (; j < dk; ++j) {
-      r0 = fma(s[s_base + j * dv + d], k[ko + k_base + j], r0);
+      r0 = fma(s[s_rd + j * dv + d], k[ko + k_base + j], r0);
     }
     float read = (r0 + r1) + (r2 + r3);
     float o0 = 0.0, o1 = 0.0, o2 = 0.0, o3 = 0.0;
     j = 0u;
     for (; j + 4u <= dk; j += 4u) {
-      float u0 = a * (s[s_base + (j + 0u) * dv + d] - b * k[ko + k_base + j + 0u] * read) +
+      float u0 = a * (s[s_rd + (j + 0u) * dv + d] - b * k[ko + k_base + j + 0u] * read) +
                  b * v[vo + v_base + d] * k[ko + k_base + j + 0u];
-      float u1 = a * (s[s_base + (j + 1u) * dv + d] - b * k[ko + k_base + j + 1u] * read) +
+      float u1 = a * (s[s_rd + (j + 1u) * dv + d] - b * k[ko + k_base + j + 1u] * read) +
                  b * v[vo + v_base + d] * k[ko + k_base + j + 1u];
-      float u2 = a * (s[s_base + (j + 2u) * dv + d] - b * k[ko + k_base + j + 2u] * read) +
+      float u2 = a * (s[s_rd + (j + 2u) * dv + d] - b * k[ko + k_base + j + 2u] * read) +
                  b * v[vo + v_base + d] * k[ko + k_base + j + 2u];
-      float u3 = a * (s[s_base + (j + 3u) * dv + d] - b * k[ko + k_base + j + 3u] * read) +
+      float u3 = a * (s[s_rd + (j + 3u) * dv + d] - b * k[ko + k_base + j + 3u] * read) +
                  b * v[vo + v_base + d] * k[ko + k_base + j + 3u];
-      s[s_base + (j + 0u) * dv + d] = u0;
-      s[s_base + (j + 1u) * dv + d] = u1;
-      s[s_base + (j + 2u) * dv + d] = u2;
-      s[s_base + (j + 3u) * dv + d] = u3;
+      s[s_wr + (j + 0u) * dv + d] = u0;
+      s[s_wr + (j + 1u) * dv + d] = u1;
+      s[s_wr + (j + 2u) * dv + d] = u2;
+      s[s_wr + (j + 3u) * dv + d] = u3;
       o0 = fma(u0, q[ko + k_base + j + 0u], o0);
       o1 = fma(u1, q[ko + k_base + j + 1u], o1);
       o2 = fma(u2, q[ko + k_base + j + 2u], o2);
@@ -74,9 +81,9 @@ void main() {
     }
     float total = (o0 + o1) + (o2 + o3);
     for (; j < dk; ++j) {
-      float updated = a * (s[s_base + j * dv + d] - b * k[ko + k_base + j] * read) +
+      float updated = a * (s[s_rd + j * dv + d] - b * k[ko + k_base + j] * read) +
                       b * v[vo + v_base + d] * k[ko + k_base + j];
-      s[s_base + j * dv + d] = updated;
+      s[s_wr + j * dv + d] = updated;
       total = fma(updated, q[ko + k_base + j], total);
     }
     o[t * heads * dv + idx] = total;

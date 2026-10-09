@@ -3720,7 +3720,7 @@ TEST(BackendTest, DeltaStepHeadsDeviceMatchesRef) {
   launch.buffers = {(*s_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*q_buf).get(), (*o_buf).get(), (*al_buf).get(),
                     (*be_buf).get()};
-  launch.scalars = {kHeads, kDk, kDv, 1};
+  launch.scalars = {kHeads, kDk, kDv, 1, 0, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<float> s_ref = s;

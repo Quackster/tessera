@@ -376,7 +376,8 @@ __global__ void SsmGateKernel(const float* a_log, const float* dt,
 __global__ void DeltaStepHeadsKernel(
     float* s, const float* k, const float* v, const float* q, float* o,
     const float* alpha, const float* beta, unsigned long long heads,
-    unsigned long long dk, unsigned long long dv, unsigned long long rows);
+    unsigned long long dk, unsigned long long dv, unsigned long long rows,
+    unsigned long long sbase, unsigned long long sstride);
 __global__ void SiluMulKernel(const float* g, const float* u, float* o,
                               unsigned long long n);
 // Built-in "embedding_f32"/"embedding_bf16"/"embedding_q4k": buffer 0

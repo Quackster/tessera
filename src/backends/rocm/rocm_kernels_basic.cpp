@@ -1239,7 +1239,8 @@ __global__ void SsmGateKernel(const float* a_log, const float* dt,
 __global__ void DeltaStepHeadsKernel(
     float* s, const float* k, const float* v, const float* q, float* o,
     const float* alpha, const float* beta, unsigned long long heads,
-    unsigned long long dk, unsigned long long dv, unsigned long long rows) {
+    unsigned long long dk, unsigned long long dv, unsigned long long rows,
+    unsigned long long sbase, unsigned long long sstride) {
   const unsigned long long idx =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= heads * dv) {
@@ -1248,6 +1249,12 @@ __global__ void DeltaStepHeadsKernel(
   const unsigned long long h = idx / dv;
   const unsigned long long d = idx % dv;
   const unsigned long long s_base = h * dk * dv;
+  // The input state is at sbase and the updated state at sbase + sstride; a
+  // zero stride advances in place, a non-zero one appends the post-step state
+  // to the next history slot so a verify can restore any accepted prefix
+  // without a per-row device copy.
+  const unsigned long long s_rd = sbase + s_base;
+  const unsigned long long s_wr = sbase + sstride + s_base;
   const unsigned long long k_base = h * dk;
   const unsigned long long v_base = h * dv;
   // Rows share the recurrent state and advance it in turn, so a whole
@@ -1265,13 +1272,13 @@ __global__ void DeltaStepHeadsKernel(
     float r3 = 0.0f;
     unsigned long long j = 0;
     for (; j + 4 <= dk; j += 4) {
-      r0 = fmaf(s[s_base + (j + 0) * dv + d], kt[k_base + j + 0], r0);
-      r1 = fmaf(s[s_base + (j + 1) * dv + d], kt[k_base + j + 1], r1);
-      r2 = fmaf(s[s_base + (j + 2) * dv + d], kt[k_base + j + 2], r2);
-      r3 = fmaf(s[s_base + (j + 3) * dv + d], kt[k_base + j + 3], r3);
+      r0 = fmaf(s[s_rd + (j + 0) * dv + d], kt[k_base + j + 0], r0);
+      r1 = fmaf(s[s_rd + (j + 1) * dv + d], kt[k_base + j + 1], r1);
+      r2 = fmaf(s[s_rd + (j + 2) * dv + d], kt[k_base + j + 2], r2);
+      r3 = fmaf(s[s_rd + (j + 3) * dv + d], kt[k_base + j + 3], r3);
     }
     for (; j < dk; ++j) {
-      r0 = fmaf(s[s_base + j * dv + d], kt[k_base + j], r0);
+      r0 = fmaf(s[s_rd + j * dv + d], kt[k_base + j], r0);
     }
     const float read = (r0 + r1) + (r2 + r3);
     float o0 = 0.0f;
@@ -1281,21 +1288,21 @@ __global__ void DeltaStepHeadsKernel(
     j = 0;
     for (; j + 4 <= dk; j += 4) {
       const float u0 =
-          a * (s[s_base + (j + 0) * dv + d] - b * kt[k_base + j + 0] * read) +
+          a * (s[s_rd + (j + 0) * dv + d] - b * kt[k_base + j + 0] * read) +
           b * vt[v_base + d] * kt[k_base + j + 0];
       const float u1 =
-          a * (s[s_base + (j + 1) * dv + d] - b * kt[k_base + j + 1] * read) +
+          a * (s[s_rd + (j + 1) * dv + d] - b * kt[k_base + j + 1] * read) +
           b * vt[v_base + d] * kt[k_base + j + 1];
       const float u2 =
-          a * (s[s_base + (j + 2) * dv + d] - b * kt[k_base + j + 2] * read) +
+          a * (s[s_rd + (j + 2) * dv + d] - b * kt[k_base + j + 2] * read) +
           b * vt[v_base + d] * kt[k_base + j + 2];
       const float u3 =
-          a * (s[s_base + (j + 3) * dv + d] - b * kt[k_base + j + 3] * read) +
+          a * (s[s_rd + (j + 3) * dv + d] - b * kt[k_base + j + 3] * read) +
           b * vt[v_base + d] * kt[k_base + j + 3];
-      s[s_base + (j + 0) * dv + d] = u0;
-      s[s_base + (j + 1) * dv + d] = u1;
-      s[s_base + (j + 2) * dv + d] = u2;
-      s[s_base + (j + 3) * dv + d] = u3;
+      s[s_wr + (j + 0) * dv + d] = u0;
+      s[s_wr + (j + 1) * dv + d] = u1;
+      s[s_wr + (j + 2) * dv + d] = u2;
+      s[s_wr + (j + 3) * dv + d] = u3;
       o0 = fmaf(u0, qt[k_base + j + 0], o0);
       o1 = fmaf(u1, qt[k_base + j + 1], o1);
       o2 = fmaf(u2, qt[k_base + j + 2], o2);
@@ -1304,12 +1311,13 @@ __global__ void DeltaStepHeadsKernel(
     float out = (o0 + o1) + (o2 + o3);
     for (; j < dk; ++j) {
       const float updated =
-          a * (s[s_base + j * dv + d] - b * kt[k_base + j] * read) +
+          a * (s[s_rd + j * dv + d] - b * kt[k_base + j] * read) +
           b * vt[v_base + d] * kt[k_base + j];
-      s[s_base + j * dv + d] = updated;
+      s[s_wr + j * dv + d] = updated;
       out = fmaf(updated, qt[k_base + j], out);
     }
     o[t * heads * dv + idx] = out;
+    // The next row reads what this one just wrote.
   }
 }
 

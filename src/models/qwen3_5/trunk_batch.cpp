@@ -357,10 +357,14 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
                          g.num_v_heads * 4) ||
         !backend.CopyD2D(*b.beta, t * g.num_v_heads * 4, *h.beta, 0,
                          g.num_v_heads * 4) ||
-        !DeltaStepHeadsDevice(backend, *h.delta_step_heads_kernel,
-                              *h.linear[layer].state, *h.k_exp, *h.v_l,
-                              *h.q_exp, *h.core, *h.alpha, *h.beta,
-                              g.num_v_heads, g.head_k_dim, g.head_v_dim) ||
+        !DeltaStepHeadsDevice(
+            backend, *h.delta_step_heads_kernel,
+            b.snapshot_states ? *b.state_hist[layer]
+                              : *h.linear[layer].state,
+            *h.k_exp, *h.v_l, *h.q_exp, *h.core, *h.alpha, *h.beta,
+            g.num_v_heads, g.head_k_dim, g.head_v_dim, 1,
+            b.snapshot_states ? t * state_len : 0,
+            b.snapshot_states ? state_len : 0) ||
         !backend.CopyD2D(*b.z, t * g.value_dim * 4, *h.z, 0, g.value_dim * 4) ||
         !RmsNormGatedDevice(backend, *h.rmsnorm_gated_kernel, *h.core,
                             *(*w_norm)->device, *h.z, *h.out, g.num_v_heads,
@@ -369,15 +373,12 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
                          g.value_dim * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    // Snapshot the recurrent state and conv history after this token so a
-    // verification can roll back to any accepted prefix.
+    // The DeltaStep already wrote this token's post-state to slot t+1 of the
+    // state history, so only the conv history needs a copy for rollback.
     if (b.snapshot_states &&
-        (!backend.CopyD2D(*h.linear[layer].state, 0,
-                          *b.state_hist[layer], (t + 1) * state_len * 4,
-                          state_len * 4) ||
-         !backend.CopyD2D(*h.linear[layer].conv_hist, 0,
-                          *b.conv_hist_hist[layer], (t + 1) * hist_len * 4,
-                          hist_len * 4))) {
+        !backend.CopyD2D(*h.linear[layer].conv_hist, 0,
+                         *b.conv_hist_hist[layer], (t + 1) * hist_len * 4,
+                         hist_len * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }
   }
@@ -611,8 +612,11 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
   result.logits.assign(last.begin(), last.end());
   result.next_token = detail::ArgMax(result.logits);
   // Keep the anchor (when present) plus the accepted drafts; drop the rest.
+  // The restore always runs: the batched verify advances the recurrent state
+  // through the history slots (each DeltaStep writes its own slot), so the
+  // live state buffer is stale even when every draft is accepted.
   const std::size_t committed = lead + accepted;
-  if (committed < draft.size() + lead) {
+  {
     const std::size_t new_pos = prefix + committed;
     for (auto& kv : h.full) {
       kv.rows = new_pos;

@@ -212,12 +212,14 @@ class Kernel {
 // rows. alpha = exp(-exp(a_log) * softplus(alpha_raw + dt)), beta =
 // sigmoid(beta_raw). The dispatch is ceil(rows * heads / 256) workgroups
 // of 256.
-// "delta_step_heads": buffer 0 is S (fp32, heads x dk x dv, updated in
-// place), buffers 1..4 are k (rows x heads x dk), v (rows x heads x dv),
-// q (rows x heads x dk) and o (rows x heads x dv), buffers 5 and 6 are
-// alpha and beta (rows x heads); scalars are heads, dk, dv, rows. The
-// rows gated-delta steps run in turn, advancing the shared state. The
-// dispatch is ceil(heads * dv / 256) workgroups of 256.
+// "delta_step_heads": buffer 0 is S (fp32, heads x dk x dv), buffers 1..4 are
+// k (rows x heads x dk), v (rows x heads x dv), q (rows x heads x dk) and o
+// (rows x heads x dv), buffers 5 and 6 are alpha and beta (rows x heads);
+// scalars are heads, dk, dv, rows, sbase, sstride. The rows gated-delta steps
+// run in turn, advancing the shared state: each step reads the state at
+// sbase + head offset and writes it at sbase + sstride + head offset, so a
+// zero stride updates in place and a non-zero one appends every step to the
+// next history slot. The dispatch is ceil(heads * dv / 256) workgroups of 256.
 // "repeat_heads": buffer 0 is IN (fp32, rows x num_k_heads x head_k_dim),
 // buffer 1 the output OUT (fp32, rows x num_v_heads x head_k_dim);
 // scalars are num_v_heads, head_k_dim, factor and rows (num_v_heads is
@@ -508,7 +510,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "delta_step_heads") {
-    if (launch.buffers.size() != 7 || launch.scalars.size() != 4) {
+    if (launch.buffers.size() != 7 || launch.scalars.size() != 6) {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||

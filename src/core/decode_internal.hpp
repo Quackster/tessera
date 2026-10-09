@@ -671,12 +671,12 @@ inline std::expected<void, StatusCode> DeltaStepHeadsDevice(
     Backend& backend, const Kernel& kernel, Buffer& state, const Buffer& k,
     const Buffer& v, const Buffer& q, Buffer& o, const Buffer& alpha,
     const Buffer& beta, std::size_t heads, std::size_t dk, std::size_t dv,
-    std::size_t rows = 1) {
+    std::size_t rows = 1, std::size_t sbase = 0, std::size_t sstride = 0) {
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>((heads * dv + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&state, &k, &v, &q, &o, &alpha, &beta};
-  launch.scalars = {heads, dk, dv, rows};
+  launch.scalars = {heads, dk, dv, rows, sbase, sstride};
   return backend.LaunchKernel(kernel, launch);
 }
 
