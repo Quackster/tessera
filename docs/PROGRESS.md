@@ -1794,14 +1794,46 @@ through RADV GFX1201, rocm through the system ROCm).
    kernels. This is item 3 (GEMM throughput) work, and it must land before
    DFlash2 is a net win. 275/275 `ctest` on both backends.
 
+- 2026-10-09: **Coalesced the fp32/bf16 GEMVs and stopped widening the head
+   (hipfire-guided).** A `rocprofv3` kernel trace of the DFlash2 run showed
+   `GemmF32Kernel` was 28.2 s of 38.9 s of device time (487 dispatches, about
+   58 ms each): `gemm_f32` read one weight row per thread with a stride-k
+   access, so it ran at about 6 GB/s. The same profile showed the cause on
+   the greedy path: the MXFP4 loader widened **every** BF16 tensor to F32,
+   including the 248320x5120 vocabulary head, so greedy decode streamed a
+   5 GB fp32 head through that uncoalesced kernel. Both `gemm_f32` and
+   `gemm_bf16` are now warp-per-output on ROCm and Vulkan (lane l sums
+   `t = l, l+32, ...`, shuffle/shared reduce), `GemmGridFor` dispatches
+   `ceil(m*n/8)` workgroups for both ids, and the head (with the embedding)
+   stays BF16 in the loader (`mxfp4.cpp`), so the head is 2.4 GB, not 4.8 GB
+   (BF16 to fp32 is exact, so the tokens are unchanged). `GenerateSpeculative`
+   (MTP) gained the same accept-count and timing log as `GenerateDFlash2`.
+   Measured on the 27B MXFP4 target (ROCm, GPU1, 128 tokens):
+   greedy **206 -> 51 ms/token** (DFlash2 prompt) and **40 ms/token** (MTP
+   prompt), DFlash2 **949 -> 296 ms/token** with the same 106 of 168
+   acceptance, and MTP **1396 ms/token accepting 0 of 508** (so MTP
+   speculation is output-preserving but useless on this target; the MTP head
+   draft quality is the next suspect, and it is now measurable).
+   `BackendTest.GemmF32DeviceMatchesRef` and `GemmBf16DeviceMatchesRef` use
+   `GemmGridFor`; 275/275 `ctest` on both backends. The design comes from
+   hipfire (`~/.hipfire/src`, the same author's Rust engine for the same
+   R9700/Qwen3.8): decode is a warp-per-row GEMV with weights kept
+   quantized, the head stays quantized (Q8_0, about 1.35 GB, never widened),
+   projections are fused per layer, and one `Speculator`/`SpecTarget` seam
+   plus `accept_greedy_prefix` is shared by MTP and DFlash.
+
 ## Next (in order)
 
-- **DFlash2 acceptance (done 2026-10-09).** The 14x gap was the two defects
-  above, not the aux. Acceptance is now 4.4 per step (reference 2.7 to 2.85),
-  but DFlash2 is 4.6x slower per token than greedy, so the draft step cost is
-  the open issue. Next: reduce the draft step cost (bf16/fp8 draft weights
-  instead of fp32, a cheaper selector, fewer per-step kernels), then
-  re-measure tokens/s. This folds into item 3.
+- **Speculation (DFlash2 done, MTP broken).** DFlash2 acceptance is fixed
+  (4.4 per step, reference 2.7 to 2.85) and the coalesced GEMVs plus the BF16
+  head cut greedy to 40 to 51 ms/token and DFlash2 to 296 ms/token on the 27B
+  MXFP4 target. Two open items: (a) DFlash2 is still about 6x slower per
+  token than greedy (draft block fp32 weights, selector, many small kernels);
+  reduce the draft step cost, then re-measure. (b) **MTP speculation accepts
+  0 of 508 draft tokens** on the MXFP4 target (output still equals greedy
+  because it falls back every step, but it is 1396 ms/token). Root-cause the
+  MTP head draft quality: it is output-preserving but worthless as a speedup
+  today. Both are item 3 work.
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.

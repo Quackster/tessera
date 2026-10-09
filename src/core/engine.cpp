@@ -237,6 +237,10 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
   if (max_tokens == 0) {
     return std::vector<std::uint32_t>{};
   }
+  const auto started = std::chrono::steady_clock::now();
+  std::size_t proposed = 0;
+  std::size_t accepted = 0;
+  std::size_t steps = 0;
   std::vector<float> hidden;
   std::vector<float> current;
   auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden);
@@ -315,6 +319,9 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     if (!verify) {
       return std::unexpected(verify.error());
     }
+    proposed += drafts.size();
+    accepted += verify->accepted;
+    ++steps;
     if (arch != nullptr) {
       arch->DraftTruncate(cache, mtp_base + verify->accepted);
     }
@@ -339,6 +346,21 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     diagnostics_.Info("engine",
                       "speculative: stopped at a declared stop token");
   }
+  diagnostics_.Info("engine",
+                    "speculative: accepted " + std::to_string(accepted) +
+                        " of " + std::to_string(proposed) +
+                        " draft token(s) over " + std::to_string(steps) +
+                        " step(s)");
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - started)
+                           .count();
+  const std::string per_token =
+      produced.empty()
+          ? std::string()
+          : " (" + std::to_string(elapsed / produced.size()) + " ms/token)";
+  diagnostics_.Info("engine", "generated " + std::to_string(produced.size()) +
+                                  " token(s) in " + std::to_string(elapsed) +
+                                  " ms" + per_token);
   return produced;
 }
 

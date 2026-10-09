@@ -290,8 +290,12 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
       if (payload.size() != rows * cols * elem_bytes) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      if (*internal == "token_embd.weight") {
-        // The embedding stays BF16; GatherEmbedding reads it row-wise.
+      if (*internal == "token_embd.weight" ||
+          *internal == "output.weight") {
+        // The embedding and the vocabulary head stay BF16: the embedding is
+        // gathered row-wise and the head runs a bf16 GEMV, so the 248320x5120
+        // head is 2.4 GB, not 4.8 GB of widened fp32. BF16 -> fp32 is exact,
+        // so widening bought nothing but traffic.
         auto buffer = Upload(backend, payload);
         if (!buffer) {
           return std::unexpected(buffer.error());

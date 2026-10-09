@@ -274,18 +274,28 @@ __device__ float Bf16ToFloatDev(unsigned short bits) {
 __global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
                                float* c, unsigned long long m,
                                unsigned long long n, unsigned long long k) {
-  unsigned long long idx =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= m * n) {
+  const unsigned long long warp =
+      (static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
+       threadIdx.x) /
+      32;
+  const unsigned long long lane = threadIdx.x & 31u;
+  if (warp >= m * n) {
     return;
   }
-  const unsigned long long row_a = idx / n;
-  const unsigned long long row_w = idx % n;
+  const unsigned long long row_a = warp / n;
+  const unsigned long long row_w = warp % n;
+  const float* a_row = a + row_a * k;
+  const unsigned short* w_row = w + row_w * k;
   float acc = 0.0f;
-  for (unsigned long long t = 0; t < k; ++t) {
-    acc = fmaf(a[row_a * k + t], Bf16ToFloatDev(w[row_w * k + t]), acc);
+  for (unsigned long long t = lane; t < k; t += 32) {
+    acc = fmaf(a_row[t], Bf16ToFloatDev(w_row[t]), acc);
   }
-  c[idx] = acc;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down(acc, offset);
+  }
+  if (lane == 0) {
+    c[warp] = acc;
+  }
 }
 
 // Built-in "round_bf16": one thread per element; round each fp32 value to
@@ -304,22 +314,35 @@ __global__ void RoundBf16Kernel(float* x, unsigned long long n) {
   memcpy(&x[i], &bits, sizeof(bits));
 }
 
-// Built-in "gemm_f32": C = A x W^T with fp32 sequential accumulation.
+// Built-in "gemm_f32": C = A x W^T with fp32 reconstruction. One 32-lane
+// warp per output element; lane l sums t = l, l+32, ..., so consecutive
+// lanes read consecutive weights (coalesced) instead of striding by k, then
+// the lane partials reduce with a shuffle. Grid: ceil(m*n / 8) workgroups.
 __global__ void GemmF32Kernel(const float* a, const float* w, float* c,
                               unsigned long long m, unsigned long long n,
                               unsigned long long k) {
-  unsigned long long idx =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= m * n) {
+  const unsigned long long warp =
+      (static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
+       threadIdx.x) /
+      32;
+  const unsigned long long lane = threadIdx.x & 31u;
+  if (warp >= m * n) {
     return;
   }
-  const unsigned long long row_a = idx / n;
-  const unsigned long long row_w = idx % n;
+  const unsigned long long row_a = warp / n;
+  const unsigned long long row_w = warp % n;
+  const float* a_row = a + row_a * k;
+  const float* w_row = w + row_w * k;
   float acc = 0.0f;
-  for (unsigned long long t = 0; t < k; ++t) {
-    acc = fmaf(a[row_a * k + t], w[row_w * k + t], acc);
+  for (unsigned long long t = lane; t < k; t += 32) {
+    acc = fmaf(a_row[t], w_row[t], acc);
   }
-  c[idx] = acc;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down(acc, offset);
+  }
+  if (lane == 0) {
+    c[warp] = acc;
+  }
 }
 
 // Built-in "gemm_fp8": C = A x (diag(s) x W)^T with fp32 sequential

@@ -682,6 +682,13 @@ TEST(HybridDecodeTest, SpeculativeMatchesGreedyOnModel) {
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   tessera::GenerateOptions options;
   options.max_tokens = 4;
+  if (const char* count = std::getenv("TESSERA_SPEC_TOKENS");
+      count != nullptr) {
+    const int value = std::atoi(count);
+    if (value > 0) {
+      options.max_tokens = static_cast<std::size_t>(value);
+    }
+  }
   options.first_token = 0;
   auto greedy = engine->Generate(**model, options);
   ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());

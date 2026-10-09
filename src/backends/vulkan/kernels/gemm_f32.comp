@@ -1,6 +1,9 @@
 #version 450
 
-// One thread per output element; dispatch ceil(m * n / 256).
+// One 32-lane group per output element; lane l sums t = l, l+32, ... so the
+// activation and weight reads are coalesced across the group (consecutive
+// lanes read consecutive elements) instead of striding by k. Eight groups
+// per 256-thread workgroup; the dispatch is ceil(m * n / 8) workgroups.
 layout(local_size_x = 256) in;
 
 // "gemm_f32" contract (tessera API): buffer 0 is A (fp32, m x k),
@@ -15,19 +18,34 @@ layout(set = 0, binding = 0) buffer A { float a[]; };
 layout(set = 0, binding = 1) buffer W { float w[]; };
 layout(set = 0, binding = 2) buffer C { float c[]; };
 
+shared float red[256];
+
 void main() {
-  uint idx = gl_GlobalInvocationID.x;
   uint m = pc.v[0];
   uint n = pc.v[2];
   uint k = pc.v[4];
-  if (idx >= m * n) {
-    return;
-  }
-  uint row_a = idx / n;
-  uint row_w = idx % n;
+  uint lid = gl_LocalInvocationID.x;
+  uint group = lid >> 5u;
+  uint lane = lid & 31u;
+  uint out_idx = gl_WorkGroupID.x * 8u + group;
+  uint total = m * n;
   float acc = 0.0;
-  for (uint t = 0; t < k; ++t) {
-    acc += a[row_a * k + t] * w[row_w * k + t];
+  if (out_idx < total) {
+    uint row_a = out_idx / n;
+    uint row_w = out_idx % n;
+    uint a_base = row_a * k;
+    uint w_base = row_w * k;
+    for (uint t = lane; t < k; t += 32u) {
+      acc += a[a_base + t] * w[w_base + t];
+    }
   }
-  c[idx] = acc;
+  red[lid] = acc;
+  barrier();
+  if (lane == 0u && out_idx < total) {
+    float sum = 0.0;
+    for (uint t = 0u; t < 32u; ++t) {
+      sum += red[group * 32u + t];
+    }
+    c[out_idx] = sum;
+  }
 }

@@ -396,7 +396,8 @@ inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
   if (gemm.Id().ends_with("_row")) {
     return static_cast<std::uint32_t>(m * n);
   }
-  if (gemm.Id() == "gemm_mxfp4") {
+  if (gemm.Id() == "gemm_mxfp4" || gemm.Id() == "gemm_f32" ||
+      gemm.Id() == "gemm_bf16") {
     return static_cast<std::uint32_t>((m * n + 7) / 8);
   }
   return static_cast<std::uint32_t>((m * n + 255) / 256);

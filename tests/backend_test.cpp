@@ -3920,7 +3920,7 @@ TEST(BackendTest, GemmF32DeviceMatchesRef) {
   auto kernel = backend->LoadKernel("gemm_f32", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kN + 255) / 256;
+  launch.grid_x = tessera::core::detail::GemmGridFor(**kernel, kM, kN);
   launch.block_x = 256;
   launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
   launch.scalars = {kM, kN, kK};
@@ -3978,7 +3978,7 @@ TEST(BackendTest, GemmBf16DeviceMatchesRef) {
   auto kernel = backend->LoadKernel("gemm_bf16", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kN + 255) / 256;
+  launch.grid_x = tessera::core::detail::GemmGridFor(**kernel, kM, kN);
   launch.block_x = 256;
   launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
   launch.scalars = {kM, kN, kK};
