@@ -10,7 +10,7 @@
 
 </div>
 
-> Status: Heavy development. The API changes without notice. There is no stable text generation yet. The code is usable for development and for backend tests. It is not ready for production use.
+> Status: Heavy development. The API changes without notice. Greedy text generation is stable on the 27B targets. DFlash2 and MTP speculation run end to end. The code is usable for development and for backend tests. It is not ready for production use.
 
 Tessera is a C++20 LLM inference engine. It runs open weight models on GPU. It has two compute backends. Vulkan supports cross vendor GPUs. ROCm supports AMD GPUs. One binary uses one backend. The backend is set at configure time.
 
@@ -28,22 +28,26 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | MXFP4 loader | Done | Parses tensor map. Uploads weights. FP8 and MXFP4 GEMM verified. |
 | Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. |
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. ROCm launches are asynchronous; Vulkan pipelines launches through a four-slot command-buffer and fence ring, so the host does not wait on a fence after every kernel. |
-| DFlash2 | Done | Draft forward built: grouped dynamic convolution, sliding attention, candidate selector and target-hidden fusion. The real draft loads and runs the block; the 27B MXFP4 target accepts 3.5 tokens per step. |
-| CLI | Partial | Loads model, prints summary, streams generated text to stdout (`--tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). Text prompts work for GGUF and MXFP4. |
-| Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in one batched forward, sized by need so long prompts do not exhaust memory and with asynchronous device-to-device copies so a long prompt pipelines. A zero `max_tokens` fills the remaining context. Generation stops at the model's declared stop tokens (GGUF `tokenizer.ggml.eos_token_id`, HuggingFace `eos_token_id`) and does not emit them; callers add stops through `GenerateOptions::stop_tokens`. Runtime options: `--context`, `--tokens`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`) or 4-bit (`--kv-q4`) KV cache. |
+| DFlash2 | Partial | Draft forward built: grouped dynamic convolution, sliding attention, candidate selector and target-hidden fusion. The real draft loads and runs the block. The 27B MXFP4 target accepts 4.4 tokens per step. Output equals greedy. The draft step costs more than greedy, so speed work remains. |
+| CLI | Partial | Loads a model, prints a tensor summary, streams generated text to stdout (`--tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). It serves HTTP (`serve`), samples (`--sample` and parameter flags), selects the KV cache (`--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`), speculates (`--speculate`, `--draft`) and encodes images (`--mmproj`, `--image`). Text prompts work for GGUF and MXFP4. |
+| Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in one batched forward, sized by need so long prompts do not exhaust memory and with asynchronous device-to-device copies so a long prompt pipelines. A zero `max_tokens` fills the remaining context. Generation stops at the model's declared stop tokens (GGUF `tokenizer.ggml.eos_token_id`, HuggingFace `eos_token_id`) and does not emit them; callers add stops through `GenerateOptions::stop_tokens`. Runtime options: `--context`, `--tokens`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) or FP8 (`--kv-fp8`) KV cache. |
 | KV cache | Done | fp32 (default), fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) and FP8 E4M3 (`--kv-fp8`, the served target's cache quant) full-attention storage on both backends. |
 | Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
-| GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Tiled batched kernels for every hot format (32x8 output tile, four partial sums per thread so the FMA chain is not latency-bound; f32 and bf16 have tiled batched kernels too) and a warp-per-output MXFP4 decode GEMV. Below 16 rows the batch uses the shallow-chain GEMV, except the very wide (vocab) head, which reads its weights once with the tiled kernel. Host reference check. Per backend tolerance. |
+| GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Tiled batched kernels for the hot formats (four partial sums per thread) and warp-per-output decode GEMVs. Small verify batches use a warp-per-column multi-row MXFP4 kernel. The vocab-width head reads its weights once with the tiled kernel. Host reference check. Per backend tolerance. |
 | Activation quant | Done | Per-token FP8 E4M3 quantize-dequantize (`quantize_fp8`) on Vulkan and ROCm, the W4A8 activation contract. The DFlash2 drafter input uses it. The served target's W4A8 linear activation is opt-in (`TESSERA_MXFP4_W4A8=1`). |
 | Attention and RoPE | Done | GQA path driven by model data; tiled O(n*d) attention (one workgroup per query/head, online softmax), including the int8, 4-bit and FP8 KV variants. RoPE kernel verified by read back on both backends. |
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. The 27B hybrid path generates coherent text. |
-| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. The causal conv1d, SiLU and q/k/v split run on the device (`conv1d_state`). |
-| Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculation run end to end; output equals greedy. Multi-token drafts are scored in one batched target forward. The MTP head now accepts most drafts (a missing Gemma norm offset made it accept none) and its default chain is one draft, which measures about 21 tok/s on the 27B (within about 15 percent of greedy); the per-draft MTP-head cost is the remaining gap. |
-| MXFP4 path | Partial | Tensor map parsing. FP8 and MXFP4 kernels. HuggingFace config, weight name map, value-head reorder and tokenizer; the Qwen 3.8 27B MXFP4 target loads, tokenizes and decodes end to end. |
-| DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). The draft conditions on a device-resident per-layer context K/V cache built from every committed target position (capped by the checkpoint window). The concatenated target hidden is quantized per token to FP8 E4M3 before `fc`, matching the drafter training data. Output equals greedy. On the 27B MXFP4 target the draft accepts 3.5 tokens per step, at or above the served reference (2.7 to 2.85), and decode runs at 8 to 10 tok/s: the verifier's MXFP4 GEMM was made compute-bound instead of latency-bound, the draft projections and the shared bf16 head now use tiled batched kernels, and the verifier uses the shallow-chain GEMV except for the vocab-sized head. Two defects were fixed (the candidate extraction ranked only the first 16 token ids on every row after the first, and the selector added the predecessor's unary logit instead of the successor's). |
+| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. The causal conv1d runs on the device (`conv1d_state`). Embedding gather runs on the device. Some linear-path glue still runs on the host. |
+| Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) run end to end; output equals greedy. Multi-token drafts score in one batched target forward. MTP accepts about half its drafts with a default chain of one. DFlash2 accepts 4.4 tokens per step but still decodes slower than greedy. |
+| MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. HuggingFace config, weight name map, value-head reorder and tokenizer. The Qwen 3.8 27B MXFP4 target loads, tokenizes and decodes end to end. Greedy output matches the GGUF reference. The FP8 MTP head loads. W4A8 activation quant is opt-in. |
+| DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). The draft conditions on a device-resident per-layer context K/V cache built from committed target positions. The concatenated target hidden is quantized per token to FP8 E4M3 before `fc`. Output equals greedy. On the 27B MXFP4 target the draft accepts 4.4 tokens per step, above the served reference (2.7 to 2.85), but decode is slower than greedy. Two defects were fixed (the candidate extraction ranked only the first 16 token ids on rows after the first, and the selector added the predecessor unary logit instead of the successor). |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
-| MoE, MLP, norms | Partial | RMSNorm, sigmoid-gate, add, silu_mul and the f32/bf16/Q4_K embedding gather kernels are done. The gated MLP runs as gemm plus silu_mul plus gemm on the device. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
+| Tokenizer and chat | Done | Byte-level BPE tokenizer from GGUF metadata or HuggingFace `tokenizer.json`. Jinja2-subset chat template renderer. Generation stops at the declared stop tokens and never emits them. |
+| Serving | Partial | Blocking HTTP/1.1 server with buffered and chunked (SSE) responses, API-key auth and CORS. First endpoint set done. Thread pool, queueing and more surfaces deferred. |
+| Vision | Partial | CLIP encoder plus merger, PPM load and resize, image-embedding injection, CLI wiring with auto `<|image_pad|>` detection. Image prefill speed work remains. |
+| Architecture modules | Done | One `Architecture` module per model family (`src/models/qwen3_5/`). The hybrid trunk and state live behind it. Core names no model. |
+| MoE, MLP, norms | Todo | RMSNorm, sigmoid-gate, add, silu_mul and the f32/bf16/Q4_K embedding gather kernels are done. The gated MLP runs as gemm plus silu_mul plus gemm on the device. No MoE kernels exist yet. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 
@@ -51,7 +55,7 @@ See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PR
 
 Core code is backend agnostic. All device work goes through the `Backend` interface. Only `src/backends/vulkan/` includes Vulkan headers. Only `src/backends/rocm/` includes HIP and ROCm headers. No vendor type crosses the backend boundary.
 
-Models are data. A new architecture arrives as config plus weights. It drives generic kernels for GEMM, attention, MLP, MoE, norms, RoPE, activations, and embeddings. Generic code has no per model branches.
+Models are data plus one module per architecture. Each architecture owns its config parse, weight map and layer assembly behind the `Architecture` interface (today `src/models/qwen3_5/`). It drives generic kernels for GEMM, attention, MLP, MoE, norms, RoPE, activations, and embeddings. Generic code has no per model branches.
 
 Speculative decoding plugs in behind the strategy interface. It is off by default. DFlash2 is the current strategy. The non speculative path is the reference baseline. It stays stable within per backend tolerance.
 
@@ -59,9 +63,11 @@ Layout:
 
 * `include/tessera/` holds the public API.
 * `src/core/` holds the engine, the model, and the weight loaders.
+* `src/models/` holds one architecture module per model family.
 * `src/backends/vulkan/` holds the Vulkan backend.
 * `src/backends/rocm/` holds the ROCm backend.
 * `src/spec/` holds speculative decoding strategies.
+* `src/serve/` holds the HTTP layer.
 * `tools/cli/` holds the thin CLI.
 * `tests/` holds the single GoogleTest binary.
 * `docs/PROGRESS.md` tracks progress.
@@ -75,7 +81,7 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | GGUF | Done | Parses v2 and v3. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS and IQ3_S. Checks bounds. |
 | MXFP4 safetensors | Done | Parses the map, maps names, converts the value layout and packs the MXFP4 weights; config.json drives the decode config. |
 | NVFP4 MoE | Todo | Planned: MoE model support (Ornith-1.5-35B-A3B). Needs MoE routing and NVFP4 kernels. |
-| DFlash2 FP8 draft | Skeleton | Validates layout only. Decode logic is in work. |
+| DFlash2 FP8 draft | Partial | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. Step cost work remains. |
 
 Model weights live outside the repo. Each variant uses one flat directory. Model paths are runtime configuration. Code and tests never hard code model paths.
 
@@ -96,7 +102,7 @@ CLI example:
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --draft ~/models/Qwen3.8-27B-DFlash2-FP8
 ```
 
-The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count and total elements. With `--tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated.
+The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count, total elements and device bytes. With `--tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head. `--draft` drafts with the DFlash2 checkpoint. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
 
 ## Usage
 
@@ -173,6 +179,8 @@ cmake --build cmake-build-vulkan -j
 cmake -B cmake-build-rocm -DTESSERA_BACKEND=rocm
 cmake --build cmake-build-rocm -j
 ```
+
+CMake defaults to a Release build. Measure speed only on Release. Build serially. The gcc-15 toolchain crashes under parallel builds.
 
 Run tests:
 

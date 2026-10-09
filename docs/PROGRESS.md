@@ -7,7 +7,7 @@ Working Principles).
 ## Current status
 
 The boilerplate is complete and passes on both backends.
-`ctest` passes 277/277 on both builds.
+`ctest` passes 278/278 on both builds.
 Both builds were verified on AMD Radeon AI PRO R9700 (vulkan
 through RADV GFX1201, rocm through the system ROCm).
 
@@ -75,15 +75,20 @@ through RADV GFX1201, rocm through the system ROCm).
   `Model::Weights` exposes them next to the manifest. Unsized
   layouts stay in the manifest but fail the load as unsupported.
 - Single-token decode loop in the core (backend agnostic): embed,
-  block forward (device GEMM/RoPE/attention/conv/scan, host norms),
-  greedy sample. It runs on vanilla-layout GGUF models and on hybrid
-  models: the gated full-attention path (fused Q-plus-gate split,
-  QK-Norm, mRoPE, sigmoid output gate) and the recurrent linear-
-  attention path (causal conv1d, gated-delta scan, L2/gated norms) are
-  both wired. Embeddings gather through the quantized formats. The 27B
-  target generates on both backends. Norms and elementwise ops run on
-  the host until their device kernels land.
-- DFlash2 strategy skeleton. It validates the draft checkpoint layout.
+   block forward (device GEMM/RoPE/attention/conv/scan, host norms),
+   greedy sample. It runs on vanilla-layout GGUF models and on hybrid
+   models: the gated full-attention path (fused Q-plus-gate split,
+   QK-Norm, mRoPE, sigmoid output gate) and the recurrent linear-
+   attention path (causal conv1d, gated-delta scan, L2/gated norms) are
+   both wired. Embeddings gather through the quantized formats. The 27B
+   target generates on both backends. RMSNorm, add, silu_mul and
+   embedding gather run on the device. The linear path still issues
+   several host-side launches per token.
+- DFlash2 strategy. It loads the real FP8 draft and speculates end
+  to end through the `SpeculativeStrategy` seam (greedy, MTP and
+  DFlash2 share one engine loop). The 27B MXFP4 target accepts 4.4
+  tokens per step, above the served reference. Output equals greedy.
+  The draft step still costs more than greedy.
 - Public generation API: `Engine::Generate(model, options)` runs greedy
   single-token decode on the non-speculative (reference) path and
   returns the produced token ids. The CLI drives it.
@@ -93,10 +98,10 @@ through RADV GFX1201, rocm through the system ROCm).
   allowlist. Endpoints: `/health`, `/metrics`, `/v1/models`, `/props`,
   `/tokenize`, `/detokenize`, `/slots`, `/v1/completions` (streaming
   SSE), `/v1/chat/completions` (SSE), `/v1/messages` and
-  `/v1/messages/count_tokens`; unimplemented surfaces return 501.
-  `Engine::GenerateStreaming` emits tokens one at a time. Chat prefill
-  is slow on the 27B (host-glue decode), a performance, not correctness,
-  gap.
+   `/v1/messages/count_tokens`; unimplemented surfaces return 501.
+   `Engine::GenerateStreaming` emits tokens one at a time. Prefill runs
+   in one batched forward. The serving surface is deferred (see Next
+   item 4).
 - Chat-template renderer: a compact Jinja2-subset engine
   (`tessera/serve/jinja`) that runs the model's GGUF chat template.
   `Model::ChatTemplate` exposes the template. It matches the reference
@@ -110,11 +115,38 @@ through RADV GFX1201, rocm through the system ROCm).
   exposes it. Not applied: NFC normalization, special-token matching,
   combining marks and emoji.
 - CLI: `tessera-cli run --model <path> [--draft <dir>] [--context <n>]
-  [--draft-block <n>] [--prompt <id>] [--prompt-text <str>]
-  [--tokens <n>]`. It loads the model, uploads weights, prints a tensor
-  summary, and with `--tokens` runs greedy decode through
-  `Engine::Generate` and prints the ids. `--prompt-text` tokenizes text
-  with the model's tokenizer.
+  [--draft-block <n>] [--prompt-text <str>] [--tokens <n>]`. It loads
+  the model, uploads weights, prints a tensor summary, and with
+  `--tokens` runs greedy decode through `Engine::GenerateStreaming`
+  and streams the text to stdout. `--prompt-text` tokenizes text
+  with the model's tokenizer. It also serves (`serve`), samples
+  (`--sample` and parameter flags), selects the KV cache (`--kv-f16`,
+  `--kv-q8`, `--kv-q4`, `--kv-fp8`), speculates (`--speculate`,
+  `--draft`) and encodes images (`--mmproj`, `--image`). The image
+  token id is detected from `<|image_pad|>`. There are no
+  `--log-tokens`, `--image-token`, `--mtp` or `--prompt` flags, even
+  though some Done entries below name them. Input and output text
+  logging is on by default. MTP speculation uses `--speculate`.
+  Prompts use `--prompt-text`.
+- Architecture modules: one `Architecture` module per model family
+  (`src/models/qwen3_5/`). The hybrid trunk, state and MTP head live
+  behind it. Core names no model.
+- MXFP4 target: the Qwen 3.8 27B MXFP4 target loads, tokenizes and
+  decodes end to end. Greedy output matches the GGUF reference. The
+  HuggingFace tokenizer and chat template parse at load. Generation
+  stops at the declared stop tokens. The FP8 MTP head loads. W4A8
+  activation quant (`TESSERA_MXFP4_W4A8=1`), bf16 target mode
+  (`TESSERA_TARGET_BF16=1`) and the fp8 KV cache (`--kv-fp8`) are
+  opt-in. None of them changed DFlash2 acceptance, so they stay off
+  by default.
+- GEMM and attention speed: tiled batched kernels for the hot formats,
+  warp-per-output decode GEMVs, a warp-per-column multi-row MXFP4
+  kernel for small verify batches, tiled quantized attention, and
+  four-way ILP in the scan and norm kernels. Vulkan launches pipeline
+  through a four-slot ring instead of waiting on a fence per launch.
+  ROCm copies use async device-to-device transfer. Greedy runs at
+  about 25 tok/s on the 27B MXFP4 target. DFlash2 runs slower than
+  greedy. See the newest Done entries for the numbers.
 - Single GoogleTest target. Device dependent tests skip cleanly when
   no device is present. Numerical checks use per backend tolerance.
 
@@ -1997,92 +2029,110 @@ through RADV GFX1201, rocm through the system ROCm).
   overrides. MTP is now within about 15 percent of greedy (46 vs 39
   ms/token). 277/277 `ctest` on both backends.
 
+- 2026-10-09: **Small-m verify GEMM (warp-per-column multi-row MXFP4 GEMV).**
+  The speculative verifier runs the target trunk at m about 2 to 7; the
+  single-row `gemm_mxfp4` is warp-per-(row,column), so each weight row is
+  re-read once per row. New `gemm_mxfp4_rows`: one warp owns one weight
+  column and accumulates all m activation rows, decoding the weight block
+  once per column. `ProjectBatch` routes MXFP4 with m in [2,16] to it (the
+  GEMV stays for m=1, the tiled kernels for m>=16 and the vocab head). The
+  DFlash2 draft head (`head_gemm_`, the shared bf16 output head) now uses the
+  tiled bf16 kernel too, so it reads the 2.5 GB head once instead of once per
+  draft row. DFlash2 on the 27B drops 121 -> 95 ms/token (CLI) and 77 -> 71
+  ms/token (test); acceptance unchanged and output equals greedy. Both
+  backends: the Vulkan shader (`gemm_mxfp4_rows.comp`, warp-per-column with a
+  shared-memory row reduction) is validated by the new
+  `BackendTest.GemmMxFp4RowsDeviceMatchesRef`. Within the rows kernel several
+  variants regressed and were
+  reverted: a cooperative element-per-lane mapping (coalesced reads, but a
+  160-deep accumulator chain) measured 200 ms/token; four partial sums per row
+  (register spill from 64 accumulators) measured 192; two partial sums per row
+  measured 102. The single-accumulator lane-per-block form stays the best
+  found, and the ILP variants making it *worse* says the kernel is
+  occupancy-bound rather than latency-bound. 277/277 `ctest` on both backends.
+  Next lever found: the engine runs an extra single-token target forward every
+  speculative step (`engine.cpp:419`, `DecodeLogits(next, &hidden)`) to advance
+  the KV cache and the hidden for the bonus token, about 450 MXFP4 GEMV calls
+  and ~43 ms/step in the DFlash2 profile. The verify's batched forward already
+  computes that position, so its KV row and captured hidden can likely be
+  reused instead of a second forward; that is the next change, ahead of the
+  shared-memory verify GEMM.
+
+- 2026-10-09: **Reference (radiance-vllm-mxfp4 / vLLM) speed techniques
+  catalogued** in `~/git/radiance-vllm-mxfp4` and `~/git/vllm`, for the
+  remaining MTP/DFlash2 gap. Measured there, candidates to port:
+  `DECODE_MAX_M` small-M decode GEMM (M<=64, split-K, TM=ceil(M/16); -4.8%
+  step, +28% conc-4) -- the same lever as the small-m verify GEMV above;
+  `RADIANCE_MXFP4_WPERM` + `..._DECODE_NT` fragment-order weight permutation
+  and nontemporal decode loads (-5.4% step); int2 target verify head
+  (+2.9%); `FAST_DRAFT` int2 MTP draft head with a bf16 rerank (+6.5%);
+  dynamic per-request verify width (+11-13% conc-8); GDN `in_proj`
+  single-GEMM merge (removes 96 launches + 48 quant per forward); fused
+  DFlash2 context-KV projection (one GEMM for every layer); the MTP head is
+  FP8 E4M3 per-channel (`fp8_mtp.py`) and runs as FP8 (tessera dequantizes
+  it to F32); DFlash2 runs as one captured graph per step.
+
+- 2026-10-09: **The linear-attention verify kernels get ILP.** The gated-delta
+  scan (`DeltaStepHeadsKernel`) accumulated its `read` dot and its output in
+  one dependent chain per state column (`dk` deep, 128); four partial sums for
+  each halve the chain. Then `L2NormKernel` and `RmsnormGatedKernel` (one
+  thread per row, sequential accumulation) got the same four-way split. Both
+  backends. DFlash2 on the 27B drops 95 -> 88 ms/token (CLI) and 71 -> 66
+  (test); acceptance unchanged (29 of 63) and output equals greedy. The
+  delta-scan read is now four deep instead of 128; the reference's GDN work
+  targets the same area. 278/278 `ctest` on both backends.
+
+- 2026-10-09: **`quantize_fp8` is one workgroup per row.** The kernel was one
+  thread per row, so the DFlash2's per-token FP8 QDQ of a single-row
+  (~1 x 25600) context hidden ran on one thread. It now uses a workgroup per
+  row with a shared-memory absmax reduction, so the whole block works.
+  Callers (`QuantizeMxFp4Input`, the DFlash2 fuse) dispatch `rows`
+  workgroups; the Vulkan shader mirrors it. DFlash2 on the 27B drops 88 -> 83
+  ms/token (CLI) and 66 -> 61 (test); acceptance unchanged (29 of 63) and
+  output equals greedy. 278/278 `ctest` on both backends.
+
 ## Next (in order)
 
-- **Speculation (seam done; decode speed improved).** Greedy and both
-  drafters share one loop and one `SpeculativeStrategy` seam. DFlash2
-  acceptance is fixed (4.4 per step, reference 2.7 to 2.85) and MTP is
-  output-preserving. Decode speed improved substantially this session (see
-  the newest Done entries): on the 27B MXFP4 (ROCm, GPU1) the 112-token
-  prefill is 2.16 s (was 18.2 s), greedy is unchanged at 25 tok/s, and
-  DFlash2 is 8 to 10 tok/s (was 3). The MXFP4 tiled batched GEMM is
-  compute-bound instead of latency-bound, the draft projections and the
-  shared bf16 head use tiled batched kernels, and the linear-attention
-  prefill loop is batched. Remaining, in order: (a) the DFlash2 verifier
-  still runs the full target trunk at the draft size (m about 7) and the
-  GEMV re-reads each weight row. Every alternative tried lost to the
-  row-major GEMV (123 ms/token): the 32x8 tiled kernel (137), an 8-row x
-  32-column tile matched to the small batch (132), a register-blocked variant
-  (rejected: fewer threads, lower occupancy), and a column-major warp order
-  that keeps the m rows of a column in one workgroup so they share the
-  weight read (correct, but slower at 135). So the row-major GEMV stays and
-  the verify cost is inherent to the current kernels; closing this gap needs
-  the reference's structure (a batched/fused verify kernel), not a tile
-  tweak;
-  (b) the draft forward (per-token `quantize_fp8`) — see the Done entry for
-  the bf16 draft weights;
-  (c) the MTP per-draft cost. Acceptance is fixed and the default chain is
-  now one draft, which measured 21 tok/s (85 percent accepted, within about
-  15 percent of greedy 25); see the newest Done entries. The remaining lever
-   is the per-draft MTP-head cost — each draft reads the shared 2.5 GB output
-  head to argmax one token, and the MTP head's own attention layer. The
-  per-draft host round-trip is not the bottleneck: removing the per-draft
-  `Synchronize` and the unused last-draft hidden download changed the decode
-  time by zero (46 ms/token), so the MTP step is GPU-bound on the MTP head
-  and the small-m verify. The greedy
-  decode is memory-bound at about 74% of the R9700's bandwidth and the GEMV
-  roofline is settled: the `rocprofv3` GL2C/MemUnitBusy counters read 0 on
-  gfx1201, so the estimate is analytical, and the three structural GEMV
-  variants tried (a single `uint4` weight load, a two-output warp, a wider
-  tile) did not beat the coalesced warp-per-output GEMV. The greedy decode
-  cost remains the one `gemm_mxfp4` GEMV (about 465 dispatches per token,
-  27 of 39 ms/token) plus about 15 ms/token of norms/scan/attention.
+- **Speculation (seam done; acceptance fixed; speed remains).**
+  Greedy and both drafters share one loop and one `SpeculativeStrategy`
+  seam. DFlash2 acceptance is fixed (4.4 per step, reference 2.7 to
+  2.85) and MTP accepts about half its drafts with a default chain of
+  one. Output equals greedy in both. Greedy runs at about 25 tok/s on
+  the 27B MXFP4 target. DFlash2 runs slower than greedy. Remaining, in
+  order: (a) the engine runs one extra single-token target forward per
+  speculative step to advance the cache for the bonus token; the
+  verify batched forward already computes that position, so reuse it;
+  (b) the DFlash2 verifier still runs the full target trunk at the
+  draft size (m about 7); closing this gap needs the reference
+  structure (a batched or fused verify kernel), not a tile tweak;
+  (c) the draft forward cost (fp32 weights, many small kernels).
+  The MTP per-draft cost is measured: each draft reads the shared
+  2.5 GB output head, so the default chain stays at one.
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.
   Count the decode rate on generation only: the model load is a one-time
   cost and is not part of tokens/s.
-  Deferred for now, because the speed is gated by the outstanding to-do
-  items, not by one knob. The causal conv is now on the device (done), but
-  the norms and SiLU still run on the host (item 2) and the GEMM throughput
-  is item 3. Each of those adds synchronous submit-and-fence round-trips or
-  host work. Land them first, then re-measure and do the remaining PERF
+  Deferred for now. Greedy runs at about 25 tok/s on the 27B MXFP4
+  target. The load target is met. The conv runs on the device, the
+  embedding gather runs on the device, and the GEMM kernels are tiled
+  (see item 3). The remaining gaps are the speculative step cost (see
+  the Speculation bullet) and the prefill on long prompts (see item
+  6). Land those first, then re-measure and do the remaining PERF
   work.
   Context: the load reads the
   19 GB safetensors, dequantizes and packs every fp4 blob, and converts
-  large BF16 tensors to F32 (the `lm_head` alone becomes a 5 GB F32
-  matrix). The reference runtime loads the same file in 8 s because it
-  keeps fp4 and dequantizes in the kernel. Measure on
+  large BF16 tensors to F32. The head and the embedding stay BF16. The
+  reference runtime loads the same file in 8 s because it keeps fp4 and
+  dequantizes in the kernel. Measure on
   `EngineTest.MxFp4GeneratesWhenProvided` and
   `EngineTest.DFlash2MatchesGreedyOnModel`.
-  Progress: the load is about 54 s now, under the 60 s target, and
-  `EngineTest.MxFp4GeneratesWhenProvided` fell from 287 s to 68 s. The
-  changes: pack blob||scales in one allocation (appending reallocated the
-  whole blob for every tensor, 180 s); copy the value-head reorder in runs;
-  memory-map the checkpoint instead of `ReadFile` (removed an 18.6 s copy
-  and the 18 GB anonymous allocation); vectorize the bulk BF16-to-F32
-  conversion; upload the F32 tensor without an extra copy; skip the second
-  fp4 copy when there is no reorder.
-  Decode fell from about 2.6 s/token to 789 ms/token (and prefill from
-  5.5 s to 1.8 s) with the same output. Two changes did it. `gemm_mxfp4`
-  now decodes a 16-entry nibble table and loads one 32-bit word (eight
-  nibbles) per eight elements instead of one byte per two; a per-kernel
-  pass had shown this kernel was 5.9 s of the ~7.3 s fence-wait total, and
-  the earlier version of this change was committed but never recompiled,
-  so it read the wrong word offset. `rmsnorm` now uses one workgroup per
-  row with a shared-memory reduction instead of one thread per row (the
-  old form serialized a 5120-element row on a single thread). The
-  remaining cost is no longer the GEMV arithmetic. A per-kernel pass put
-  the total fence wait at about 1.4 s over the run (gemm_mxfp4 870 ms) while
-  decode alone is about 3.2 s, so most of a token is the per-op submit and
-  fence round-trip: on the order of 700 copies and 500 kernel launches per
-  forward, each blocking on its own fence. Reusing the command buffer and
-  fence in `LaunchKernel` did not change the time, so it is the latency of
-  the synchronous submit, not the allocation. The fixes are to batch a
-  step's ops into one command buffer and wait once, and to remove ops. The
-  device conv (done) removed the per-layer host round-trip and took decode
-  from 789 ms to 513 ms/token (and the GGUF from 1100 ms to 492 ms). A
-  tiled or split-K GEMV would then help the remaining kernel time.
+  Progress: the load is about 54 s now, under the 60 s target. Past
+  decode wins are in the Done entries (device conv, tiled batched
+  GEMMs, warp-per-output GEMVs, the Vulkan launch ring, async copies).
+  Greedy is at about 25 tok/s on the 27B MXFP4 target. What remains is
+  the speculative step cost and the long-prompt prefill (see the
+  Speculation bullet and item 6).
 
 0. **DFlash2 (acceptance fixed 2026-10-09)**: runs end to end
    (`Engine::GenerateDraft`, CLI `--draft`) and output equals greedy. The
@@ -2090,11 +2140,12 @@ through RADV GFX1201, rocm through the system ROCm).
    its reusable index vector so every mask row after the first ranked only
    ids 0..top_k-1, and the selector transition score added the predecessor's
    unary logit instead of the successor's (see the newest Done entry). The
-   27B MXFP4 target now accepts 3.5 per step, at or above the served 2.7 to
-   2.85. Remaining backlog: measure steady-state tokens/s (the draft is only
-   a win when a step costs less than the tokens it recovers) and, if wanted,
-   batched draft scoring. The older notes below are kept for history.
-   Deferred: the fp8 W4A8 activation quant is implemented (`quantize_fp8`,
+   27B MXFP4 target now accepts 4.4 per step, at or above the served 2.7 to
+   2.85. Steady-state speed is measured: greedy is about 25 tok/s and
+   DFlash2 is slower than greedy (see the Speculation bullet). Remaining
+   backlog: the per-step draft cost, not quality. If wanted, batched
+   draft scoring. The older notes below are kept for history.
+    Deferred: the fp8 W4A8 activation quant is implemented (`quantize_fp8`,
    default off, `TESSERA_MXFP4_W4A8=1`); turning it on did not raise
    acceptance on the noisy 5-token fixture and costs about 2.5x decode.
    Next: measure on a 128-token generation, and try the other differences
@@ -2198,42 +2249,32 @@ through RADV GFX1201, rocm through the system ROCm).
 - **Hybrid SSM device path (done)**: the causal conv1d, the SiLU and the
   q/k/v split now run on the device (`conv1d_state`), with the history in
   `linear[l].conv_hist`, in both trunk paths. See the Done entry.
-2. **MoE, MLP, RMSNorm and embedding kernels (current focus)** as the
-   Qwen 3.8 definition needs them. RMSNorm, sigmoid-gate, add, silu_mul
-   and the embedding gather (`embedding_f32`/`embedding_bf16`/
-   `embedding_q4k`) run on the device; the gated MLP is gemm + silu_mul +
-   gemm on the device. The Qwen 3.8 27B definition is dense, so no MoE
-   kernel is needed for it; the MoE router/expert kernels are for the
-   planned Ornith-1.5-35B-A3B and stay on this item. The Qwen 3.8 MXFP4
-   definition's MTP head is now complete: its eight FP8 E4M3 projections
-   (the `fp8_mtp.py` head, per-output-channel F32 scales) load and
-   dequantize to F32, so `Engine::GenerateSpeculative` / MTP drafting
-   works on that target. Remaining architecture specific behavior moves
-   behind the `Architecture` module interface (see item 0).
+2. **MoE, MLP, RMSNorm and embedding kernels (done for Qwen 3.8)**.
+   RMSNorm, sigmoid-gate, add, silu_mul and the embedding gather
+   (`embedding_f32`/`embedding_bf16`/`embedding_q4k`) run on the device.
+   The gated MLP is gemm + silu_mul + gemm on the device. The Qwen 3.8
+   27B definition is dense, so it needs no MoE kernel. The Qwen 3.8 MXFP4
+   definition's MTP head is complete: its eight FP8 E4M3 projections
+   load and dequantize to F32, and MTP drafting accepts about half its
+   drafts. The `Architecture` module interface is done (see the Done
+   entries). Remaining: the MoE router and expert kernels for the
+   planned Ornith-1.5-35B-A3B.
 3. **GEMM throughput**: the model runs far below memory bandwidth, so the
-   GEMM kernels are the cost. The per-kernel profile above shows the hot
-   ones: `gemm_q5k` (31%), `gemm_q4k_batched` (21%), `gemm_q6k` (17%),
-   `gemm_iq4xs` (15%); the plain `gemm_q4k` decode is small. Done so far:
-   tiled `gemm_q4k_batched`/`gemm_q5k_batched`/`gemm_q6k_batched`/
-   `gemm_iq4xs_batched`/`gemm_mxfp4_batched`, wide MXFP4 and Q4_K reads,
-   the E8M0 bit cast, and the coalesced `gemm_q4k_row` (kept, but slower).
-   The tiling set covers every hot format. Next: (a) the same wide-read
-   treatment on the Q5_K/Q6_K/IQ4_XS decode GEMVs; (b) a split-K GEMV for
-   the m = 1 decode, designed so the block header is decoded once per
-   workgroup (the naive coalesced version lost to the reduction overhead).
-   Tiling saves nothing at a five-row batch, so (b) is where the decode
-   time is. Applies on both backends. 2026-10-09: the
-   attention_q8/attention_q4/attention_fp8 kernels are tiled now
-   (O(n * head_dim) per query/head, see the Done entry), and the
-   `gemm_mxfp4` m = 1 decode runs warp-per-output with coalesced reads
-   (7.5% faster, see the Done entry). 2026-10-09: the `gemm_mxfp4_batched`
-   kernel was latency-bound (one accumulator, a 5120-deep FMA chain);
-   four independent partial sums on a 32x8 tile made it compute-bound
-   (prefill 3.27 -> 2.18 s, DFlash2 decode 3 -> 7 tok/s), and new tiled
-   `gemm_f32_batched`/`gemm_bf16_batched` cover the DFlash2 draft and the
-   shared head, with the GEMV kept for batches below 16 rows and the
-   vocab-width head (see the Done entries). Still to do: the same wide-read
-   treatment on the Q4_K/Q5_K/Q6_K/IQ4_XS decode GEMVs.
+   GEMM kernels are the cost. Done so far: tiled `gemm_q4k_batched`/
+   `gemm_q5k_batched`/`gemm_q6k_batched`/`gemm_iq4xs_batched`/
+   `gemm_mxfp4_batched`/`gemm_f32_batched`/`gemm_bf16_batched`, the
+   warp-per-output `gemm_mxfp4`/`gemm_f32`/`gemm_bf16` decode GEMVs, the
+   warp-per-column multi-row `gemm_mxfp4_rows` verify kernel, tiled
+   quantized attention, wide MXFP4 and Q4_K reads, the E8M0 bit cast,
+   hardware fp16 scale decode, and the fused four-partial-sum compute
+   form. The coalesced `gemm_q4k_row` is kept but measures slower. The
+   greedy GEMV roofline is settled: no structural variant tried beat
+   the coalesced warp-per-output form. Next: the same wide-read
+   treatment on the Q5_K, Q6_K and IQ4_XS decode GEMVs; a fused or
+   batched verify kernel for the speculative path (see the Speculation
+   bullet). Applies on both backends. The tree holds uncommitted f32
+   and bf16 rows kernels plus a top-k kernel; they need device tests
+   and a measurement before they commit.
 4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
@@ -2245,19 +2286,23 @@ through RADV GFX1201, rocm through the system ROCm).
    embedding/rerank/audio/pooling/classify/score surfaces.
 5. **Runtime options**: context size, draft-block and the GPU index
    (`--gpu`) are CLI flags now, and the KV cache can be fp16 (`--kv-f16`)
-   (--kv-q8) or 4-bit (`--kv-q4`). Still to wire: mmproj path for vision
-   input and batch caps (features that do not exist yet). No hard-coded
-   paths or sizes.
-6. **Prefill optimisation**: the batched prefill is much faster this
-   session (112 tokens: 18.2 s to 2.16 s, 51 prompt tok/s). Done: the ROCm
-   device-to-device copy is asynchronous, the MXFP4 tiled GEMM is
-   compute-bound (a 32x8 tile with four partial sums reads the weight matrix
-   once per 32-row tile), and the per-row linear-attention loop is batched
+   (--kv-q8), 4-bit (`--kv-q4`) or FP8 (`--kv-fp8`). Vision input is
+   wired (`--mmproj`, `--image`, with auto `<|image_pad|>` detection).
+   Still to wire: batch caps (features that do not exist yet). No
+   hard-coded paths or sizes. Note: the CLI has no `--log-tokens`,
+   `--image-token`, `--mtp` or `--prompt` flags. Add them or keep the
+   current behavior (logging is default-on, the image token is
+   detected, MTP uses `--speculate`, prompts use `--prompt-text`).
+6. **Prefill optimisation**: the batched prefill is much faster now
+   (112 tokens in about 2.2 s, 51 prompt tok/s, was 18.2 s). Done: the
+   ROCm device-to-device copy is asynchronous, the Vulkan launch ring
+   pipelines kernels, the MXFP4 tiled GEMM is compute-bound (four
+   partial sums), and the per-row linear-attention loop is batched
    into one launch per kernel (see the Done entries). Remaining: the
-   full-attention layers still run per layer at the prompt row count, and
-   the tiled GEMMs still dequantize each weight block once per 32-row tile
-   rather than once per prompt. Measure prompt tokens per second on a text
-   prompt and on an image prompt.
+   full-attention layers still run per layer at the prompt row count,
+   and the tiled GEMMs still dequantize each weight block once per
+   tile rather than once per prompt. Measure prompt tokens per second
+   on a text prompt and on an image prompt.
 7. **Multimodal (mmproj)**: config, weights, encoder+merger, image
    load/resize, image-embedding injection, the CLI wiring and the
    `<|image_pad|>` placeholder default are done
