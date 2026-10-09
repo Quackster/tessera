@@ -236,6 +236,11 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
   auto strategy = CreateMtpStrategy();
+  auto attached =
+      strategy->Attach(StrategyOptions{"", options.draft_tokens});
+  if (!attached) {
+    return std::unexpected(attached.error());
+  }
   auto previous = std::move(speculative_);
   speculative_ = std::move(strategy);
   auto produced = Generate(model, options);

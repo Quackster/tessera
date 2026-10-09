@@ -60,6 +60,25 @@ TEST(SpecTest, AttachBlockSize) {
   EXPECT_EQ(too_big.error(), StatusCode::InvalidArgument);
 }
 
+// Every draft knob defaults to the same sentinel: 0 means automatic.
+// GenerateOptions and StrategyOptions both use 0, the CLI default is 0,
+// and each strategy resolves it (MTP to 1, DFlash2 to its checkpoint).
+TEST(SpecTest, DraftDefaultsToAuto) {
+  EXPECT_EQ(tessera::GenerateOptions{}.draft_tokens, 0u);
+  EXPECT_EQ(StrategyOptions{}.draft_block_size, 0u);
+  EXPECT_EQ(tessera::CreateMtpStrategy()->DraftBlock(), 1u);
+}
+
+// The MTP override flows through Attach (GenerateSpeculative attaches
+// the request value): 0 keeps the default, a nonzero value wins.
+TEST(SpecTest, MtpAttachOverridesBlock) {
+  auto strategy = tessera::CreateMtpStrategy();
+  ASSERT_TRUE(strategy->Attach(StrategyOptions{"", 4}).has_value());
+  EXPECT_EQ(strategy->DraftBlock(), 4u);
+  ASSERT_TRUE(strategy->Attach(StrategyOptions{"", 0}).has_value());
+  EXPECT_EQ(strategy->DraftBlock(), 4u);
+}
+
 TEST(SpecTest, AttachMissingDir) {
   auto strategy = CreateDFlash2Strategy();
   auto result =
