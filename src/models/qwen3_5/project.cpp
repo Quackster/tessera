@@ -216,7 +216,8 @@ std::expected<void, StatusCode> ProjectBatch(
     }
   }
   if (!projected_done &&
-      (m >= detail::kGemmTiledMinRows || n >= detail::kGemmTiledMinCols) &&
+      (m >= detail::kGemmTiledMinRows ||
+       (m >= 2 && n >= detail::kGemmTiledMinCols)) &&
       !detail::GemmTiledKernelName(dtype).empty()) {
     auto tiled = detail::GemmTiledFor(backend, h.gemm_tiled, dtype);
     if (tiled) {
