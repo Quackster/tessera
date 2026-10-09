@@ -48,6 +48,24 @@ class MtpStrategy final : public SpeculativeStrategy {
   std::span<const std::size_t> CaptureLayers() const override { return {}; }
   std::span<Buffer* const> CaptureBuffers() override { return {}; }
 
+  // The MTP head chains from one anchor hidden, so it has no batched
+  // prefill: the engine keeps the per-token OnAnchor path for it. An
+  // empty probe still returns Ok per the interface contract.
+  std::expected<void, StatusCode> AppendPrefill(
+      Backend& backend, Model& target, core::DecodeCache& cache,
+      std::span<const std::uint32_t> tokens, std::uint64_t position,
+      std::span<Buffer* const> captures) override {
+    (void)backend;
+    (void)target;
+    (void)cache;
+    (void)position;
+    (void)captures;
+    if (tokens.empty()) {
+      return {};
+    }
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+
   std::expected<void, StatusCode> OnAnchor(
       Backend& backend, Model& target, core::DecodeCache& cache,
       std::uint32_t token, std::uint64_t position,

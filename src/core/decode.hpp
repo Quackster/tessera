@@ -163,15 +163,18 @@ ScoreTokens(Backend& backend, const Model& model,
 DecodeLogitsBatch(Backend& backend, const Model& model, DecodeCache& cache,
                   std::span<const std::uint32_t> tokens);
 
-// Prefill a prompt in one batched forward: commit every token to the
-// cache and return the logits after the last token (and its hidden).
-// The hybrid path runs one batched trunk forward with the output head on
-// the last row only; other models fall back to a sequential loop.
+// Prefill a prompt in chunk-sized batched forwards: commit every token
+// to the cache and return the logits after the last token (and its
+// hidden). `chunk_tokens` bounds one forward's scratch (0 runs one
+// forward for the whole prompt); only the last chunk scores logits.
+// The hybrid path runs one batched trunk forward per chunk with the
+// output head on the last row only; other models fall back to a
+// sequential loop.
 [[nodiscard]] std::expected<std::vector<float>, StatusCode> PrefillTokens(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens,
     std::vector<float>* hidden_out = nullptr,
-    const Buffer* embeddings = nullptr);
+    const Buffer* embeddings = nullptr, std::size_t chunk_tokens = 0);
 
 // Greedy speculative verification. Given the target's distribution at the
 // current prefix (`prefix_logits`) and a draft, feed each draft token only

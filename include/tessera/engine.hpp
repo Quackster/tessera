@@ -25,8 +25,9 @@ struct EngineOptions {
   // GPU index to run on (default 0, the first GPU). Create fails with
   // InvalidArgument when the index is out of range.
   int device_index = 0;
-  // Tokens per prefill forward; 0 selects automatically from the model
-  // context at generation time. Chunking is not applied yet.
+  // Tokens per prefill forward; 0 selects the automatic default
+  // (kDefaultPrefillChunkTokens). Chunking bounds one forward's
+  // scratch so a long prompt prefills in several forwards.
   //
   // Usage:
   //   EngineOptions options;
@@ -75,7 +76,8 @@ struct GenerateOptions {
   // template's end-of-turn token when the definition does not declare it.
   std::vector<std::uint32_t> stop_tokens;
   // Tokens per prefill forward for this request; 0 uses the engine
-  // default, which itself resolves to the model context when 0.
+  // default, which itself resolves to kDefaultPrefillChunkTokens
+  // when 0.
   //
   // Usage:
   //   GenerateOptions gen;
@@ -83,9 +85,15 @@ struct GenerateOptions {
   std::size_t prefill_chunk_tokens = 0;
 };
 
+// Tokens per prefill forward when neither the engine nor the request
+// sets one (llama.cpp ubatch analog). Bounds one forward's scratch
+// (about rows x ffn_dim floats) so a 220k-token prompt prefills in
+// bounded memory instead of losing the device.
+constexpr std::size_t kDefaultPrefillChunkTokens = 512;
+
 // Resolve the prefill chunk for one request. The request value wins
 // when nonzero; otherwise the engine default wins; otherwise the
-// model context is used (current single-forward behavior).
+// automatic default is used.
 //
 // Usage:
 //   const std::size_t chunk = ResolvePrefillChunkTokens(
@@ -94,13 +102,14 @@ struct GenerateOptions {
 [[nodiscard]] inline std::size_t ResolvePrefillChunkTokens(
     std::size_t engine_default, std::size_t request_override,
     std::size_t max_context) {
+  (void)max_context;
   if (request_override > 0) {
     return request_override;
   }
   if (engine_default > 0) {
     return engine_default;
   }
-  return max_context > 0 ? max_context : 1;
+  return kDefaultPrefillChunkTokens;
 }
 
 // Top-level facade: owns the backend and the loaded models.

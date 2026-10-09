@@ -2108,7 +2108,22 @@ through RADV GFX1201, rocm through the system ROCm).
   turn, and clean text answers. The opencode provider wiring
   (`tessera/qwen3.8-27b` on 127.0.0.1:8080) resolves, but live agency
   is blocked: opencode's first prompt is about 10k tokens against the
-  4096 serve context at 11 prompt tok/s (see Next item 4).
+   4096 serve context at 11 prompt tok/s (see Next item 4).
+
+- 2026-10-09: **Chunked prefill and 220k context on the 8-bit KV path
+  (299/299 `ctest` on vulkan).** `PrefillTokens` splits the prompt into
+  chunk-sized forwards (automatic default 512, `--prefill-chunk` to
+  override), so a 220k-token prompt prefills in bounded scratch instead
+  of losing the device in one giant forward. Only the last chunk scores
+  logits. The DFlash2 path prefills the prompt head without capture and
+  appends only its recent window (2048+1 rows) in batched chunks through
+  the new `PrefillCaptureTail`/`AppendPrefill` strategy seam; MTP keeps
+  the per-token loop. A prompt past the context is rejected with
+  `InvalidArgument` before any device work (serve answers 400). Also
+  fixed: `ForwardBatch` returned a stale hidden row when the reused
+  batch scratch outlived its rows; it now copies the last row out
+  first. Chunked prefill matches one forward on both hybrid fixtures
+  (logits, hidden and the follow-up decode).
 
 ## Next (in order)
 

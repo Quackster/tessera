@@ -493,12 +493,19 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
   }
   h.position += rows;
   if (hidden_out != nullptr) {
+    // The batch scratch outlives its rows (a later smaller batch reuses
+    // the capacity), so the last row is copied out first: reading the
+    // buffer tail would return a stale row.
     hidden_out->resize(hidden);
-    auto last = detail::DownloadF32(backend, *h.batch->x);
+    if (!backend.CopyD2D(*h.batch->x, (rows - 1) * hidden * 4, *h.x, 0,
+                         hidden * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    auto last = detail::DownloadF32(backend, *h.x);
     if (!last) {
       return std::unexpected(last.error());
     }
-    std::copy(last->end() - hidden, last->end(), hidden_out->begin());
+    std::copy(last->begin(), last->end(), hidden_out->begin());
   }
   if (logits_out != nullptr) {
     auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);

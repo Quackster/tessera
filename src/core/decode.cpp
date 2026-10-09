@@ -1,5 +1,6 @@
 #include "core/decode.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 
@@ -85,18 +86,65 @@ std::expected<std::vector<std::vector<float>>, StatusCode> ScoreTokens(
 std::expected<std::vector<float>, StatusCode> PrefillTokens(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* hidden_out,
-    const Buffer* embeddings) {
+    const Buffer* embeddings, std::size_t chunk_tokens) {
   if (tokens.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
   const Architecture* arch = model.Arch();
   if (arch != nullptr) {
+    const std::size_t chunk =
+        chunk_tokens == 0 ? tokens.size() : chunk_tokens;
+    if (chunk == 0 || tokens.size() <= chunk) {
+      std::vector<float> logits;
+      auto status = arch->ForwardBatch(backend, model, cache, tokens, &logits,
+                                       hidden_out, /*all_logits=*/false,
+                                       embeddings);
+      if (!status) {
+        return std::unexpected(status.error());
+      }
+      return logits;
+    }
+    // Long prompt, bounded scratch: one forward per chunk, the head on
+    // the last chunk's last row only. The cache carries the state
+    // across chunks, so the result matches one forward.
+    auto config = model.Config();
+    if (!config) {
+      return std::unexpected(config.error());
+    }
+    const std::size_t hidden = config->hidden_dim;
+    std::unique_ptr<Buffer> staged;
+    if (embeddings != nullptr) {
+      auto made = backend.AllocateBuffer(chunk * hidden * 4,
+                                         MemoryKind::Device);
+      if (!made) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      staged = std::move(*made);
+    }
     std::vector<float> logits;
-    auto status = arch->ForwardBatch(backend, model, cache, tokens, &logits,
-                                     hidden_out, /*all_logits=*/false,
-                                     embeddings);
-    if (!status) {
-      return std::unexpected(status.error());
+    for (std::size_t off = 0; off < tokens.size(); off += chunk) {
+      const std::size_t len = std::min(chunk, tokens.size() - off);
+      const bool last = off + len == tokens.size();
+      const Buffer* chunk_emb = nullptr;
+      if (staged) {
+        if (!backend.CopyD2D(*embeddings, off * hidden * 4, *staged, 0,
+                             len * hidden * 4)) {
+          return std::unexpected(StatusCode::DeviceError);
+        }
+        chunk_emb = staged.get();
+      }
+      std::vector<float>* chunk_hidden = last ? hidden_out : nullptr;
+      std::vector<float> chunk_logits;
+      auto status = arch->ForwardBatch(
+          backend, model, cache, tokens.subspan(off, len),
+          last ? &chunk_logits : nullptr, chunk_hidden,
+          /*all_logits=*/false, chunk_emb);
+      if (!status) {
+        return std::unexpected(status.error());
+      }
+      if (last) {
+        logits = std::move(chunk_logits);
+      }
     }
     return logits;
   }

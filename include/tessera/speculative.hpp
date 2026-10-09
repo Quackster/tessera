@@ -75,6 +75,33 @@ class SpeculativeStrategy {
   // when CaptureLayers() is empty.
   [[nodiscard]] virtual std::span<Buffer* const> CaptureBuffers() = 0;
 
+  // Trailing prompt positions the strategy consumes during prefill. A
+  // bounded draft context (DFlash2 keeps the recent window) needs only
+  // the tail; the engine prefills earlier positions without capture
+  // and skips their per-row append. Zero (the default) keeps every
+  // prompt position, which is the long-standing behavior.
+  //
+  // Usage:
+  //   const std::size_t tail = strategy->PrefillCaptureTail();
+  [[nodiscard]] virtual std::size_t PrefillCaptureTail() const { return 0; }
+
+  // Append a prefill chunk to the draft context in one call: `tokens`
+  // are the chunk's tokens at absolute `position`, and `captures` holds
+  // one device buffer per CaptureLayers() entry (chunk rows x hidden
+  // each, in CaptureLayers order) with their per-position residual
+  // hidden, as filled by the target batched forward. Strategies
+  // without batched prefill return UnsupportedFeature; the engine
+  // then falls back to the per-token OnAnchor loop. An empty `tokens`
+  // call probes support and must return Ok (it appends nothing).
+  //
+  // Usage:
+  //   auto appended = strategy->AppendPrefill(backend, model, cache,
+  //       tokens, position, captures);
+  virtual std::expected<void, StatusCode> AppendPrefill(
+      Backend& backend, Model& target, core::DecodeCache& cache,
+      std::span<const std::uint32_t> tokens, std::uint64_t position,
+      std::span<Buffer* const> captures) = 0;
+
   // The target has advanced by `token` at absolute `position`; `hidden` is
   // that position's target residual hidden. The strategy's own capture buffers
   // hold the per-layer residual hidden for the same position. Record the

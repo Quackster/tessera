@@ -369,6 +369,28 @@ TEST(EngineTest, GenerateRejectsPromptBeyondContext) {
   EXPECT_EQ(streamed.error(), StatusCode::InvalidArgument);
 }
 
+// Strategies without batched prefill keep the per-token path: the MTP
+// tail keeps every position, the empty call probes support, and a real
+// chunk is refused.
+TEST(EngineTest, StrategyPrefillDefaults) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("strategy_defaults.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 64});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto strategy = tessera::CreateMtpStrategy();
+  EXPECT_EQ(strategy->PrefillCaptureTail(), 0u);
+  tessera::core::DecodeCache cache;
+  auto probe = strategy->AppendPrefill(engine->Owner(), **model, cache, {}, 0,
+                                       {});
+  EXPECT_TRUE(probe.has_value());
+  const std::vector<std::uint32_t> tokens = {0, 1};
+  auto refused = strategy->AppendPrefill(engine->Owner(), **model, cache,
+                                         tokens, 0, {});
+  ASSERT_FALSE(refused.has_value());
+  EXPECT_EQ(refused.error(), StatusCode::UnsupportedFeature);
+}
+
 // A multi-token prompt prefills through the forward-only path (all but the
 // last prompt token skip the output head) and still generates.
 TEST(EngineTest, GenerateWithPromptTokensPrefills) {
@@ -1285,14 +1307,15 @@ TEST(EngineTest, RejectsOutOfRangeDeviceIndex) {
 }
 
 // Prefill chunk plumbing: the request value wins, then the engine
-// default, then the model context (automatic). Chunking is logged
-// but not applied yet.
+// default, then the automatic default (kDefaultPrefillChunkTokens).
 TEST(EngineTest, ResolvePrefillChunkTokens) {
-  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(0, 0, 4096), 4096u);
+  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(0, 0, 4096),
+            tessera::kDefaultPrefillChunkTokens);
   EXPECT_EQ(tessera::ResolvePrefillChunkTokens(512, 0, 4096), 512u);
   EXPECT_EQ(tessera::ResolvePrefillChunkTokens(512, 256, 4096), 256u);
   EXPECT_EQ(tessera::ResolvePrefillChunkTokens(0, 256, 4096), 256u);
-  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(0, 0, 0), 1u);
+  EXPECT_EQ(tessera::ResolvePrefillChunkTokens(0, 0, 0),
+            tessera::kDefaultPrefillChunkTokens);
 }
 
 // New options default to automatic (0); the engine keeps its

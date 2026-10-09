@@ -499,7 +499,74 @@ TEST(HybridDecodeTest, BatchedPrefillMatchesSequential) {
   }
 }
 
-// Regression (prefill over-allocation): the batched scratch must size the
+// Chunked prefill must equal one forward: the same last logits and
+// hidden, and the same follow-up decode (the cache state carries
+// across chunk boundaries). A 220k-token prompt on the 8-bit KV path
+// prefills in bounded memory only through chunking.
+TEST(HybridDecodeTest, ChunkedPrefillMatchesSingleForward) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  const std::vector<std::string> fixtures = {
+      WriteGatedHybridFixture("chunk-gated.gguf").string(),
+      WriteLinearHybridFixture("chunk-linear.gguf").string()};
+  const std::vector<std::uint32_t> tokens = {0, 1, 0, 26, 5, 3, 7, 2};
+  for (const std::string& path : fixtures) {
+    auto model = engine->LoadModel(ModelOptions{path, 1024});
+    ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+    tessera::core::DecodeCache single;
+    std::vector<float> single_hidden;
+    auto single_logits = tessera::core::PrefillTokens(engine->Owner(), **model,
+                                                      single, tokens,
+                                                      &single_hidden);
+    ASSERT_TRUE(single_logits.has_value())
+        << tessera::ToString(single_logits.error());
+    tessera::core::DecodeCache chunked;
+    std::vector<float> chunked_hidden;
+    auto chunked_logits = tessera::core::PrefillTokens(
+        engine->Owner(), **model, chunked, tokens, &chunked_hidden,
+        nullptr, /*chunk_tokens=*/3);
+    ASSERT_TRUE(chunked_logits.has_value())
+        << tessera::ToString(chunked_logits.error());
+    // Chunked forwards reuse the same kernels per chunk, so they agree
+    // with one forward far more closely than the sequential path does;
+    // keep the same bound as the batched-vs-sequential test.
+    constexpr float kChunkConsistency = 1e-2f;
+    ASSERT_EQ(chunked_logits->size(), single_logits->size());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < single_logits->size(); ++i) {
+      max_abs = std::max(max_abs,
+                         std::abs((*chunked_logits)[i] - (*single_logits)[i]));
+    }
+    EXPECT_LE(max_abs, kChunkConsistency)
+        << path << " logits max_abs " << max_abs;
+    ASSERT_EQ(chunked_hidden.size(), single_hidden.size());
+    float hidden_abs = 0.0f;
+    for (std::size_t i = 0; i < single_hidden.size(); ++i) {
+      hidden_abs = std::max(hidden_abs,
+                            std::abs(chunked_hidden[i] - single_hidden[i]));
+    }
+    EXPECT_LE(hidden_abs, kChunkConsistency)
+        << path << " hidden max_abs " << hidden_abs;
+    // The caches must agree past the boundary: one more decode step
+    // from each cache scores the same distribution.
+    auto next_single =
+        tessera::core::DecodeLogits(engine->Owner(), **model, single, 4);
+    auto next_chunked =
+        tessera::core::DecodeLogits(engine->Owner(), **model, chunked, 4);
+    ASSERT_TRUE(next_single.has_value())
+        << tessera::ToString(next_single.error());
+    ASSERT_TRUE(next_chunked.has_value())
+        << tessera::ToString(next_chunked.error());
+    ASSERT_EQ(next_chunked->size(), next_single->size());
+    float next_abs = 0.0f;
+    for (std::size_t i = 0; i < next_single->size(); ++i) {
+      next_abs = std::max(next_abs,
+                          std::abs((*next_chunked)[i] - (*next_single)[i]));
+    }
+    EXPECT_LE(next_abs, kChunkConsistency)
+        << path << " follow-up max_abs " << next_abs;
+  }
+}
 // logits and the per-layer linear state snapshots by need, not by every
 // prompt row. Prefill scores one row and never rolls back; a following
 // verification then grows the state history and still accepts the draft.
@@ -615,6 +682,50 @@ TEST(HybridDecodeTest, BatchedPrefillEmbeddingsMatchSequential) {
   float max_abs = 0.0f;
   for (std::size_t i = 0; i < slow->size(); ++i) {
     max_abs = std::max(max_abs, std::abs((*fast)[i] - (*slow)[i]));
+  }
+  EXPECT_LE(max_abs, 1e-3f) << "logits max_abs " << max_abs;
+}
+
+// Chunked prefill with caller embeddings must equal one forward: the
+// staging slice per chunk feeds the same rows.
+TEST(HybridDecodeTest, ChunkedPrefillEmbeddingsMatchSingle) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("emb-chunk-gated.gguf").string(),
+                   1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto cfg = (*model)->Config();
+  ASSERT_TRUE(cfg.has_value());
+  const std::size_t hidden = cfg->hidden_dim;
+  const std::vector<std::uint32_t> tokens = {0, 1, 0, 26, 5};
+  const std::size_t rows = tokens.size();
+  std::vector<float> emb(rows * hidden);
+  for (std::size_t i = 0; i < emb.size(); ++i) {
+    emb[i] = 0.0007f * static_cast<float>(i) - 0.5f;
+  }
+  auto emb_buf =
+      engine->Owner().AllocateBuffer(rows * hidden * 4, tessera::MemoryKind::Device);
+  ASSERT_TRUE(emb_buf.has_value());
+  ASSERT_TRUE(engine->Owner()
+                  .CopyH2D(**emb_buf,
+                           std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(emb.data()),
+                               emb.size() * 4))
+                  .has_value());
+  tessera::core::DecodeCache single;
+  auto want = tessera::core::PrefillTokens(engine->Owner(), **model, single,
+                                           tokens, nullptr, emb_buf->get());
+  ASSERT_TRUE(want.has_value()) << tessera::ToString(want.error());
+  tessera::core::DecodeCache chunked;
+  auto got = tessera::core::PrefillTokens(engine->Owner(), **model, chunked,
+                                          tokens, nullptr, emb_buf->get(),
+                                          /*chunk_tokens=*/3);
+  ASSERT_TRUE(got.has_value()) << tessera::ToString(got.error());
+  ASSERT_EQ(got->size(), want->size());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < want->size(); ++i) {
+    max_abs = std::max(max_abs, std::abs((*got)[i] - (*want)[i]));
   }
   EXPECT_LE(max_abs, 1e-3f) << "logits max_abs " << max_abs;
 }

@@ -27,8 +27,8 @@ constexpr std::size_t kDefaultContext = 4096;
 // drafter is trained for one fixed block; a mismatched block silently
 // lowers acceptance (the DFlash2 checkpoint is trained for block 8).
 constexpr std::size_t kDefaultDraftBlock = 0;
-// 0 resolves automatically to the model context; chunking is logged
-// but not applied yet.
+// 0 resolves automatically to kDefaultPrefillChunkTokens (512):
+// long prompts prefill in chunk-sized forwards.
 constexpr std::size_t kDefaultPrefillChunk = 0;
 
 void PrintUsage() {

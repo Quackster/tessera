@@ -210,6 +210,32 @@ class DFlash2Strategy final : public SpeculativeStrategy {
 
   std::span<Buffer* const> CaptureBuffers() override { return capture_ptrs_; }
 
+  // Only the recent context window survives the limit eviction, so a
+  // long prefill appends just its tail; earlier positions never reach
+  // the draft context. Zero (unbounded checkpoint) keeps everything.
+  std::size_t PrefillCaptureTail() const override {
+    return ctx_window_ == 0 ? 0 : ctx_window_ + 1;
+  }
+
+  // One batched draft-context append for a prefill chunk, identical to
+  // one OnAnchor per row: the same rows land at the same absolute
+  // positions under the same limit.
+  std::expected<void, StatusCode> AppendPrefill(
+      Backend& backend, Model& target, core::DecodeCache& cache,
+      std::span<const std::uint32_t> tokens, std::uint64_t position,
+      std::span<Buffer* const> captures) override {
+    (void)target;
+    (void)cache;
+    (void)position;
+    if (tokens.empty()) {
+      return {};
+    }
+    std::vector<const Buffer*> aux(captures.begin(), captures.end());
+    anchor_ = tokens.back();
+    return drafter_.AppendContext(backend, aux, /*row_offset=*/0,
+                                  tokens.size());
+  }
+
   std::expected<void, StatusCode> OnAnchor(
       Backend& backend, Model& target, core::DecodeCache& cache,
       std::uint32_t token, std::uint64_t position,

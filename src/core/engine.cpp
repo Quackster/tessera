@@ -28,6 +28,117 @@ std::vector<std::uint32_t> StopSet(const Model& model,
 }
 }  // namespace
 
+namespace {
+
+// The draft context of a hidden-conditioned drafter only needs the
+// prompt tail (DFlash2 keeps its recent window); earlier positions
+// prefill in chunk-sized forwards without capture, and the tail runs
+// chunked with engine-owned capture buffers plus one strategy append
+// per chunk. Only a strategy without a batched append keeps the
+// per-token loop.
+std::expected<void, StatusCode> PrefillCapturing(
+    Backend& backend, Model& model, core::DecodeCache& cache,
+    SpeculativeStrategy& strategy, std::span<const std::uint32_t> prompt,
+    std::size_t chunk, const std::vector<std::size_t>& capture_layers,
+    std::vector<Buffer*>& strategy_buffers, std::vector<float>& hidden_out,
+    std::vector<float>& logits_out) {
+  const std::size_t tail = strategy.PrefillCaptureTail();
+  const std::size_t keep =
+      (tail == 0 || tail >= prompt.size()) ? prompt.size() : tail;
+  const std::size_t head = prompt.size() - keep;
+  const Architecture* arch = model.Arch();
+  // An empty call probes support: Ok selects the batched tail below,
+  // UnsupportedFeature the per-token loop, anything else fails fast.
+  bool batched = arch != nullptr;
+  if (batched) {
+    auto probe = strategy.AppendPrefill(backend, model, cache, {}, 0, {});
+    if (!probe && probe.error() == StatusCode::UnsupportedFeature) {
+      batched = false;
+    } else if (!probe) {
+      return std::unexpected(probe.error());
+    }
+  }
+  if (!batched) {
+    std::vector<Buffer*>* capture_ptr =
+        capture_layers.empty() ? nullptr : &strategy_buffers;
+    const std::vector<std::size_t>* layers_ptr =
+        capture_layers.empty() ? nullptr : &capture_layers;
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+      const bool last = i + 1 == prompt.size();
+      if (last) {
+        auto logits = core::DecodeLogits(backend, model, cache, prompt[i],
+                                         &hidden_out, layers_ptr, capture_ptr);
+        if (!logits) {
+          return std::unexpected(logits.error());
+        }
+        logits_out = std::move(*logits);
+      } else {
+        auto step = core::DecodeForward(backend, model, cache, prompt[i],
+                                        &hidden_out, nullptr, layers_ptr,
+                                        capture_ptr);
+        if (!step) {
+          return std::unexpected(step.error());
+        }
+      }
+      auto anchored =
+          strategy.OnAnchor(backend, model, cache, prompt[i], i, hidden_out);
+      if (!anchored) {
+        return std::unexpected(anchored.error());
+      }
+    }
+    return {};
+  }
+  for (std::size_t off = 0; off < head; off += chunk) {
+    const std::size_t len = std::min(chunk, head - off);
+    auto status = arch->ForwardBatch(backend, model, cache,
+                                     prompt.subspan(off, len), nullptr,
+                                     nullptr, /*all_logits=*/false, nullptr);
+    if (!status) {
+      return std::unexpected(status.error());
+    }
+  }
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const std::size_t hidden = config->hidden_dim;
+  const std::size_t rows = std::min(chunk, keep);
+  std::vector<std::unique_ptr<Buffer>> cap_store;
+  std::vector<Buffer*> cap_ptrs;
+  for (std::size_t i = 0; i < capture_layers.size(); ++i) {
+    auto made = backend.AllocateBuffer(rows * hidden * 4, MemoryKind::Device);
+    if (!made) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    cap_ptrs.push_back(made->get());
+    cap_store.push_back(std::move(*made));
+  }
+  for (std::size_t off = head; off < prompt.size(); off += chunk) {
+    const std::size_t len = std::min(chunk, prompt.size() - off);
+    const bool last = off + len == prompt.size();
+    std::vector<float> chunk_logits;
+    auto status = arch->ForwardBatch(
+        backend, model, cache, prompt.subspan(off, len),
+        last ? &chunk_logits : nullptr, last ? &hidden_out : nullptr,
+        /*all_logits=*/false, nullptr, &capture_layers, &cap_ptrs);
+    if (!status) {
+      return std::unexpected(status.error());
+    }
+    auto appended = strategy.AppendPrefill(backend, model, cache,
+                                           prompt.subspan(off, len), off,
+                                           cap_ptrs);
+    if (!appended) {
+      return std::unexpected(appended.error());
+    }
+    if (last) {
+      logits_out = std::move(chunk_logits);
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
 Engine::Engine(std::unique_ptr<Backend> backend, log::Diagnostics diagnostics,
                std::size_t prefill_chunk_tokens)
     : backend_(std::move(backend)),
@@ -121,10 +232,10 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
                                      "prefill so the device stays alive");
     return std::unexpected(StatusCode::InvalidArgument);
   }
+  const std::size_t prefill_chunk = ResolvePrefillChunkTokens(
+      prefill_chunk_tokens_, options.prefill_chunk_tokens,
+      model.MaxContextLength());
   if (options.progress_every > 0) {
-    const std::size_t prefill_chunk = ResolvePrefillChunkTokens(
-        prefill_chunk_tokens_, options.prefill_chunk_tokens,
-        model.MaxContextLength());
     diagnostics_.Info("engine", std::string("multimodal prefill: ") +
                                     std::to_string(prompt.size()) +
                                     " token(s), " +
@@ -142,7 +253,7 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
     return std::unexpected(StatusCode::OutOfMemory);
   }
   // Assemble one embedding per row: the image rows replace the placeholder
-  // token's gathered row. Then prefill the whole prompt in one forward.
+  // token's gathered row. Then prefill in chunk-sized forwards.
   std::vector<float> host(prompt.size() * hidden);
   std::vector<float> row(hidden);
   std::size_t used_images = 0;
@@ -168,7 +279,7 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
     return std::unexpected(StatusCode::DeviceError);
   }
   auto first = core::PrefillTokens(*backend_, model, cache, prompt, nullptr,
-                                   embedding_buffer->get());
+                                    embedding_buffer->get(), prefill_chunk);
   if (!first) {
     return std::unexpected(first.error());
   }
@@ -357,42 +468,17 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   std::vector<float> hidden;
   std::vector<float> first_logits;
   if (capturing) {
-    // A hidden-conditioned drafter needs every prompt position's residual
-    // hidden, so prefill one token at a time and append it to the draft
-    // context (hipfire batches this in spec_advance; a per-token prefill is
-    // the correctness-preserving version).
-    for (std::size_t i = 0; i < prompt.size(); ++i) {
-      const bool last = i + 1 == prompt.size();
-      if (last) {
-        auto logits = core::DecodeLogits(*backend_, model, cache, prompt[i],
-                                         &hidden, capture_layers_ptr,
-                                         capture_ptr);
-        if (!logits) {
-          diagnostics_.Warn("engine",
-                            std::string("prefill failed: ") +
-                                std::string(ToString(logits.error())));
-          return std::unexpected(logits.error());
-        }
-        first_logits = std::move(*logits);
-      } else {
-        auto step = core::DecodeForward(*backend_, model, cache, prompt[i],
-                                        &hidden, nullptr, capture_layers_ptr,
-                                        capture_ptr);
-        if (!step) {
-          diagnostics_.Warn("engine",
-                            std::string("prefill failed: ") +
-                                std::string(ToString(step.error())));
-          return std::unexpected(step.error());
-        }
-      }
-      auto anchored =
-          strategy->OnAnchor(*backend_, model, cache, prompt[i], i, hidden);
-      if (!anchored) {
-        return std::unexpected(anchored.error());
-      }
+    auto prefilled = PrefillCapturing(*backend_, model, cache, *strategy,
+                                      prompt, prefill_chunk, capture_layers,
+                                      capture_buffers, hidden, first_logits);
+    if (!prefilled) {
+      diagnostics_.Warn("engine", std::string("prefill failed: ") +
+                                      std::string(ToString(prefilled.error())));
+      return std::unexpected(prefilled.error());
     }
   } else {
-    auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden);
+    auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden,
+                                      nullptr, prefill_chunk);
     if (!logits) {
       diagnostics_.Warn("engine", std::string("prefill failed: ") +
                                       std::string(ToString(logits.error())));
