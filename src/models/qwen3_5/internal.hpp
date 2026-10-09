@@ -65,6 +65,10 @@ inline std::expected<LinearGeometry, StatusCode> DeriveGeometry(
     const Buffer& w, Buffer& out, std::size_t m, std::size_t n,
     std::size_t k);
 
+// Drop the cached fp8 activation pack (see ProjectBatch). Call after a
+// kernel rewrites a projection input, so the next projection re-packs.
+void InvalidateActivationPack(Qwen35State& h);
+
 // The per-token FP8 QDQ used by ProjectBatch for an MXFP4 weight; a no-op
 // for other dtypes. Exposed for the MTP head. `data` is rows x cols fp32.
 [[nodiscard]] std::expected<void, StatusCode> QuantizeMxFp4Input(

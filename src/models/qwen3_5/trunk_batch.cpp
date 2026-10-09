@@ -148,8 +148,11 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
   }
   Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*mlp_norm)->device,
-                     *b.xn, rows, cfg.hidden_dim, cfg.norm_eps) ||
-      !ProjectBatch(backend, h, (*fg)->manifest.dtype, *b.xn, *(*fg)->device,
+                     *b.xn, rows, cfg.hidden_dim, cfg.norm_eps)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  InvalidateActivationPack(h);
+  if (!ProjectBatch(backend, h, (*fg)->manifest.dtype, *b.xn, *(*fg)->device,
                     *b.fgate, rows, cfg.ffn_dim, cfg.hidden_dim) ||
       !ProjectBatch(backend, h, (*fu)->manifest.dtype, *b.xn, *(*fu)->device,
                     *b.fup, rows, cfg.ffn_dim, cfg.hidden_dim) ||
@@ -191,8 +194,11 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   }
   Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*norm)->device, *b.xn,
-                     rows, hidden, cfg.norm_eps) ||
-      !ProjectBatch(backend, h, (*wq)->manifest.dtype, *b.xn, *(*wq)->device,
+                     rows, hidden, cfg.norm_eps)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  InvalidateActivationPack(h);
+  if (!ProjectBatch(backend, h, (*wq)->manifest.dtype, *b.xn, *(*wq)->device,
                     *b.fused, rows, heads * head_dim * 2, hidden) ||
       !QGateSplitDevice(backend, *h.qgate_split_kernel, *b.fused, *b.q, *b.gate,
                         heads, head_dim, rows) ||
@@ -288,8 +294,11 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
   }
   Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*norm)->device, *b.xn,
-                     rows, hidden, cfg.norm_eps) ||
-      !ProjectBatch(backend, h, (*w_qkv)->manifest.dtype, *b.xn,
+                     rows, hidden, cfg.norm_eps)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  InvalidateActivationPack(h);
+  if (!ProjectBatch(backend, h, (*w_qkv)->manifest.dtype, *b.xn,
                     *(*w_qkv)->device, *b.qkv, rows, g.conv_dim, hidden) ||
       !ProjectBatch(backend, h, (*w_gate)->manifest.dtype, *b.xn,
                     *(*w_gate)->device, *b.z, rows, g.value_dim, hidden) ||

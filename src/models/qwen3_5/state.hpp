@@ -74,6 +74,14 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> wmma_a;
   std::unique_ptr<Buffer> wmma_as;
   std::unique_ptr<Buffer> wmma_part;
+  // The activation last packed into wmma_a/wmma_as. Several projections in a
+  // layer share one input (q/k/v/gate); the pack is reused while the source
+  // buffer and shape are unchanged. Invalidated whenever a norm rewrites a
+  // projection input or wmma_a is reallocated.
+  const void* wmma_pack_src = nullptr;
+  std::size_t wmma_pack_rows = 0;
+  std::size_t wmma_pack_cols = 0;
+  bool wmma_pack_valid = false;
   std::unordered_map<const void*, std::unique_ptr<Buffer>> mxfp4_wref;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;

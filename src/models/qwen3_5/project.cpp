@@ -17,6 +17,10 @@ namespace tessera::models::qwen3_5 {
 
 namespace detail = ::tessera::core::detail;
 
+void InvalidateActivationPack(Qwen35State& h) {
+  h.wmma_pack_valid = false;
+}
+
 std::expected<void, StatusCode> QuantizeMxFp4Input(
     Backend& backend, Qwen35State& h, DType dtype, Buffer& data,
     std::size_t rows, std::size_t cols) {
@@ -89,11 +93,13 @@ std::expected<bool, StatusCode> ProjectWmma(Backend& backend, Qwen35State& h,
     auto buf = backend.AllocateBuffer(m * k, MemoryKind::Device);
     if (!buf) return std::unexpected(buf.error());
     h.wmma_a = std::move(*buf);
+    h.wmma_pack_valid = false;  // a reallocation drops the cached pack
   }
   if (h.wmma_as == nullptr || h.wmma_as->Size() < m * 4) {
     auto buf = backend.AllocateBuffer(m * 4, MemoryKind::Device);
     if (!buf) return std::unexpected(buf.error());
     h.wmma_as = std::move(*buf);
+    h.wmma_pack_valid = false;
   }
   Buffer* wref = nullptr;
   auto it = h.mxfp4_wref.find(&w);
@@ -112,13 +118,22 @@ std::expected<bool, StatusCode> ProjectWmma(Backend& backend, Qwen35State& h,
   } else {
     wref = it->second.get();
   }
-  KernelLaunch ql;
-  ql.grid_x = static_cast<std::uint32_t>(m);
-  ql.block_x = 1024;
-  ql.buffers = {&a, h.wmma_a.get(), h.wmma_as.get()};
-  ql.scalars = {m, k};
-  if (auto st = backend.LaunchKernel(*h.fp8_pack_kernel, ql); !st) {
-    return std::unexpected(st.error());
+  // Several projections in a layer share one activation (q/k/v/gate on the
+  // normed hidden); pack it once and reuse while the source and shape match.
+  if (!(h.wmma_pack_valid && h.wmma_pack_src == static_cast<const void*>(&a) &&
+        h.wmma_pack_rows == m && h.wmma_pack_cols == k)) {
+    KernelLaunch ql;
+    ql.grid_x = static_cast<std::uint32_t>(m);
+    ql.block_x = 1024;
+    ql.buffers = {&a, h.wmma_a.get(), h.wmma_as.get()};
+    ql.scalars = {m, k};
+    if (auto st = backend.LaunchKernel(*h.fp8_pack_kernel, ql); !st) {
+      return std::unexpected(st.error());
+    }
+    h.wmma_pack_src = &a;
+    h.wmma_pack_rows = m;
+    h.wmma_pack_cols = k;
+    h.wmma_pack_valid = true;
   }
   // Split-K: aim for a target workgroup count so the fp8 GEMM saturates the
   // device on the narrow projections (n ~ 5120) where one block per 64
