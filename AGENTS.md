@@ -31,6 +31,11 @@ read, fix, and extend it without asking.
   3. Performance: every line of code serves inference speed. Choose the
      faster implementation even when it takes more code. Hot paths avoid
      needless copies, allocations, and abstraction overhead.
+- Backend parity: Vulkan and ROCm implement the same kernels. Every kernel
+  exists on both backends with the same contract, the same element order,
+  and the same numerics. A kernel that lands on one backend lands on the
+  other in the same change. Only the numerical tolerance may differ per
+  backend.
 
 ## Architecture Rules
 
