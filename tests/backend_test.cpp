@@ -943,6 +943,55 @@ TEST(BackendTest, GemmMxFp4ColdThroughput) {
     std::printf("[cold gemv m=1] %.3f ms/launch, %.1f GB/s\n",
                 secs * 1000.0 / kIters, bytes / secs / 1e9);
   }
+  {
+    // Fragment-order GEMV on the same bytes: the reader the greedy baseline
+    // uses once the weights are permuted. Must match the row-order rate.
+    std::vector<std::byte> frag(w.size());
+    ASSERT_TRUE(core::PermuteMxFp4ToWmma(w, frag, kN, kK).has_value());
+    std::vector<std::byte> wpacked_frag = frag;
+    wpacked_frag.insert(wpacked_frag.end(), scales.begin(), scales.end());
+    auto fw_buf =
+        backend->AllocateBuffer(wpacked_frag.size(), MemoryKind::Device);
+    ASSERT_TRUE(fw_buf.has_value());
+    ASSERT_TRUE(backend->CopyH2D(**fw_buf,
+                                 std::span<const std::byte>(wpacked_frag))
+                    .has_value());
+    std::vector<float> a(kK, 0.1f);
+    auto a_buf = backend->AllocateBuffer(kK * 4, MemoryKind::Device);
+    auto c_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+    ASSERT_TRUE(a_buf && c_buf);
+    ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                            reinterpret_cast<const std::byte*>(
+                                                a.data()),
+                                            a.size() * 4)).has_value());
+    auto kernel = backend->LoadKernel("gemm_mxfp4_frag", {});
+    auto reduce = backend->LoadKernel("gemm_mxfp4_wmma_reduce", {});
+    if (kernel && reduce) {
+      auto part = backend->AllocateBuffer(kN * 4 * 8, MemoryKind::Device);
+      ASSERT_TRUE(part.has_value());
+      for (std::uint64_t split : {1ull, 4ull, 8ull}) {
+        tessera::KernelLaunch launch;
+        launch.grid_x =
+            static_cast<std::uint32_t>(((kN + 15) / 16 + 7) / 8);
+        launch.grid_y = static_cast<std::uint32_t>(split);
+        launch.block_x = 256;
+        launch.buffers = {(*a_buf).get(), (*fw_buf).get(), (*part).get()};
+        launch.scalars = {1ull, kN, kK, split};
+        for (int i = 0; i < 2; ++i)
+          ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+        backend->Synchronize();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kIters; ++i)
+          ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+        backend->Synchronize();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        std::printf("[cold gemv m=1 frag split=%llu] %.3f ms/launch, %.1f GB/s\n",
+                    static_cast<unsigned long long>(split),
+                    secs * 1000.0 / kIters, bytes / secs / 1e9);
+      }
+    }
+  }
 }
 
 TEST(BackendTest, GemmMxFp4RowsAndGemvThroughput) {
@@ -985,6 +1034,75 @@ TEST(BackendTest, GemmMxFp4RowsAndGemvThroughput) {
   run("gemm_mxfp4_rows", 8, static_cast<std::uint32_t>((kN + 7) / 8), 256);
   run("gemm_mxfp4_rows", 16, static_cast<std::uint32_t>((kN + 7) / 8), 256);
   run("gemm_mxfp4", 1, static_cast<std::uint32_t>((1 * kN + 7) / 8), 256);
+}
+
+// The fragment-order m=1 GEMV reads the fp8-WMMA weight layout
+// [n-tile][k-step][half][row][4] and must reproduce the row-order GEMV on the
+// same bytes, so permuting the weights cannot change the greedy output.
+TEST(BackendTest, GemmMxFp4FragMatchesRowGemm) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto frag = backend->LoadKernel("gemm_mxfp4_frag", {});
+  if (!frag) GTEST_SKIP() << "backend has no fragment-order MXFP4 GEMV";
+  constexpr std::size_t kN = 48, kK = 256, kBlocks = kK / 32;
+  std::mt19937 rng(29);
+  std::vector<std::byte> nib(kN * kK / 2);
+  for (auto& b : nib) b = static_cast<std::byte>(rng() & 0xFF);
+  std::vector<std::byte> scales(kN * kBlocks, std::byte(127));
+  std::vector<std::byte> roworder = nib;
+  roworder.insert(roworder.end(), scales.begin(), scales.end());
+  std::vector<std::byte> fragblob(nib.size());
+  ASSERT_TRUE(core::PermuteMxFp4ToWmma(nib, fragblob, kN, kK).has_value());
+  std::vector<std::byte> fragorder = fragblob;
+  fragorder.insert(fragorder.end(), scales.begin(), scales.end());
+  std::vector<float> a(kK);
+  for (auto& v : a) v = DrawValue(rng);
+  std::vector<float> c_row(kN, 0.0f), c_frag(kN, 0.0f);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_row = backend->AllocateBuffer(roworder.size(), MemoryKind::Device);
+  auto w_frag = backend->AllocateBuffer(fragorder.size(), MemoryKind::Device);
+  auto c_row_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto c_frag_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && w_row && w_frag && c_row_buf && c_frag_buf);
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(
+                                               a.data()),
+                                           a.size() * 4)).has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_row, std::span<const std::byte>(roworder))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_frag, std::span<const std::byte>(fragorder))
+                  .has_value());
+  auto row = backend->LoadKernel("gemm_mxfp4", {});
+  ASSERT_TRUE(row.has_value());
+  {
+    tessera::KernelLaunch launch;
+    launch.grid_x = static_cast<std::uint32_t>((kN + 7) / 8);
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_row).get(), (*c_row_buf).get()};
+    launch.scalars = {1ull, kN, kK};
+    ASSERT_TRUE(backend->LaunchKernel(**row, launch).has_value());
+  }
+  {
+    tessera::KernelLaunch launch;
+    launch.grid_x =
+        static_cast<std::uint32_t>(((kN + 15) / 16 + 7) / 8);
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_frag).get(), (*c_frag_buf).get()};
+    launch.scalars = {1ull, kN, kK, 1ull};
+    ASSERT_TRUE(backend->LaunchKernel(**frag, launch).has_value());
+  }
+  backend->Synchronize();
+  ASSERT_TRUE(backend
+                  ->CopyD2H(**c_row_buf, reinterpret_cast<std::byte*>(c_row.data()),
+                            c_row.size() * 4)
+                  .has_value());
+  ASSERT_TRUE(backend
+                  ->CopyD2H(**c_frag_buf, reinterpret_cast<std::byte*>(c_frag.data()),
+                            c_frag.size() * 4)
+                  .has_value());
+  for (std::size_t i = 0; i < kN; ++i) {
+    EXPECT_NEAR(c_row[i], c_frag[i], 1e-3f * (1.0f + std::abs(c_row[i])));
+  }
 }
 
 // Random weight bytes with small exact scales patched into every
