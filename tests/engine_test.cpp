@@ -1452,6 +1452,10 @@ TEST(EngineTest, MtpDecodeOnModel) {
       options.max_tokens = static_cast<std::size_t>(value);
     }
   }
+  if (const char* block = std::getenv("TESSERA_MTP_BLOCK");
+      block != nullptr) {
+    options.draft_tokens = static_cast<std::size_t>(std::atoi(block));
+  }
   options.prompt_tokens = {760, 6511, 314, 9338, 369};
   auto greedy = engine->Generate(**model, options);
   ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());
