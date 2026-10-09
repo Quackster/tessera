@@ -2110,6 +2110,16 @@ through RADV GFX1201, rocm through the system ROCm).
   is blocked: opencode's first prompt is about 10k tokens against the
    4096 serve context at 11 prompt tok/s (see Next item 4).
 
+- 2026-10-09: **Tool-path thinking as `reasoning_content` (308/308
+  `ctest` on vulkan).** The tool handler deleted the `<think>` span,
+  so a client that sends `tools` (opencode always does) never saw the
+  reasoning. `ParseToolCalls` now also returns the think text, and the
+  buffered and streamed tool replies report it as `reasoning_content`
+  (the vLLM convention) beside the stripped content and the calls.
+  Verified live on the 27B MXFP4 (Vulkan, GPU0): the SSE stream
+  carries the thinking delta, then the clean answer, with no device
+  errors.
+
 - 2026-10-09: **Chunked prefill and 220k context on the 8-bit KV path
   (299/299 `ctest` on vulkan).** `PrefillTokens` splits the prompt into
   chunk-sized forwards (automatic default 512, `--prefill-chunk` to

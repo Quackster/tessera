@@ -74,10 +74,15 @@ void ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
     return;
   }
   std::string before;
-  const std::vector<ToolCall> calls = ParseToolCalls(text, &before);
+  std::string reasoning;
+  const std::vector<ToolCall> calls =
+      ParseToolCalls(text, &before, &reasoning);
   const bool has_calls = !calls.empty();
   core::Json message = core::Json::Object();
   message.Set("role", core::Json::String("assistant"));
+  if (!reasoning.empty()) {
+    message.Set("reasoning_content", core::Json::String(reasoning));
+  }
   message.Set("content",
               before.empty() ? core::Json() : core::Json::String(before));
   if (has_calls) {
@@ -125,7 +130,14 @@ void ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
   role_delta.Set("role", core::Json::String("assistant"));
   WriteSse(writer, "", StreamChunk(model_name, std::move(role_delta), ""), false);
   std::string before;
-  const std::vector<ToolCall> calls = ParseToolCalls(text, &before);
+  std::string reasoning;
+  const std::vector<ToolCall> calls =
+      ParseToolCalls(text, &before, &reasoning);
+  if (!reasoning.empty()) {
+    core::Json delta = core::Json::Object();
+    delta.Set("reasoning_content", core::Json::String(reasoning));
+    WriteSse(writer, "", StreamChunk(model_name, std::move(delta), ""), false);
+  }
   if (!before.empty()) {
     core::Json delta = core::Json::Object();
     delta.Set("content", core::Json::String(before));

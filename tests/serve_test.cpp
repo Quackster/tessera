@@ -275,6 +275,60 @@ TEST(ServeTest, ParseToolCallsStripsOpenThink) {
   EXPECT_TRUE(before.empty());
 }
 
+// The stripped reasoning is reported, so the client still sees the
+// thinking block that never belongs in the reply content.
+TEST(ServeTest, ParseToolCallsReportsReasoning) {
+  const std::string text =
+      "<think>\nprivate\n</think>\n\n<tool_call>\n<function=read>\n"
+      "</function>\n</tool_call>";
+  std::string before;
+  std::string reasoning = "untouched";
+  const std::vector<tessera::serve::ToolCall> calls =
+      tessera::serve::ParseToolCalls(text, &before, &reasoning);
+  ASSERT_EQ(calls.size(), 1u);
+  EXPECT_TRUE(before.empty());
+  EXPECT_EQ(reasoning, "private");
+}
+
+// Reasoning without an opener (the prompt ends with <think>) is
+// reported too, and the answer text stays intact beside a call.
+TEST(ServeTest, ParseToolCallsReportsOpenReasoning) {
+  const std::string text =
+      "private reasoning\n</think>\nthe answer\n<tool_call>\n<function=read>\n"
+      "</function>\n</tool_call>";
+  std::string before;
+  std::string reasoning;
+  const std::vector<tessera::serve::ToolCall> calls =
+      tessera::serve::ParseToolCalls(text, &before, &reasoning);
+  ASSERT_EQ(calls.size(), 1u);
+  EXPECT_EQ(before, "the answer");
+  EXPECT_EQ(reasoning, "private reasoning");
+}
+
+// Plain text reports no reasoning and keeps the whole text.
+TEST(ServeTest, ParseToolCallsNoReasoningWithoutThink) {
+  std::string before;
+  std::string reasoning = "untouched";
+  const std::vector<tessera::serve::ToolCall> calls =
+      tessera::serve::ParseToolCalls("just an answer", &before, &reasoning);
+  EXPECT_TRUE(calls.empty());
+  EXPECT_EQ(before, "just an answer");
+  EXPECT_TRUE(reasoning.empty());
+}
+
+// A think span without a closer stays in the text (an unfinished turn
+// keeps its words); only closed spans count as reasoning.
+TEST(ServeTest, ParseToolCallsKeepsUnclosedThink) {
+  const std::string text = "answer <think>unfinished";
+  std::string before;
+  std::string reasoning = "untouched";
+  const std::vector<tessera::serve::ToolCall> calls =
+      tessera::serve::ParseToolCalls(text, &before, &reasoning);
+  EXPECT_TRUE(calls.empty());
+  EXPECT_EQ(before, text);
+  EXPECT_TRUE(reasoning.empty());
+}
+
 // The effective tool list is absent, empty, or disabled by choice.
 TEST(ServeTest, EffectiveToolsSelection) {
   std::string error;

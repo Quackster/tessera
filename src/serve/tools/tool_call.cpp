@@ -31,25 +31,37 @@ std::string Trim(std::string_view text) {
       text.substr(begin, text.find_last_not_of(" \t\r\n") - begin + 1));
 }
 
-// Drop <think>...</think> spans; reasoning must not leak into the
-// reply content or the next turn's history. The generation prompt
+// Split <think>...</think> spans from the reply: reasoning holds the
+// concatenated inner text, text the remainder. Reasoning must not leak
+// into the reply content or the next turn's history, but the client
+// still sees it through `reasoning_content`. The generation prompt
 // already ends with an open <think>, so a leading span may have no
-// opener: drop everything through its closer then.
-std::string StripThink(std::string_view text) {
-  std::string out(text);
+// opener: everything through its closer counts as reasoning. A span
+// without a closer stays in the text (an unfinished turn keeps its
+// words, same as before).
+struct ThinkSplit {
+  std::string reasoning;
+  std::string text;
+};
+
+ThinkSplit SplitThink(std::string_view input) {
+  ThinkSplit split{std::string(), std::string(input)};
   while (true) {
-    const std::size_t close = out.find(kThinkClose);
+    const std::size_t close = split.text.find(kThinkClose);
     if (close == std::string::npos) {
-      return out;
+      return split;
     }
     std::size_t begin = 0;
+    std::size_t inner = 0;
     if (close > 0) {
-      const std::size_t open = out.rfind(kThinkOpen, close - 1);
+      const std::size_t open = split.text.rfind(kThinkOpen, close - 1);
       if (open != std::string::npos) {
         begin = open;
+        inner = open + sizeof(kThinkOpen) - 1;
       }
     }
-    out.erase(begin, close + sizeof(kThinkClose) - 1 - begin);
+    split.reasoning += split.text.substr(inner, close - inner);
+    split.text.erase(begin, close + sizeof(kThinkClose) - 1 - begin);
   }
 }
 
@@ -164,32 +176,38 @@ bool NormalizeCall(const core::Json& call, core::Json* out,
 }  // namespace
 
 std::vector<ToolCall> ParseToolCalls(std::string_view text,
-                                     std::string* text_before) {
+                                      std::string* text_before,
+                                      std::string* reasoning) {
+  const ThinkSplit split = SplitThink(text);
+  const std::string_view body = split.text;
+  if (reasoning != nullptr) {
+    *reasoning = Trim(split.reasoning);
+  }
   std::vector<ToolCall> calls;
   std::size_t pos = 0;
   bool first = true;
   while (true) {
-    const std::size_t open = text.find(kCallOpen, pos);
+    const std::size_t open = body.find(kCallOpen, pos);
     if (open == kMissing) {
       break;
     }
     if (first) {
-      *text_before = Trim(StripThink(text.substr(0, open)));
+      *text_before = Trim(body.substr(0, open));
       first = false;
     }
-    const std::size_t close = text.find(kCallClose, open);
+    const std::size_t close = body.find(kCallClose, open);
     if (close == kMissing) {
       break;
     }
     const std::size_t begin = open + sizeof(kCallOpen) - 1;
-    if (auto call = ParseBlock(text.substr(begin, close - begin),
+    if (auto call = ParseBlock(body.substr(begin, close - begin),
                                calls.size())) {
       calls.push_back(std::move(*call));
     }
     pos = close + sizeof(kCallClose) - 1;
   }
   if (first) {
-    *text_before = Trim(StripThink(text));
+    *text_before = Trim(split.text);
   }
   return calls;
 }

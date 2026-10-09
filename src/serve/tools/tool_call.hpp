@@ -22,9 +22,13 @@ struct ToolCall {
 // Parse complete `<tool_call>...</tool_call>` blocks from generated
 // `text`, in order. `text_before` receives the text before the first
 // block (reasoning stripped, trimmed); the whole text when no block
-// parses. Truncated and malformed blocks are skipped.
+// parses. `reasoning` (null to skip) receives the `<think>` span text
+// (trimmed), so the client can still see the reasoning that never
+// belongs in the reply content. Truncated and malformed blocks are
+// skipped.
 [[nodiscard]] std::vector<ToolCall> ParseToolCalls(std::string_view text,
-                                                   std::string* text_before);
+                                                    std::string* text_before,
+                                                    std::string* reasoning = nullptr);
 
 // The tool list from the request body to render, or nullptr for none.
 // Sets `error` when `tools` is not an array or `tool_choice` is neither
