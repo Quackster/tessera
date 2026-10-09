@@ -822,6 +822,129 @@ TEST(BackendTest, GemmMxFp4WmmaThroughput) {
   }
 }
 
+// Cold (weights far larger than the last-level cache) comparison of the fp8
+// tensor-core GEMM against the m=1 GEMV. Both stream the same weight bytes,
+// so the ratio isolates the weight-read access pattern from occupancy.
+TEST(BackendTest, GemmMxFp4ColdThroughput) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kK = 20480, kN = 17408, kBlocks = kK / 32;
+  constexpr int kIters = 20;
+  std::mt19937 rng(13);
+  std::vector<std::byte> w(kN * kK / 2);
+  for (auto& b : w) b = static_cast<std::byte>(rng() & 0xFF);
+  std::vector<std::byte> scales(kN * kBlocks, std::byte(127));
+  std::vector<std::byte> wpacked = w;
+  wpacked.insert(wpacked.end(), scales.begin(), scales.end());
+  auto w_buf = backend->AllocateBuffer(wpacked.size(), MemoryKind::Device);
+  ASSERT_TRUE(w_buf.has_value());
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(wpacked)).has_value());
+  const double bytes = static_cast<double>(wpacked.size()) * kIters;
+  {
+    constexpr std::size_t kM = 8;
+    auto kernel = backend->LoadKernel("gemm_mxfp4_wmma", {});
+    if (!kernel) GTEST_SKIP() << "no fp8 tensor-core GEMM";
+    std::vector<std::byte> a(kM * kK, std::byte(0x38));
+    std::vector<float> as(kM, 1.0f);
+    auto a_buf = backend->AllocateBuffer(a.size(), MemoryKind::Device);
+    auto as_buf = backend->AllocateBuffer(kM * 4, MemoryKind::Device);
+    auto wref_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+    auto c_buf = backend->AllocateBuffer(kM * kN * 4 * 16, MemoryKind::Device);
+    ASSERT_TRUE(a_buf && as_buf && wref_buf && c_buf);
+    ASSERT_TRUE(
+        backend->CopyH2D(**a_buf, std::span<const std::byte>(a)).has_value());
+    ASSERT_TRUE(backend->CopyH2D(**as_buf, std::span<const std::byte>(
+                                            reinterpret_cast<const std::byte*>(
+                                                as.data()),
+                                            as.size() * 4)).has_value());
+    for (std::uint64_t split : {1ull, 2ull, 4ull}) {
+      tessera::KernelLaunch launch;
+      launch.grid_x = static_cast<std::uint32_t>((kN + 63) / 64);
+      launch.grid_y = static_cast<std::uint32_t>(split);
+      launch.block_x = 128;
+      launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*as_buf).get(),
+                        (*wref_buf).get(), (*c_buf).get()};
+      launch.scalars = {kM, kN, kK, split, 0};
+      for (int i = 0; i < 2; ++i)
+        ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+      backend->Synchronize();
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < kIters; ++i)
+        ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+      backend->Synchronize();
+      const auto t1 = std::chrono::steady_clock::now();
+      const double secs = std::chrono::duration<double>(t1 - t0).count();
+      std::printf("[cold wmma split=%llu] %.3f ms/launch, %.1f GB/s\n",
+                  static_cast<unsigned long long>(split),
+                  secs * 1000.0 / kIters, bytes / secs / 1e9);
+    }
+    // Fragment-order (wperm) weight: the same bytes permuted to the fp8-WMMA
+    // layout, so one wave's 16 rows for a k-step are 128 contiguous bytes.
+    {
+      std::vector<std::byte> frag(w.size());
+      ASSERT_TRUE(core::PermuteMxFp4ToWmma(w, frag, kN, kK).has_value());
+      std::vector<std::byte> wpacked_frag = frag;
+      wpacked_frag.insert(wpacked_frag.end(), scales.begin(), scales.end());
+      auto fw_buf =
+          backend->AllocateBuffer(wpacked_frag.size(), MemoryKind::Device);
+      ASSERT_TRUE(fw_buf.has_value());
+      ASSERT_TRUE(backend->CopyH2D(**fw_buf,
+                                   std::span<const std::byte>(wpacked_frag))
+                      .has_value());
+      for (std::uint64_t split : {2ull, 4ull}) {
+        tessera::KernelLaunch launch;
+        launch.grid_x = static_cast<std::uint32_t>((kN + 63) / 64);
+        launch.grid_y = static_cast<std::uint32_t>(split);
+        launch.block_x = 128;
+        launch.buffers = {(*a_buf).get(), (*fw_buf).get(), (*as_buf).get(),
+                          (*wref_buf).get(), (*c_buf).get()};
+        launch.scalars = {kM, kN, kK, split, 1};
+        for (int i = 0; i < 2; ++i)
+          ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+        backend->Synchronize();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kIters; ++i)
+          ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+        backend->Synchronize();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        std::printf("[cold wmma wperm split=%llu] %.3f ms/launch, %.1f GB/s\n",
+                    static_cast<unsigned long long>(split),
+                    secs * 1000.0 / kIters, bytes / secs / 1e9);
+      }
+    }
+  }
+  {
+    std::vector<float> a(kK, 0.1f);
+    auto a_buf = backend->AllocateBuffer(kK * 4, MemoryKind::Device);
+    auto c_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+    ASSERT_TRUE(a_buf && c_buf);
+    ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                            reinterpret_cast<const std::byte*>(
+                                                a.data()),
+                                            a.size() * 4)).has_value());
+    auto kernel = backend->LoadKernel("gemm_mxfp4", {});
+    if (!kernel) GTEST_SKIP() << "no gemm_mxfp4";
+    tessera::KernelLaunch launch;
+    launch.grid_x = static_cast<std::uint32_t>((kN + 7) / 8);
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+    launch.scalars = {1ull, kN, kK};
+    for (int i = 0; i < 2; ++i)
+      ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+    backend->Synchronize();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kIters; ++i)
+      ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+    backend->Synchronize();
+    const auto t1 = std::chrono::steady_clock::now();
+    const double secs = std::chrono::duration<double>(t1 - t0).count();
+    std::printf("[cold gemv m=1] %.3f ms/launch, %.1f GB/s\n",
+                secs * 1000.0 / kIters, bytes / secs / 1e9);
+  }
+}
+
 TEST(BackendTest, GemmMxFp4RowsAndGemvThroughput) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
