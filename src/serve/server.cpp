@@ -372,7 +372,8 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
     }
     if (request.method == "GET" && (path == "/" || path == "/index.html")) {
       (void)writer.SendHeaders(200, "text/html");
-      (void)writer.Write(std::string_view(serve::web::kWebIndexHtml));
+      (void)writer.Write(
+          serve::InjectWebDefaults(std::string_view(serve::web::kWebIndexHtml)));
       return;
     }
     if (request.method == "GET" &&

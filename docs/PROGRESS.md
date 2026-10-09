@@ -2135,6 +2135,13 @@ through RADV GFX1201, rocm through the system ROCm).
   MXFP4 (Vulkan, GPU0): the full session flow through curl, including
   pause, resume and a stopped turn persisted with its flag.
 
+- 2026-10-09: **Default 32k completion cap (322/322 `ctest` on
+  vulkan).** Requests without `max_tokens` decoded to the end of the
+  context. `tessera::kDefaultMaxTokens` (32k) is now the single
+  source: `ServeOptions`, the CLI `--tokens` default and help text,
+  and the web UI input default (injected into the served page) all
+  derive from it. The engine keeps 0-means-fill for direct API use.
+
 - 2026-10-09: **Chunked prefill and 220k context on the 8-bit KV path
   (299/299 `ctest` on vulkan).** `PrefillTokens` splits the prompt into
   chunk-sized forwards (automatic default 512, `--prefill-chunk` to

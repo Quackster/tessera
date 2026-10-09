@@ -50,7 +50,7 @@ void PrintUsage() {
                "  --prefill-chunk <n> prefill tokens per forward (0 = auto, "
                "%zu)\n"
   "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
-  "  --tokens <n>      decode steps (default: fill the context)\n"
+  "  --tokens <n>      decode steps (default %zu)\n"
                "  --speculate       verify MTP drafts instead of plain greedy\n"
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
@@ -71,9 +71,10 @@ void PrintUsage() {
                "  --host <ip>       serve bind address (default 127.0.0.1)\n"
                "  --port <n>        serve port (default 8080)\n"
                "  --api-key <k>     accepted API key (repeatable; env "
-               "TESSERA_API_KEY)\n"
-               "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
-               kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk);
+                "TESSERA_API_KEY)\n"
+  "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
+                kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk,
+                tessera::kDefaultMaxTokens);
 }
 
 }  // namespace
@@ -280,7 +281,10 @@ int main(int argc, char** argv) {
   }
   if (!prompt_text.empty() || !image_path.empty() || tokens > 0) {
     tessera::GenerateOptions gen;
-    gen.max_tokens = tokens;  // Zero fills the remaining context.
+    // Zero (flag absent) selects the default cap instead of filling
+    // the remaining context.
+    gen.max_tokens =
+        tokens == 0 ? tessera::kDefaultMaxTokens : tokens;
     gen.sample = sample;
     gen.sampling = sampling;
     gen.seed = seed;
