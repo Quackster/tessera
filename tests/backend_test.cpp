@@ -4099,8 +4099,9 @@ TEST(BackendTest, Conv1dStateDeviceMatchesRef) {
   launch.grid_x = (kConvDim + 255) / 256;
   launch.block_x = 256;
   launch.buffers = {(*qkv_buf).get(), (*w_buf).get(), (*hist_buf).get(),
-                    (*q_buf).get(), (*k_buf).get(), (*v_buf).get()};
-  launch.scalars = {kConvDim, kWidth, kKeyDim, 0, 1};
+                    (*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
+                    (*hist_buf).get()};
+  launch.scalars = {kConvDim, kWidth, kKeyDim, 0, 1, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   const auto download = [&backend](auto& buf, std::vector<float>& out) {
@@ -4148,6 +4149,90 @@ TEST(BackendTest, Conv1dStateDeviceMatchesRef) {
   }
   for (std::size_t i = 0; i < kHist; ++i) {
     EXPECT_NEAR(got_hist[i], ref_hist[i], 1e-5f);
+  }
+}
+
+// Device: with a non-zero conv history stride the conv records each row's
+// post-conv history into its own slot, which a batched verify restores from.
+TEST(BackendTest, Conv1dStateAppendsHist) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97);
+  constexpr std::size_t kConvDim = 8, kKeyDim = 2, kWidth = 3, kRows = 3;
+  constexpr std::size_t kValueDim = kConvDim - 2 * kKeyDim;
+  const std::size_t hist_len = kConvDim * (kWidth - 1);
+  std::vector<float> qkv(kRows * kConvDim), w(kConvDim * kWidth);
+  std::vector<float> hist0(hist_len);
+  for (auto& v : qkv) v = DrawValue(rng);
+  for (auto& v : w) v = DrawValue(rng);
+  for (auto& v : hist0) v = DrawValue(rng);
+  auto mk = [&](std::size_t n) {
+    return backend->AllocateBuffer(n * 4, MemoryKind::Device);
+  };
+  auto qkv_buf = mk(qkv.size()), w_buf = mk(w.size()), hist_buf = mk(hist_len);
+  auto q_buf = mk(kRows * kKeyDim), k_buf = mk(kRows * kKeyDim);
+  auto v_buf = mk(kRows * kValueDim), hh_buf = mk((kRows + 1) * hist_len);
+  ASSERT_TRUE(qkv_buf && w_buf && hist_buf && q_buf && k_buf && v_buf && hh_buf);
+  const auto upload = [&backend](auto& buf, const std::vector<float>& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(qkv_buf, qkv).has_value());
+  ASSERT_TRUE(upload(w_buf, w).has_value());
+  ASSERT_TRUE(upload(hist_buf, hist0).has_value());
+  std::vector<float> hh0((kRows + 1) * hist_len, 0.0f);
+  std::copy(hist0.begin(), hist0.end(), hh0.begin());  // caller seeds slot 0
+  ASSERT_TRUE(upload(hh_buf, hh0).has_value());
+  auto kernel = backend->LoadKernel("conv1d_state", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kConvDim + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*qkv_buf).get(), (*w_buf).get(), (*hist_buf).get(),
+                    (*q_buf).get(),     (*k_buf).get(), (*v_buf).get(),
+                    (*hh_buf).get()};
+  launch.scalars = {kConvDim, kWidth, kKeyDim, 0, kRows, hist_len};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<float> ref_hist = hist0, ref_q(kRows * kKeyDim),
+                     ref_k(kRows * kKeyDim), ref_v(kRows * kValueDim);
+  std::vector<float> ref_hh((kRows + 1) * hist_len, 0.0f);
+  std::copy(hist0.begin(), hist0.end(), ref_hh.begin());
+  for (std::size_t t = 0; t < kRows; ++t) {
+    for (std::size_t c = 0; c < kConvDim; ++c) {
+      const std::size_t base = c * (kWidth - 1);
+      float acc = w[c * kWidth + (kWidth - 1)] * qkv[t * kConvDim + c];
+      for (std::size_t i = 1; i < kWidth; ++i) {
+        acc += w[c * kWidth + (kWidth - 1 - i)] * ref_hist[base + (i - 1)];
+      }
+      const float result = acc / (1.0f + std::exp(-acc));
+      if (c < kKeyDim) {
+        ref_q[t * kKeyDim + c] = result;
+      } else if (c < 2 * kKeyDim) {
+        ref_k[t * kKeyDim + (c - kKeyDim)] = result;
+      } else {
+        ref_v[t * kValueDim + (c - 2 * kKeyDim)] = result;
+      }
+      for (std::size_t i = kWidth - 1; i > 1; --i) {
+        ref_hist[base + (i - 1)] = ref_hist[base + (i - 2)];
+      }
+      ref_hist[base] = qkv[t * kConvDim + c];
+    }
+    std::copy(ref_hist.begin(), ref_hist.end(),
+              ref_hh.begin() + (t + 1) * hist_len);
+  }
+  const auto download = [&backend](auto& buf, std::vector<float>& out) {
+    std::vector<std::byte> raw(out.size() * 4);
+    if (!backend->CopyD2H(**buf, raw.data(), raw.size()).has_value()) {
+      return false;
+    }
+    std::memcpy(out.data(), raw.data(), raw.size());
+    return true;
+  };
+  std::vector<float> got_hh(ref_hh.size());
+  ASSERT_TRUE(download(hh_buf, got_hh));
+  for (std::size_t i = 0; i < ref_hh.size(); ++i) {
+    EXPECT_NEAR(got_hh[i], ref_hh[i], 1e-5f);
   }
 }
 

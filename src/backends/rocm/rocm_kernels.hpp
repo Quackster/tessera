@@ -366,11 +366,13 @@ __global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
 // and the q/k/v split (the Vulkan "conv1d_state" contract).
 __global__ void Conv1dStateKernel(const float* qkv, const float* w,
                                   float* hist, float* q, float* k, float* v,
+                                  float* hist_hist,
                                   unsigned long long conv_dim,
                                   unsigned long long width,
                                   unsigned long long key_dim,
                                   unsigned long long qkv_offset,
-                                  unsigned long long rows);
+                                  unsigned long long rows,
+                                  unsigned long long hist_stride);
 __global__ void SsmGateKernel(const float* a_log, const float* dt,
                               const float* alpha_raw, const float* beta_raw,
                               float* alpha, float* beta,

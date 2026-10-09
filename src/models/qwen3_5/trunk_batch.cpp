@@ -292,15 +292,32 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
     return std::unexpected(StatusCode::DeviceError);
   }
   const float q_scale = 1.0 / std::sqrt(static_cast<double>(g.head_k_dim));
-  // Prefill never rolls back, so it batches the whole per-row linear step
-  // into one launch per kernel instead of about eleven launches per row:
-  // the conv advances the shared history across the rows, then the L2
-  // norms, head repeat, delta scan and gated norm run over all rows.
-  if (!b.snapshot_states && rows > 1) {
-    if (!Conv1dStateDevice(backend, *h.conv1d_state_kernel, *b.qkv,
-                           *(*w_conv)->device, *h.linear[layer].conv_hist,
-                           *b.q_all, *b.k_all, *b.v_all, g.conv_dim, g.width,
-                           g.key_dim, 0, rows) ||
+  const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
+  const std::size_t hist_len = g.conv_dim * (g.width - 1);
+  // Snapshot the pre-block state and conv history (slot 0). The batched conv
+  // and DeltaStep then write each row's post-step state to its own slot (row
+  // t reads slot t, writes slot t+1) so the commit restores any accepted
+  // prefix. Prefill never rolls back, so it skips both writes.
+  if (b.snapshot_states &&
+      (!backend.CopyD2D(*h.linear[layer].state, 0, *b.state_hist[layer], 0,
+                        state_len * 4) ||
+       !backend.CopyD2D(*h.linear[layer].conv_hist, 0,
+                        *b.conv_hist_hist[layer], 0, hist_len * 4))) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (rows > 1) {
+    // Prefill and the batched verify run one launch per kernel for all rows
+    // instead of about twelve launches per row: the conv advances the shared
+    // history across the rows, then the L2 norms, head repeat, delta scan and
+    // gated norm run over all rows.
+    Buffer& state =
+        b.snapshot_states ? *b.state_hist[layer] : *h.linear[layer].state;
+    if (!Conv1dStateDevice(
+            backend, *h.conv1d_state_kernel, *b.qkv, *(*w_conv)->device,
+            *h.linear[layer].conv_hist, *b.q_all, *b.k_all, *b.v_all,
+            g.conv_dim, g.width, g.key_dim, 0, rows,
+            b.snapshot_states ? b.conv_hist_hist[layer].get() : nullptr,
+            b.snapshot_states ? hist_len : 0) ||
         !L2NormDevice(backend, *h.l2norm_kernel, *b.q_all, *b.q_all,
                       rows * g.num_k_heads, g.head_k_dim, 1e-6f, q_scale) ||
         !L2NormDevice(backend, *h.l2norm_kernel, *b.k_all, *b.k_all,
@@ -311,10 +328,11 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
         !RepeatHeadsDevice(backend, *h.repeat_heads_kernel, *b.k_all,
                            *b.k_exp_all, g.num_v_heads, g.head_k_dim, g.factor,
                            rows) ||
-        !DeltaStepHeadsDevice(backend, *h.delta_step_heads_kernel,
-                              *h.linear[layer].state, *b.k_exp_all, *b.v_all,
-                              *b.q_exp_all, *b.core_all, *b.alpha, *b.beta,
-                              g.num_v_heads, g.head_k_dim, g.head_v_dim, rows) ||
+        !DeltaStepHeadsDevice(backend, *h.delta_step_heads_kernel, state,
+                              *b.k_exp_all, *b.v_all, *b.q_exp_all, *b.core_all,
+                              *b.alpha, *b.beta, g.num_v_heads, g.head_k_dim,
+                              g.head_v_dim, rows, 0,
+                              b.snapshot_states ? state_len : 0, 0) ||
         !RmsNormGatedDevice(backend, *h.rmsnorm_gated_kernel, *b.core_all,
                             *(*w_norm)->device, *b.z, *b.out,
                             rows * g.num_v_heads, g.head_v_dim, cfg.norm_eps) ||
@@ -324,19 +342,6 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
       return std::unexpected(StatusCode::DeviceError);
     }
     return RunFfnBatch(backend, model, cfg, h, layer, rows);
-  }
-  const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
-  const std::size_t hist_len = g.conv_dim * (g.width - 1);
-  // Snapshot the state and the conv history before the block (slot 0);
-  // each token appends its post-token state to slot t+1 so a verification
-  // can roll back. Prefill never rolls back, so it skips both the writes
-  // and the GB-scale allocation they would need.
-  if (b.snapshot_states &&
-      (!backend.CopyD2D(*h.linear[layer].state, 0, *b.state_hist[layer], 0,
-                        state_len * 4) ||
-       !backend.CopyD2D(*h.linear[layer].conv_hist, 0,
-                        *b.conv_hist_hist[layer], 0, hist_len * 4))) {
-    return std::unexpected(StatusCode::DeviceError);
   }
   for (std::size_t t = 0; t < rows; ++t) {
     // The causal conv, SiLU and q/k/v split run on the device; the

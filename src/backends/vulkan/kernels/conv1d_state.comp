@@ -11,11 +11,14 @@ layout(local_size_x = 256) in;
 // (width-1), newest first), Q (rows x key_dim), K (rows x key_dim), V
 // (rows x value_dim).
 // Scalars: conv_dim v[0], width v[2], key_dim v[4], qkv_offset v[6]
-// (the row offset into QKV; 0 for a whole-sequence call), rows v[8].
+// (the row offset into QKV; 0 for a whole-sequence call), rows v[8],
+// hist_stride v[10].
 //   acc = sum_i W[c][width-1-i] * window[i], window[0] = QKV[off+c],
 //   window[i] = HIST[c][i-1]; out = acc * sigmoid(acc); the output goes
 //   to Q, K or V by channel block; then HIST shifts and takes QKV[off+c].
-// The rows advance the shared history in turn.
+// The rows advance the shared history in turn. With a non-zero hist_stride
+// each row's post-conv history is also written to its own slot of HH (buffer
+// 6), which a batched verify uses to restore an accepted prefix.
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -26,6 +29,7 @@ layout(set = 0, binding = 2) buffer H { float hist[]; };
 layout(set = 0, binding = 3) buffer Q { float q[]; };
 layout(set = 0, binding = 4) buffer K { float k[]; };
 layout(set = 0, binding = 5) buffer V { float v[]; };
+layout(set = 0, binding = 6) buffer HH { float hist_hist[]; };
 
 void main() {
   uint c = gl_GlobalInvocationID.x;
@@ -37,6 +41,7 @@ void main() {
   uint key_dim = pc.v[4];
   uint offset = pc.v[6];
   uint rows = pc.v[8];
+  uint hist_stride = pc.v[10];
   uint value_dim = conv_dim - 2u * key_dim;
   uint stride = width - 1;
   uint hbase = c * stride;
@@ -59,6 +64,12 @@ void main() {
         hist[hbase + (i - 1)] = hist[hbase + (i - 2)];
       }
       hist[hbase] = current;
+    }
+    if (hist_stride != 0u) {
+      uint dst = (t + 1u) * hist_stride + hbase;
+      for (uint i = 0u; i < stride; ++i) {
+        hist_hist[dst + i] = hist[hbase + i];
+      }
     }
   }
 }

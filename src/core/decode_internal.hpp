@@ -618,17 +618,22 @@ inline std::expected<void, StatusCode> Conv1dDevice(
 }
 
 // Current-step causal depthwise conv with the history on the device, plus
-// the SiLU and the q/k/v split. Replaces the host conv round-trip.
+// the SiLU and the q/k/v split. Replaces the host conv round-trip. When
+// `hist_hist` and a non-zero `hist_stride` are given, each row's post-conv
+// history is also written to its own slot (buffer 6), which a batched verify
+// uses to restore an accepted prefix.
 inline std::expected<void, StatusCode> Conv1dStateDevice(
     Backend& backend, const Kernel& kernel, const Buffer& qkv, const Buffer& w,
     const Buffer& hist, const Buffer& q, const Buffer& k, const Buffer& v,
     std::size_t conv_dim, std::size_t width, std::size_t key_dim,
-    std::size_t qkv_offset = 0, std::size_t rows = 1) {
+    std::size_t qkv_offset = 0, std::size_t rows = 1,
+    const Buffer* hist_hist = nullptr, std::size_t hist_stride = 0) {
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>((conv_dim + 255) / 256);
   launch.block_x = 256;
-  launch.buffers = {&qkv, &w, &hist, &q, &k, &v};
-  launch.scalars = {conv_dim, width, key_dim, qkv_offset, rows};
+  launch.buffers = {&qkv,      &w, &hist, &q,
+                    &k,        &v, hist_hist != nullptr ? hist_hist : &hist};
+  launch.scalars = {conv_dim, width, key_dim, qkv_offset, rows, hist_stride};
   return backend.LaunchKernel(kernel, launch);
 }
 

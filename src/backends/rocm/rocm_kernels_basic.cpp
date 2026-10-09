@@ -1381,11 +1381,13 @@ __global__ void Conv1dStepKernel(const float* x, const float* w, float* y,
 // is newest first.
 __global__ void Conv1dStateKernel(const float* qkv, const float* w,
                                   float* hist, float* q, float* k, float* v,
+                                  float* hist_hist,
                                   unsigned long long conv_dim,
                                   unsigned long long width,
                                   unsigned long long key_dim,
                                   unsigned long long qkv_offset,
-                                  unsigned long long rows) {
+                                  unsigned long long rows,
+                                  unsigned long long hist_stride) {
   const unsigned long long c =
       static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (c >= conv_dim) {
@@ -1395,7 +1397,9 @@ __global__ void Conv1dStateKernel(const float* qkv, const float* w,
   const unsigned long long hbase = c * stride;
   const unsigned long long value_dim = conv_dim - 2 * key_dim;
   // Rows advance the shared history in turn, so a sequence costs one launch
-  // (rows = 1 with qkv_offset = t * conv_dim is the single-token step).
+  // (rows = 1 with qkv_offset = t * conv_dim is the single-token step). With
+  // a non-zero hist_stride each row's post-conv history is written to its own
+  // slot, so a batched verify can restore any accepted prefix.
   for (unsigned long long t = 0; t < rows; ++t) {
     const float current = qkv[qkv_offset + t * conv_dim + c];
     float acc = w[c * width + (width - 1)] * current;
@@ -1415,6 +1419,12 @@ __global__ void Conv1dStateKernel(const float* qkv, const float* w,
         hist[hbase + (i - 1)] = hist[hbase + (i - 2)];
       }
       hist[hbase] = current;
+    }
+    if (hist_stride != 0) {
+      float* dst = hist_hist + (t + 1) * hist_stride + hbase;
+      for (unsigned long long i = 0; i < stride; ++i) {
+        dst[i] = hist[hbase + i];
+      }
     }
   }
 }
