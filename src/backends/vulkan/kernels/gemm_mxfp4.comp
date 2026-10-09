@@ -1,7 +1,9 @@
 #version 450
 
-// One workgroup per 256 output elements; the dispatch is
-// ceil(m * n / 256) workgroups via grid_x.
+// One 32-lane warp per output element; lane l sums blocks l, l+32, ... so
+// the activation and weight reads are coalesced across the warp. Eight
+// warps per 256-thread workgroup; the dispatch is ceil(m * n / 8)
+// workgroups via grid_x.
 layout(local_size_x = 256) in;
 
 // "gemm_mxfp4" contract (tessera API): buffer 0 is A (fp32, m x k),
@@ -26,6 +28,8 @@ layout(set = 0, binding = 2) buffer C {
   float c[];
 };
 
+shared float red[256];
+
 // Byte `offset` of the packed weight buffer viewed as uint words.
 uint wbyte(uint offset) {
   return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
@@ -38,34 +42,44 @@ const float kE2M1[16] = float[16](
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
 
 void main() {
-  uint idx = gl_GlobalInvocationID.x;
   uint m = pc.v[0];
   uint n = pc.v[2];
   uint k = pc.v[4];
-  if (idx >= m * n) {
-    return;
-  }
-  uint row_a = idx / n;
-  uint row_w = idx % n;
-  uint blocks = k / 32;
-  uint scale_base = (n * k) >> 1;
-  uint a_base = row_a * k;
-  uint w_base = row_w * k;
+  uint lid = gl_LocalInvocationID.x;
+  uint group = lid >> 5u;
+  uint lane = lid & 31u;
+  uint out_idx = gl_WorkGroupID.x * 8u + group;
+  uint total = m * n;
   float acc = 0.0;
-  for (uint b = 0; b < blocks; ++b) {
-    float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
-    uint base = b * 32;
-    // A 32-bit word holds eight nibbles, so load one word per eight
-    // elements instead of one byte per two. `w_base + base` is an element
-    // index; /2 gives bytes and /4 words, so the shift is 3.
-    uint word = (w_base + base) >> 3;
-    for (uint q = 0; q < 4; ++q) {
-      uint bits = w[word + q];
-      for (uint j = 0; j < 8; ++j) {
-        acc += a[a_base + base + q * 8 + j] * (scale * kE2M1[bits & 15u]);
-        bits >>= 4;
+  if (out_idx < total) {
+    uint row_a = out_idx / n;
+    uint row_w = out_idx % n;
+    uint blocks = k / 32u;
+    uint scale_base = (n * k) >> 1;
+    uint a_base = row_a * k;
+    uint w_base = row_w * k;
+    for (uint b = lane; b < blocks; b += 32u) {
+      float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
+      uint base = b * 32u;
+      // A 32-bit word holds eight nibbles, so load one word per eight
+      // elements. `w_base + base` is an element index, so the shift is 3.
+      uint word = (w_base + base) >> 3u;
+      for (uint q = 0u; q < 4u; ++q) {
+        uint bits = w[word + q];
+        for (uint j = 0u; j < 8u; ++j) {
+          acc += a[a_base + base + q * 8u + j] * (scale * kE2M1[bits & 15u]);
+          bits >>= 4;
+        }
       }
     }
   }
-  c[idx] = acc;
+  red[lid] = acc;
+  barrier();
+  if (lane == 0u && out_idx < total) {
+    float sum = 0.0;
+    for (uint t = 0u; t < 32u; ++t) {
+      sum += red[group * 32u + t];
+    }
+    c[out_idx] = sum;
+  }
 }

@@ -176,7 +176,9 @@ class Kernel {
 // weights W (n x k/2 blob bytes, two E2M1 nibbles per byte, followed by
 // the n x k/32 E8M0 scale bytes at offset n*k/2), buffer 2 the output C
 // (fp32, m x n); scalars are m, n, k with k a positive multiple of 32.
-// The dispatch is ceil(m * n / 256) workgroups of 256.
+// One 32-lane warp computes one output element (lane l sums blocks
+// l, l+32, ... for coalesced reads, then a shuffle reduces): the dispatch
+// is ceil(m * n / 8) workgroups of 256.
 // "gemm_q5k", "gemm_q6k", "gemm_q3k", "gemm_iq4nl", "gemm_iq4xs",
 // "gemm_iq3s", "gemm_q80": buffer 0 is A (fp32, m x k), buffer 1 the
 // quantized weights W, buffer 2 the output C (fp32, m x n); scalars

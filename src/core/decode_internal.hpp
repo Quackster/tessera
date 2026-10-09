@@ -369,13 +369,18 @@ inline std::expected<void, StatusCode> GatherEmbedding(
 
 // Grid rule shared by the GEMM launch helpers: a kernel id ending in
 // "_row" runs one workgroup per output element (coalesced reads across
-// the workgroup); every other quant/plain GEMM runs one thread per
-// output element with 256-thread workgroups. Both backends implement the
-// same ids, so the rule stays backend-agnostic.
+// the workgroup); "gemm_mxfp4" runs one 32-lane warp per output (eight
+// per 256-thread workgroup, coalesced reads across the warp); every other
+// quant/plain GEMM runs one thread per output element with 256-thread
+// workgroups. Both backends implement the same ids, so the rule stays
+// backend-agnostic.
 inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
                                  std::size_t n) {
   if (gemm.Id().ends_with("_row")) {
     return static_cast<std::uint32_t>(m * n);
+  }
+  if (gemm.Id() == "gemm_mxfp4") {
+    return static_cast<std::uint32_t>((m * n + 7) / 8);
   }
   return static_cast<std::uint32_t>((m * n + 255) / 256);
 }

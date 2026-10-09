@@ -1647,6 +1647,21 @@ through RADV GFX1201, rocm through the system ROCm).
    `AttentionQ4DeviceMatchesRef` and `AttentionFp8DeviceMatchesRef` cover
    the tiled paths.
 
+- 2026-10-09: **Warp-per-output MXFP4 GEMV (item 3b).** The m = 1
+   `gemm_mxfp4` decode read a whole weight row per thread, uncoalesced across
+   the warp, which the profile called the remaining item 3 lever. It now
+   assigns one 32-lane warp per output element: lane l sums blocks
+   `l, l+32, ...`, so consecutive lanes read consecutive MXFP4 blocks
+   (coalesced) and the activation row is read coalesced, then the lane
+   partials reduce with a shuffle (ROCm `__shfl_down`; Vulkan a 32-lane
+   shared-memory group, eight per 256-thread workgroup). The grid is
+   `ceil(m*n/8)` (`GemmGridFor` special-cases the id; the contract comment
+   and the MXFP4 device test follow). A/B on the 27B MXFP4 target (ROCm,
+   GPU0), three runs each of `EngineTest.MxFp4GeneratesWhenProvided`:
+   602-605 ms/token before, 559-560 ms/token after, a 7.5% decode
+   improvement with the same tokens (`11751, 13, 198, 760`), so the fp32
+   reassociation did not change the output. 271/271 `ctest` on both builds.
+
 ## Next (in order)
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
@@ -1827,7 +1842,10 @@ through RADV GFX1201, rocm through the system ROCm).
    Tiling saves nothing at a five-row batch, so (b) is where the decode
    time is. Applies on both backends. 2026-10-09: the
    attention_q8/attention_q4/attention_fp8 kernels are tiled now
-   (O(n * head_dim) per query/head, see the Done entry).
+   (O(n * head_dim) per query/head, see the Done entry), and the
+   `gemm_mxfp4` m = 1 decode runs warp-per-output with coalesced reads
+   (7.5% faster, see the Done entry). The same treatment on the Q4_K/Q5_K/
+   Q6_K/IQ4_XS decode GEMVs is still to do.
 4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
    explicitly told. A first slice lives in `src/serve/` (`/health`,
    `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,

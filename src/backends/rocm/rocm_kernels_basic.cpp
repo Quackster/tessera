@@ -362,22 +362,30 @@ __global__ void GemmFp8BlockKernel(const float* a, const unsigned char* w,
 __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
                                 float* c, unsigned long long m,
                                 unsigned long long n, unsigned long long k) {
-  unsigned long long idx =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= m * n) {
+  // One 32-lane warp per output element; lane l sums blocks l, l+32, ...,
+  // so the activation and weight reads are coalesced across the warp
+  // (consecutive lanes read consecutive blocks), then the lane partials
+  // are reduced with a shuffle. Grid: ceil(m*n / 8) workgroups of 256.
+  const unsigned long long warp =
+      (static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
+       threadIdx.x) /
+      32;
+  const unsigned long long lane = threadIdx.x & 31u;
+  const unsigned long long total = m * n;
+  if (warp >= total) {
     return;
   }
   const unsigned char* s = w + (n * k) / 2;
-  const unsigned long long row_a = idx / n;
-  const unsigned long long row_w = idx % n;
+  const unsigned long long row_a = warp / n;
+  const unsigned long long row_w = warp % n;
   const unsigned long long blocks = k / 32;
   const float* a_row = a + row_a * k;
-  float acc = 0.0f;
   // A 32-bit word holds eight nibbles. Row starts (row_w * k) and block
   // starts (b * 32) are multiples of 32 elements, so the byte offset is a
   // multiple of 16 and every word load is aligned.
   const unsigned int* words = reinterpret_cast<const unsigned int*>(w);
-  for (unsigned long long b = 0; b < blocks; ++b) {
+  float acc = 0.0f;
+  for (unsigned long long b = lane; b < blocks; b += 32) {
     const float scale = E8M0ToFloatDev(s[row_w * blocks + b]);
     const unsigned long long base = b * 32;
     // Element index / 8 gives the word index.
@@ -390,7 +398,12 @@ __global__ void GemmMxFp4Kernel(const float* a, const unsigned char* w,
       }
     }
   }
-  c[idx] = acc;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down(acc, offset);
+  }
+  if (lane == 0) {
+    c[warp] = acc;
+  }
 }
 
 // Built-in "gemm_mxfp4_batched": tiled C = A x dequant(W)^T for a batch.
