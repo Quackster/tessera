@@ -778,7 +778,16 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
       const unsigned int* wp = reinterpret_cast<const unsigned int*>(w);
       const unsigned long long ks_total = k / 16;
       const unsigned long long nt = n0 / 16;
-      for (int g = lane; g < 16 * (kWmmaDbk / 16); g += 32) {
+      // Each lane stages four 8-byte weight groups. Load all four (and their
+      // scale/fold index) first, then fold and store, so the cold weight
+      // reads are in flight together instead of one-at-a-time behind the
+      // fold (which left the verify latency-bound at ~193 GB/s).
+      WmmaU2 wvs[4];
+      int d0s[4];
+      int dst[4];
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        const int g = lane + u * 32;
         int r, cg;
         if (wperm != 0) {
           r = g % 16;
@@ -791,37 +800,39 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
         const int nrc = nr < static_cast<int>(n) ? nr : static_cast<int>(n) - 1;
         const unsigned long long kt0 =
             k0 + static_cast<unsigned long long>(cg * 16);
-        WmmaU2 wv;
         if (wperm != 0) {
           const unsigned long long base =
               ((nt * ks_total + kt0 / 16) * 2ull) * 16ull;
-          reinterpret_cast<unsigned int*>(&wv)[0] = wp[base + r];
-          reinterpret_cast<unsigned int*>(&wv)[1] = wp[base + 16 + r];
+          reinterpret_cast<unsigned int*>(&wvs[u])[0] = wp[base + r];
+          reinterpret_cast<unsigned int*>(&wvs[u])[1] = wp[base + 16 + r];
         } else {
-          wv = *reinterpret_cast<const WmmaU2*>(
+          wvs[u] = *reinterpret_cast<const WmmaU2*>(
               &w[(static_cast<unsigned long long>(nrc) * k + kt0) / 2]);
         }
         // One E8M0 scale covers this 16-wide group (a scale spans 32
-        // elements, the group starts on a 16 boundary); hoist the read.
+        // elements, the group starts on a 16 boundary).
         const int wref_n = static_cast<int>(wref[nrc]);
-        const int sbyte =
-            wref_n - static_cast<int>(scales[static_cast<unsigned long long>(nrc) *
-                                                 blocks +
-                                             (k0 + cg * 16) / 32]);
-        const int d0 = sbyte < 0 ? 0 : (sbyte > 15 ? 15 : sbyte);
+        const int sbyte = wref_n - static_cast<int>(
+            scales[static_cast<unsigned long long>(nrc) * blocks +
+                   (k0 + cg * 16) / 32]);
+        d0s[u] = sbyte < 0 ? 0 : (sbyte > 15 ? 15 : sbyte);
+        dst[u] = (wave * 16 + r) * kWmmaAstr + cg * 16;
+      }
+#pragma unroll
+      for (int u = 0; u < 4; ++u) {
         // Fold the 16 nibbles to 16 fp8 bytes with three v_perm per eight
         // nibbles (the served reference's trick) instead of a per-element
         // kMag load. d0's row of kMagDev holds the eight magnitude bytes;
         // the sign bit rides in each nibble's bit 3.
         const unsigned int t0 =
-            *reinterpret_cast<const unsigned int*>(&kMagDev[d0][0]);
+            *reinterpret_cast<const unsigned int*>(&kMagDev[d0s[u]][0]);
         const unsigned int t1 =
-            *reinterpret_cast<const unsigned int*>(&kMagDev[d0][4]);
+            *reinterpret_cast<const unsigned int*>(&kMagDev[d0s[u]][4]);
         unsigned int outw[4];
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           const unsigned int w32 =
-              reinterpret_cast<const unsigned int*>(&wv)[h];
+              reinterpret_cast<const unsigned int*>(&wvs[u])[h];
           const unsigned int ev = w32 & 0x0F0F0F0Fu;
           const unsigned int od = (w32 >> 4) & 0x0F0F0F0Fu;
           const unsigned int be =
@@ -833,8 +844,7 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
           outw[2 * h] = __builtin_amdgcn_perm(bo, be, 0x05010400u);
           outw[2 * h + 1] = __builtin_amdgcn_perm(bo, be, 0x07030602u);
         }
-        *reinterpret_cast<WmmaU4*>(
-            &sW[(wave * 16 + r) * kWmmaAstr + cg * 16]) =
+        *reinterpret_cast<WmmaU4*>(&sW[dst[u]]) =
             *reinterpret_cast<WmmaU4*>(outw);
       }
     }
