@@ -1822,6 +1822,35 @@ through RADV GFX1201, rocm through the system ROCm).
    projections are fused per layer, and one `Speculator`/`SpecTarget` seam
    plus `accept_greedy_prefix` is shared by MTP and DFlash.
 
+- 2026-10-09: **Greedy and speculation are one loop (`SpeculativeStrategy`
+   seam).** The engine had three parallel decode loops (`Generate` greedy,
+   `GenerateSpeculative` MTP, `GenerateDraft` DFlash2) and the public
+   `SpeculativeStrategy` was a skeleton DFlash2 did not implement. It is now a
+   real drafter seam with `Prepare`, `DraftBlock`, `CaptureLayers`,
+   `CaptureBuffers`, `OnAnchor`, `Draft` and `Commit`, mirroring hipfire's
+   `Speculator`/`SpecTarget`: the engine owns the target, the KV/recurrent
+   state and the single accept rule (`VerifyDraft`); the strategy owns the
+   draft model, the policy and the target-hidden capture buffers it reads.
+   `Engine::GenerateStreaming` is the one decode loop: with no strategy it is
+   plain greedy; when a strategy is attached it does prefill (per-token with
+   capture for a hidden-conditioned drafter, batched otherwise), then per
+   window `OnAnchor` -> `Draft` -> `VerifyDraft` -> `Commit` -> emit the
+   accepted prefix plus the bonus, capping at `max_tokens`. `GenerateDraft`
+   and `GenerateSpeculative` now attach a `CreateDFlash2Strategy()` /
+   `CreateMtpStrategy()` and run that loop; the old free function
+   `spec::GenerateDFlash2` and the `dflash2_generate.*` pair were deleted.
+   Behaviour is preserved: on the 27B MXFP4 target DFlash2 still accepts
+   106 of 168 (4.4 per step) and MTP still accepts 0 of 508 (output equals
+   greedy in both). The engine now logs prefill and decode throughput
+   separately (`prefill: N prompt token(s) ... prompt tok/s` and `decode: M
+   token(s) ... tok/s`), so prompt and decode are measured apart the way
+   hipfire's README reports pp8192 and decode. Measured (ROCm, GPU1, 128
+   tokens, 5-token prompt): greedy decode 25 tok/s (39 ms/token), DFlash2
+   decode 3 tok/s (295 ms/token), MTP 0 tok/s (1393 ms/token, no acceptance).
+   Both are far below hipfire on the same R9700 (DFlash 123 tok/s, MTP 68,
+   greedy ~200), so the next work is decode speed, not the seam. 275/275
+   `ctest` on both backends.
+
 ## Next (in order)
 
 - **Speculation (DFlash2 done, MTP broken).** DFlash2 acceptance is fixed

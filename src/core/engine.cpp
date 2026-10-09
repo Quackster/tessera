@@ -9,14 +9,10 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/sampling.hpp"
-#include "spec/dflash2_generate.hpp"
 
 namespace tessera {
 
 namespace {
-// MTP drafts per batched verification when the caller does not set one.
-constexpr std::size_t kDefaultMtpBlock = 4;
-
 // The stop set for one request: the model's declared stop tokens first, then
 // the caller's extras from GenerateOptions, without duplicates.
 std::vector<std::uint32_t> StopSet(const Model& model,
@@ -209,9 +205,17 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::GenerateDraft(
     Model& model, const GenerateOptions& options,
     const std::string& draft_path) {
-  const std::vector<std::uint32_t> stops = StopSet(model, options);
-  return spec::GenerateDFlash2(*backend_, model, options, draft_path, stops,
-                               &diagnostics_);
+  auto strategy = CreateDFlash2Strategy();
+  auto attached =
+      strategy->Attach(StrategyOptions{draft_path, options.draft_tokens});
+  if (!attached) {
+    return std::unexpected(attached.error());
+  }
+  auto previous = std::move(speculative_);
+  speculative_ = std::move(strategy);
+  auto produced = Generate(model, options);
+  speculative_ = std::move(previous);
+  return produced;
 }
 
 std::expected<std::vector<std::uint32_t>, StatusCode>
@@ -221,146 +225,14 @@ Engine::GenerateSpeculative(Model& model, const GenerateOptions& options) {
     return std::unexpected(config.error());
   }
   if (!config->hybrid) {
-    diagnostics_.Warn("engine",
-                      "GenerateSpeculative: MTP needs a hybrid model");
+    diagnostics_.Warn("engine", "GenerateSpeculative: MTP needs a hybrid model");
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  core::DecodeCache cache;
-  cache.kv_type = options.kv_type;
-  std::vector<std::uint32_t> prompt = options.prompt_tokens;
-  if (prompt.empty()) {
-    prompt.push_back(options.first_token);
-  }
-  // A zero count fills the remaining context.
-  const std::size_t max_tokens =
-      model.EffectiveMaxTokens(prompt.size(), options.max_tokens);
-  if (max_tokens == 0) {
-    return std::vector<std::uint32_t>{};
-  }
-  const auto started = std::chrono::steady_clock::now();
-  std::size_t proposed = 0;
-  std::size_t accepted = 0;
-  std::size_t steps = 0;
-  std::vector<float> hidden;
-  std::vector<float> current;
-  auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden);
-  if (!logits) {
-    diagnostics_.Warn("engine", std::string("speculative prefill failed: ") +
-                                    std::string(ToString(logits.error())));
-    return std::unexpected(logits.error());
-  }
-  current = std::move(*logits);
-  std::vector<std::uint32_t> produced;
-  produced.reserve(max_tokens);
-  const Architecture* arch = model.Arch();
-  std::uint64_t pos = prompt.size();
-  const std::vector<std::uint32_t> stops = StopSet(model, options);
-  std::uint32_t next = core::detail::ArgMax(current);
-  bool stopped = false;
-  // Number of MTP tokens to draft before one batched verification forward.
-  const std::size_t block =
-      options.draft_tokens > 0 ? options.draft_tokens : kDefaultMtpBlock;
-  while (produced.size() < max_tokens) {
-    if (core::detail::IsStopToken(next, stops)) {
-      stopped = true;
-      break;
-    }
-    produced.push_back(next);
-    if (produced.size() >= max_tokens) {
-      break;
-    }
-    // Advance the target cache by the token just emitted; `current`/`hidden`
-    // now describe that token's position.
-    auto fed = core::DecodeLogits(*backend_, model, cache, next, &hidden);
-    if (!fed) {
-      diagnostics_.Warn(
-          "engine", std::string("speculative step failed: ") +
-                        std::string(ToString(fed.error())));
-      return std::unexpected(fed.error());
-    }
-    current = std::move(*fed);
-    ++pos;
-    // Draft up to `block` tokens by chaining the MTP head (each draft fuses
-    // the target hidden with the previous draft token).
-    const std::size_t mtp_base = arch != nullptr ? arch->DraftRows(cache) : 0;
-    std::vector<std::uint32_t> drafts;
-    std::vector<float> chain = hidden;
-    std::uint32_t tok = next;
-    std::uint64_t p = pos;
-    bool mtp_missing = false;
-    for (std::size_t i = 0; i < block; ++i) {
-      std::vector<float> next_chain;
-      auto draft =
-          core::MtpDraftStep(*backend_, model, cache, chain, tok, p, &next_chain);
-      if (!draft) {
-        if (draft.error() != StatusCode::UnsupportedFeature) {
-          return std::unexpected(draft.error());
-        }
-        mtp_missing = true;
-        break;
-      }
-      drafts.push_back(*draft);
-      chain = std::move(next_chain);
-      tok = *draft;
-      ++p;
-    }
-    if (mtp_missing) {
-      // No MTP head: fall back to the target's greedy token.
-      if (arch != nullptr) {
-        arch->DraftTruncate(cache, mtp_base);
-      }
-      next = core::detail::ArgMax(current);
-      continue;
-    }
-    // One batched target forward scores every draft; accept the matching
-    // prefix and roll the MTP key/value cache back to it.
-    auto verify =
-        core::VerifyDraft(*backend_, model, cache, drafts, current, &hidden);
-    if (!verify) {
-      return std::unexpected(verify.error());
-    }
-    proposed += drafts.size();
-    accepted += verify->accepted;
-    ++steps;
-    if (arch != nullptr) {
-      arch->DraftTruncate(cache, mtp_base + verify->accepted);
-    }
-    for (std::size_t i = 0; i < verify->accepted; ++i) {
-      if (core::detail::IsStopToken(drafts[i], stops)) {
-        stopped = true;
-        break;
-      }
-      produced.push_back(drafts[i]);
-      if (produced.size() >= max_tokens) {
-        break;
-      }
-    }
-    if (stopped || produced.size() >= max_tokens) {
-      break;
-    }
-    current = std::move(verify->logits);
-    next = verify->next_token;
-    pos += verify->accepted;
-  }
-  if (stopped) {
-    diagnostics_.Info("engine",
-                      "speculative: stopped at a declared stop token");
-  }
-  diagnostics_.Info("engine",
-                    "speculative: accepted " + std::to_string(accepted) +
-                        " of " + std::to_string(proposed) +
-                        " draft token(s) over " + std::to_string(steps) +
-                        " step(s)");
-  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - started)
-                           .count();
-  const std::string per_token =
-      produced.empty()
-          ? std::string()
-          : " (" + std::to_string(elapsed / produced.size()) + " ms/token)";
-  diagnostics_.Info("engine", "generated " + std::to_string(produced.size()) +
-                                  " token(s) in " + std::to_string(elapsed) +
-                                  " ms" + per_token);
+  auto strategy = CreateMtpStrategy();
+  auto previous = std::move(speculative_);
+  speculative_ = std::move(strategy);
+  auto produced = Generate(model, options);
+  speculative_ = std::move(previous);
   return produced;
 }
 
@@ -396,12 +268,6 @@ std::expected<void, StatusCode> Engine::AttachSpeculative(
 std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
     Model& model, const GenerateOptions& options,
     const std::function<bool(std::uint32_t)>& on_token) {
-  const auto started = std::chrono::steady_clock::now();
-  const auto elapsed_ms = [&started]() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now() - started)
-        .count();
-  };
   if (options.sample) {
     const SamplingOptions& p = options.sampling;
     if (!(p.temperature >= 0.0f) || !(p.top_p > 0.0f && p.top_p <= 1.0f) ||
@@ -424,26 +290,97 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   if (max_tokens == 0) {
     return 0;
   }
-  // Prefill: only the last prompt token needs logits, so every earlier
-  // token runs the block forward without the vocab-sized output head.
+  // The speculative strategy (null on the plain greedy path). The engine owns
+  // the target and the accept rule; the strategy owns the draft.
+  SpeculativeStrategy* strategy = speculative_.get();
+  std::vector<std::size_t> capture_layers;
+  std::vector<Buffer*> capture_buffers;
+  if (strategy != nullptr) {
+    auto prepared = strategy->Prepare(*backend_, model);
+    if (!prepared) {
+      diagnostics_.Warn("engine", "strategy prepare failed: " +
+                                      std::string(ToString(prepared.error())));
+      return std::unexpected(prepared.error());
+    }
+    const std::span<const std::size_t> layers = strategy->CaptureLayers();
+    capture_layers.assign(layers.begin(), layers.end());
+    const std::span<Buffer* const> buffers = strategy->CaptureBuffers();
+    capture_buffers.assign(buffers.begin(), buffers.end());
+  }
+  const bool capturing = !capture_layers.empty();
+  const std::vector<std::size_t>* capture_layers_ptr =
+      capturing ? &capture_layers : nullptr;
+  std::vector<Buffer*>* capture_ptr = capturing ? &capture_buffers : nullptr;
+
+  // The prefill clock starts after strategy preparation, so a one-time draft
+  // weight load is not billed to the prompt.
+  const auto prefill_started = std::chrono::steady_clock::now();
   if (options.progress_every > 0) {
     diagnostics_.Info("engine", std::string("prefill: ") +
                                     std::to_string(prompt.size()) +
                                     " prompt token(s)");
   }
-  auto first_logits = core::PrefillTokens(*backend_, model, cache, prompt);
-  if (!first_logits) {
-    diagnostics_.Warn("engine", std::string("prefill failed: ") +
-                                    std::string(ToString(first_logits.error())));
-    return std::unexpected(first_logits.error());
+  std::vector<float> hidden;
+  std::vector<float> first_logits;
+  if (capturing) {
+    // A hidden-conditioned drafter needs every prompt position's residual
+    // hidden, so prefill one token at a time and append it to the draft
+    // context (hipfire batches this in spec_advance; a per-token prefill is
+    // the correctness-preserving version).
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+      const bool last = i + 1 == prompt.size();
+      if (last) {
+        auto logits = core::DecodeLogits(*backend_, model, cache, prompt[i],
+                                         &hidden, capture_layers_ptr,
+                                         capture_ptr);
+        if (!logits) {
+          diagnostics_.Warn("engine",
+                            std::string("prefill failed: ") +
+                                std::string(ToString(logits.error())));
+          return std::unexpected(logits.error());
+        }
+        first_logits = std::move(*logits);
+      } else {
+        auto step = core::DecodeForward(*backend_, model, cache, prompt[i],
+                                        &hidden, nullptr, capture_layers_ptr,
+                                        capture_ptr);
+        if (!step) {
+          diagnostics_.Warn("engine",
+                            std::string("prefill failed: ") +
+                                std::string(ToString(step.error())));
+          return std::unexpected(step.error());
+        }
+      }
+      auto anchored =
+          strategy->OnAnchor(*backend_, model, cache, prompt[i], i, hidden);
+      if (!anchored) {
+        return std::unexpected(anchored.error());
+      }
+    }
+  } else {
+    auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden);
+    if (!logits) {
+      diagnostics_.Warn("engine", std::string("prefill failed: ") +
+                                      std::string(ToString(logits.error())));
+      return std::unexpected(logits.error());
+    }
+    first_logits = std::move(*logits);
   }
 
-  if (options.progress_every > 0) {
+  const long long prefill_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - prefill_started)
+          .count();
+  if (options.progress_every > 0 && prefill_ms > 0) {
+    const long long prompt_tps =
+        static_cast<long long>(prompt.size()) * 1000 / prefill_ms;
     diagnostics_.Info("engine",
                       std::string("prefill: ") + std::to_string(prompt.size()) +
-                          " token(s) in " + std::to_string(elapsed_ms()) +
-                          " ms");
+                          " prompt token(s) in " + std::to_string(prefill_ms) +
+                          " ms (" + std::to_string(prompt_tps) +
+                          " prompt tok/s)");
   }
+  const auto decode_started = std::chrono::steady_clock::now();
   std::mt19937_64 rng(options.seed);
   std::vector<std::uint32_t> history = prompt;
   const std::vector<std::uint32_t> stops = StopSet(model, options);
@@ -452,10 +389,19 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
                ? core::SampleToken(logits, options.sampling, history, rng)
                : core::detail::ArgMax(logits);
   };
-  std::uint32_t next = pick(*first_logits);
+  std::size_t block = strategy != nullptr ? strategy->DraftBlock() : 0;
+  if (options.draft_tokens > 0 && options.draft_tokens < block) {
+    block = options.draft_tokens;
+  }
+  std::vector<std::uint32_t> drafts(block);
+  std::uint32_t next = pick(first_logits);
+  std::uint64_t position = prompt.size();
   std::size_t produced = 0;
+  std::size_t spec_proposed = 0;
+  std::size_t spec_accepted = 0;
+  std::size_t spec_steps = 0;
   bool stopped = false;
-  for (std::size_t step = 0; step < max_tokens; ++step) {
+  while (produced < max_tokens) {
     if (core::detail::IsStopToken(next, stops)) {
       stopped = true;
       break;
@@ -464,33 +410,104 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       break;
     }
     ++produced;
-    if (step + 1 == max_tokens) {
+    if (produced >= max_tokens) {
       break;
     }
     history.push_back(next);
-    auto logits = core::DecodeLogits(*backend_, model, cache, next);
+    // Advance the target by the just-emitted token. `hidden` describes its
+    // position, which the drafter chains from.
+    auto logits = core::DecodeLogits(*backend_, model, cache, next, &hidden,
+                                     capture_layers_ptr, capture_ptr);
     if (!logits) {
       diagnostics_.Warn(
-          "engine", std::string("generation step ") + std::to_string(step) +
-                        " failed: " + std::string(ToString(logits.error())));
+          "engine", std::string("generation step failed: ") +
+                        std::string(ToString(logits.error())));
       return std::unexpected(logits.error());
     }
+    if (strategy != nullptr && block > 0) {
+      auto anchored = strategy->OnAnchor(*backend_, model, cache, next,
+                                         position, hidden);
+      if (!anchored) {
+        return std::unexpected(anchored.error());
+      }
+      auto count =
+          strategy->Draft(*backend_, model, cache, *logits, next, drafts);
+      if (!count) {
+        return std::unexpected(count.error());
+      }
+      if (*count > 0) {
+        std::span<const std::uint32_t> proposal(drafts.data(), *count);
+        auto verify = core::VerifyDraft(*backend_, model, cache, proposal,
+                                        *logits, &hidden, capture_layers_ptr,
+                                        capture_ptr);
+        if (!verify) {
+          return std::unexpected(verify.error());
+        }
+        auto committed = strategy->Commit(*backend_, model, cache,
+                                          verify->accepted);
+        if (!committed) {
+          return std::unexpected(committed.error());
+        }
+        spec_proposed += *count;
+        spec_accepted += verify->accepted;
+        ++spec_steps;
+        for (std::size_t i = 0; i < verify->accepted; ++i) {
+          if (produced >= max_tokens) {
+            break;
+          }
+          if (core::detail::IsStopToken(drafts[i], stops)) {
+            stopped = true;
+            break;
+          }
+          if (!on_token(drafts[i])) {
+            stopped = true;
+            break;
+          }
+          history.push_back(drafts[i]);
+          ++produced;
+        }
+        if (stopped || produced >= max_tokens) {
+          break;
+        }
+        next = verify->next_token;
+        position += 1 + verify->accepted;
+        continue;
+      }
+    }
     next = pick(*logits);
+    ++position;
   }
   if (stopped) {
     diagnostics_.Info("engine", std::string("stopped at declared stop token ") +
                                     std::to_string(next));
   }
+  if (spec_steps > 0) {
+    diagnostics_.Info("engine",
+                      "speculative: accepted " + std::to_string(spec_accepted) +
+                          " of " + std::to_string(spec_proposed) +
+                          " draft token(s) over " + std::to_string(spec_steps) +
+                          " step(s)");
+  }
   if (produced > 0) {
-    const long long ms = elapsed_ms();
+    const long long decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() -
+                                    decode_started)
+                                    .count();
+    const long long decode_tps =
+        decode_ms > 0
+            ? static_cast<long long>(produced) * 1000 / decode_ms
+            : 0;
     diagnostics_.Info(
-        "engine", std::string("generated ") + std::to_string(produced) +
-                      " token(s) in " + std::to_string(ms) + " ms (" +
-                      std::to_string(ms / static_cast<long long>(produced)) +
+        "engine", std::string("decode: ") + std::to_string(produced) +
+                      " token(s) in " + std::to_string(decode_ms) + " ms (" +
+                      std::to_string(decode_tps) + " tok/s, " +
+                      std::to_string(decode_ms /
+                                     static_cast<long long>(produced)) +
                       " ms/token)");
   }
   return produced;
 }
+
 
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(
     Model& model, const GenerateOptions& options) {
