@@ -3939,6 +3939,86 @@ TEST(BackendTest, DeltaStepHeadsDeviceMatchesRef) {
   }
 }
 
+// Device: with a non-zero state stride the delta step writes each row's
+// post-state to its own history slot (row t reads slot t, writes slot t+1),
+// which is what lets a batched verify restore any accepted prefix.
+TEST(BackendTest, DeltaStepHeadsAppendsRowStates) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(94);
+  constexpr std::size_t kHeads = 2, kDk = 8, kDv = 6, kRows = 3;
+  const std::size_t state_len = kHeads * kDk * kDv;
+  const std::size_t kd = kHeads * kDk, vd = kHeads * kDv;
+  std::vector<float> state((kRows + 1) * state_len);
+  for (auto& x : state) x = DrawValue(rng);
+  std::vector<float> k(kRows * kd), v(kRows * vd), q(kRows * kd);
+  std::vector<float> alpha(kRows * kHeads, 0.9f), beta(kRows * kHeads, 0.5f);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  for (auto& x : q) x = DrawValue(rng);
+  auto mk = [&](std::size_t n) {
+    return backend->AllocateBuffer(n * 4, MemoryKind::Device);
+  };
+  auto s_buf = mk(state.size()), k_buf = mk(k.size()), v_buf = mk(v.size());
+  auto q_buf = mk(q.size()), o_buf = mk(kRows * vd);
+  auto al_buf = mk(alpha.size()), be_buf = mk(beta.size());
+  ASSERT_TRUE(s_buf && k_buf && v_buf && q_buf && o_buf && al_buf && be_buf);
+  const auto upload = [&backend](auto& buf, const std::vector<float>& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(s_buf, state).has_value());
+  ASSERT_TRUE(upload(k_buf, k).has_value());
+  ASSERT_TRUE(upload(v_buf, v).has_value());
+  ASSERT_TRUE(upload(q_buf, q).has_value());
+  ASSERT_TRUE(upload(al_buf, alpha).has_value());
+  ASSERT_TRUE(upload(be_buf, beta).has_value());
+  auto kernel = backend->LoadKernel("delta_step_heads", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kHeads * kDv + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*s_buf).get(), (*k_buf).get(), (*v_buf).get(),
+                    (*q_buf).get(), (*o_buf).get(), (*al_buf).get(),
+                    (*be_buf).get()};
+  launch.scalars = {kHeads, kDk, kDv, kRows, 0, state_len, 0};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  // Reference: apply the single-step recurrence row by row, recording each
+  // post-state into slot t+1.
+  std::vector<float> ref_state(state);
+  std::vector<float> o_ref(kRows * vd);
+  for (std::size_t t = 0; t < kRows; ++t) {
+    std::vector<float> slot(ref_state.begin() + t * state_len,
+                            ref_state.begin() + (t + 1) * state_len);
+    ASSERT_TRUE(core::DeltaStepHeadsRef(
+                    std::span<float>(slot),
+                    std::span<const float>(k.data() + t * kd, kd),
+                    std::span<const float>(v.data() + t * vd, vd),
+                    std::span<const float>(q.data() + t * kd, kd),
+                    std::span<float>(o_ref.data() + t * vd, vd),
+                    std::span<const float>(alpha.data() + t * kHeads, kHeads),
+                    std::span<const float>(beta.data() + t * kHeads, kHeads),
+                    kHeads, kDk, kDv)
+                    .has_value());
+    std::copy(slot.begin(), slot.end(),
+              ref_state.begin() + (t + 1) * state_len);
+  }
+  std::vector<std::byte> o_back(kRows * vd * 4), s_back(state.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**o_buf, o_back.data(), o_back.size())
+                  .has_value());
+  ASSERT_TRUE(backend->CopyD2H(**s_buf, s_back.data(), s_back.size())
+                  .has_value());
+  const auto* got_o = reinterpret_cast<const float*>(o_back.data());
+  const auto* got_s = reinterpret_cast<const float*>(s_back.data());
+  for (std::size_t i = 0; i < o_ref.size(); ++i) {
+    EXPECT_NEAR(got_o[i], o_ref[i], 1e-4f);
+  }
+  for (std::size_t i = 0; i < state.size(); ++i) {
+    EXPECT_NEAR(got_s[i], ref_state[i], 1e-4f);
+  }
+}
+
 // Device: the current-step conv matches the host reference.
 TEST(BackendTest, Conv1dStepDeviceMatchesRef) {
   std::unique_ptr<Backend> backend;

@@ -1285,16 +1285,18 @@ __global__ void DeltaStepHeadsKernel(
   const unsigned long long d = idx % dv;
   const unsigned long long s_base = h * dk * dv;
   // The input state is at sbase and the updated state at sbase + sstride; a
-  // zero stride advances in place, a non-zero one appends the post-step state
-  // to the next history slot so a verify can restore any accepted prefix
-  // without a per-row device copy.
-  const unsigned long long s_rd = sbase + s_base;
-  const unsigned long long s_wr = sbase + sstride + s_base;
+  // zero stride advances in place, a non-zero one appends each row's
+  // post-step state to its own history slot (row t reads slot t, writes slot
+  // t+1) so a verify can restore any accepted prefix without a per-row
+  // device copy.
+  const unsigned long long s_base_in = sbase + s_base;
   const unsigned long long k_base = h * dk;
   const unsigned long long v_base = h * dv;
   // Rows share the recurrent state and advance it in turn, so a whole
   // sequence costs one launch (rows = 1 is the single-token step).
   for (unsigned long long t = 0; t < rows; ++t) {
+    const unsigned long long s_rd = s_base_in + t * sstride;
+    const unsigned long long s_wr = s_base_in + (t + 1) * sstride;
     const float* kt = k + t * heads * dk;
     const float* vt = v + t * heads * dv;
     const float* qt = q + t * heads * dk;
