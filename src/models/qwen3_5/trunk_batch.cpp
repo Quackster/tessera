@@ -212,15 +212,28 @@ std::expected<void, StatusCode> RunFullBlockBatch(
                    cfg.attention.rope_theta)) {
     return std::unexpected(StatusCode::DeviceError);
   }
+  // F32 caches append straight from the batch K/V at row t (no scratch
+  // round-trip); the cast/quant paths still copy the row first.
+  const bool kv_f32 = kv.type == KvCacheType::F32;
   for (std::size_t t = 0; t < rows; ++t) {
-    if (!backend.CopyD2D(*b.kf, t * kv_dim * 4, *h.kf, 0, kv_dim * 4) ||
-        !backend.CopyD2D(*b.vf, t * kv_dim * 4, *h.vf, 0, kv_dim * 4)) {
-      return std::unexpected(StatusCode::DeviceError);
+    const Buffer* ksrc = b.kf.get();
+    const Buffer* vsrc = b.vf.get();
+    std::size_t row_offset = 0;
+    if (kv_f32) {
+      row_offset = t * kv_dim * 4;
+    } else {
+      if (!backend.CopyD2D(*b.kf, t * kv_dim * 4, *h.kf, 0, kv_dim * 4) ||
+          !backend.CopyD2D(*b.vf, t * kv_dim * 4, *h.vf, 0, kv_dim * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      ksrc = h.kf.get();
+      vsrc = h.vf.get();
     }
     if (auto appended =
             AppendKv(backend, h.cast_kernel.get(), h.quant_kernel.get(),
                      h.kv_scratch.get(), h.kv_scratch.get(),
-                     h.scale_scratch.get(), kv, *h.kf, *h.vf, kv_dim);
+                     h.scale_scratch.get(), kv, *ksrc, *vsrc, kv_dim,
+                     row_offset);
         !appended) {
       return std::unexpected(appended.error());
     }

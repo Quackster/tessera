@@ -226,7 +226,8 @@ template <typename Kv>
 inline std::expected<void, StatusCode> AppendKv(
     Backend& backend, const Kernel* cast, const Kernel* quant,
     Buffer* f16_scratch, Buffer* q8_scratch, Buffer* scale_scratch, Kv& kv,
-    const Buffer& k_row, const Buffer& v_row, std::size_t kv_dim) {
+    const Buffer& k_row, const Buffer& v_row, std::size_t kv_dim,
+    std::size_t row_byte_offset = 0) {
   const std::size_t row_bytes =
       kv.type == KvCacheType::F32   ? kv_dim * 4
       : kv.type == KvCacheType::F16 ? kv_dim * 2
@@ -275,7 +276,8 @@ inline std::expected<void, StatusCode> AppendKv(
   const auto store = [&](const Buffer& row, Buffer& dst,
                          Buffer* scale_dst) -> bool {
     if (kv.type == KvCacheType::F32) {
-      return backend.CopyD2D(row, 0, dst, kv.rows * row_bytes, row_bytes)
+      return backend
+          .CopyD2D(row, row_byte_offset, dst, kv.rows * row_bytes, row_bytes)
           .has_value();
     }
     if (kv.type == KvCacheType::F16) {
