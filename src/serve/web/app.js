@@ -7,6 +7,10 @@ let currentMessages = [];
 let streaming = false;
 let paused = false;
 let readerAbort = null;
+// Turn tokens: only the newest turn may draw or reset the controls,
+// so a stale turn never paints over the current view.
+let activeTurn = 0;
+let streamingId = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -202,7 +206,10 @@ async function openSession(id) {
 
 // Stream one turn (chat or retry) over `base` history: the user bubble
 // and an empty assistant show instantly, then live deltas fill in.
-async function streamTurn(path, payload, base) {
+// Only this turn (by token) may draw or reset the controls.
+async function streamTurn(path, payload, base, sid) {
+  const myTurn = ++activeTurn;
+  streamingId = sid;
   const key = apiKey();
   const headers = {'Content-Type': 'application/json'};
   if (key) headers['x-api-key'] = key;
@@ -216,6 +223,7 @@ async function streamTurn(path, payload, base) {
   let thinking = '';
   let content = '';
   const draw = (thinkingOpen) => {
+    if (myTurn !== activeTurn) return;
     renderMessages(base.concat([{
       role: 'assistant',
       content,
@@ -265,9 +273,11 @@ async function streamTurn(path, payload, base) {
   } catch (error) {
     if (error.name !== 'AbortError') showError(String(error));
   } finally {
+    if (myTurn !== activeTurn) return;
     streaming = false;
     paused = false;
     readerAbort = null;
+    streamingId = null;
     updateControls();
     // Authoritative state (stopped flags, usage) comes from the server.
     try {
@@ -281,6 +291,11 @@ async function sendMessage() {
   const input = $('input');
   const text = input.value.trim();
   if (!text || streaming) return;
+  // Claim the turn synchronously: a second Enter/click while the
+  // session opens must not start a duplicate generation.
+  streaming = true;
+  updateControls();
+  setStatus('Sending\u2026');
   // No session yet: open one first, the message is not lost.
   if (!currentId) {
     try {
@@ -288,6 +303,9 @@ async function sendMessage() {
       currentId = created.id;
       await refreshSessions();
     } catch (error) {
+      streaming = false;
+      updateControls();
+      setStatus('Ready');
       showError(String(error));
       return;
     }
@@ -306,7 +324,7 @@ async function sendMessage() {
     stream: true,
     max_tokens: Number($('max-tokens').value) || 512,
     enable_thinking: $('thinking').checked,
-  }, base);
+  }, base, currentId);
 }
 
 async function retryTurn() {
@@ -321,20 +339,27 @@ async function retryTurn() {
     stream: true,
     max_tokens: Number($('max-tokens').value) || 512,
     enable_thinking: $('thinking').checked,
-  }, base);
+  }, base, currentId);
+}
+
+// Controls target the live turn when one runs, else the open session.
+function controlId() {
+  return streamingId || currentId;
 }
 
 async function stopTurn() {
-  if (!currentId) return;
-  try { await api('POST', '/api/sessions/' + currentId + '/stop'); }
+  const id = controlId();
+  if (!id) return;
+  try { await api('POST', '/api/sessions/' + id + '/stop'); }
   catch (error) { showError(String(error)); }
   if (readerAbort) readerAbort.abort();
 }
 
 async function pauseTurn() {
-  if (!currentId) return;
+  const id = controlId();
+  if (!id) return;
   try {
-    await api('POST', '/api/sessions/' + currentId + '/pause');
+    await api('POST', '/api/sessions/' + id + '/pause');
     paused = true;
     updateControls();
     setStatus('Paused');
@@ -342,9 +367,10 @@ async function pauseTurn() {
 }
 
 async function resumeTurn() {
-  if (!currentId) return;
+  const id = controlId();
+  if (!id) return;
   try {
-    await api('POST', '/api/sessions/' + currentId + '/resume');
+    await api('POST', '/api/sessions/' + id + '/resume');
     paused = false;
     updateControls();
     setStatus('Generating\u2026');
