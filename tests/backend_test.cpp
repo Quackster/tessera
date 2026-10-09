@@ -639,7 +639,7 @@ TEST(BackendTest, GemmMxFp4WmmaDeviceMatchesRef) {
     tessera::Buffer* dst = split > 1 ? part_buf->get() : c_buf->get();
     launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*as_buf).get(),
                       (*wref_buf).get(), dst};
-    launch.scalars = {kM, kN, kK, split};
+    launch.scalars = {kM, kN, kK, split, 0};
     ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
     if (split > 1) {
       tessera::KernelLaunch rl;
@@ -668,6 +668,39 @@ TEST(BackendTest, GemmMxFp4WmmaDeviceMatchesRef) {
         << "backend " << backend->Name() << " split " << split << " max_rel "
         << max_rel;
   }
+  // The fragment-order (WPERM) weight read must give the same result.
+  std::vector<std::byte> wperm_nibbles(kN * kK / 2);
+  ASSERT_TRUE(core::PermuteMxFp4ToWmma(w, wperm_nibbles, kN, kK).has_value());
+  std::vector<std::byte> wperm_packed = wperm_nibbles;
+  wperm_packed.insert(wperm_packed.end(), scales.begin(), scales.end());
+  auto wperm_buf =
+      backend->AllocateBuffer(wperm_packed.size(), MemoryKind::Device);
+  ASSERT_TRUE(wperm_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**wperm_buf,
+                               std::span<const std::byte>(wperm_packed))
+                  .has_value());
+  tessera::KernelLaunch wl;
+  wl.grid_x = static_cast<std::uint32_t>((kN + 63) / 64);
+  wl.block_x = 128;
+  wl.buffers = {(*a_buf).get(), (*wperm_buf).get(), (*as_buf).get(),
+                (*wref_buf).get(), (*c_buf).get()};
+  wl.scalars = {kM, kN, kK, 1ull, 1ull};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, wl).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> wperm_readback(kM * kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**c_buf, wperm_readback.data(),
+                               wperm_readback.size())
+                  .has_value());
+  const auto* wperm_got =
+      reinterpret_cast<const float*>(wperm_readback.data());
+  float wperm_abs = 0.0f, wperm_rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    const float e = std::abs(wperm_got[i] - ref[i]);
+    wperm_abs = std::max(wperm_abs, e);
+    wperm_rel = std::max(wperm_rel, e / std::max(1.0f, std::abs(ref[i])));
+  }
+  EXPECT_LE(wperm_abs, tol.abs) << "wperm max_abs " << wperm_abs;
+  EXPECT_LE(wperm_rel, tol.rel) << "wperm max_rel " << wperm_rel;
 }
 
 TEST(BackendTest, GemmBf16WmmaDeviceMatchesRef) {
@@ -773,7 +806,7 @@ TEST(BackendTest, GemmMxFp4WmmaThroughput) {
       launch.block_x = 128;
       launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*as_buf).get(),
                         (*wref_buf).get(), (*c_buf).get()};
-      launch.scalars = {kM, kN, kK, split};
+      launch.scalars = {kM, kN, kK, split, 0};
       for (int i = 0; i < 5; ++i) ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
       backend->Synchronize();
       const auto t0 = std::chrono::steady_clock::now();

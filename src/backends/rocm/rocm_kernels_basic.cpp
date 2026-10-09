@@ -734,7 +734,8 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
                                     const unsigned char* wref, float* c,
                                     unsigned long long m, unsigned long long n,
                                     unsigned long long k,
-                                    unsigned long long split) {
+                                    unsigned long long split,
+                                    unsigned long long wperm) {
   __shared__ unsigned char sA[16 * kWmmaAstr];
   __shared__ unsigned char sW[kWmmaDwn * 16 * kWmmaAstr];
   const int tid = threadIdx.x;
@@ -771,14 +772,35 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
     // W tile: DBK/16 groups of 16 nibbles per row, folded to 16 fp8 bytes.
     // Each wave stages its own 16 columns (its 32 lanes cover the groups).
     if (n0 < n) {
+      // With wperm the weight is fragment order [n-tile][k-step][half][row][4];
+      // a row's 16 nibbles are two 4-byte halves 64 bytes apart, and
+      // consecutive lanes take consecutive rows so the read coalesces.
+      const unsigned int* wp = reinterpret_cast<const unsigned int*>(w);
+      const unsigned long long ks_total = k / 16;
+      const unsigned long long nt = n0 / 16;
       for (int g = lane; g < 16 * (kWmmaDbk / 16); g += 32) {
-        const int r = g / (kWmmaDbk / 16), cg = g % (kWmmaDbk / 16);
+        int r, cg;
+        if (wperm != 0) {
+          r = g % 16;
+          cg = g / 16;
+        } else {
+          r = g / (kWmmaDbk / 16);
+          cg = g % (kWmmaDbk / 16);
+        }
         const int nr = static_cast<int>(n0) + r;
         const int nrc = nr < static_cast<int>(n) ? nr : static_cast<int>(n) - 1;
         const unsigned long long kt0 =
             k0 + static_cast<unsigned long long>(cg * 16);
-        const WmmaU2 wv = *reinterpret_cast<const WmmaU2*>(
-            &w[(static_cast<unsigned long long>(nrc) * k + kt0) / 2]);
+        WmmaU2 wv;
+        if (wperm != 0) {
+          const unsigned long long base =
+              ((nt * ks_total + kt0 / 16) * 2ull) * 16ull;
+          reinterpret_cast<unsigned int*>(&wv)[0] = wp[base + r];
+          reinterpret_cast<unsigned int*>(&wv)[1] = wp[base + 16 + r];
+        } else {
+          wv = *reinterpret_cast<const WmmaU2*>(
+              &w[(static_cast<unsigned long long>(nrc) * k + kt0) / 2]);
+        }
         // One E8M0 scale covers this 16-wide group (a scale spans 32
         // elements, the group starts on a 16 boundary); hoist the read.
         const int wref_n = static_cast<int>(wref[nrc]);

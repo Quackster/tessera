@@ -152,7 +152,7 @@ std::expected<bool, StatusCode> ProjectWmma(Backend& backend, Qwen35State& h,
   wl.grid_y = static_cast<std::uint32_t>(split);
   wl.block_x = 128;
   wl.buffers = {h.wmma_a.get(), &w, h.wmma_as.get(), wref, dst};
-  wl.scalars = {m, n, k, split};
+  wl.scalars = {m, n, k, split, 0};
   if (auto st = backend.LaunchKernel(*h.mxfp4_wmma_kernel, wl); !st) {
     return std::unexpected(st.error());
   }
