@@ -197,8 +197,9 @@ std::expected<void, StatusCode> RunFullBlock(
       !appended) {
     return std::unexpected(appended.error());
   }
-  const bool quantized =
-      kv.type == KvCacheType::Q8 || kv.type == KvCacheType::Q4;
+  const bool quantized = kv.type == KvCacheType::Q8 ||
+                         kv.type == KvCacheType::Q4 ||
+                         kv.type == KvCacheType::FP8;
   const bool attention_ok =
       quantized
           ? detail::AttentionQuantDevice(backend, *h.attention_kernel, *h.q,
@@ -241,9 +242,10 @@ std::expected<void, StatusCode> EnsureHybridReady(
         !load(h.qgate_split_kernel, "qgate_split") ||
         !load(h.mrope_kernel, "mrope") ||
         !load(h.attention_kernel,
-              cache.kv_type == KvCacheType::Q8   ? "attention_q8"
-              : cache.kv_type == KvCacheType::Q4 ? "attention_q4"
-                                                 : "attention") ||
+              cache.kv_type == KvCacheType::Q8    ? "attention_q8"
+              : cache.kv_type == KvCacheType::Q4  ? "attention_q4"
+              : cache.kv_type == KvCacheType::FP8 ? "attention_fp8"
+                                                  : "attention") ||
         !load(h.repeat_heads_kernel, "repeat_heads") ||
         !load(h.l2norm_kernel, "l2norm") ||
         !load(h.ssm_gate_kernel, "ssm_gate") ||
@@ -271,16 +273,20 @@ std::expected<void, StatusCode> EnsureHybridReady(
       }
       h.kv_scratch = std::move(*kv_scratch);
     } else if (cache.kv_type == KvCacheType::Q8 ||
-               cache.kv_type == KvCacheType::Q4) {
-      const bool q8 = cache.kv_type == KvCacheType::Q8;
-      auto quant =
-          backend.LoadKernel(q8 ? "quantize_q8" : "quantize_q4", {});
+               cache.kv_type == KvCacheType::Q4 ||
+               cache.kv_type == KvCacheType::FP8) {
+      const bool q4 = cache.kv_type == KvCacheType::Q4;
+      auto quant = backend.LoadKernel(
+          cache.kv_type == KvCacheType::Q8    ? "quantize_q8"
+          : cache.kv_type == KvCacheType::Q4  ? "quantize_q4"
+                                              : "quantize_fp8_pack",
+          {});
       if (!quant) {
         return std::unexpected(quant.error());
       }
       h.quant_kernel = std::move(*quant);
       auto kv_scratch = backend.AllocateBuffer(
-          q8 ? cache_kv_dim : cache_kv_dim / 2, MemoryKind::Device);
+          q4 ? cache_kv_dim / 2 : cache_kv_dim, MemoryKind::Device);
       auto scale = backend.AllocateBuffer(4, MemoryKind::Device);
       if (!kv_scratch || !scale) {
         return std::unexpected(StatusCode::OutOfMemory);

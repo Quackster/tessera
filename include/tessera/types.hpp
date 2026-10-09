@@ -18,6 +18,7 @@ enum class KvCacheType : int {
   F16 = 1,
   Q8 = 2,
   Q4 = 3,
+  FP8 = 4,
 };
 
 // Status codes for result-style returns (runtime I/O, parsing, device errors).
@@ -48,6 +49,22 @@ enum class StatusCode : int {
     case StatusCode::DeviceError: return "device_error";
   }
   return "unknown";
+}
+
+// Human-readable name of the full-attention KV cache storage type.
+//
+// Usage:
+//   log.Info("cli", std::string("kv cache: ") +
+//                       std::string(ToString(options.kv_type)));
+[[nodiscard]] inline std::string_view ToString(KvCacheType type) {
+  switch (type) {
+    case KvCacheType::F32: return "fp32";
+    case KvCacheType::F16: return "fp16";
+    case KvCacheType::Q8: return "int8";
+    case KvCacheType::Q4: return "4-bit";
+    case KvCacheType::FP8: return "fp8";
+  }
+  return "fp32";
 }
 
 // Element types the engine can hold. Block-quantized types (Q*) and

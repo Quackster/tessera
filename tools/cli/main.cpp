@@ -61,6 +61,7 @@ void PrintUsage() {
                "  --kv-f16          store the KV cache in fp16 (default fp32)\n"
                "  --kv-q8           store the KV cache in int8\n"
                "  --kv-q4           store the KV cache in 4-bit\n"
+               "  --kv-fp8          store the KV cache in FP8 E4M3\n"
                "  --host <ip>       serve bind address (default 127.0.0.1)\n"
                "  --port <n>        serve port (default 8080)\n"
                "  --api-key <k>     accepted API key (repeatable; env "
@@ -154,6 +155,8 @@ int main(int argc, char** argv) {
       kv_type = tessera::KvCacheType::Q8;
     } else if (arg == "--kv-q4") {
       kv_type = tessera::KvCacheType::Q4;
+    } else if (arg == "--kv-fp8") {
+      kv_type = tessera::KvCacheType::FP8;
     } else if (arg == "--temperature" && i + 1 < argc) {
       sampling.temperature = std::stof(argv[++i]);
     } else if (arg == "--top-p" && i + 1 < argc) {
@@ -277,14 +280,7 @@ int main(int argc, char** argv) {
     gen.progress_every = quiet ? 0 : 64;
     if (!quiet) {
       log.Info("cli", "kv cache: " +
-                          std::string(kv_type == tessera::KvCacheType::F16
-                                          ? "fp16"
-                                          : kv_type == tessera::KvCacheType::Q8
-                                                ? "int8"
-                                                : kv_type ==
-                                                          tessera::KvCacheType::Q4
-                                                      ? "4-bit"
-                                                      : "fp32"));
+                          std::string(tessera::ToString(kv_type)));
       if (sample) {
         log.Info("cli", "sampling: temperature=" +
                             std::to_string(sampling.temperature) +

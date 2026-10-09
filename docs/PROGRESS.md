@@ -1561,9 +1561,54 @@ through RADV GFX1201, rocm through the system ROCm).
   either. W4A8 also costs about 2.5x decode (1105 ms/token against 428 with
   it off), so it is off by default pending a long (128-token) generation
   measurement; the default MXFP4 output is unchanged and still matches the
-  GGUF. The remaining suspect stays the aux hidden values from a different
-  source (the served target also uses an fp8 KV cache and R4D fp8
-  attention).
+   GGUF. The remaining suspect stays the aux hidden values from a different
+   source (the served target also uses an fp8 KV cache and R4D fp8
+   attention).
+
+- 2026-10-09: **DFlash2 full-prefix draft context tried and reverted.** The
+   drafter training reference (`paroquant/drafter/train_drafter.py`) builds
+   the context from every position `0..anchor` (`ctx_ok = ctx_pos <=
+   anchors`), so the committed windowed context (one position) was a
+   simplification, not the reference behavior. The experiment extended
+   `Verify`/`ForwardBatch` to capture the per-row residual hidden and kept
+   every accepted prefix position as draft context, which matches the
+   reference layout. Measured on the 27B MXFP4 target (ROCm, one generation
+   of 32 tokens): acceptance fell to 0 of 217 draft tokens against 3 of 84
+   with the windowed baseline (`TESSERA_DFLASH2_CTX=1`). Two causes. First,
+   the implementation assembled the raw aux on the host and re-uploaded all
+   `n * ctx * hidden` floats every step, so the run is O(ctx) in host memory
+   and bandwidth (250 s for 32 tokens) and is not viable for a full
+   generation. Second, the aux hidden values already differ from the served
+   target (the deferred W4A8 and fp8-KV gap), so the extra context rows
+   carry the same error and compound it. Reverted to the committed windowed
+   baseline. A correct full-prefix implementation needs a device-resident
+   context K/V cache (like vLLM's `precompute_and_store_context_kv`), not a
+   raw-aux re-upload, and it must wait for the aux-value fix. The draft
+   block itself is covered at `ctx = 3` by `BackendTest.DraftBlockMatchesRef`,
+   so the kernel plumbing for a longer context is already exercised.
+
+- 2026-10-09: **fp8 KV cache.** New generic "quantize_fp8_pack" (packed
+   OCP FP8 E4M3 bytes with the dynamic per-token scale, four bytes per word)
+   and "attention_fp8" (GQA over E4M3 keys and values with one fp32 scale
+   per key row) on Vulkan (GLSL) and ROCm (HIP), with the host references
+   `QuantizeFp8PackRef` and `AttentionFp8Ref` in `src/core/numerics/quant.*`
+   and `attention.*` and device-vs-reference tests
+   (`BackendTest.QuantizeFp8PackMatchesRef`,
+   `BackendTest.AttentionFp8DeviceMatchesRef`). `KvCacheType::FP8` is wired
+   through the vanilla and hybrid decode paths (`AppendKv`, the
+   attention-kernel selection and the KV scratch), `ToString(KvCacheType)`
+   names the types, and the CLI adds `--kv-fp8`. This is the fp8 KV cache
+   the served MXFP4 target uses (item 0). 271/271 `ctest` on both builds;
+   the 27B GGUF with `--kv-fp8` answers coherently end to end ("The capital
+   of France is" gives " Paris."), which exercises the batched prefill and
+   the hybrid decode. Fixed a latent host/device disagreement at the E4M3
+   saturation boundary: the scaled row maximum can round just past 448,
+   which the host converter turned into the NaN code (0x7F) while the device
+   clamped to 448 (0x7E). The `quantize_fp8` and `quantize_fp8_pack` paths
+   now clamp the quotient to `+-448` before the conversion, matching the OCP
+   saturating semantics and keeping NaN out of a KV row. The
+   `HybridDecodeTest.Fp8KvDecodesDeterministically` test pins the fixture
+   path.
 
 ## Next (in order)
 
@@ -1620,9 +1665,14 @@ through RADV GFX1201, rocm through the system ROCm).
    acceptance on the noisy 5-token fixture and costs about 2.5x decode.
    Next: measure on a 128-token generation, and try the other differences
    to the served target (fp8 KV cache, R4D fp8 attention) before more
-   quant work.
+   quant work. 2026-10-09: the fp8 KV cache landed (`--kv-fp8`,
+   `quantize_fp8_pack` + `attention_fp8`), so the served target's cache
+   quant is now available for that comparison (see the Done entry). R4D fp8
+   attention remains.
    Batching and the draft context width are
-   done (see the Done entry). Corrected 2026-10-08: the draft block is
+   done (see the Done entry). 2026-10-09: the full-prefix context the
+   reference uses was tried and reverted; it regressed acceptance and needs
+   a device-resident context K/V cache to be viable (see the Done entry). Corrected 2026-10-08: the draft block is
    NOT NaN and NOT unstable. The forward is faithful to radiance's
    `train_drafter.py` (correlation 0.99976) and stable (absmax ~31); the
    query embeddings are byte-exact with the target. The low acceptance is

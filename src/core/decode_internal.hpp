@@ -153,10 +153,11 @@ inline std::expected<void, StatusCode> AppendKv(
   const std::size_t row_bytes =
       kv.type == KvCacheType::F32   ? kv_dim * 4
       : kv.type == KvCacheType::F16 ? kv_dim * 2
-      : kv.type == KvCacheType::Q8  ? kv_dim
-                                    : kv_dim / 2;
-  const bool quantized =
-      kv.type == KvCacheType::Q8 || kv.type == KvCacheType::Q4;
+      : kv.type == KvCacheType::Q4  ? kv_dim / 2
+                                    : kv_dim;
+  const bool quantized = kv.type == KvCacheType::Q8 ||
+                         kv.type == KvCacheType::Q4 ||
+                         kv.type == KvCacheType::FP8;
   if (kv.rows == kv.capacity) {
     const std::size_t new_capacity =
         kv.capacity == 0 ? kInitialKvRows : kv.capacity * 2;

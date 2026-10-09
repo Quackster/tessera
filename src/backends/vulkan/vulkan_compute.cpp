@@ -58,6 +58,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"cast_f32_f16", kCastF32F16SpirV, sizeof(kCastF32F16SpirV)},
     {"quantize_q8", kQuantizeQ8SpirV, sizeof(kQuantizeQ8SpirV)},
     {"quantize_fp8", kQuantizeFp8SpirV, sizeof(kQuantizeFp8SpirV)},
+    {"quantize_fp8_pack", kQuantizeFp8PackSpirV, sizeof(kQuantizeFp8PackSpirV)},
+    {"attention_fp8", kAttentionFp8SpirV, sizeof(kAttentionFp8SpirV)},
     {"attention_q8", kAttentionQ8SpirV, sizeof(kAttentionQ8SpirV)},
     {"quantize_q4", kQuantizeQ4SpirV, sizeof(kQuantizeQ4SpirV)},
     {"attention_q4", kAttentionQ4SpirV, sizeof(kAttentionQ4SpirV)},

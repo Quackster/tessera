@@ -194,8 +194,9 @@ std::expected<void, StatusCode> RunFullBlockBatch(
       return std::unexpected(appended.error());
     }
   }
-  const bool quantized =
-      kv.type == KvCacheType::Q8 || kv.type == KvCacheType::Q4;
+  const bool quantized = kv.type == KvCacheType::Q8 ||
+                         kv.type == KvCacheType::Q4 ||
+                         kv.type == KvCacheType::FP8;
   const bool attention_ok =
       quantized
           ? detail::AttentionQuantDevice(backend, *h.attention_kernel, *b.q,

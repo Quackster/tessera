@@ -193,8 +193,36 @@ std::expected<void, StatusCode> QuantizeFp8Ref(std::span<float> data,
     const float s = std::max(amax / kFp8E4M3Max, kFp8E4M3MinScale);
     scale[r] = s;
     for (std::size_t c = 0; c < cols; ++c) {
-      const std::uint8_t bits = Fp32ToFp8E4M3Bits(data[r * cols + c] / s);
+      // Saturation: the scaled max can round just past 448, so clamp the
+      // quotient to the E4M3 max instead of letting it become the NaN code.
+      const float q = std::clamp(data[r * cols + c] / s, -kFp8E4M3Max,
+                                 kFp8E4M3Max);
+      const std::uint8_t bits = Fp32ToFp8E4M3Bits(q);
       data[r * cols + c] = Fp8E4M3ToFloat(bits) * s;
+    }
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> QuantizeFp8PackRef(
+    std::span<const float> in, std::span<std::byte> out,
+    std::span<float> scale, std::size_t rows, std::size_t cols) {
+  if (rows == 0 || cols == 0 || cols % 4 != 0 || in.size() != rows * cols ||
+      out.size() != rows * cols || scale.size() != rows) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    float amax = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      amax = std::max(amax, std::abs(in[r * cols + c]));
+    }
+    const float s = std::max(amax / kFp8E4M3Max, kFp8E4M3MinScale);
+    scale[r] = s;
+    for (std::size_t c = 0; c < cols; ++c) {
+      const float q =
+          std::clamp(in[r * cols + c] / s, -kFp8E4M3Max, kFp8E4M3Max);
+      out[r * cols + c] =
+          static_cast<std::byte>(Fp32ToFp8E4M3Bits(q));
     }
   }
   return {};

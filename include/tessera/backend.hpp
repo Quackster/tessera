@@ -264,6 +264,15 @@ class Kernel {
 // with round-to-nearest-even, the W4A8 activation the served MXFP4 target
 // feeds its linear layers. One thread per row.
 // "attention_q4": like attention_q8 but keys/values are symmetric 4-bit.
+// "quantize_fp8_pack": buffer 0 is In (fp32, rows x cols), buffer 1 the
+// packed OCP FP8 E4M3 output (rows x cols bytes, four per uint), buffer 2
+// one fp32 scale per row; scalars are rows and cols (cols a multiple of
+// 4). The scale is max(amax/448, 1/(448*512)) with round-to-nearest-even,
+// the fp8 KV cache quantization. One thread per row.
+// "attention_fp8": like attention_q8 but keys and values are OCP FP8 E4M3
+// (buffer 1 K, buffer 2 V), with one fp32 scale per key row (buffer 3 for
+// K, buffer 4 for V) and the fp32 output (buffer 5); scalars are m, n,
+// heads, kv_heads, head_dim, q_base and window.
 // "cast_f32_f16": buffer 0 is In (fp32, n elements), buffer 1 the
 // output (fp16, n elements, two per uint); scalar n (must be even). The
 // dispatch is ceil(n/2 / 256).
@@ -569,7 +578,7 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
   }
-  if (kernel.Id() == "attention_q8") {
+  if (kernel.Id() == "attention_q8" || kernel.Id() == "attention_fp8") {
     if (launch.buffers.size() != 6 || launch.scalars.size() != 7) {
       return StatusCode::InvalidArgument;
     }
@@ -594,6 +603,15 @@ class Kernel {
       return StatusCode::InvalidArgument;
     }
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "quantize_fp8_pack") {
+    if (launch.buffers.size() != 3 || launch.scalars.size() != 2) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
+        launch.scalars[1] % 4 != 0) {
       return StatusCode::InvalidArgument;
     }
   }

@@ -246,6 +246,18 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
                                   unsigned long long head_dim,
                                   unsigned long long q_base,
                                   unsigned long long window);
+__global__ void QuantizeFp8PackKernel(const float* in, unsigned int* packed,
+                                      float* scale, unsigned long long rows,
+                                      unsigned long long cols);
+__global__ void AttentionFp8Kernel(const float* q, const unsigned char* k,
+                                   const unsigned char* v, const float* ks,
+                                   const float* vs, float* out,
+                                   unsigned long long m, unsigned long long n,
+                                   unsigned long long heads,
+                                   unsigned long long kv_heads,
+                                   unsigned long long head_dim,
+                                   unsigned long long q_base,
+                                   unsigned long long window);
 __global__ void SpatialMergeKernel(const float* x, float* y,
                                    unsigned long long embed,
                                    unsigned long long grid_w,

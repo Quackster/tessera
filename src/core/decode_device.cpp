@@ -64,9 +64,10 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
         !load(state->silu_mul_kernel, "silu_mul") ||
         !load(state->rope_kernel, "rope") ||
         !load(state->attention_kernel,
-              cache.kv_type == KvCacheType::Q8   ? "attention_q8"
-              : cache.kv_type == KvCacheType::Q4 ? "attention_q4"
-                                                 : "attention")) {
+              cache.kv_type == KvCacheType::Q8    ? "attention_q8"
+              : cache.kv_type == KvCacheType::Q4  ? "attention_q4"
+              : cache.kv_type == KvCacheType::FP8 ? "attention_fp8"
+                                                  : "attention")) {
       return std::unexpected(StatusCode::DeviceError);
     }
     if (cache.kv_type == KvCacheType::F16) {
@@ -79,12 +80,14 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
       }
       state->kv_scratch = std::move(*scratch);
     } else if (cache.kv_type == KvCacheType::Q8 ||
-               cache.kv_type == KvCacheType::Q4) {
+               cache.kv_type == KvCacheType::Q4 ||
+               cache.kv_type == KvCacheType::FP8) {
       const std::size_t quant_bytes =
-          cache.kv_type == KvCacheType::Q8 ? kv_dim : kv_dim / 2;
-      if (!load(state->quant_kernel, cache.kv_type == KvCacheType::Q8
-                                         ? "quantize_q8"
-                                         : "quantize_q4")) {
+          cache.kv_type == KvCacheType::Q4 ? kv_dim / 2 : kv_dim;
+      if (!load(state->quant_kernel,
+                cache.kv_type == KvCacheType::Q8    ? "quantize_q8"
+                : cache.kv_type == KvCacheType::Q4  ? "quantize_q4"
+                                                    : "quantize_fp8_pack")) {
         return std::unexpected(StatusCode::DeviceError);
       }
       auto scratch = backend.AllocateBuffer(quant_bytes, MemoryKind::Device);
@@ -209,8 +212,9 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
         !appended) {
       return std::unexpected(appended.error());
     }
-    const bool quantized =
-        kv.type == KvCacheType::Q8 || kv.type == KvCacheType::Q4;
+    const bool quantized = kv.type == KvCacheType::Q8 ||
+                           kv.type == KvCacheType::Q4 ||
+                           kv.type == KvCacheType::FP8;
     const bool attention_ok =
         quantized
             ? AttentionQuantDevice(backend, *st.attention_kernel, *st.q, *kv.k,

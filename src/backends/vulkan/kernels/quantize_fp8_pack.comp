@@ -3,15 +3,16 @@
 // One thread per row.
 layout(local_size_x = 256) in;
 
-// "quantize_fp8" contract: buffer 0 is the fp32 rows x cols data,
-// quantized and dequantized in place to OCP FP8 E4M3; buffer 1 one fp32
-// scale per row. Scalars: rows v[0], cols v[2].
+// "quantize_fp8_pack" contract: buffer 0 is the fp32 rows x cols data,
+// buffer 1 the packed OCP FP8 E4M3 bytes (four per uint), buffer 2 one
+// fp32 scale per row. Scalars: rows v[0], cols v[2] (a multiple of 4).
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
 
 layout(set = 0, binding = 0) buffer Data { float data[]; };
-layout(set = 0, binding = 1) buffer Scale { float scale[]; };
+layout(set = 0, binding = 1) buffer Packed { uint packed[]; };
+layout(set = 0, binding = 2) buffer Scale { float scale[]; };
 
 // fp32 -> OCP FP8 E4M3 byte, round to nearest even (port of the core
 // Fp32ToFp8E4M3Bits). NaN and values above 448 saturate to the all-ones
@@ -49,25 +50,6 @@ uint fp8_e4m3_bits(float value) {
   return (sign << 7) | (uint(field) << 3) | uint(mant);
 }
 
-// OCP FP8 E4M3 byte -> fp32 (port of the core Fp8E4M3ToFloat).
-float fp8_e4m3_value(uint bits) {
-  uint sign = bits >> 7;
-  uint exp = (bits >> 3) & 0xFu;
-  uint mant = bits & 0x7u;
-  float value;
-  if (exp == 0u) {
-    value = float(mant) * exp2(-9.0);
-  } else if (exp == 15u) {
-    if (mant == 7u) {
-      return sqrt(-1.0);  // NaN
-    }
-    value = (1.0 + float(mant) / 8.0) * 256.0;
-  } else {
-    value = (1.0 + float(mant) / 8.0) * exp2(float(int(exp) - 7));
-  }
-  return sign != 0u ? -value : value;
-}
-
 void main() {
   uint r = gl_GlobalInvocationID.x;
   uint rows = pc.v[0];
@@ -82,8 +64,14 @@ void main() {
   }
   float s = max(amax / 448.0, 1.0 / (448.0 * 512.0));
   scale[r] = s;
-  for (uint c = 0; c < cols; ++c) {
-    uint bits = fp8_e4m3_bits(clamp(data[base + c] / s, -448.0, 448.0));
-    data[base + c] = fp8_e4m3_value(bits) * s;
+  uint words = cols / 4u;
+  for (uint w = 0; w < words; ++w) {
+    uint word = 0u;
+    for (uint b = 0u; b < 4u; ++b) {
+      uint bits =
+          fp8_e4m3_bits(clamp(data[base + w * 4u + b] / s, -448.0, 448.0));
+      word |= bits << (b * 8u);
+    }
+    packed[r * words + w] = word;
   }
 }

@@ -67,6 +67,15 @@ inline constexpr float kFp8E4M3MinScale = 1.0f / (kFp8E4M3Max * 512.0f);
     std::span<float> data, std::span<float> scale, std::size_t rows,
     std::size_t cols);
 
+// Host reference for the "quantize_fp8_pack" built-in: quantize each row
+// of `in` to OCP FP8 E4M3 bytes with the same dynamic per-token scale and
+// round-to-nearest-even as QuantizeFp8Ref, but keep the packed bytes.
+// `out` is rows*cols bytes and `scale` one fp32 per row. cols must be a
+// multiple of 4 (the kernel packs four bytes per word).
+[[nodiscard]] std::expected<void, StatusCode> QuantizeFp8PackRef(
+    std::span<const float> in, std::span<std::byte> out,
+    std::span<float> scale, std::size_t rows, std::size_t cols);
+
 // Decode a bfloat16 (little-endian) to fp32. bf16 shares the fp32
 // exponent field, so the conversion is exact.
 [[nodiscard]] float Bf16ToFloat(std::uint16_t bits);

@@ -253,6 +253,16 @@ These are hard rules, set by the project owner:
     - If a command could exceed the machine's memory, split it or ask the
       project owner first.
 
+21. **Match the reference runtime** - the behavior contract is the served
+    reference runtime, `radiance-vllm-mxfp4` first and vLLM second. When a
+    tessera result differs, read the reference source, find the exact
+    difference, and change tessera to match. Do not ask the project owner
+    which behavior is correct and do not guess. The served target container
+    (`r9700-qwen3.8-mxfp4-g0a`, launcher
+    `Quackster/vllm-gfx1201-launchers`) and its captured outputs are the
+    reference. A numerical or acceptance difference from the reference is a
+    defect to root-cause, not a property of the model.
+
 ## Working Principles
 
 Repository-specific constraints on top of the hard rules:
