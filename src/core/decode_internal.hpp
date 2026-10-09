@@ -598,7 +598,7 @@ inline std::expected<void, StatusCode> RmsNormGatedDevice(
   std::memcpy(&bits, &eps_f, sizeof(bits));
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>(rows);
-  launch.block_x = 256;
+  launch.block_x = 1024;
   launch.buffers = {&x, &w, &gate, &y};
   launch.scalars = {rows, cols, bits};
   return backend.LaunchKernel(kernel, launch);
