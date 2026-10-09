@@ -2120,6 +2120,21 @@ through RADV GFX1201, rocm through the system ROCm).
   carries the thinking delta, then the clean answer, with no device
   errors.
 
+- 2026-10-09: **Web chat UI with sessions (316/316 `ctest` on
+  vulkan).** The HTTP server runs one worker thread per connection,
+  so a streaming generation never blocks control requests; device
+  generation stays serialized (a second turn answers 503). New
+  in-memory sessions (`SessionStore`) with `/api/sessions` CRUD, chat
+  and retry turns (SSE or buffered), and stop/pause/resume controls
+  that abort or stall the decode loop. Session turns split thinking
+  live (`ThinkStreamer`) into `reasoning_content` deltas beside the
+  answer. The dependency-free UI (`src/serve/web/`, embedded at
+  configure time, served at `/`) lists sessions, streams thinking and
+  answers, and renders fenced SVG inline, fenced HTML in a sandbox
+  frame, and markdown and data URL images. Verified live on the 27B
+  MXFP4 (Vulkan, GPU0): the full session flow through curl, including
+  pause, resume and a stopped turn persisted with its flag.
+
 - 2026-10-09: **Chunked prefill and 220k context on the 8-bit KV path
   (299/299 `ctest` on vulkan).** `PrefillTokens` splits the prompt into
   chunk-sized forwards (automatic default 512, `--prefill-chunk` to

@@ -57,8 +57,10 @@ class ResponseWriter {
 using HttpHandler = std::function<void(const HttpRequest&, ResponseWriter&)>;
 
 // Listen on `host:port` and serve until `stop` becomes true or a fatal
-// socket error occurs. The handler runs on the accept thread. Logs the
-// listening endpoint once the socket is ready. Every socket failure is
+// socket error occurs. Each connection runs the handler on its own
+// worker thread, so a streaming response never blocks other requests;
+// the handler must be thread-safe and serialize device work itself.
+// Logs the listening endpoint once the socket is ready. Every socket failure is
 // logged through `log` with the failing call, the endpoint and the
 // errno text, and reported as DeviceError (InvalidArgument for a host
 // that is not an IPv4 literal).

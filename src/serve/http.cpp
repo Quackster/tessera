@@ -11,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <system_error>
+#include <thread>
 
 namespace tessera::serve {
 
@@ -95,6 +96,63 @@ bool ReadHeaders(int fd, std::string& buffer, std::size_t& header_end) {
     }
     buffer.append(chunk, static_cast<std::size_t>(got));
   }
+}
+
+// One connection: read the request, run the handler, close. Runs on
+// a worker thread per connection so a streaming generation never
+// blocks pause/stop/session requests (handlers must be thread-safe;
+// generation itself is serialized by the caller).
+bool ParseHead(const std::string& head, HttpRequest& request,
+               std::size_t* content_length);
+
+void ServeConnection(const HttpHandler& handler, int client) {
+  std::string buffer;
+  std::size_t header_end = std::string::npos;
+  if (!ReadHeaders(client, buffer, header_end)) {
+    ::close(client);
+    return;
+  }
+  HttpRequest request;
+  std::size_t content_length = 0;
+  const std::string head = buffer.substr(0, header_end);
+  if (!ParseHead(head, request, &content_length)) {
+    ResponseWriter writer(client);
+    (void)writer.SendHeaders(400, "application/json");
+    (void)writer.Write(R"({"error":"bad request line"})");
+    writer.Close();
+    ::close(client);
+    return;
+  }
+  if (content_length > kMaxBodyBytes) {
+    ResponseWriter writer(client);
+    (void)writer.SendHeaders(413, "application/json");
+    (void)writer.Write(R"({"error":"body too large"})");
+    writer.Close();
+    ::close(client);
+    return;
+  }
+  std::string body = buffer.substr(header_end);
+  char chunk[4096];
+  while (body.size() < content_length) {
+    const ssize_t got = ::recv(client, chunk, sizeof(chunk), 0);
+    if (got <= 0) {
+      break;
+    }
+    body.append(chunk, static_cast<std::size_t>(got));
+  }
+  if (body.size() < content_length) {
+    ResponseWriter writer(client);
+    (void)writer.SendHeaders(400, "application/json");
+    (void)writer.Write(R"({"error":"truncated body"})");
+    writer.Close();
+    ::close(client);
+    return;
+  }
+  request.body = body.substr(0, content_length);
+  ResponseWriter writer(client);
+  handler(request, writer);
+  writer.Close();
+  ::close(client);
 }
 
 // Parse method/path/headers from the header block.
@@ -268,53 +326,9 @@ std::expected<void, StatusCode> RunHttpServer(
                              "; the server stops accepting requests");
       return std::unexpected(StatusCode::DeviceError);
     }
-    std::string buffer;
-    std::size_t header_end = std::string::npos;
-    if (!ReadHeaders(client, buffer, header_end)) {
-      ::close(client);
-      continue;
-    }
-    HttpRequest request;
-    std::size_t content_length = 0;
-    const std::string head = buffer.substr(0, header_end);
-    if (!ParseHead(head, request, &content_length)) {
-      ResponseWriter writer(client);
-      (void)writer.SendHeaders(400, "application/json");
-      (void)writer.Write(R"({"error":"bad request line"})");
-      writer.Close();
-      ::close(client);
-      continue;
-    }
-    if (content_length > kMaxBodyBytes) {
-      ResponseWriter writer(client);
-      (void)writer.SendHeaders(413, "application/json");
-      (void)writer.Write(R"({"error":"body too large"})");
-      writer.Close();
-      ::close(client);
-      continue;
-    }
-    std::string body = buffer.substr(header_end);
-    char chunk[4096];
-    while (body.size() < content_length) {
-      const ssize_t got = ::recv(client, chunk, sizeof(chunk), 0);
-      if (got <= 0) {
-        break;
-      }
-      body.append(chunk, static_cast<std::size_t>(got));
-    }
-    if (body.size() < content_length) {
-      ResponseWriter writer(client);
-      (void)writer.SendHeaders(400, "application/json");
-      (void)writer.Write(R"({"error":"truncated body"})");
-      writer.Close();
-      ::close(client);
-      continue;
-    }
-    request.body = body.substr(0, content_length);
-    ResponseWriter writer(client);
-    handler(request, writer);
-    writer.Close();
-    ::close(client);
+    // One worker thread per connection: a streaming generation never
+    // blocks control requests on other connections.
+    std::thread(ServeConnection, handler, client).detach();
   }
   ::close(server);
   return {};

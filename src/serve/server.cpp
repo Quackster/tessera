@@ -2,14 +2,19 @@
 
 #include <atomic>
 #include <cctype>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "serve/http.hpp"
 #include "serve/render.hpp"
 #include "serve/respond.hpp"
+#include "serve/session.hpp"
+#include "serve/session_chat.hpp"
 #include "serve/tools/chat.hpp"
 #include "core/json.hpp"
+#include "web_assets.hpp"
 
 namespace tessera {
 
@@ -280,8 +285,13 @@ bool Bridge(const HttpRequest& request, const std::string& path) {
 std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
                                       const ServeOptions& options) {
   const Tokenizer* tokenizer = model.GetTokenizer();
-  const auto handler = [&engine, &model, tokenizer, &options](
-                           const HttpRequest& request, ResponseWriter& writer) {
+  serve::SessionStore sessions;
+  // One generation at a time on the device; connection threads share
+  // it (a second turn answers 503).
+  std::mutex generation;
+  const auto handler = [&engine, &model, tokenizer, &options, &sessions,
+                        &generation](const HttpRequest& request,
+                                     ResponseWriter& writer) {
     ++g_requests;
     // CORS.
     const std::string origin = request.Header("origin");
@@ -309,7 +319,10 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
     const std::string path = request.path;
     const bool is_public = Bridge(request, "/health") ||
                            Bridge(request, "/v1/health") ||
-                           Bridge(request, "/metrics");
+                           Bridge(request, "/metrics") ||
+                           (request.method == "GET" &&
+                            (path == "/" || path == "/index.html" ||
+                             path == "/app.js" || path == "/style.css"));
     // API key check.
     if (!options.api_keys.empty() && !is_public) {
       std::string key = request.Header("authorization");
@@ -346,6 +359,22 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
                          std::to_string(g_requests.load()) + "\n");
       return;
     }
+    // Web UI (no build step: single files embedded at configure time).
+    if (request.method == "GET" && path == "/app.js") {
+      (void)writer.SendHeaders(200, "text/javascript");
+      (void)writer.Write(std::string_view(serve::web::kWebAppJs));
+      return;
+    }
+    if (request.method == "GET" && path == "/style.css") {
+      (void)writer.SendHeaders(200, "text/css");
+      (void)writer.Write(std::string_view(serve::web::kWebStyleCss));
+      return;
+    }
+    if (request.method == "GET" && (path == "/" || path == "/index.html")) {
+      (void)writer.SendHeaders(200, "text/html");
+      (void)writer.Write(std::string_view(serve::web::kWebIndexHtml));
+      return;
+    }
     if (request.method == "GET" &&
         (Bridge(request, "/v1/models") || Bridge(request, "/models"))) {
       Json entry = Json::Object();
@@ -372,6 +401,101 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
     }
     if (tokenizer == nullptr) {
       SendError(writer, 422, "this model has no tokenizer");
+      return;
+    }
+    // One generation at a time; a second turn answers 503 instead of
+    // queueing behind minutes of prefill on the device.
+    auto gpu_slot = [&](ResponseWriter& target)
+        -> std::optional<std::unique_lock<std::mutex>> {
+      std::unique_lock<std::mutex> slot(generation, std::try_to_lock);
+      if (!slot.owns_lock()) {
+        SendError(target, 503, "another generation is already running");
+        return std::nullopt;
+      }
+      return slot;
+    };
+    serve::SessionHandler session_handler(engine, model, *tokenizer, sessions,
+                                          generation,
+                                          options.default_max_tokens);
+    if (path == "/api/sessions") {
+      if (request.method == "GET") {
+        session_handler.HandleList(writer);
+        return;
+      }
+      if (request.method == "POST") {
+        auto body = Json::Parse(request.body);
+        if (body == nullptr) {
+          SendError(writer, 400, "invalid JSON body");
+          return;
+        }
+        session_handler.HandleCreate(writer, *body);
+        return;
+      }
+      SendError(writer, 405, "method not allowed");
+      return;
+    }
+    if (path.rfind("/api/sessions/", 0) == 0) {
+      const std::string rest = path.substr(sizeof("/api/sessions/") - 1);
+      const std::size_t slash = rest.find('/');
+      const std::string id =
+          slash == std::string::npos ? rest : rest.substr(0, slash);
+      const std::string action =
+          slash == std::string::npos ? std::string() : rest.substr(slash + 1);
+      if (id.empty()) {
+        SendError(writer, 404, "unknown session");
+        return;
+      }
+      if (action.empty()) {
+        if (request.method == "GET") {
+          session_handler.HandleGet(writer, id);
+          return;
+        }
+        if (request.method == "DELETE") {
+          session_handler.HandleDelete(writer, id);
+          return;
+        }
+        if (request.method == "PUT") {
+          auto body = Json::Parse(request.body);
+          if (body == nullptr) {
+            SendError(writer, 400, "invalid JSON body");
+            return;
+          }
+          session_handler.HandleRename(writer, id, *body);
+          return;
+        }
+        SendError(writer, 405, "method not allowed");
+        return;
+      }
+      if (request.method != "POST") {
+        SendError(writer, 405, "method not allowed");
+        return;
+      }
+      if (action == "chat" || action == "retry") {
+        auto body = Json::Parse(request.body);
+        if (body == nullptr) {
+          SendError(writer, 400, "invalid JSON body");
+          return;
+        }
+        if (action == "chat") {
+          session_handler.HandleChat(writer, id, *body);
+        } else {
+          session_handler.HandleRetry(writer, id, *body);
+        }
+        return;
+      }
+      if (action == "stop") {
+        session_handler.HandleStop(writer, id);
+        return;
+      }
+      if (action == "pause") {
+        session_handler.HandlePause(writer, id);
+        return;
+      }
+      if (action == "resume") {
+        session_handler.HandleResume(writer, id);
+        return;
+      }
+      SendError(writer, 404, "unknown session action");
       return;
     }
     if (request.method == "POST" && Bridge(request, "/tokenize")) {
@@ -426,6 +550,10 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
         SendError(writer, 422, "prompt must be a string");
         return;
       }
+      auto slot = gpu_slot(writer);
+      if (!slot) {
+        return;
+      }
       Complete(engine, model, *tokenizer, writer, prompt->AsString(),
                MaxTokensFrom(*body, options.default_max_tokens),
                WantsStream(*body));
@@ -436,6 +564,10 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
       auto body = Json::Parse(request.body);
       if (body == nullptr) {
         SendError(writer, 400, "invalid JSON body");
+        return;
+      }
+      auto slot = gpu_slot(writer);
+      if (!slot) {
         return;
       }
       Chat(engine, model, *tokenizer, writer, *body,
@@ -467,6 +599,10 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
       auto body = Json::Parse(request.body);
       if (body == nullptr) {
         SendError(writer, 400, "invalid JSON body");
+        return;
+      }
+      auto slot = gpu_slot(writer);
+      if (!slot) {
         return;
       }
       Chat(engine, model, *tokenizer, writer, *body,

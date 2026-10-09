@@ -30,6 +30,36 @@ struct ToolCall {
                                                     std::string* text_before,
                                                     std::string* reasoning = nullptr);
 
+// Incremental think/content splitter for live session streaming.
+// Feed detokenized pieces in order; each push returns the new
+// reasoning/content text since the last call, each word exactly once
+// in exactly one field. While the prompt ends with an open <think>
+// (think_expected) and no closer arrived, all text is pending thought
+// and no content deltas flow. A trailing unclosed span is likewise
+// withheld until it closes (or Finish flushes it), so span markup
+// never leaks into the content. Finish flushes the remainder, so
+// concatenated deltas always equal SplitThink(all).
+class ThinkStreamer {
+ public:
+  explicit ThinkStreamer(bool think_expected);
+  struct Deltas {
+    std::string reasoning;
+    std::string content;
+  };
+  [[nodiscard]] Deltas Push(std::string_view piece);
+  // End-of-turn remainder (an unclosed trailing span stays content,
+  // same as the post-hoc split).
+  [[nodiscard]] Deltas Finish();
+
+ private:
+  const bool think_expected_;
+  bool resolved_ = false;
+  bool withhold_ = true;
+  std::string raw_;
+  std::string emitted_reasoning_;
+  std::string emitted_content_;
+};
+
 // The tool list from the request body to render, or nullptr for none.
 // Sets `error` when `tools` is not an array or `tool_choice` is neither
 // a string nor an object.

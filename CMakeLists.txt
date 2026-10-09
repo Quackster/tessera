@@ -59,6 +59,8 @@ add_library(tessera STATIC
     src/serve/respond.cpp
     src/serve/render.cpp
     src/serve/server.cpp
+    src/serve/session.cpp
+    src/serve/session_chat.cpp
     src/serve/tools/tool_call.cpp
     src/serve/tools/chat.cpp
     src/serve/jinja/value.cpp
@@ -83,6 +85,35 @@ add_library(tessera STATIC
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
 target_compile_options(tessera PRIVATE -Wall -Wextra)
+
+# Embed the web UI (single dependency-free files) in a generated
+# header. Editing src/serve/web/* needs a fresh `cmake -B` run, like
+# the Vulkan kernels below.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/web)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/serve/web/index.html
+     TESSERA_WEB_INDEX)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/serve/web/app.js TESSERA_WEB_APP)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/serve/web/style.css
+     TESSERA_WEB_STYLE)
+set(TESSERA_WEB_HEADER
+"// Generated at configure time from src/serve/web/*.
+// Do not edit.
+#pragma once
+namespace tessera::serve::web {
+")
+string(APPEND TESSERA_WEB_HEADER
+"constexpr char kWebIndexHtml[] = R\"TESSERAWEB(${TESSERA_WEB_INDEX})TESSERAWEB\";
+constexpr char kWebAppJs[] = R\"TESSERAWEB(${TESSERA_WEB_APP})TESSERAWEB\";
+constexpr char kWebStyleCss[] = R\"TESSERAWEB(${TESSERA_WEB_STYLE})TESSERAWEB\";
+")
+string(APPEND TESSERA_WEB_HEADER
+"}  // namespace tessera::serve::web
+")
+# The quoted expansion keeps the ';' terminators (unquoted expansion
+# splits the header on them).
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/web/web_assets.hpp
+     "${TESSERA_WEB_HEADER}")
+target_include_directories(tessera PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/web)
 
 if(TESSERA_BACKEND STREQUAL "vulkan")
     target_sources(tessera PRIVATE src/backends/vulkan/vulkan_backend.cpp
