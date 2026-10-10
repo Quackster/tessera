@@ -21,9 +21,19 @@ Json MessageJson(const SessionMessage& message) {
   item.Set("role", Json::String(message.role));
   item.Set("content", Json::String(message.content));
   item.Set("reasoning_content", Json::String(message.reasoning));
+  if (!message.tool_calls_json.empty()) {
+    if (auto calls = Json::Parse(message.tool_calls_json)) {
+      item.Set("tool_calls", std::move(*calls));
+    }
+  }
+  if (!message.tool_call_id.empty()) {
+    item.Set("tool_call_id", Json::String(message.tool_call_id));
+  }
   item.Set("stopped", Json::Bool(message.stopped));
   return item;
 }
+
+}  // namespace
 
 Json SessionJson(const SessionView& view) {
   Json items = Json::Array();
@@ -48,6 +58,83 @@ Json SessionInfoJson(const SessionInfo& info) {
   item.Set("busy", Json::Bool(info.busy));
   return item;
 }
+
+// History as the renderer input: every stored turn back in OpenAI
+// form, so a session prompt and a stateless prompt render the same.
+Json SessionHistoryJson(const SessionView& view) {
+  Json messages = Json::Array();
+  for (const SessionMessage& message : view.messages) {
+    Json item = Json::Object();
+    item.Set("role", Json::String(message.role));
+    item.Set("content", Json::String(message.content));
+    if (!message.tool_calls_json.empty()) {
+      if (auto calls = Json::Parse(message.tool_calls_json)) {
+        item.Set("tool_calls", std::move(*calls));
+      }
+    }
+    if (!message.tool_call_id.empty()) {
+      item.Set("tool_call_id", Json::String(message.tool_call_id));
+    }
+    messages.Push(std::move(item));
+  }
+  return messages;
+}
+
+// One incoming history message to stored form. Reasoning never comes
+// back from an OpenAI client (it lives in `reasoning_content`, not the
+// prompt), so a resent history still prefix-matches the stored one.
+bool SessionMessagesFromJson(const core::Json& messages,
+                             std::vector<SessionMessage>* out,
+                             std::string* error) {
+  if (!messages.isArray()) {
+    *error = "messages must be an array";
+    return false;
+  }
+  std::vector<SessionMessage> parsed;
+  for (const Json& message : messages.AsArray()) {
+    if (!message.isObject()) {
+      *error = "messages entries must be objects";
+      return false;
+    }
+    const Json* role = message.Find("role");
+    if (role == nullptr || !role->isString()) {
+      *error = "messages entries need a string role";
+      return false;
+    }
+    SessionMessage stored;
+    stored.role = role->AsString();
+    const Json* content = message.Find("content");
+    if (content == nullptr || content->type() == Json::Type::Null) {
+      stored.content.clear();
+    } else if (content->isString()) {
+      stored.content = content->AsString();
+    } else {
+      *error = "session history needs string content";
+      return false;
+    }
+    if (const Json* calls = message.Find("tool_calls");
+        calls != nullptr && !calls->isNull()) {
+      if (!calls->isArray()) {
+        *error = "tool_calls must be an array";
+        return false;
+      }
+      stored.tool_calls_json = calls->Dump();
+    }
+    if (const Json* call_id = message.Find("tool_call_id");
+        call_id != nullptr && !call_id->isNull()) {
+      if (!call_id->isString()) {
+        *error = "tool_call_id must be a string";
+        return false;
+      }
+      stored.tool_call_id = call_id->AsString();
+    }
+    parsed.push_back(std::move(stored));
+  }
+  *out = std::move(parsed);
+  return true;
+}
+
+namespace {
 
 Json SseDelta(Json delta, const std::string& finish) {
   Json choice = Json::Object();
@@ -83,16 +170,6 @@ bool BodyFlag(const Json& body, std::string_view key, bool fallback) {
   }
   return fallback;
 }
-
-// Releases the session turn on every exit path.
-struct TurnGuard {
-  std::shared_ptr<Session> session;
-  ~TurnGuard() {
-    if (session != nullptr) {
-      session->End();
-    }
-  }
-};
 
 }  // namespace
 
@@ -169,18 +246,11 @@ void SessionHandler::HandleRename(ResponseWriter& writer, std::string_view id,
 // stop flag aborts the decode loop (prefill has no token hook and runs
 // to completion); pause blocks it between tokens.
 void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
-                            ResponseWriter& writer, std::size_t max_tokens,
-                            bool enable_thinking, bool stream) const {
+                             ResponseWriter& writer, std::size_t max_tokens,
+                             bool enable_thinking, bool stream) const {
   auto view = sessions_.View(session->Id());
-  Json messages = Json::Array();
-  for (const SessionMessage& message : view->messages) {
-    Json item = Json::Object();
-    item.Set("role", Json::String(message.role));
-    item.Set("content", Json::String(message.content));
-    messages.Push(std::move(item));
-  }
   Json prompt_body = Json::Object();
-  prompt_body.Set("messages", std::move(messages));
+  prompt_body.Set("messages", SessionHistoryJson(*view));
   prompt_body.Set("enable_thinking", Json::Bool(enable_thinking));
   std::string error;
   const std::string prompt = RenderPrompt(model_, prompt_body, &error);
@@ -282,9 +352,11 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     reasoning_text += tail.reasoning;
     content_text += tail.content;
     session->Append(SessionMessage{"assistant", content_text, reasoning_text,
+                                   /*tool_calls_json=*/{}, /*tool_call_id=*/{},
                                    saw_stop});
-    Json message = MessageJson(SessionMessage{"assistant", content_text,
-                                              reasoning_text, saw_stop});
+    Json message = MessageJson(SessionMessage{
+        "assistant", content_text, reasoning_text, /*tool_calls_json=*/{},
+        /*tool_call_id=*/{}, saw_stop});
     Json response = Json::Object();
     response.Set("message", std::move(message));
     response.Set("usage", UsageJson(ids->size(), produced));
@@ -292,25 +364,27 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     return;
   }
   session->Append(SessionMessage{"assistant", content_text, reasoning_text,
-                                 saw_stop});
+                                   /*tool_calls_json=*/{}, /*tool_call_id=*/{},
+                                   saw_stop});
 }
 
-// Acquire the session turn and the GPU slot: 409 when the session is
-// busy, 503 when another generation runs. The guard releases the turn.
+// Acquire the session turn and queue for the device: 409 when the
+// session is busy, otherwise wait behind running generations (a closed
+// peer waiting gives up its place). The guard releases the turn.
 bool SessionHandler::BeginTurn(const std::shared_ptr<Session>& session,
                                ResponseWriter& writer,
                                std::unique_lock<std::mutex>& gpu,
-                               TurnGuard& guard) const {
+                               SessionTurn& guard) const {
   if (!session->TryBegin()) {
     SendError(writer, 409, "session is already generating");
     return false;
   }
-  gpu = std::unique_lock<std::mutex>(generation_, std::try_to_lock);
-  if (!gpu.owns_lock()) {
+  auto slot = WaitForGpu(generation_, writer);
+  if (!slot) {
     session->End();
-    SendError(writer, 503, "another generation is already running");
     return false;
   }
+  gpu = std::move(*slot);
   guard.session = session;
   return true;
 }
@@ -329,15 +403,16 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
     return;
   }
   const bool first = session->View().messages.empty();
-  session->Append(
-      SessionMessage{"user", message->AsString(), /*reasoning=*/{}, false});
+  session->Append(SessionMessage{"user", message->AsString(), /*reasoning=*/{},
+                                 /*tool_calls_json=*/{}, /*tool_call_id=*/{},
+                                 false});
   if (first) {
     auto view = session->View();
     if (view.title == kDefaultTitle) {
       session->SetTitle(TitleFromText(message->AsString()));
     }
   }
-  TurnGuard guard;
+  SessionTurn guard;
   std::unique_lock<std::mutex> gpu;
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
@@ -359,7 +434,7 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
     SendError(writer, 422, "nothing to retry");
     return;
   }
-  TurnGuard guard;
+  SessionTurn guard;
   std::unique_lock<std::mutex> gpu;
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;

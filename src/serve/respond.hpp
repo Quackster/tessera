@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -23,6 +25,16 @@ void SendError(ResponseWriter& writer, int status, const std::string& message);
 // Positive `max_tokens` from the body, else `fallback`.
 [[nodiscard]] std::size_t MaxTokensFrom(const core::Json& body,
                                         std::size_t fallback);
+// Session id from the body (`session_id` string); empty when the
+// request is stateless. OpenAI clients ignore the unknown field, so
+// passing it is compatible with other servers.
+[[nodiscard]] std::string SessionIdFrom(const core::Json& body);
+// Queue for the single device behind running generations. Blocks in
+// arrival order instead of failing; nullopt when the peer goes away
+// while waiting (the waiter gives up its place). The single canonical
+// device queue for every endpoint.
+[[nodiscard]] std::optional<std::unique_lock<std::mutex>> WaitForGpu(
+    std::mutex& generation, const ResponseWriter& writer);
 // True when the body asks for server-sent events.
 [[nodiscard]] bool WantsStream(const core::Json& body);
 // Send the failure of a generation call: InvalidArgument (for example

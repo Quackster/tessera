@@ -10,6 +10,7 @@
 #include "serve/http.hpp"
 #include "serve/render.hpp"
 #include "serve/respond.hpp"
+#include "serve/session.hpp"
 #include "serve/tools/tool_call.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
@@ -59,9 +60,10 @@ core::Json StreamChunk(const std::string& model_name, core::Json delta,
   return chunk;
 }
 
-void ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
-                  ResponseWriter& writer, const std::string& model_name,
-                  const GenerateOptions& options, std::size_t prompt_size) {
+bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
+                   ResponseWriter& writer, const std::string& model_name,
+                   const GenerateOptions& options, std::size_t prompt_size,
+                   SessionMessage* out_turn) {
   std::string text;
   auto streamed = engine.GenerateStreaming(
       model, options, [&](std::uint32_t token) {
@@ -74,13 +76,21 @@ void ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
       });
   if (!streamed) {
     SendGenerationError(writer, streamed.error());
-    return;
+    return false;
   }
   std::string before;
   std::string reasoning;
   const std::vector<ToolCall> calls =
       ParseToolCalls(text, &before, &reasoning);
   const bool has_calls = !calls.empty();
+  if (out_turn != nullptr) {
+    out_turn->role = "assistant";
+    out_turn->content = before;
+    out_turn->reasoning = reasoning;
+    out_turn->tool_calls_json =
+        has_calls ? ToolCallsJson(calls).Dump() : std::string();
+    out_turn->stopped = writer.IsPeerGone();
+  }
   core::Json message = core::Json::Object();
   message.Set("role", core::Json::String("assistant"));
   if (!reasoning.empty()) {
@@ -105,13 +115,14 @@ void ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
   response.Set("choices", std::move(choices));
   response.Set("usage", UsageJson(prompt_size, *streamed));
   SendJson(writer, 200, response);
+  return true;
 }
 
 // The turn is generated first, then replayed as SSE: the client cannot
 // tell content apart from a tool call until the block is complete.
-void ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
+bool ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
                   ResponseWriter& writer, const std::string& model_name,
-                  const GenerateOptions& options) {
+                  const GenerateOptions& options, SessionMessage* out_turn) {
   std::string text;
   auto streamed = engine.GenerateStreaming(
       model, options, [&](std::uint32_t token) {
@@ -129,7 +140,7 @@ void ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
                                ? "prompt exceeds the model context window"
                                : "generation failed"));
     WriteSse(writer, "", chunk, false);
-    return;
+    return false;
   }
   (void)writer.SendHeaders(200, "text/event-stream", true);
   core::Json role_delta = core::Json::Object();
@@ -139,6 +150,14 @@ void ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
   std::string reasoning;
   const std::vector<ToolCall> calls =
       ParseToolCalls(text, &before, &reasoning);
+  if (out_turn != nullptr) {
+    out_turn->role = "assistant";
+    out_turn->content = before;
+    out_turn->reasoning = reasoning;
+    out_turn->tool_calls_json =
+        calls.empty() ? std::string() : ToolCallsJson(calls).Dump();
+    out_turn->stopped = writer.IsPeerGone();
+  }
   if (!reasoning.empty()) {
     core::Json delta = core::Json::Object();
     delta.Set("reasoning_content", core::Json::String(reasoning));
@@ -170,6 +189,7 @@ void ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
                        calls.empty() ? "length" : "tool_calls"),
            false);
   (void)writer.Write("data: [DONE]\n\n");
+  return true;
 }
 
 }  // namespace
@@ -179,34 +199,34 @@ bool WantsTools(const Json& body) {
   return EffectiveTools(body, &error) != nullptr;
 }
 
-void ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
+bool ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
                    ResponseWriter& writer, const Json& body,
-                   std::size_t default_max) {
+                   std::size_t default_max, SessionMessage* out_turn) {
   std::string error;
   const std::string prompt = RenderPrompt(model, body, &error);
   if (!error.empty()) {
     SendError(writer, 422, error);
-    return;
+    return false;
   }
   auto ids = tokenizer.Encode(prompt);
   if (!ids) {
     SendError(writer, 500, "tokenization failed");
-    return;
+    return false;
   }
   GenerateOptions options;
   options.max_tokens = MaxTokensFrom(body, default_max);
   options.prompt_tokens = *ids;
   if (RejectOversizePrompt(writer, ids->size(), options.max_tokens,
                            model.MaxContextLength())) {
-    return;
+    return false;
   }
   const std::string model_name(model.Name());
   if (WantsStream(body)) {
-    ChatStreamed(engine, model, tokenizer, writer, model_name, options);
-  } else {
-    ChatBuffered(engine, model, tokenizer, writer, model_name, options,
-                 ids->size());
+    return ChatStreamed(engine, model, tokenizer, writer, model_name, options,
+                        out_turn);
   }
+  return ChatBuffered(engine, model, tokenizer, writer, model_name, options,
+                      ids->size(), out_turn);
 }
 
 }  // namespace tessera::serve

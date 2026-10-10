@@ -96,12 +96,14 @@ through RADV GFX1201, rocm through the system ROCm).
   buffered and a chunked (SSE) response path, API-key auth
   (Bearer/X-Api-Key/x-api-key, env `TESSERA_API_KEY`) and a CORS
   allowlist. Endpoints: `/health`, `/metrics`, `/v1/models`, `/props`,
-  `/tokenize`, `/detokenize`, `/slots`, `/v1/completions` (streaming
-  SSE), `/v1/chat/completions` (SSE), `/v1/messages` and
-   `/v1/messages/count_tokens`; unimplemented surfaces return 501.
-   `Engine::GenerateStreaming` emits tokens one at a time. Prefill runs
-   in one batched forward. The serving surface is deferred (see Next
-   item 4).
+  `/tokenize`, `/detokenize`, `/slots` (live sessions), `/v1/completions`
+  (streaming SSE), `/v1/chat/completions` (SSE), `/v1/messages` and
+  `/v1/messages/count_tokens`; unimplemented surfaces return 501.
+  `Engine::GenerateStreaming` emits tokens one at a time. Generations
+  queue in arrival order on the single device instead of answering 503,
+  so parallel windows wait their turn. Chats live in server sessions
+  (`/api/sessions`, `/v1/sessions` aliases); the OpenAI endpoints
+  continue one through `session_id` (see the newest Done entry).
 - Chat-template renderer: a compact Jinja2-subset engine
   (`tessera/serve/jinja`) that runs the model's GGUF chat template.
   `Model::ChatTemplate` exposes the template. It matches the reference
@@ -2249,6 +2251,22 @@ through RADV GFX1201, rocm through the system ROCm).
   (c) the draft forward cost (fp32 weights, many small kernels).
   The MTP per-draft cost is measured: each draft reads the shared
   2.5 GB output head, so the default chain stays at one.
+- 2026-10-10: **OpenAI session management and device queueing (324/324
+  `ctest` on vulkan).** Generations queue in arrival order on the single
+  device instead of answering 503, so parallel windows and parallel API
+  clients each get their turn; a peer that disconnects while queued
+  gives up its place (`WaitForGpu`). The OpenAI endpoints
+  (`/v1/completions`, `/v1/chat/completions`, `/v1/messages`) accept
+  `session_id` to continue a stored session (404 unknown, 409 already
+  generating): incoming histories reconcile by common prefix
+  (`Session::SyncHistory`), so a client that resends the full history
+  and a client that sends only new turns both converge, and the
+  assistant reply (text, reasoning, tool calls) is appended to the
+  session. Sessions are managed through `/api/sessions` and the
+  `/v1/sessions` aliases; `GET /slots` reports the live sessions. The
+  OpenAI endpoint code moves from `server.cpp` to `src/serve/openai.*`,
+  keeping both files under the size cap.
+
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.
@@ -2416,15 +2434,20 @@ through RADV GFX1201, rocm through the system ROCm).
    bullet). Applies on both backends. The tree holds uncommitted f32
    and bf16 rows kernels plus a top-k kernel; they need device tests
    and a measurement before they commit.
-4. **Serving API (DEFERRED)**: do not extend the HTTP surface unless
-   explicitly told. A first slice lives in `src/serve/` (`/health`,
-   `/metrics`, `/v1/models`, `/props`, `/tokenize`, `/detokenize`,
-   `/slots`, `/v1/completions`, `/v1/chat/completions`, `/v1/messages`,
+4. **Serving API (partly done)**: the owner asked for session
+   management and parallel windows, so the HTTP surface grew there:
+   generations queue in arrival order on the device (no more 503),
+   chats live in server sessions (`/api/sessions`, `/v1/sessions`
+   aliases, `GET /slots` reports them), and the OpenAI endpoints
+   continue one through `session_id`. Still deferred unless explicitly
+   told: thread pool, keep-alive, `/v1/responses`,
+   render/derender/batch, `/tokenizer_info`, `/load` and LoRA, and the
+   501 embedding/rerank/audio/pooling/classify/score surfaces. A first
+   slice lives in `src/serve/` (`/health`, `/metrics`, `/v1/models`,
+   `/props`, `/tokenize`, `/detokenize`, `/slots`, `/v1/completions`,
+   `/v1/chat/completions`, `/v1/messages`,
    `/v1/messages/count_tokens`, SSE for completions/chat/messages,
-   API-key auth, CORS). Not done and deferred: thread pool/engine
-   queue, keep-alive, `/v1/responses`, render/derender/batch,
-   `/tokenizer_info`, `/load` and LoRA, and the 501
-   embedding/rerank/audio/pooling/classify/score surfaces.
+   API-key auth, CORS).
 5. **Runtime options**: context size, draft-block and the GPU index
    (`--gpu`) are CLI flags now, and the KV cache can be fp16 (`--kv-f16`)
    (--kv-q8), 4-bit (`--kv-q4`) or FP8 (`--kv-fp8`). Vision input is

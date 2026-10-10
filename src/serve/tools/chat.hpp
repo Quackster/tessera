@@ -16,6 +16,7 @@ class Tokenizer;
 namespace serve {
 
 class ResponseWriter;
+struct SessionMessage;
 
 // True when the body carries a non-empty tool list that is not disabled
 // by `tool_choice: "none"`.
@@ -23,10 +24,15 @@ class ResponseWriter;
 
 // Run one tool-aware chat turn and write the OpenAI chat response
 // (buffered or SSE). Falls back to a plain text answer when the model
-// emits no tool call.
-void ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
-                   ResponseWriter& writer, const core::Json& body,
-                   std::size_t default_max);
+// emits no tool call. `out_turn` (null to skip) receives the assistant
+// turn for session history: text content, reasoning and the OpenAI-form
+// tool_calls dump. True when the turn generated (and `out_turn`, when
+// given, is valid); the error response is already sent otherwise.
+[[nodiscard]] bool ChatWithTools(Engine& engine, Model& model,
+                                const Tokenizer& tokenizer,
+                                ResponseWriter& writer, const core::Json& body,
+                                std::size_t default_max,
+                                SessionMessage* out_turn);
 
 }  // namespace serve
 

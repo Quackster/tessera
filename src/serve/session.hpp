@@ -19,13 +19,23 @@ namespace tessera::serve {
 // names it unless the caller set a title.
 inline constexpr char kDefaultTitle[] = "New chat";
 
-// One stored chat turn message.
+// One stored chat turn message. Tool turns keep their OpenAI form:
+// an assistant message carries the `tool_calls` array dump, a tool
+// message its `tool_call_id`, so the history re-renders exactly.
 struct SessionMessage {
-  std::string role;      // "user" or "assistant"
+  std::string role;      // "user", "assistant", "system" or "tool"
   std::string content;
   std::string reasoning;  // assistant thinking (may be empty)
+  std::string tool_calls_json;  // assistant tool_calls array dump, else empty
+  std::string tool_call_id;     // tool message id, else empty
   bool stopped = false;   // generation was stopped mid-turn
 };
+
+// True when two messages render the same prompt row: the response-side
+// metadata (reasoning, stopped) is ignored, so a resent OpenAI history
+// still matches the stored one.
+[[nodiscard]] bool SamePromptRow(const SessionMessage& a,
+                                 const SessionMessage& b);
 
 // Read-only session copy for JSON responses.
 struct SessionView {
@@ -55,6 +65,13 @@ class Session {
   [[nodiscard]] SessionInfo Info() const;
   // Append a history message (user before, assistant after a turn).
   void Append(SessionMessage message);
+  // Reconcile with an incoming OpenAI history. A common prefix keeps
+  // the stored turns and appends the incoming remainder; a divergence
+  // after that prefix drops the stored tail first (branch switch). No
+  // common prefix means the client sent only new turns, so they append
+  // and nothing is lost. A full-history resend and a delta-only client
+  // both converge without duplication.
+  void SyncHistory(std::vector<SessionMessage> incoming);
   // Drop trailing assistant messages (retry); returns the count.
   std::size_t PopTrailingAssistant();
   void SetTitle(const std::string& title);
@@ -92,6 +109,14 @@ class SessionStore {
   mutable std::mutex mutex_;
   std::vector<std::shared_ptr<Session>> sessions_;
   std::size_t next_ = 1;
+};
+
+// Releases a session turn; empty when no turn was taken. The single
+// canonical guard (the web handler and the OpenAI endpoints share it);
+// the destructor ends the turn on every exit path.
+struct SessionTurn {
+  std::shared_ptr<Session> session;
+  ~SessionTurn();
 };
 
 // Default title from the first user text: trimmed first line,

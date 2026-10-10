@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 #include <string_view>
@@ -13,6 +15,7 @@
 #include "serve/http.hpp"
 #include "serve/respond.hpp"
 #include "serve/session.hpp"
+#include "serve/session_chat.hpp"
 #include "serve/tools/tool_call.hpp"
 #include "core/json.hpp"
 #include "tessera/log.hpp"
@@ -439,9 +442,9 @@ TEST(ServeTest, SessionStoreCrud) {
 TEST(ServeTest, SessionHistoryAndTurnGuard) {
   tessera::serve::SessionStore store;
   auto session = store.Create({});
-  session->Append({"user", "hi", {}, false});
-  session->Append({"assistant", "hello", "thinking", false});
-  session->Append({"assistant", "again", {}, false});
+  session->Append({"user", "hi", {}, {}, {}, false});
+  session->Append({"assistant", "hello", "thinking", {}, {}, false});
+  session->Append({"assistant", "again", {}, {}, {}, false});
   EXPECT_EQ(session->View().messages.size(), 3u);
   EXPECT_EQ(session->PopTrailingAssistant(), 2u);
   EXPECT_EQ(session->View().messages.size(), 1u);
@@ -717,4 +720,253 @@ TEST(ServeTest, HttpServesConcurrentConnections) {
     ::close(dummy);
   }
   server.join();
+}
+
+// session_id reads the OpenAI session field; anything else is stateless.
+TEST(ServeTest, SessionIdFromReadsSessionField) {
+  auto present = Json::Parse(R"({"session_id":"s3","messages":[]})");
+  ASSERT_NE(present, nullptr);
+  EXPECT_EQ(tessera::serve::SessionIdFrom(*present), "s3");
+  auto absent = Json::Parse(R"({"messages":[]})");
+  ASSERT_NE(absent, nullptr);
+  EXPECT_TRUE(tessera::serve::SessionIdFrom(*absent).empty());
+  auto typed = Json::Parse(R"({"session_id":7})");
+  ASSERT_NE(typed, nullptr);
+  EXPECT_TRUE(tessera::serve::SessionIdFrom(*typed).empty());
+  auto empty = Json::Parse(R"({"session_id":""})");
+  ASSERT_NE(empty, nullptr);
+  EXPECT_TRUE(tessera::serve::SessionIdFrom(*empty).empty());
+}
+
+// Prompt-row equality ignores response metadata, so a resent OpenAI
+// history (no reasoning) still matches the stored turns.
+TEST(ServeTest, SamePromptRowIgnoresResponseMetadata) {
+  const tessera::serve::SessionMessage stored{"assistant", "hi", "thinking",
+                                              {}, {}, false};
+  const tessera::serve::SessionMessage resent{"assistant", "hi", {}, {}, {},
+                                              true};
+  EXPECT_TRUE(tessera::serve::SamePromptRow(stored, resent));
+  const tessera::serve::SessionMessage other{"assistant", "bye", "thinking",
+                                             {}, {}, false};
+  EXPECT_FALSE(tessera::serve::SamePromptRow(stored, other));
+  const tessera::serve::SessionMessage role{"user", "hi", {}, {}, {}, false};
+  EXPECT_FALSE(tessera::serve::SamePromptRow(stored, role));
+  const tessera::serve::SessionMessage tools{"assistant", "hi", "thinking",
+                                             "[{}]", {}, false};
+  EXPECT_FALSE(tessera::serve::SamePromptRow(stored, tools));
+}
+
+// A full-history resend converges without duplicating the prefix.
+TEST(ServeTest, SyncHistoryMergesFullResend) {
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hi", {}, {}, {}, false});
+  session->Append({"assistant", "hello", "thinking", {}, {}, false});
+  std::vector<tessera::serve::SessionMessage> incoming{
+      {"user", "hi", {}, {}, {}, false},
+      {"assistant", "hello", {}, {}, {}, false},
+      {"user", "again", {}, {}, {}, false},
+  };
+  session->SyncHistory(std::move(incoming));
+  const auto view = session->View();
+  ASSERT_EQ(view.messages.size(), 3u);
+  EXPECT_EQ(view.messages[0].content, "hi");
+  EXPECT_EQ(view.messages[1].content, "hello");
+  EXPECT_EQ(view.messages[1].reasoning, "thinking");
+  EXPECT_EQ(view.messages[2].content, "again");
+}
+
+// A delta-only client (new turns without the history) appends cleanly.
+TEST(ServeTest, SyncHistoryAppendsDeltaOnly) {
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hi", {}, {}, {}, false});
+  std::vector<tessera::serve::SessionMessage> incoming{
+      {"user", "next", {}, {}, {}, false},
+  };
+  session->SyncHistory(std::move(incoming));
+  const auto view = session->View();
+  ASSERT_EQ(view.messages.size(), 2u);
+  EXPECT_EQ(view.messages[1].content, "next");
+}
+// A divergent history truncates the stored tail, like a branch switch.
+TEST(ServeTest, SyncHistoryTruncatesOnDiverge) {
+
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hi", {}, {}, {}, false});
+  session->Append({"assistant", "hello", {}, {}, {}, false});
+  std::vector<tessera::serve::SessionMessage> incoming{
+      {"user", "hi", {}, {}, {}, false},
+      {"assistant", "changed", {}, {}, {}, false},
+  };
+  session->SyncHistory(std::move(incoming));
+  const auto view = session->View();
+  ASSERT_EQ(view.messages.size(), 2u);
+  EXPECT_EQ(view.messages[1].content, "changed");
+}
+
+// An empty incoming history leaves the stored turns alone.
+TEST(ServeTest, SyncHistoryKeepsHistoryOnEmpty) {
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hi", {}, {}, {}, false});
+  std::vector<tessera::serve::SessionMessage> incoming;
+  session->SyncHistory(std::move(incoming));
+  const auto view = session->View();
+  ASSERT_EQ(view.messages.size(), 1u);
+  EXPECT_EQ(view.messages[0].content, "hi");
+}
+
+// OpenAI histories parse to stored turns; null content reads as empty
+// (tool-call-only assistant messages), tool turns round-trip.
+TEST(ServeTest, SessionMessagesFromJsonParsesHistory) {
+  auto body = Json::Parse(
+      R"({"messages":[
+        {"role":"user","content":"hi"},
+        {"role":"assistant","content":null,"tool_calls":[
+          {"id":"call_0","type":"function",
+           "function":{"name":"read","arguments":"{}"}}]},
+        {"role":"tool","content":"data","tool_call_id":"call_0"}]})");
+  ASSERT_NE(body, nullptr);
+  const Json* messages = body->Find("messages");
+  ASSERT_NE(messages, nullptr);
+  std::vector<tessera::serve::SessionMessage> out;
+  std::string error;
+  ASSERT_TRUE(
+      tessera::serve::SessionMessagesFromJson(*messages, &out, &error));
+  EXPECT_TRUE(error.empty());
+  ASSERT_EQ(out.size(), 3u);
+  EXPECT_EQ(out[0].role, "user");
+  EXPECT_EQ(out[0].content, "hi");
+  EXPECT_TRUE(out[1].content.empty());
+  EXPECT_FALSE(out[1].tool_calls_json.empty());
+  EXPECT_EQ(out[2].tool_call_id, "call_0");
+}
+
+// Non-string content cannot round-trip through the text history.
+TEST(ServeTest, SessionMessagesFromJsonRejectsBlocks) {
+  auto body = Json::Parse(
+      R"({"messages":[{"role":"user","content":[{"type":"text"}]}]})");
+  ASSERT_NE(body, nullptr);
+  std::vector<tessera::serve::SessionMessage> out;
+  std::string error;
+  EXPECT_FALSE(
+      tessera::serve::SessionMessagesFromJson(*body->Find("messages"), &out,
+                                              &error));
+  EXPECT_EQ(error, "session history needs string content");
+  auto missing = Json::Parse(R"({})");
+  ASSERT_NE(missing, nullptr);
+  EXPECT_FALSE(tessera::serve::SessionMessagesFromJson(*missing, &out, &error));
+}
+
+// History survives a JSON round trip, including tool turns.
+TEST(ServeTest, SessionHistoryJsonRoundTripsTools) {
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hi", {}, {}, {}, false});
+  session->Append({"assistant", "", "thinking", R"([{"id":"call_0"}])", {},
+                   false});
+  session->Append({"tool", "data", {}, {}, "call_0", false});
+  const Json history =
+      tessera::serve::SessionHistoryJson(session->View());
+  ASSERT_TRUE(history.isArray());
+  ASSERT_EQ(history.AsArray().size(), 3u);
+  std::vector<tessera::serve::SessionMessage> back;
+  std::string error;
+  ASSERT_TRUE(
+      tessera::serve::SessionMessagesFromJson(history, &back, &error));
+  ASSERT_EQ(back.size(), 3u);
+  for (std::size_t i = 0; i < 3; ++i) {
+    EXPECT_TRUE(tessera::serve::SamePromptRow(
+        session->View().messages[i], back[i]));
+  }
+  EXPECT_EQ(back[1].tool_calls_json, R"([{"id":"call_0"}])");
+  EXPECT_EQ(back[2].tool_call_id, "call_0");
+}
+
+// Session JSON exposes tool turns for API clients; the info entry
+// feeds the sidebar and GET /slots.
+TEST(ServeTest, SessionJsonExposesToolTurns) {
+  tessera::serve::SessionMessage turn{"assistant", "", "thinking",
+                                      R"([{"id":"call_0"}])", {}, false};
+  tessera::serve::SessionView view{"s1", "title", {turn}, true, false};
+  const Json json = tessera::serve::SessionJson(view);
+  const Json* messages = json.Find("messages");
+  ASSERT_NE(messages, nullptr);
+  ASSERT_EQ(messages->AsArray().size(), 1u);
+  const Json* calls = messages->AsArray()[0].Find("tool_calls");
+  ASSERT_NE(calls, nullptr);
+  ASSERT_TRUE(calls->isArray());
+  const Json info =
+      tessera::serve::SessionInfoJson({"s1", "title", 1, true});
+  EXPECT_EQ(info.Find("id")->AsString(), "s1");
+  EXPECT_EQ(info.Find("title")->AsString(), "title");
+  EXPECT_EQ(info.Find("message_count")->AsNumber(), 1.0);
+  EXPECT_TRUE(info.Find("busy")->AsBool());
+}
+
+// The shared turn guard ends the turn when it drops.
+TEST(ServeTest, SessionTurnGuardReleases) {
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  EXPECT_TRUE(session->TryBegin());
+  {
+    tessera::serve::SessionTurn guard;
+    guard.session = session;
+    EXPECT_FALSE(session->TryBegin());
+  }
+  EXPECT_TRUE(session->TryBegin());
+  session->End();
+}
+
+// A free device grants the queue immediately.
+TEST(ServeTest, WaitForGpuAcquiresFreeDevice) {
+  int pair[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+  tessera::serve::ResponseWriter writer(pair[0]);
+  std::mutex generation;
+  auto slot = tessera::serve::WaitForGpu(generation, writer);
+  ASSERT_TRUE(slot.has_value());
+  EXPECT_TRUE(slot->owns_lock());
+  slot.reset();
+  ::close(pair[0]);
+  ::close(pair[1]);
+}
+
+// A waiter behind a held device proceeds once it frees.
+TEST(ServeTest, WaitForGpuQueuesBehindHeldDevice) {
+  int pair[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+  tessera::serve::ResponseWriter writer(pair[0]);
+  std::mutex generation;
+  std::unique_lock<std::mutex> held(generation);
+  std::optional<std::unique_lock<std::mutex>> slot;
+  std::thread waiter([&] { slot = tessera::serve::WaitForGpu(generation,
+                                                             writer); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  held.unlock();
+  waiter.join();
+  ASSERT_TRUE(slot.has_value());
+  EXPECT_TRUE(slot->owns_lock());
+  slot.reset();
+  ::close(pair[0]);
+  ::close(pair[1]);
+}
+
+// A peer that disconnects while queued gives up its place.
+TEST(ServeTest, WaitForGpuAbortsWhenPeerGone) {
+  int pair[2] = {-1, -1};
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+  std::mutex generation;
+  std::unique_lock<std::mutex> held(generation);
+  ::close(pair[1]);  // the peer goes away before queueing
+  tessera::serve::ResponseWriter writer(pair[0]);
+  std::optional<std::unique_lock<std::mutex>> slot;
+  std::thread waiter([&] { slot = tessera::serve::WaitForGpu(generation,
+                                                             writer); });
+  waiter.join();
+  EXPECT_FALSE(slot.has_value());
+  held.unlock();
+  ::close(pair[0]);
 }

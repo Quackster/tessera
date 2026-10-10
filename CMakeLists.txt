@@ -59,6 +59,7 @@ add_library(tessera STATIC
     src/serve/respond.cpp
     src/serve/render.cpp
     src/serve/server.cpp
+    src/serve/openai.cpp
     src/serve/session.cpp
     src/serve/session_chat.cpp
     src/serve/tools/tool_call.cpp

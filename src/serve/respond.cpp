@@ -1,11 +1,22 @@
 #include "serve/respond.hpp"
 
+#include <chrono>
+#include <mutex>
 #include <string>
+#include <thread>
 
 #include "tessera/serve.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera::serve {
+
+namespace {
+
+// Poll interval while queued for the device: short enough to start
+// promptly, long enough to stay out of the way.
+constexpr int kQueuePollMs = 10;
+
+}  // namespace
 
 void SendJson(ResponseWriter& writer, int status, const core::Json& body) {
   (void)writer.SendHeaders(status, "application/json");
@@ -37,6 +48,30 @@ std::size_t MaxTokensFrom(const core::Json& body, std::size_t fallback) {
     return static_cast<std::size_t>(value->AsNumber());
   }
   return fallback;
+}
+
+std::string SessionIdFrom(const core::Json& body) {
+  const core::Json* value = body.Find("session_id");
+  if (value != nullptr && value->isString()) {
+    return value->AsString();
+  }
+  return {};
+}
+
+std::optional<std::unique_lock<std::mutex>> WaitForGpu(
+    std::mutex& generation, const ResponseWriter& writer) {
+  for (;;) {
+    std::unique_lock<std::mutex> slot(generation, std::try_to_lock);
+    if (slot.owns_lock()) {
+      return slot;
+    }
+    // A peer that disconnects while queued stops waiting instead of
+    // holding its place behind a generation it never reads.
+    if (writer.IsPeerGone()) {
+      return std::nullopt;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kQueuePollMs));
+  }
 }
 
 bool WantsStream(const core::Json& body) {

@@ -1,0 +1,499 @@
+#include "serve/openai.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "core/json.hpp"
+#include "serve/http.hpp"
+#include "serve/render.hpp"
+#include "serve/respond.hpp"
+#include "serve/session_chat.hpp"
+#include "serve/tools/chat.hpp"
+#include "serve/tools/tool_call.hpp"
+#include "tessera/engine.hpp"
+#include "tessera/model.hpp"
+#include "tessera/tokenizer.hpp"
+
+namespace tessera::serve {
+
+namespace {
+
+using core::Json;
+
+// First user text in a history, for naming a new session.
+std::string FirstUserText(const SessionView& view) {
+  for (const SessionMessage& message : view.messages) {
+    if (message.role == "user" && !message.content.empty()) {
+      return message.content;
+    }
+  }
+  return {};
+}
+
+// Title a fresh session from its first user turn.
+void MaybeNameSession(const std::shared_ptr<Session>& session,
+                      const SessionView& before) {
+  if (!before.messages.empty() || before.title != kDefaultTitle) {
+    return;
+  }
+  const std::string text = FirstUserText(session->View());
+  if (!text.empty()) {
+    session->SetTitle(TitleFromText(text));
+  }
+}
+
+// Assistant turn stored from generated `text`: thinking and tool markup
+// stay out of the history, so a resent OpenAI history still matches.
+SessionMessage AssistantTurn(std::string_view text, bool stopped) {
+  std::string before;
+  std::string reasoning;
+  (void)ParseToolCalls(text, &before, &reasoning);
+  return SessionMessage{"assistant", before, reasoning,
+                        /*tool_calls_json=*/{}, /*tool_call_id=*/{}, stopped};
+}
+
+// Reconcile an incoming OpenAI history with the session: 422 on a
+// malformed history, otherwise the merged view for rendering.
+bool BeginChatTurn(const std::shared_ptr<Session>& session,
+                   ResponseWriter& writer, const Json& body,
+                   SessionView* view) {
+  const Json* messages = body.Find("messages");
+  if (messages == nullptr) {
+    SendError(writer, 422, "messages must be an array");
+    return false;
+  }
+  std::vector<SessionMessage> incoming;
+  std::string error;
+  if (!SessionMessagesFromJson(*messages, &incoming, &error)) {
+    SendError(writer, 422, error);
+    return false;
+  }
+  const SessionView before = session->View();
+  session->SyncHistory(std::move(incoming));
+  MaybeNameSession(session, before);
+  *view = session->View();
+  return true;
+}
+
+// Prompt body for a session turn: the full stored history plus the
+// request-level fields (system prompt, tools, thinking flag).
+Json SessionPromptBody(const Json& body, const SessionView& view) {
+  Json prompt_body = Json::Object();
+  prompt_body.Set("messages", SessionHistoryJson(view));
+  for (const char* key : {"system", "tools", "tool_choice",
+                          "enable_thinking"}) {
+    if (const Json* value = body.Find(key)) {
+      prompt_body.Set(key, *value);
+    }
+  }
+  return prompt_body;
+}
+
+// Take the session turn (404 unknown, 409 already generating). The
+// guard ends it on every exit path once set.
+bool BeginSession(SessionStore& sessions, const std::string& session_id,
+                  ResponseWriter& writer, std::shared_ptr<Session>* session,
+                  SessionTurn* turn) {
+  *session = sessions.Get(session_id);
+  if (*session == nullptr) {
+    SendError(writer, 404, "unknown session");
+    return false;
+  }
+  if (!(*session)->TryBegin()) {
+    SendError(writer, 409, "session is already generating");
+    return false;
+  }
+  turn->session = *session;
+  return true;
+}
+
+}  // namespace
+
+void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
+                    SessionStore& sessions, std::mutex& generation,
+                    ResponseWriter& writer, const Json& body,
+                    std::size_t default_max) {
+  const std::string session_id = SessionIdFrom(body);
+  const Json* prompt = body.Find("prompt");
+  if (prompt == nullptr || !prompt->isString()) {
+    SendError(writer, 422, "prompt must be a string");
+    return;
+  }
+  std::shared_ptr<Session> session;
+  SessionTurn turn;
+  if (!session_id.empty() &&
+      !BeginSession(sessions, session_id, writer, &session, &turn)) {
+    return;
+  }
+  auto slot = WaitForGpu(generation, writer);
+  if (!slot) {
+    return;
+  }
+  std::string prompt_text = prompt->AsString();
+  if (session != nullptr) {
+    const SessionView before = session->View();
+    session->Append(SessionMessage{"user", prompt_text, /*reasoning=*/{},
+                                   /*tool_calls_json=*/{}, /*tool_call_id=*/{},
+                                   false});
+    MaybeNameSession(session, before);
+    std::string error;
+    prompt_text = RenderPrompt(model, SessionPromptBody(body, session->View()),
+                               &error);
+    if (!error.empty()) {
+      SendError(writer, 422, error);
+      return;
+    }
+  }
+  auto ids = tokenizer.Encode(prompt_text);
+  if (!ids) {
+    SendError(writer, 500, "tokenization failed");
+    return;
+  }
+  const std::size_t max_tokens = MaxTokensFrom(body, default_max);
+  const bool stream = WantsStream(body);
+  GenerateOptions options;
+  options.max_tokens = max_tokens;
+  options.prompt_tokens = *ids;
+  if (RejectOversizePrompt(writer, ids->size(), max_tokens,
+                           model.MaxContextLength())) {
+    return;
+  }
+  if (!stream) {
+    // GenerateStreaming with a liveness hook instead of Generate:
+    // identical tokens, but a closed window aborts the turn instead
+    // of decoding into the void.
+    std::vector<std::uint32_t> produced;
+    auto streamed = engine.GenerateStreaming(
+        model, options, [&](std::uint32_t token) {
+          if (writer.IsPeerGone()) {
+            return false;
+          }
+          produced.push_back(token);
+          return true;
+        });
+    if (!streamed) {
+      // A gone peer fails here only on a real error (abort returns a
+      // count); anything else is reported when someone listens.
+      if (!writer.IsPeerGone()) {
+        SendGenerationError(writer, streamed.error());
+      }
+      return;
+    }
+    auto text = tokenizer.Decode(produced);
+    if (!text) {
+      SendError(writer, 500, "detokenization failed");
+      return;
+    }
+    if (session != nullptr) {
+      session->Append(AssistantTurn(*text, writer.IsPeerGone()));
+    }
+    Json choice = Json::Object();
+    choice.Set("text", Json::String(*text));
+    choice.Set("index", Json::Number(0));
+    choice.Set("finish_reason", Json::String("length"));
+    Json choices = Json::Array();
+    choices.Push(std::move(choice));
+    Json response = Json::Object();
+    response.Set("id", Json::String("cmpl-0"));
+    response.Set("object", Json::String("text_completion"));
+    response.Set("model", Json::String(std::string(model.Name())));
+    response.Set("choices", std::move(choices));
+    response.Set("usage", UsageJson(ids->size(), produced.size()));
+    SendJson(writer, 200, response);
+    return;
+  }
+  (void)writer.SendHeaders(200, "text/event-stream", true);
+  std::size_t count = 0;
+  std::string text;
+  auto streamed = engine.GenerateStreaming(
+      model, options, [&](std::uint32_t token) {
+        if (writer.IsPeerGone()) {
+          return false;
+        }
+        auto piece = tokenizer.Decode(
+            std::span<const std::uint32_t>(&token, 1));
+        if (piece) {
+          text += *piece;
+        }
+        Json choice = Json::Object();
+        choice.Set("text", Json::String(piece ? *piece : std::string()));
+        choice.Set("index", Json::Number(0));
+        choice.Set("finish_reason", Json());
+        Json choices = Json::Array();
+        choices.Push(std::move(choice));
+        Json chunk = Json::Object();
+        chunk.Set("id", Json::String("cmpl-0"));
+        chunk.Set("object", Json::String("text_completion"));
+        chunk.Set("choices", std::move(choices));
+        WriteSse(writer, "", chunk, false);
+        ++count;
+        return true;
+      });
+  if (session != nullptr) {
+    session->Append(AssistantTurn(text, writer.IsPeerGone()));
+  }
+  if (!streamed) {
+    Json chunk = Json::Object();
+    chunk.Set("error", Json::String(
+                           streamed.error() == StatusCode::InvalidArgument
+                               ? "prompt exceeds the model context window"
+                               : "generation failed"));
+    WriteSse(writer, "", chunk, false);
+  }
+  Json done = Json::Object();
+  done.Set("choices", Json());
+  Json choices = Json::Array();
+  Json choice = Json::Object();
+  choice.Set("text", Json::String(""));
+  choice.Set("index", Json::Number(0));
+  choice.Set("finish_reason", Json::String("length"));
+  choices.Push(std::move(choice));
+  done.Set("choices", std::move(choices));
+  WriteSse(writer, "", done, false);
+  (void)writer.Write("data: [DONE]\n\n");
+  (void)count;
+}
+
+void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
+                SessionStore& sessions, std::mutex& generation,
+                ResponseWriter& writer, const Json& body,
+                std::size_t default_max, bool anthropic) {
+  const std::string session_id = SessionIdFrom(body);
+  std::shared_ptr<Session> session;
+  SessionTurn turn;
+  Json prompt_body = body;
+  if (!session_id.empty()) {
+    if (!BeginSession(sessions, session_id, writer, &session, &turn)) {
+      return;
+    }
+  }
+  auto slot = WaitForGpu(generation, writer);
+  if (!slot) {
+    return;
+  }
+  if (session != nullptr) {
+    SessionView view{"", "", {}, false, false};
+    if (!BeginChatTurn(session, writer, body, &view)) {
+      return;
+    }
+    prompt_body = SessionPromptBody(body, view);
+  }
+  if (!anthropic && WantsTools(prompt_body)) {
+    SessionMessage assistant;
+    const bool ok =
+        ChatWithTools(engine, model, tokenizer, writer, prompt_body,
+                      default_max, session != nullptr ? &assistant : nullptr);
+    if (session != nullptr && ok) {
+      session->Append(std::move(assistant));
+    }
+    return;
+  }
+  std::string error;
+  const std::string prompt = RenderPrompt(model, prompt_body, &error);
+  if (!error.empty()) {
+    SendError(writer, 422, error);
+    return;
+  }
+  auto ids = tokenizer.Encode(prompt);
+  if (!ids) {
+    SendError(writer, 500, "tokenization failed");
+    return;
+  }
+  const std::size_t max_tokens = MaxTokensFrom(prompt_body, default_max);
+  const bool stream = WantsStream(prompt_body);
+  GenerateOptions options;
+  options.max_tokens = max_tokens;
+  options.prompt_tokens = *ids;
+  if (RejectOversizePrompt(writer, ids->size(), max_tokens,
+                           model.MaxContextLength())) {
+    return;
+  }
+  const std::string model_name(model.Name());
+  if (anthropic) {
+    if (!stream) {
+      // GenerateStreaming with a liveness hook instead of Generate:
+      // identical tokens, but a closed window aborts the turn instead
+      // of decoding into the void.
+      std::vector<std::uint32_t> produced;
+      auto streamed = engine.GenerateStreaming(
+          model, options, [&](std::uint32_t token) {
+            if (writer.IsPeerGone()) {
+              return false;
+            }
+            produced.push_back(token);
+            return true;
+          });
+      if (!streamed) {
+        // A gone peer fails here only on a real error (abort returns a
+        // count); anything else is reported when someone listens.
+        if (!writer.IsPeerGone()) {
+          SendGenerationError(writer, streamed.error());
+        }
+        return;
+      }
+      auto text = tokenizer.Decode(produced);
+      if (session != nullptr) {
+        session->Append(AssistantTurn(text ? *text : std::string(),
+                                      writer.IsPeerGone()));
+      }
+      Json content = Json::Array();
+      Json block = Json::Object();
+      block.Set("type", Json::String("text"));
+      block.Set("text", Json::String(text ? *text : std::string()));
+      content.Push(std::move(block));
+      Json usage = Json::Object();
+      usage.Set("input_tokens", Json::Number(static_cast<double>(ids->size())));
+      usage.Set("output_tokens",
+                Json::Number(static_cast<double>(produced.size())));
+      Json response = Json::Object();
+      response.Set("id", Json::String("msg_0"));
+      response.Set("type", Json::String("message"));
+      response.Set("role", Json::String("assistant"));
+      response.Set("model", Json::String(model_name));
+      response.Set("content", std::move(content));
+      response.Set("stop_reason", Json::String("max_tokens"));
+      response.Set("usage", std::move(usage));
+      SendJson(writer, 200, response);
+      return;
+    }
+    (void)writer.SendHeaders(200, "text/event-stream", true);
+    Json start = Json::Object();
+    start.Set("type", Json::String("message_start"));
+    Json message = Json::Object();
+    message.Set("id", Json::String("msg_0"));
+    message.Set("role", Json::String("assistant"));
+    message.Set("content", Json::Array());
+    start.Set("message", std::move(message));
+    WriteSse(writer, "message_start", start, true);
+    Json block_start = Json::Object();
+    block_start.Set("type", Json::String("content_block_start"));
+    block_start.Set("index", Json::Number(0));
+    Json block = Json::Object();
+    block.Set("type", Json::String("text"));
+    block.Set("text", Json::String(""));
+    block_start.Set("content_block", std::move(block));
+    WriteSse(writer, "content_block_start", block_start, true);
+    std::string text;
+    (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
+      if (writer.IsPeerGone()) {
+        return false;
+      }
+      auto piece =
+          tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
+      if (piece) {
+        text += *piece;
+      }
+      Json delta = Json::Object();
+      delta.Set("type", Json::String("content_block_delta"));
+      delta.Set("index", Json::Number(0));
+      Json text_delta = Json::Object();
+      text_delta.Set("type", Json::String("text_delta"));
+      text_delta.Set("text", Json::String(piece ? *piece : std::string()));
+      delta.Set("delta", std::move(text_delta));
+      WriteSse(writer, "content_block_delta", delta, true);
+      return true;
+    });
+    if (session != nullptr) {
+      session->Append(AssistantTurn(text, writer.IsPeerGone()));
+    }
+    Json stop = Json::Object();
+    stop.Set("type", Json::String("content_block_stop"));
+    stop.Set("index", Json::Number(0));
+    WriteSse(writer, "content_block_stop", stop, true);
+    Json message_delta = Json::Object();
+    message_delta.Set("type", Json::String("message_delta"));
+    Json md = Json::Object();
+    md.Set("stop_reason", Json::String("end_turn"));
+    message_delta.Set("delta", std::move(md));
+    WriteSse(writer, "message_delta", message_delta, true);
+    Json message_stop = Json::Object();
+    message_stop.Set("type", Json::String("message_stop"));
+    WriteSse(writer, "message_stop", message_stop, true);
+    return;
+  }
+  // OpenAI chat.
+  if (!stream) {
+    // GenerateStreaming with a liveness hook instead of Generate:
+    // identical tokens, but a closed window aborts the turn instead
+    // of decoding into the void.
+    std::vector<std::uint32_t> produced;
+    auto streamed = engine.GenerateStreaming(
+        model, options, [&](std::uint32_t token) {
+          if (writer.IsPeerGone()) {
+            return false;
+          }
+          produced.push_back(token);
+          return true;
+        });
+    if (!streamed) {
+      // A gone peer fails here only on a real error (abort returns a
+      // count); anything else is reported when someone listens.
+      if (!writer.IsPeerGone()) {
+        SendGenerationError(writer, streamed.error());
+      }
+      return;
+    }
+    auto text = tokenizer.Decode(produced);
+    if (!text) {
+      SendError(writer, 500, "detokenization failed");
+      return;
+    }
+    if (session != nullptr) {
+      session->Append(AssistantTurn(*text, writer.IsPeerGone()));
+    }
+    Json message = Json::Object();
+    message.Set("role", Json::String("assistant"));
+    message.Set("content", Json::String(*text));
+    Json choice = Json::Object();
+    choice.Set("index", Json::Number(0));
+    choice.Set("message", std::move(message));
+    choice.Set("finish_reason", Json::String("length"));
+    Json choices = Json::Array();
+    choices.Push(std::move(choice));
+    Json response = Json::Object();
+    response.Set("id", Json::String("chatcmpl-0"));
+    response.Set("object", Json::String("chat.completion"));
+    response.Set("model", Json::String(model_name));
+    response.Set("choices", std::move(choices));
+    response.Set("usage", UsageJson(ids->size(), produced.size()));
+    SendJson(writer, 200, response);
+    return;
+  }
+  (void)writer.SendHeaders(200, "text/event-stream", true);
+  std::string text;
+  (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
+    if (writer.IsPeerGone()) {
+      return false;
+    }
+    auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
+    if (piece) {
+      text += *piece;
+    }
+    Json delta = Json::Object();
+    delta.Set("content", Json::String(piece ? *piece : std::string()));
+    Json choice = Json::Object();
+    choice.Set("index", Json::Number(0));
+    choice.Set("delta", std::move(delta));
+    choice.Set("finish_reason", Json());
+    Json choices = Json::Array();
+    choices.Push(std::move(choice));
+    Json chunk = Json::Object();
+    chunk.Set("id", Json::String("chatcmpl-0"));
+    chunk.Set("object", Json::String("chat.completion.chunk"));
+    chunk.Set("model", Json::String(model_name));
+    chunk.Set("choices", std::move(choices));
+    WriteSse(writer, "", chunk, false);
+    return true;
+  });
+  if (session != nullptr) {
+    session->Append(AssistantTurn(text, writer.IsPeerGone()));
+  }
+  (void)writer.Write("data: [DONE]\n\n");
+}
+
+}  // namespace tessera::serve

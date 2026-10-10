@@ -1,5 +1,6 @@
 #include "serve/session.hpp"
 
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,6 +26,18 @@ std::string Trim(std::string_view text) {
 Session::Session(std::string id, std::string title)
     : id_(std::move(id)), title_(std::move(title)) {}
 
+bool SamePromptRow(const SessionMessage& a, const SessionMessage& b) {
+  return a.role == b.role && a.content == b.content &&
+         a.tool_calls_json == b.tool_calls_json &&
+         a.tool_call_id == b.tool_call_id;
+}
+
+SessionTurn::~SessionTurn() {
+  if (session != nullptr) {
+    session->End();
+  }
+}
+
 std::string Session::Id() const {
   return id_;
 }
@@ -42,6 +55,27 @@ SessionInfo Session::Info() const {
 void Session::Append(SessionMessage message) {
   std::lock_guard<std::mutex> lock(control_);
   messages_.push_back(std::move(message));
+}
+
+void Session::SyncHistory(std::vector<SessionMessage> incoming) {
+  std::lock_guard<std::mutex> lock(control_);
+  std::size_t keep = 0;
+  while (keep < messages_.size() && keep < incoming.size() &&
+         SamePromptRow(messages_[keep], incoming[keep])) {
+    ++keep;
+  }
+  if (keep == 0 && !messages_.empty()) {
+    // No common prefix: the client sent only new turns, so they append
+    // and the stored history survives.
+    messages_.insert(messages_.end(),
+                     std::make_move_iterator(incoming.begin()),
+                     std::make_move_iterator(incoming.end()));
+    return;
+  }
+  messages_.erase(messages_.begin() + keep, messages_.end());
+  messages_.insert(messages_.end(), std::make_move_iterator(incoming.begin() +
+                                                            keep),
+                   std::make_move_iterator(incoming.end()));
 }
 
 std::size_t Session::PopTrailingAssistant() {
