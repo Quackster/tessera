@@ -153,6 +153,48 @@ TEST(BackendTest, BufferRoundTrip) {
   EXPECT_TRUE(read_mapped);
 }
 
+// Batched upload: several buffers land in one call, each with its own
+// bytes, and an oversized source is rejected. This is the weight-upload
+// path, so it must match CopyH2D exactly.
+TEST(BackendTest, CopyH2DBatchUploadsEachBuffer) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  const std::size_t sizes[4] = {64, 4096, 1024, 7};
+  std::vector<std::unique_ptr<tessera::Buffer>> buffers;
+  std::vector<std::vector<std::byte>> patterns;
+  std::vector<Backend::HostCopy> copies;
+  for (std::size_t b = 0; b < 4; ++b) {
+    auto buffer = backend->AllocateBuffer(sizes[b], MemoryKind::Device);
+    ASSERT_TRUE(buffer.has_value()) << tessera::ToString(buffer.error());
+    std::vector<std::byte> pattern(sizes[b]);
+    for (std::size_t i = 0; i < sizes[b]; ++i) {
+      pattern[i] = static_cast<std::byte>((i * 13 + b * 7) & 0xFF);
+    }
+    copies.push_back(Backend::HostCopy{buffer->get(), pattern});
+    patterns.push_back(std::move(pattern));
+    buffers.push_back(std::move(*buffer));
+  }
+  auto uploaded = backend->CopyH2DBatch(copies);
+  ASSERT_TRUE(uploaded.has_value()) << tessera::ToString(uploaded.error());
+  for (std::size_t b = 0; b < buffers.size(); ++b) {
+    std::vector<std::byte> readback(sizes[b]);
+    auto download =
+        backend->CopyD2H(*buffers[b], readback.data(), readback.size());
+    ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+    EXPECT_EQ(patterns[b], readback) << "buffer " << b;
+  }
+
+  // A source larger than its destination is rejected before any copy.
+  auto small = backend->AllocateBuffer(4, MemoryKind::Device);
+  ASSERT_TRUE(small.has_value()) << tessera::ToString(small.error());
+  std::vector<std::byte> too_big(8);
+  const Backend::HostCopy bad{small->get(), too_big};
+  auto rejected = backend->CopyH2DBatch(std::span<const Backend::HostCopy>(&bad, 1));
+  EXPECT_FALSE(rejected.has_value());
+  EXPECT_EQ(rejected.error(), StatusCode::InvalidArgument);
+}
+
+
 // Per backend tolerance for the fp GEMM kernels.
 struct FpTolerance {
   float abs = 0.0f;

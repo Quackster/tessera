@@ -474,11 +474,13 @@ std::expected<GgufFile, StatusCode> ParseGguf(
 
 std::expected<GgufFile, StatusCode> ParseGgufFile(
     const std::filesystem::path& path) {
-  auto data = ReadFile(path);
-  if (!data) {
-    return std::unexpected(data.error());
+  // Map the file: a large GGUF must not be copied into a zero-filled host
+  // vector before parsing.
+  auto mapped = MappedFile::Open(path);
+  if (!mapped) {
+    return std::unexpected(mapped.error());
   }
-  return ParseGguf(std::span<const std::byte>(*data));
+  return ParseGguf(mapped->bytes());
 }
 
 }  // namespace tessera::core

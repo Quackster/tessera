@@ -375,6 +375,8 @@ std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
     std::span<const std::byte> bytes) {
   std::vector<DeviceTensor> weights;
   weights.reserve(tensors.size());
+  std::vector<Backend::HostCopy> copies;
+  copies.reserve(tensors.size());
   for (std::size_t i = 0; i < tensors.size(); ++i) {
     const auto& entry = tensors[i];
     auto sized = TensorBytes(entry.dtype, entry.shape.Numel());
@@ -391,12 +393,15 @@ std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
     if (!buffer) {
       return std::unexpected(buffer.error());
     }
-    auto uploaded = backend.CopyH2D(
-        **buffer, bytes.subspan(static_cast<std::size_t>(begin), count));
-    if (!uploaded) {
-      return std::unexpected(uploaded.error());
-    }
     weights.push_back(DeviceTensor{entry, std::move(*buffer)});
+    copies.push_back(Backend::HostCopy{
+        weights.back().device.get(),
+        bytes.subspan(static_cast<std::size_t>(begin), count)});
+  }
+  // One batched upload: backends pipeline the copies and synchronize once
+  // per chunk instead of a round trip per tensor.
+  if (auto uploaded = backend.CopyH2DBatch(copies); !uploaded) {
+    return std::unexpected(uploaded.error());
   }
   return weights;
 }
@@ -412,11 +417,15 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     return std::unexpected(StatusCode::FileNotFound);
   }
   if (std::filesystem::is_regular_file(path, ec) && !ec) {
-    auto bytes = core::ReadFile(path);
-    if (!bytes) {
-      return std::unexpected(bytes.error());
+    // Map the file instead of reading it: a multi-gigabyte GGUF would
+    // otherwise be copied into a zero-filled host vector (a full memset
+    // of the file) before parsing and uploading.
+    auto mapped = core::MappedFile::Open(path);
+    if (!mapped) {
+      return std::unexpected(mapped.error());
     }
-    auto gguf = core::ParseGguf(std::span<const std::byte>(*bytes));
+    const std::span<const std::byte> bytes = mapped->bytes();
+    auto gguf = core::ParseGguf(bytes);
     if (!gguf) {
       return std::unexpected(gguf.error());
     }
@@ -443,7 +452,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     }
     auto weights =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
-                      gguf->tensor_data_start, std::span<const std::byte>(*bytes));
+                      gguf->tensor_data_start, bytes);
     if (!weights) {
       return std::unexpected(weights.error());
     }

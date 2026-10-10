@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 375/375 `ctest` on vulkan. 375/375 `ctest` on ROCm.
+Latest suite: 381/381 `ctest` on vulkan. 381/381 `ctest` on ROCm.
 Both builds verified on AMD Radeon AI PRO R9700 (vulkan through
 RADV GFX1201, rocm through the system ROCm).
 
@@ -67,6 +67,13 @@ RADV GFX1201, rocm through the system ROCm).
   greedy. `TESSERA_MXFP4_WMMA=0` selects the all-scalar fallback
   for backends without fp8 tensor cores. Model load is about 54 s,
   under the 60 s target.
+- GGUF load is now fast. The 27B Q4_K_M GGUF (866 tensors, 16.4
+  GB, MTP head included) loads in 2.6 s on ROCm and 5.4 s on
+  Vulkan, down from 12.3 s and 17.2 s. The loader memory-maps the
+  file instead of reading it into a zero-filled host vector (that
+  alone was 7 s of memset), and a batched `CopyH2DBatch` upload
+  drains all tensors with one synchronization per backend chunk
+  instead of one per tensor.
 - KV cache types: fp32 (default), fp16, symmetric int8, symmetric
   4-bit, FP8. Selected by option (`--kv-f16`, `--kv-q8`,
   `--kv-q4`, `--kv-fp8`). Caches are preallocated and grow
@@ -184,7 +191,20 @@ RADV GFX1201, rocm through the system ROCm).
 - Performance: tiled GEMMs, decode GEMVs, multi-row verify GEMM,
   tiled attention, scan and norm ILP, Vulkan launch ring, async
   ROCm copies, cached host weights, chunked and bounded prefill.
-  Greedy 23 tok/s. DFlash2 60 tok/s. Load 54 s.
+  Greedy 23 tok/s. DFlash2 60 tok/s. Load 54 s (MXFP4).
+- Weight load: the GGUF file memory-maps (`MappedFile`) instead of
+  reading into a `std::vector` that value-initializes (zeroes)
+  every byte; for the 16.4 GB 27B file that removed a 7 s memset
+  and the anonymous 16 GB host buffer. A batched
+  `Backend::CopyH2DBatch` uploads every tensor with one
+  synchronization per chunk: ROCm issues `hipMemcpyAsync` on the
+  null stream and syncs once, Vulkan records a whole chunk into one
+  command buffer and submits it once (bounded 256 MiB staging
+  window, so host-visible memory stays bounded). 27B Q4_K_M GGUF
+  load: ROCm 12.3 s to 2.6 s, Vulkan 17.2 s to 5.4 s. Covered by
+  `BackendTest.CopyH2DBatchUploadsEachBuffer` and
+  `GgufTest.ParsesFileFromDisk` on both backends; the real MTP
+  speculation still equals greedy.
 - Attention tile reduction: each 256-key tile now computes its
   max and softmax weights once on one thread and shares them.
   Before, all 256 threads scanned the tile, so a long context

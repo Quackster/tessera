@@ -63,6 +63,33 @@ TEST(GgufTest, ParsesValidV3File) {
   EXPECT_EQ(file->dropped_array_keys.size(), 0u);
 }
 
+// ParseGgufFile maps the file instead of reading it; the parsed result
+// must match the in-memory parse, and a missing file is FileNotFound.
+TEST(GgufTest, ParsesFileFromDisk) {
+  auto bytes = MakeValidGgufV3();
+  auto dir = tessera::testing::FreshTempDir("tessera_tests_gguf_mmap");
+  auto path = dir / "valid.gguf";
+  tessera::testing::WriteBytes(path, bytes);
+
+  auto mapped = ParseGgufFile(path);
+  ASSERT_TRUE(mapped.has_value()) << tessera::ToString(mapped.error());
+  auto in_memory = ParseGguf(std::span<const std::byte>(bytes));
+  ASSERT_TRUE(in_memory.has_value()) << tessera::ToString(in_memory.error());
+  EXPECT_EQ(mapped->version, in_memory->version);
+  ASSERT_EQ(mapped->tensors.size(), in_memory->tensors.size());
+  for (std::size_t i = 0; i < mapped->tensors.size(); ++i) {
+    EXPECT_EQ(mapped->tensors[i].name, in_memory->tensors[i].name);
+    EXPECT_EQ(mapped->tensors[i].dtype, in_memory->tensors[i].dtype);
+    EXPECT_EQ(mapped->tensors[i].shape.Numel(),
+              in_memory->tensors[i].shape.Numel());
+    EXPECT_EQ(mapped->tensor_offsets[i], in_memory->tensor_offsets[i]);
+  }
+
+  auto missing = ParseGgufFile(dir / "absent.gguf");
+  ASSERT_FALSE(missing.has_value());
+  EXPECT_EQ(missing.error(), StatusCode::FileNotFound);
+}
+
 TEST(GgufTest, AcceptsVersion2) {
   // v2 and v3 share the byte layout; the same image parses as v2.
   GgufBuilder builder;

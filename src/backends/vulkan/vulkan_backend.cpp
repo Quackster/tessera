@@ -19,6 +19,11 @@ namespace {
 
 constexpr const char* kValidationLayer = "VK_LAYER_KHRONOS_validation";
 
+// Host-visible staging window for a batched upload. A large checkpoint is
+// copied through one reusable buffer of this size, so host-visible memory
+// stays bounded regardless of the total weight bytes.
+constexpr std::size_t kUploadStagingBytes = 256ull << 20;
+
 // A single allocated memory block. The core sees only an opaque handle;
 // the vendor objects live here.
 struct MemoryRecord {
@@ -413,6 +418,59 @@ class VulkanBackend final : public Backend {
                       dst_offset, bytes);
   }
 
+  std::expected<void, StatusCode> CopyH2DBatch(
+      std::span<const Backend::HostCopy> copies) override {
+    for (const Backend::HostCopy& copy : copies) {
+      if (copy.dst == nullptr || copy.src.size() > copy.dst->Size()) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+    }
+    // Drain the batch through one bounded staging buffer at a time. Every
+    // copy in a chunk is recorded into a single command buffer: the whole
+    // upload submits once per chunk instead of once per tensor, which is
+    // the difference between hundreds of fence waits and a few.
+    std::size_t index = 0;
+    while (index < copies.size()) {
+      std::size_t staging_size = 0;
+      std::size_t end = index;
+      while (end < copies.size() &&
+             staging_size + copies[end].src.size() <= kUploadStagingBytes) {
+        staging_size += copies[end].src.size();
+        ++end;
+      }
+      if (end == index) {  // one copy larger than the whole window
+        staging_size = copies[index].src.size();
+        end = index + 1;
+      }
+      auto staging = AllocateStaging(staging_size);
+      if (!staging) {
+        return std::unexpected(staging.error());
+      }
+      std::vector<CopyRegion> regions;
+      regions.reserve(end - index);
+      std::size_t offset = 0;
+      for (std::size_t i = index; i < end; ++i) {
+        std::memcpy(static_cast<std::byte*>(staging->mapped) + offset,
+                    copies[i].src.data(), copies[i].src.size());
+        const auto* record = LookupRecord(copies[i].dst->Handle());
+        if (record == nullptr) {
+          ReleaseStaging(*staging);
+          return std::unexpected(StatusCode::DeviceError);
+        }
+        regions.push_back(CopyRegion{record->buffer, 0, offset,
+                                     copies[i].src.size()});
+        offset += copies[i].src.size();
+      }
+      auto submitted = SubmitCopyRegions(staging->buffer, regions);
+      ReleaseStaging(*staging);
+      if (!submitted) {
+        return submitted;
+      }
+      index = end;
+    }
+    return {};
+  }
+
   std::expected<std::unique_ptr<Kernel>, StatusCode> LoadKernel(
       std::string_view name, std::span<const std::byte> code) override {
     auto kernel = compute_.LoadKernel(name, code);
@@ -579,10 +637,29 @@ class VulkanBackend final : public Backend {
     }
   }
 
+  // One destination region of a batched copy from a single source.
+  struct CopyRegion {
+    VkBuffer dst = VK_NULL_HANDLE;
+    VkDeviceSize dst_offset = 0;
+    VkDeviceSize src_offset = 0;
+    VkDeviceSize size = 0;
+  };
+
   // One transfer: command buffer + fence, then wait for completion.
   std::expected<void, StatusCode> SubmitCopy(
       const VkBuffer source, const VkBuffer destination,
       std::size_t src_offset, std::size_t dst_offset, std::size_t bytes) {
+    const CopyRegion region{destination, dst_offset, src_offset, bytes};
+    return SubmitCopyRegions(source, std::span<const CopyRegion>(&region, 1));
+  }
+
+  // Record every region as one command buffer and submit it once, so a
+  // batch of copies pays one fence wait rather than one per copy.
+  std::expected<void, StatusCode> SubmitCopyRegions(
+      const VkBuffer source, std::span<const CopyRegion> regions) {
+    if (regions.empty()) {
+      return {};
+    }
     VkCommandBufferAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     alloc_info.commandPool = state_.pool;
@@ -601,12 +678,14 @@ class VulkanBackend final : public Backend {
       vkFreeCommandBuffers(state_.device, state_.pool, 1, &command);
       return std::unexpected(FromVkResult(result));
     }
-    // The 1.4+ C API takes a region table, not offsets.
-    VkBufferCopy region{};
-    region.srcOffset = src_offset;
-    region.dstOffset = dst_offset;
-    region.size = bytes;
-    vkCmdCopyBuffer(command, source, destination, 1, &region);
+    for (const CopyRegion& region : regions) {
+      // The 1.4+ C API takes a region table, not offsets.
+      VkBufferCopy copy{};
+      copy.srcOffset = region.src_offset;
+      copy.dstOffset = region.dst_offset;
+      copy.size = region.size;
+      vkCmdCopyBuffer(command, source, region.dst, 1, &copy);
+    }
     result = vkEndCommandBuffer(command);
     if (result != VK_SUCCESS) {
       vkFreeCommandBuffers(state_.device, state_.pool, 1, &command);

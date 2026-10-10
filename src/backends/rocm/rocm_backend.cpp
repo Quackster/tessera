@@ -229,6 +229,34 @@ class RocmBackend final : public Backend {
     return {};
   }
 
+  std::expected<void, StatusCode> CopyH2DBatch(
+      std::span<const Backend::HostCopy> copies) override {
+    // Queue every copy on the null stream, then drain once. A synchronous
+    // hipMemcpy per tensor paid the full round-trip latency on each of the
+    // hundreds of weight tensors; the async form pays it once.
+    for (const Backend::HostCopy& copy : copies) {
+      if (copy.dst == nullptr || copy.src.size() > copy.dst->Size()) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+      auto error = hipMemcpyAsync(copy.dst->Handle(), copy.src.data(),
+                                  copy.src.size(), hipMemcpyHostToDevice,
+                                  nullptr);
+      if (error != hipSuccess) {
+        LogError(std::string("hipMemcpyAsync H2D of ") +
+                 std::to_string(copy.src.size()) + " bytes failed (" +
+                 HipErrorName(error) + ")");
+        return std::unexpected(FromHip(error));
+      }
+    }
+    auto error = hipDeviceSynchronize();
+    if (error != hipSuccess) {
+      LogError(std::string("hipDeviceSynchronize after batch upload failed (") +
+               HipErrorName(error) + ")");
+      return std::unexpected(FromHip(error));
+    }
+    return {};
+  }
+
   std::expected<void, StatusCode> CopyD2H(const Buffer& src, std::byte* dst,
                                          std::size_t bytes) override {
     return CopyD2HAt(src, 0, dst, bytes);

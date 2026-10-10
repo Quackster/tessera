@@ -845,6 +845,34 @@ class Backend {
   // Copy host bytes into `dst` (bounds-checked against the buffer size).
   virtual std::expected<void, StatusCode> CopyH2D(
       Buffer& dst, std::span<const std::byte> src) = 0;
+
+  // One host-to-device copy in a batch: `src` lands at the start of `dst`.
+  struct HostCopy {
+    Buffer* dst = nullptr;
+    std::span<const std::byte> src;
+  };
+
+  // Copy many host buffers into their device buffers with far fewer
+  // synchronization round trips than CopyH2D per tensor. Both backends
+  // stage the copies and synchronize once per internal chunk, so this is
+  // the path a weight upload uses. Every src must fit its dst (otherwise
+  // InvalidArgument) and all copies complete before return. The default
+  // implementation loops CopyH2D, which is correct but slow; backends
+  // override it.
+  virtual std::expected<void, StatusCode> CopyH2DBatch(
+      std::span<const HostCopy> copies) {
+    for (const HostCopy& copy : copies) {
+      if (copy.dst == nullptr) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+      auto result = CopyH2D(*copy.dst, copy.src);
+      if (!result) {
+        return result;
+      }
+    }
+    return {};
+  }
+
   // Copy `bytes` from `src` into host memory (bounds-checked).
   virtual std::expected<void, StatusCode> CopyD2H(
       const Buffer& src, std::byte* dst, std::size_t bytes) = 0;
