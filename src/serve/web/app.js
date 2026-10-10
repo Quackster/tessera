@@ -4,13 +4,15 @@
 let sessions = [];
 let currentId = null;
 let currentMessages = [];
-let streaming = false;
-let paused = false;
-let readerAbort = null;
-// Turn tokens: only the newest turn may draw or reset the controls,
-// so a stale turn never paints over the current view.
-let activeTurn = 0;
-let streamingId = null;
+// Live turns: at most one per session, keyed by session id. A turn owns
+// that session's stream from the moment send is claimed until it ends.
+// Only the turn whose session is active paints the shared message view,
+// so a background stream never overwrites the chat on screen. The server
+// queues device work, so several sessions may hold a live turn at once.
+let live = {};
+// True while a first message is creating its session, before that
+// chat's live turn exists: a second click must not create a second one.
+let creatingSession = false;
 // Browser-side chat cache (localStorage): instant paint on reload.
 // The server stays authoritative: a miss, or an id the server no
 // longer knows, falls back to fetching (the prefill path).
@@ -299,13 +301,15 @@ function messageMeta(message) {
   return '<div class="meta"' + counts + '>' + time + speed + '</div>';
 }
 
-function renderMessages(messages, liveThinkingOpen, scroll) {
+function renderMessages(messages, liveThinkingOpen, scroll, resetOpen) {
   const box = $('messages');
   // Preserve thinking boxes across re-renders: rebuilding the list
   // would force every box back to the streamed default, so a box the
-  // user closed would snap open on the next token.
-  const openStates = [...box.querySelectorAll('details.thinking')]
-      .map((details) => details.open);
+  // user closed would snap open on the next token. A session switch
+  // resets them: open state belongs to one chat, never the next.
+  const openStates = resetOpen ? [] :
+      [...box.querySelectorAll('details.thinking')]
+          .map((details) => details.open);
   // Sticky scroll: follow the stream only while the view sits at the
   // bottom, so reading back never yanks. A fresh session opens at the
   // bottom instead.
@@ -345,11 +349,12 @@ function renderSidebar() {
       title.replaceWith(input);
       input.focus();
     });
+    const busy = session.busy || !!live[session.id];
     const meta = document.createElement('span');
     meta.className = 'meta';
-    meta.textContent = (session.busy ? '\u25cf ' : '') +
+    meta.textContent = (busy ? '\u25cf ' : '') +
         session.message_count + ' messages';
-    if (session.busy) meta.classList.add('busy-dot');
+    if (busy) meta.classList.add('busy-dot');
     const del = document.createElement('button');
     del.className = 'del';
     del.textContent = '\u00d7';
@@ -373,14 +378,56 @@ function renderSidebar() {
   }
 }
 
+// The live turn of the open chat, or null when that chat is idle.
+function activeTurnState() {
+  return currentId ? live[currentId] : null;
+}
+
+// A live turn as the trailing assistant message the view renders.
+function liveMessage(turn) {
+  return {
+    role: 'assistant',
+    content: turn.content,
+    reasoning_content: turn.thinking,
+    stopped: false,
+    created_ms: turn.started,
+    tokens_per_second: 0,
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    prefill: (!turn.thinking && !turn.content) ? turn.prefill : '',
+  };
+}
+
+function statusForTurn(turn) {
+  if (turn.paused) return 'Paused';
+  if (turn.generating) return 'Generating\u2026';
+  if (turn.prefill) return turn.prefill;
+  return 'Thinking\u2026';
+}
+
+// Repaint the open chat from a live turn. A turn for another chat is
+// left in `live` untouched: it becomes visible when that chat opens.
+function drawTurn(sid, resetOpen) {
+  if (sid !== currentId) return;
+  const turn = live[sid];
+  if (!turn) return;
+  renderMessages(turn.base.concat([liveMessage(turn)]),
+      turn.thinkingOpen, 'sticky', resetOpen);
+  setStatus(statusForTurn(turn));
+}
+
+// Controls act on the open chat: send and retry are blocked only while
+// that chat itself generates, so another chat may still request a queued
+// turn. Stop, pause and resume show only for the open chat's live turn.
 function updateControls() {
-  $('send').disabled = streaming || !serverReady;
-  $('retry').disabled = streaming || !serverReady || !currentId;
+  const turn = activeTurnState();
+  $('send').disabled = !serverReady || !!turn || creatingSession;
+  $('retry').disabled = !serverReady || !currentId || !!turn;
   $('new-chat').disabled = !serverReady;
   $('input').disabled = !serverReady;
-  $('stop').hidden = !streaming;
-  $('pause').hidden = !streaming || paused;
-  $('resume').hidden = !streaming || !paused;
+  $('stop').hidden = !turn;
+  $('pause').hidden = !turn || turn.paused;
+  $('resume').hidden = !turn || !turn.paused;
 }
 
 // One stored or cached message to the rendered shape; unknown fields
@@ -450,7 +497,18 @@ async function refreshSessions() {
 
 async function openSession(id) {
   currentId = id;
+  // A live turn owns the chat until it ends: paint its in-progress state
+  // instead of the stored history, which lacks the streaming assistant.
+  const turn = live[id];
+  if (turn) {
+    currentMessages = turn.base;
+    drawTurn(id, true);
+    renderSidebar();
+    updateControls();
+    return;
+  }
   const session = await api('GET', '/api/sessions/' + id);
+  if (currentId !== id) return;  // a newer selection won the race
   currentMessages = session.messages.map(normalizeMessage);
   cachedFull[session.id] = {
     id: session.id,
@@ -458,7 +516,7 @@ async function openSession(id) {
     messages: currentMessages,
   };
   writeCache();
-  renderMessages(currentMessages, false, 'bottom');
+  renderMessages(currentMessages, false, 'bottom', true);
   renderSidebar();
   updateControls();
   setStatus(session.busy ? 'Generating\u2026' : 'Ready');
@@ -473,55 +531,44 @@ function paintCached(id) {
   }
   currentId = id;
   currentMessages = cached.messages.map(normalizeMessage);
-  renderMessages(currentMessages, false, 'bottom');
+  renderMessages(currentMessages, false, 'bottom', true);
   renderSidebar();
   updateControls();
   setStatus('Connecting\u2026');
   return true;
 }
 
-// Stream one turn (chat or retry) over `base` history: the user bubble
-// and an empty assistant show instantly, then live deltas fill in.
-// Only this turn (by token) may draw or reset the controls.
+// Stream one turn (chat or retry) over `base` history into session `sid`:
+// the user bubble and an empty assistant show instantly when that session
+// is active, then live deltas fill in. The turn lives in `live[sid]` for
+// its whole life, so the stream keeps running while another chat is open
+// and only paints the view when `sid` is the active chat.
 async function streamTurn(path, payload, base, sid) {
-  const myTurn = ++activeTurn;
-  streamingId = sid;
+  const turn = {
+    base,
+    thinking: '',
+    content: '',
+    prefill: '',
+    generating: false,
+    paused: false,
+    thinkingOpen: true,
+    started: Date.now(),
+    controller: new AbortController(),
+  };
+  live[sid] = turn;
+  if (sid === currentId) showError('');
+  updateControls();
+  renderSidebar();
+  drawTurn(sid);
   const key = apiKey();
   const headers = {'Content-Type': 'application/json'};
   if (key) headers['x-api-key'] = key;
-  const controller = new AbortController();
-  readerAbort = controller;
-  streaming = true;
-  paused = false;
-  updateControls();
-  setStatus('Thinking\u2026');
-  showError('');
-  let thinking = '';
-  let content = '';
-  let prefill = '';
-  let generating = false;
-  const turnStarted = Date.now();
-  const draw = (thinkingOpen) => {
-    if (myTurn !== activeTurn) return;
-    renderMessages(base.concat([{
-      role: 'assistant',
-      content,
-      reasoning_content: thinking,
-      stopped: false,
-      created_ms: turnStarted,
-      tokens_per_second: 0,
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      prefill: (!thinking && !content) ? prefill : '',
-    }]), thinkingOpen, 'sticky');
-  };
-  draw(true);
   try {
     const response = await fetch(path, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
-      signal: controller.signal,
+      signal: turn.controller.signal,
     });
     if (!response.ok) {
       const text = await response.text();
@@ -551,63 +598,74 @@ async function streamTurn(path, payload, base, sid) {
           if (delta.prefill) {
             const done = Number(delta.prefill.done) || 0;
             const total = Number(delta.prefill.total) || 0;
-            prefill = total > 0
+            turn.prefill = total > 0
                 ? 'Prefill ' + done + '/' + total + ' (' +
                   Math.round(done / total * 100) + '%)'
                 : 'Prefill ' + done + ' tokens';
-            setStatus(prefill);
-            draw(true);
+            drawTurn(sid);
             continue;
           }
-          if (!generating) {
-            generating = true;
-            setStatus('Generating\u2026');
-          }
-          if (delta.reasoning_content) thinking += delta.reasoning_content;
-          if (delta.content) content += delta.content;
-          draw(!content);
+          turn.generating = true;
+          if (delta.reasoning_content) turn.thinking += delta.reasoning_content;
+          if (delta.content) turn.content += delta.content;
+          turn.thinkingOpen = !turn.content;
+          drawTurn(sid);
         }
       }
     }
   } catch (error) {
-    if (error.name !== 'AbortError') showError(String(error));
+    if (error.name !== 'AbortError' && sid === currentId) {
+      showError(String(error));
+    }
   } finally {
-    if (myTurn !== activeTurn) return;
-    streaming = false;
-    paused = false;
-    readerAbort = null;
-    streamingId = null;
-    updateControls();
+    if (live[sid] !== turn) return;  // superseded by a newer turn
+    delete live[sid];
     // Authoritative state (stopped flags, usage) comes from the server.
     try {
-      if (currentId) await openSession(currentId);
+      const session = await api('GET', '/api/sessions/' + sid);
+      cachedFull[sid] = {
+        id: sid,
+        title: session.title,
+        messages: session.messages.map(normalizeMessage),
+      };
+      writeCache();
+    } catch (error) {
+      if (sid === currentId) showError(String(error));
+    }
+    await refreshSessions();
+    if (sid === currentId && cachedFull[sid]) {
+      currentMessages = cachedFull[sid].messages;
+      renderMessages(currentMessages, false, 'sticky', true);
       setStatus('Ready');
-    } catch (error) { showError(String(error)); }
+    }
   }
 }
 
 async function sendMessage() {
   const input = $('input');
   const text = input.value.trim();
-  if (!text || streaming || !serverReady) return;
-  // Claim the turn synchronously: a second Enter/click while the
-  // session opens must not start a duplicate generation.
-  streaming = true;
-  updateControls();
-  setStatus('Sending\u2026');
+  if (!text || !serverReady) return;
+  if (currentId && live[currentId]) return;  // this chat is generating
+  let sid = currentId;
   // No session yet: open one first, the message is not lost.
-  if (!currentId) {
+  if (!sid) {
+    if (creatingSession) return;
+    creatingSession = true;
+    updateControls();
     try {
       const created = await api('POST', '/api/sessions', {});
-      currentId = created.id;
+      sid = created.id;
+      currentId = sid;
+      currentMessages = [];
       await refreshSessions();
     } catch (error) {
-      streaming = false;
-      updateControls();
-      setStatus('Ready');
       showError(String(error));
       return;
+    } finally {
+      creatingSession = false;
+      updateControls();
     }
+    if (currentId !== sid) return;  // a newer selection won the race
   }
   input.value = '';
   const userMessage = {
@@ -622,23 +680,37 @@ async function sendMessage() {
   };
   const base = currentMessages.concat([userMessage]);
   currentMessages = base;
-  await streamTurn('/api/sessions/' + currentId + '/chat', {
+  cachedFull[sid] = {
+    id: sid,
+    title: (cachedFull[sid] && cachedFull[sid].title) || 'New chat',
+    messages: base,
+  };
+  writeCache();
+  await streamTurn('/api/sessions/' + sid + '/chat', {
     message: text,
     stream: true,
     max_completion_tokens: completionBudget(),
     max_thinking_tokens: thinkingBudget(),
     enable_thinking: $('thinking').checked,
-  }, base, currentId);
+  }, base, sid);
 }
 
 async function retryTurn() {
-  if (streaming || !currentId) return;
+  if (!serverReady || !currentId || live[currentId]) return;
   // Drop trailing assistant turns locally, mirroring the server, so
   // the fresh answer streams after the right history.
   const base = currentMessages.slice();
   while (base.length && base[base.length - 1].role === 'assistant') {
     base.pop();
   }
+  currentMessages = base;
+  cachedFull[currentId] = {
+    id: currentId,
+    title: (cachedFull[currentId] && cachedFull[currentId].title) ||
+        'New chat',
+    messages: base,
+  };
+  writeCache();
   await streamTurn('/api/sessions/' + currentId + '/retry', {
     stream: true,
     max_completion_tokens: completionBudget(),
@@ -659,38 +731,34 @@ function thinkingBudget() {
   return Number(input.value) || 0;
 }
 
-// Controls target the live turn when one runs, else the open session.
-function controlId() {
-  return streamingId || currentId;
-}
-
+// Controls act on the open chat's live turn.
 async function stopTurn() {
-  const id = controlId();
-  if (!id) return;
-  try { await api('POST', '/api/sessions/' + id + '/stop'); }
+  const turn = activeTurnState();
+  if (!currentId) return;
+  try { await api('POST', '/api/sessions/' + currentId + '/stop'); }
   catch (error) { showError(String(error)); }
-  if (readerAbort) readerAbort.abort();
+  if (turn) turn.controller.abort();
 }
 
 async function pauseTurn() {
-  const id = controlId();
-  if (!id) return;
+  const turn = activeTurnState();
+  if (!currentId || !turn) return;
   try {
-    await api('POST', '/api/sessions/' + id + '/pause');
-    paused = true;
+    await api('POST', '/api/sessions/' + currentId + '/pause');
+    turn.paused = true;
     updateControls();
-    setStatus('Paused');
+    setStatus(statusForTurn(turn));
   } catch (error) { showError(String(error)); }
 }
 
 async function resumeTurn() {
-  const id = controlId();
-  if (!id) return;
+  const turn = activeTurnState();
+  if (!currentId || !turn) return;
   try {
-    await api('POST', '/api/sessions/' + id + '/resume');
-    paused = false;
+    await api('POST', '/api/sessions/' + currentId + '/resume');
+    turn.paused = false;
     updateControls();
-    setStatus('Generating\u2026');
+    setStatus(statusForTurn(turn));
   } catch (error) { showError(String(error)); }
 }
 
