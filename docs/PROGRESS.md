@@ -55,10 +55,12 @@ RADV GFX1201, rocm through the system ROCm).
   baseline. Output with any strategy on equals greedy output.
 - Speculative decoding behind one `SpeculativeStrategy` seam, off
   by default. MTP drafting and DFlash2 drafting share one engine
-  loop with greedy. DFlash2 loads the real FP8 draft, captures
-  target hidden states at the draft layer ids, drafts a mask-token
-  block, re-ranks candidates with the selector, and verifies with
-  a batched target forward. MTP chain default is one.
+  loop with greedy. The CLI attaches the chosen strategy to the
+  engine, so `--speculate` (MTP) and `--draft` (DFlash2) both drive
+  `run` and every served turn. DFlash2 loads the real FP8 draft,
+  captures target hidden states at the draft layer ids, drafts a
+  mask-token block, re-ranks candidates with the selector, and
+  verifies with a batched target forward. MTP chain default is one.
 - Measured on the 27B MXFP4 target (ROCm, GPU1): greedy about
   23 tok/s (43 ms/token, fp8 WMMA path). DFlash2 about 60 tok/s
   (75 ms/step, 256 tokens, 199 of 392 accepted). Output equals

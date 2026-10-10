@@ -85,7 +85,7 @@ void PrintUsage() {
    "remaining context, default %zu)\n"
    "  --max-thinking-tokens <n> think-block budget per turn (0 leaves "
    "thinking unlimited, default 0)\n"
-               "  --speculate       verify MTP drafts instead of plain greedy\n"
+               "  --speculate       draft with the MTP head (run and serve)\n"
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
                "  --quiet           suppress progress and info logs\n"
@@ -256,20 +256,27 @@ int main(int argc, char** argv) {
   tessera::Engine& engine = **created;
   auto& log = engine.Diagnostics();
 
-  if (!draft_path.empty()) {
-    auto strategy = tessera::CreateDFlash2Strategy();
+  // Attach the speculative strategy before serving or generating. DFlash2
+  // drafts from its checkpoint; MTP drafts from the target's own nextn
+  // head, so it needs no path. Both the serve path and the plain generate
+  // path read this one attachment, so --speculate serves as it runs.
+  if (!draft_path.empty() || speculate) {
+    std::unique_ptr<tessera::SpeculativeStrategy> strategy =
+        draft_path.empty() ? tessera::CreateMtpStrategy()
+                           : tessera::CreateDFlash2Strategy();
+    const std::string label =
+        draft_path.empty() ? "MTP" : "DFlash2 ('" + draft_path + "')";
     auto attach =
         strategy->Attach(tessera::StrategyOptions{draft_path, draft_block});
     if (!attach) {
-      log.Warn("cli",
-               std::string("draft attach failed for '") + draft_path + ": " +
-                   std::string(tessera::ToString(attach.error())) +
-                   "; continuing without speculative decoding");
+      log.Warn("cli", label + " attach failed: " +
+                           std::string(tessera::ToString(attach.error())) +
+                           "; continuing without speculative decoding");
     } else {
       auto attached = engine.AttachSpeculative(std::move(strategy));
       if (!attached) {
         log.Warn("cli",
-                 std::string("strategy attach failed: ") +
+                 label + " strategy attach failed: " +
                      std::string(tessera::ToString(attached.error())) +
                      "; continuing without speculative decoding");
       }

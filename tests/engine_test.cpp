@@ -1284,6 +1284,18 @@ TEST(EngineTest, AttachSpeculativeValid) {
   EXPECT_EQ(engine->Speculative()->Name(), "dflash2");
 }
 
+// MTP attaches like DFlash2, with no checkpoint path (it drafts from the
+// target's own nextn head). This is the attachment the CLI makes for
+// --speculate, on both the run and the serve path.
+TEST(EngineTest, AttachMtpStrategy) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto attached = engine->AttachSpeculative(tessera::CreateMtpStrategy());
+  ASSERT_TRUE(attached.has_value()) << tessera::ToString(attached.error());
+  ASSERT_NE(engine->Speculative(), nullptr);
+  EXPECT_EQ(engine->Speculative()->Name(), "mtp");
+}
+
 // --list-gpus path: when a device is present the backend enumerates at
 // least that device, and the index matches the one Engine::Create picks.
 TEST(EngineTest, ListGpuNamesWhenDevice) {
@@ -1465,6 +1477,11 @@ TEST(EngineTest, MtpDecodeOnModel) {
   auto spec = engine->GenerateSpeculative(**model, options);
   ASSERT_TRUE(spec.has_value()) << tessera::ToString(spec.error());
   EXPECT_EQ(*spec, *greedy);
+  // The attachment also drives the plain generate path, which is the
+  // path the HTTP server runs for every served turn.
+  auto served = engine->Generate(**model, options);
+  ASSERT_TRUE(served.has_value()) << tessera::ToString(served.error());
+  EXPECT_EQ(*served, *greedy);
 }
 
 // The vision config parser rejects a non-CLIP GGUF.

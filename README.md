@@ -39,7 +39,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. |
 | Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. The 27B hybrid path generates coherent text. |
 | Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. The causal conv1d runs on the device (`conv1d_state`). Embedding gather runs on the device. Some linear-path glue still runs on the host. |
-| Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) run end to end; output equals greedy. Multi-token drafts score in one batched target forward. MTP accepts about half its drafts with a default chain of one. DFlash2 accepts 3.5 to 4.4 tokens per step and decodes faster than greedy (about 60 against 23 tok/s on the 27B MXFP4 target). |
+| Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculative decode run end to end on both `run` and `serve`; output equals greedy. Multi-token drafts score in one batched target forward. MTP accepts about half its drafts with a default chain of one. DFlash2 accepts 3.5 to 4.4 tokens per step and decodes faster than greedy (about 60 against 23 tok/s on the 27B MXFP4 target). |
 | MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. HuggingFace config, weight name map, value-head reorder and tokenizer. The Qwen 3.8 27B MXFP4 target loads, tokenizes and decodes end to end. Greedy output matches the GGUF reference. The FP8 MTP head loads. W4A8 activation quant is opt-in. |
 | DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). The draft conditions on a device-resident per-layer context K/V cache built from committed target positions. The concatenated target hidden is quantized per token to FP8 E4M3 before `fc`. Output equals greedy. On the 27B MXFP4 target the draft accepts 3.5 to 4.4 tokens per step, above the served reference (2.7 to 2.85), and decodes faster than greedy (about 60 against 23 tok/s). The speculative step is about 75 ms; the remaining gap to the reference is the draft forward cost. Two defects were fixed (the candidate extraction ranked only the first 16 token ids on rows after the first, and the selector added the predecessor unary logit instead of the successor). |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
@@ -108,7 +108,7 @@ CLI example:
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --draft ~/models/Qwen3.8-27B-DFlash2-FP8
 ```
 
-The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count, total elements and device bytes. With `--max-completion-tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head. `--draft` drafts with the DFlash2 checkpoint. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
+The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count, total elements and device bytes. With `--max-completion-tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head on both `run` and `serve`. `--draft` drafts with the DFlash2 checkpoint. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
 
 ## Usage
 
@@ -184,7 +184,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--no-chat` | run | off | Do not apply the chat template. |
 | `--max-completion-tokens <n>` | run | 0 | Completion tokens. 0 fills the remaining context. |
 | `--max-thinking-tokens <n>` | run | 0 | Think-block budget per turn. 0 leaves thinking unlimited. |
-| `--speculate` | run | off | Verify MTP drafts instead of plain greedy decode. |
+| `--speculate` | both | off | MTP speculative decode. It drafts from the target's own nextn head, so it needs no checkpoint path and drives both `run` and served turns. |
 | `--sample` | run | off | Sample instead of greedy decode. |
 | `--temperature <f>` | run | 0.6 | Sampling temperature. |
 | `--top-p <f>` | run | 0.95 | Nucleus probability. |
