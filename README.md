@@ -128,6 +128,70 @@ CLI examples:
 
 The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` or `--speculate` is set. It prints tensor count, total elements and device bytes. With `--max-completion-tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head on both `run` and `serve`. `--draft` drafts with the DFlash2 checkpoint. The DFlash2 draft is tested against the MXFP4 target, not the GGUF. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
 
+## Calibration
+
+Calibration measures the engine settings that depend on the machine. It keeps
+the fastest value. It changes only speed. It never changes the produced
+tokens. Run it once on each machine and model, before the first `run` or
+`serve`.
+
+The `calibrate` subcommand loads the model one time, warms it, and sweeps the
+candidate values for each setting. The whole sweep stays inside a 15 minute
+cap. It writes a JSON file and prints a report with the identity, the sweep
+points, the chosen settings, and an example `run` command.
+
+```sh
+# Sweep on ROCm with the DFlash2 draft and write the result.
+./cmake-build-rocm/tessera-cli calibrate \
+  --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --draft ~/models/Qwen3.8-27B-DFlash2-FP8 \
+  --calibration ~/.config/tessera/calibration.json
+```
+
+The `calibrate` flags:
+
+* `--model <path>` model to measure. Required.
+* `--draft <dir>` DFlash2 draft checkpoint. It enables the draft block and
+  draft context sweeps.
+* `--calibration <file>` file to read and write. The environment variable
+  `TESSERA_CALIBRATION` supplies it when the flag is absent. One of the two is
+  required.
+* `--context <n>` context length in the hardware key. Default 4096.
+* `--gpu <n>` device index. Default 0, the first device.
+* `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8` KV cache type. Default int8
+  (kv8).
+* `--prompts <file>` fixed prompts, one per non-empty line. Default three
+  fixed prompts.
+
+The settings it sweeps are the same settings in the tables below:
+
+* `mxfp4_split_target` and `mxfp4_split_cap` on ROCm only. On Vulkan the fp8
+  kernel does not exist, so the command reports both as not applicable.
+* `prefill_chunk_tokens` on both backends.
+* `attention_split` on both backends, when the prompts reach the split
+  threshold (1024 keys).
+* `draft_tokens` and `draft_context` only when a draft is attached.
+
+Apply a saved entry to `run` or `serve` with `--calibration <file>`, or set
+`TESSERA_CALIBRATION`. The engine uses the saved value for the current machine
+and model unless an explicit flag overrides it. An explicit flag always wins.
+
+```sh
+# Serve with the calibrated values for this machine and model.
+./cmake-build-rocm/tessera-cli serve \
+  --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --draft ~/models/Qwen3.8-27B-DFlash2-FP8 \
+  --calibration ~/.config/tessera/calibration.json \
+  --port 8080
+```
+
+The file is JSON. It holds one entry per hardware key. The key joins the
+backend, the device name, the model name, the context, the KV type, and the
+strategy. Each entry stores the chosen settings, the measured decode and
+prefill rates, and the date. A machine, model, context, KV type, or strategy
+that differs from the key does not match the entry. The path is runtime
+configuration and is never hard-coded.
+
 ## Usage
 
 Simple text prompt with the CLI:
