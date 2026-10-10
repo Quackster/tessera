@@ -23,31 +23,32 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 
 | Area | State | Detail |
 | --- | --- | --- |
-| Public API | Done | `Engine` owns backend and models. `Backend` covers buffers and launch. `SpeculativeStrategy` covers draft methods. |
-| GGUF loader | Done | Parses v2 and v3 headers. Checks bounds. Rejects bad input. The file is memory-mapped, not read into an anonymous host buffer, so a multi-gigabyte GGUF is neither copied nor zero-filled before parsing and upload. |
-| MXFP4 loader | Done | Parses tensor map. Uploads weights. FP8 and MXFP4 GEMM verified. |
-| Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. A batched host-to-device upload (`CopyH2DBatch`) drains many weight tensors through a bounded pinned or host-visible window, one synchronization per chunk: ROCm copies from a 256 MiB pinned staging buffer and releases it after the transfer, Vulkan records a whole chunk into one command buffer and submits it once. Model load logs one timing line per phase (`model: phase 'upload weights to device' done in ...`). |
-| Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. Vulkan defers the submission: every dispatch and device copy of a decode step records into one command buffer (with an inter-operation barrier), so a step of about two thousand small launches pays one queue submit, not thousands. ROCm launches on one stream configured with the blocking synchronization policy, so host waits sleep instead of busy-waiting in the runtime; host readbacks and uploads stage through pinned memory. |
-| DFlash2 | Partial | Draft forward built: grouped dynamic convolution, sliding attention, candidate selector and target-hidden fusion. The real draft loads and runs the block. The 27B MXFP4 target accepts 4.4 tokens per step. Output equals greedy. The draft step costs more than greedy, so speed work remains. |
-| CLI | Partial | Loads a model, prints a tensor summary, streams generated text to stdout (`--max-completion-tokens`), caps thinking per turn (`--max-thinking-tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). It serves HTTP (`serve`), samples (`--sample` and parameter flags), selects the KV cache (`--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`), speculates (`--speculate`, `--draft`) and encodes images (`--mmproj`, `--image`). Text prompts work for GGUF and MXFP4. |
-| Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in chunk-sized batched forwards (512 by default, `--prefill-chunk`), so a 220k-token prompt on the 8-bit KV cache (`--context 220000 --kv-q8`) prefills in bounded memory. Each forward is also clamped to the attention work budget, so a long prompt cannot wedge the device with one oversized launch. A prompt past the context is rejected before any device work. A zero `max_completion_tokens` fills the remaining context, which is also the default for requests that omit it. A `max_thinking_tokens` budget force-closes the think block past budget and decoding continues with the answer. Generation stops at the model's declared stop tokens (GGUF `tokenizer.ggml.eos_token_id`, HuggingFace `eos_token_id`) and does not emit them; callers add stops through `GenerateOptions::stop_tokens`. Runtime options: `--context`, `--max-completion-tokens`, `--max-thinking-tokens`, `--prefill-chunk`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) or FP8 (`--kv-fp8`) KV cache. |
-| KV cache | Done | fp32 (default), fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) and FP8 E4M3 (`--kv-fp8`, the served target's cache quant) full-attention storage on both backends. An appended quantized row is written by a row-parallel kernel: one workgroup per row reduces the absmax in shared memory and packs the codes together. This replaced a single-thread launch per row, which dominated fp8 KV decode (a 27B DFlash2 verify step pays 16 full-attention layers times 2 tensors times the block width in rows). |
-| Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
-| GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Tiled batched kernels for the hot formats (four partial sums per thread) and warp-per-output decode GEMVs. An fp8 tensor-core MXFP4 GEMM and a bf16 tensor-core GEMM cover the m=1 to 16 decode and verify batch. The vocab-width bf16 head uses the bf16 tensor-core kernel, so it streams coalesced. Host reference check. Per backend tolerance. |
-| Activation quant | Done | Per-token FP8 E4M3 quantize-dequantize (`quantize_fp8`) on Vulkan and ROCm, the W4A8 activation contract. The DFlash2 drafter input uses it. The served target's W4A8 linear activation is opt-in (`TESSERA_MXFP4_W4A8=1`). |
-| Attention and RoPE | Done | GQA path driven by model data; tiled O(n*d) attention (one workgroup per query/head, online softmax), including the int8, 4-bit and FP8 KV variants. The single-token path splits the key range (16 chunks, flash decoding) and merges the partials, so a long context is not one serial tile chain per workgroup. RoPE kernel verified by read back on both backends. |
-| Weight upload | Done | Manifest to device buffers. `Model::Weights` holds them. Every tensor uploads in one `CopyH2DBatch` call, staged through a bounded pinned window on ROCm, so a 27B GGUF (866 tensors) does not pay a device round trip per tensor. Each load phase logs its duration. |
-| Decode loop | Done | Single token loop on vanilla and hybrid (gated attention + gated-delta linear) GGUF. The 27B hybrid path generates coherent text. |
-| Hybrid SSM | Partial | Definition, load, kernels and both decode paths done. MTP head done. The causal conv1d runs on the device (`conv1d_state`). Embedding gather runs on the device. Some linear-path glue still runs on the host. |
-| Speculative decode | Partial | MTP (`--speculate`) and DFlash2 (`--draft`) speculative decode run end to end on both `run` and `serve`; output equals greedy. Multi-token drafts score in one batched target forward. MTP accepts about half its drafts with a default chain of one. DFlash2 accepts 3.5 to 4.4 tokens per step and decodes faster than greedy (about 60 against 23 tok/s on the 27B MXFP4 target). |
-| MXFP4 path | Done | Tensor map parsing. FP8 and MXFP4 kernels. HuggingFace config, weight name map, value-head reorder and tokenizer. The Qwen 3.8 27B MXFP4 target loads, tokenizes and decodes end to end. Greedy output matches the GGUF reference. The FP8 MTP head loads. W4A8 activation quant is opt-in. |
-| DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). The draft conditions on a device-resident per-layer context K/V cache built from committed target positions. The concatenated target hidden is quantized per token to FP8 E4M3 before `fc`. Output equals greedy. On the 27B MXFP4 target the draft accepts 3.5 to 4.4 tokens per step, above the served reference (2.7 to 2.85), and decodes faster than greedy (about 60 against 23 tok/s). The speculative step is about 75 ms; the remaining gap to the reference is the draft forward cost. Two defects were fixed (the candidate extraction ranked only the first 16 token ids on rows after the first, and the selector added the predecessor unary logit instead of the successor). |
-| Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
-| Tokenizer and chat | Done | Byte-level BPE tokenizer from GGUF metadata or HuggingFace `tokenizer.json`. Jinja2-subset chat template renderer. Generation stops at the declared stop tokens and never emits them. |
-| Serving | Partial | Blocking HTTP/1.1 server with buffered and chunked (SSE) responses, API-key auth and CORS. First endpoint set done. `/v1/chat/completions` supports OpenAI-form tool calls (template-rendered tools, `tool_calls` answers, `tool_choice`). Generations queue in arrival order on the single device, so parallel windows wait instead of failing. Each chat lives in a server session (`/api/sessions`, `/v1/sessions` aliases); the OpenAI endpoints continue one through `session_id`, and `GET /slots` reports the live sessions. The model thinking block streams live as `reasoning_content` instead of leaking into the reply. A dependency-free web chat UI at `/` offers session history with retry, pause and stop, per-message timestamps and generation speed, an expandable thinking box, sticky scrolling that never yanks the view, browser-local chat caching, and model-generated chat titles. Each chat keeps its own live stream, so switching chats while one generates shows the open chat and queues a new turn behind the running one. It renders SVG, HTML and images. Turns take `max_completion_tokens` and `max_thinking_tokens` budgets. A request's `chat_template_kwargs` (any key) and top-level `reasoning_effort` pass to the model chat template unchanged; `/props` reports the `reasoning_efforts` the template accepts and the web UI shows them as a difficulty selector. Prefill progress streams ahead of thinking. A closed window or cancelled request aborts its generation and frees the device. The server binds before the model finishes loading, so a client can connect while weights and kernels load: `/health` answers 503 with a JSON `status`/`detail` body until the model is loaded and warm, then 200, and the web UI waits on it and keeps the composer disabled until ready. More surfaces deferred. |
-| Vision | Partial | CLIP encoder plus merger, PPM load and resize, image-embedding injection, CLI wiring with auto `<|image_pad|>` detection. Image prefill speed work remains. |
-| Architecture modules | Done | One `Architecture` module per model family (`src/models/qwen3_5/`). The hybrid trunk and state live behind it. Core names no model. |
-| MoE, MLP, norms | Todo | RMSNorm, sigmoid-gate, add, silu_mul and the f32/bf16/Q4_K embedding gather kernels are done. The gated MLP runs as gemm plus silu_mul plus gemm on the device. No MoE kernels exist yet. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
+| Public API | Done | `Engine`, `Backend`, `SpeculativeStrategy`. |
+| GGUF loader | Done | v2/v3 headers, bounds-checked, memory-mapped (not copied). |
+| MXFP4 loader | Done | Tensor map, weight upload. FP8 and MXFP4 GEMM verified. |
+| Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched H2D upload (`CopyH2DBatch`); ROCm drains a 256 MiB pinned window, one sync per chunk. |
+| Kernel launch | Done | Vulkan records a whole decode step into one command buffer. ROCm runs one blocking stream with pinned staging. |
+| DFlash2 | Partial | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. Draft cost still high. |
+| CLI | Partial | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, calibrate. |
+| Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
+| KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. |
+| Sampling | Done | Seeded sampling with Qwen 27B defaults. |
+| GEMM | Done | Q4_K to IQ, FP8/MXFP4, block-scaled FP8, bf16, fp32. Tensor-core paths for decode and verify. |
+| Activation quant | Done | Per-token FP8 E4M3 quant-dequant. W4A8 opt-in. |
+| Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. |
+| Weight upload | Done | Manifest to device buffers. One batched upload per load, staged through a pinned window on ROCm. Each load phase is timed. |
+| Decode loop | Done | Single-token vanilla and hybrid GGUF loops. |
+| Hybrid SSM | Partial | Load, kernels, both decode paths, MTP head done. Some host glue remains. |
+| Speculative decode | Partial | MTP and DFlash2 end to end. Output equals greedy. About 60 vs 23 tok/s on 27B. |
+| MXFP4 path | Done | Parse, kernels, HF config, tokenizer. Matches GGUF greedy output. |
+| DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |
+| Baseline pinning | Done | Fixed-seed fixtures identical on Vulkan and ROCm. |
+| Tokenizer and chat | Done | Byte-level BPE, Jinja2-subset templates, stop tokens. |
+| Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. |
+| Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
+| Architecture modules | Done | One module per model family. |
+| MoE, MLP, norms | Todo | Norms and MLP kernels done. No MoE kernels yet (planned Ornith-1.5-35B-A3B). |
+| Calibration | Done | Measures machine-dependent settings, keeps only gains above the noise floor, writes a JSON keyed by backend, device and model. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 
@@ -227,6 +228,8 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--no-auto-title` | serve | off | Keep the first user line as the chat title instead of asking the model. |
 | `--api-key <k>` | serve | none | Accepted API key. Repeatable. |
 | `--allow-origin <o>` | serve | none | CORS origin. Repeatable. `*` allows all origins. |
+| `--calibration <file>` | run, serve, calibrate | env `TESSERA_CALIBRATION` | Calibration file. `run` and `serve` apply a saved entry for the current machine and model unless an explicit flag overrides it. `calibrate` reads and writes it. |
+| `--prompts <file>` | calibrate | three fixed prompts | Fixed prompts, one per non-empty line, for the calibration sweep. |
 
 The KV cache is fp32 when no `--kv-*` flag is set. The sampling defaults match the Qwen 3.8 27B defaults.
 
@@ -234,6 +237,8 @@ Environment variables:
 
 * `TESSERA_API_KEY` supplies `--api-key` when the flag is absent.
 * `TESSERA_MXFP4_W4A8=1` enables the served MXFP4 target's W4A8 linear activation.
+* `TESSERA_CALIBRATION` supplies `--calibration` when the flag is absent.
+* `TESSERA_MXFP4_SPLIT` and `TESSERA_MXFP4_SPLITCAP` override the split-K target and cap as a diagnostic (they win over the request value).
 
 ## Build and test
 
