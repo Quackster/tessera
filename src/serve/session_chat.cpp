@@ -259,7 +259,7 @@ void SessionHandler::HandleRename(ResponseWriter& writer, std::string_view id,
 // stop flag aborts the decode loop (prefill has no token hook and runs
 // to completion); pause blocks it between tokens.
 void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
-                             ResponseWriter& writer,
+                             ResponseWriter& writer, const Json& request,
                              std::size_t max_completion_tokens,
                              std::size_t max_thinking_tokens,
                              bool enable_thinking, bool stream) const {
@@ -267,6 +267,13 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
   Json prompt_body = Json::Object();
   prompt_body.Set("messages", SessionHistoryJson(*view));
   prompt_body.Set("enable_thinking", Json::Bool(enable_thinking));
+  // Forward the caller's template arguments (difficulty and any other
+  // chat_template_kwargs) so RenderPrompt sees them.
+  for (const char* key : {"reasoning_effort", "chat_template_kwargs"}) {
+    if (const Json* value = request.Find(key)) {
+      prompt_body.Set(key, *value);
+    }
+  }
   std::string error;
   const std::string prompt = RenderPrompt(model_, prompt_body, &error);
   if (!error.empty()) {
@@ -453,7 +460,7 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
   }
-  RunTurn(session, writer,
+  RunTurn(session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body));
@@ -477,7 +484,7 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
   }
-  RunTurn(session, writer,
+  RunTurn(session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body));

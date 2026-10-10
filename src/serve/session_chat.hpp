@@ -66,7 +66,8 @@ class SessionHandler {
   private:
   // Shared turn core for chat and retry (see the .cpp for the flow).
   void RunTurn(const std::shared_ptr<Session>& session,
-               ResponseWriter& writer, std::size_t max_completion_tokens,
+               ResponseWriter& writer, const core::Json& request,
+               std::size_t max_completion_tokens,
                std::size_t max_thinking_tokens, bool enable_thinking,
                bool stream) const;
   // 409 when the session is busy; otherwise take the turn and queue

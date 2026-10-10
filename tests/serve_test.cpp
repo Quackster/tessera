@@ -16,6 +16,7 @@
 #include "serve/auto_title.hpp"
 #include "serve/http.hpp"
 #include "serve/readiness.hpp"
+#include "serve/render.hpp"
 #include "serve/respond.hpp"
 #include "serve/session.hpp"
 #include "serve/session_chat.hpp"
@@ -56,6 +57,62 @@ TEST(ServeTest, JsonRejectsMalformed) {
   EXPECT_EQ(Json::Parse("[1,2"), nullptr);
   EXPECT_EQ(Json::Parse("nul"), nullptr);
   EXPECT_EQ(Json::Parse("1 2"), nullptr);
+}
+
+// Chat template arguments pass through from the request unchanged: the
+// nested chat_template_kwargs object plus a top-level reasoning_effort.
+TEST(ServeTest, RequestTemplateKwargsPassThrough) {
+  Json body = Json::Object();
+  Json kwargs = Json::Object();
+  kwargs.Set("reasoning_effort", Json::String("high"));
+  kwargs.Set("preserve_thinking", Json::Bool(true));
+  body.Set("chat_template_kwargs", std::move(kwargs));
+  const std::vector<tessera::serve::jinja::Kwarg> resolved =
+      tessera::serve::RequestTemplateKwargs(body);
+  ASSERT_EQ(resolved.size(), 2u);
+  const auto find = [&resolved](std::string_view name) {
+    for (const auto& [key, value] : resolved) {
+      if (key == name) {
+        return &value;
+      }
+    }
+    return static_cast<const tessera::serve::jinja::Value*>(nullptr);
+  };
+  const tessera::serve::jinja::Value* effort = find("reasoning_effort");
+  ASSERT_NE(effort, nullptr);
+  EXPECT_EQ(effort->asStr(), "high");
+  const tessera::serve::jinja::Value* preserve = find("preserve_thinking");
+  ASSERT_NE(preserve, nullptr);
+  EXPECT_TRUE(preserve->asBool());
+}
+
+TEST(ServeTest, RequestTemplateKwargsTopLevelReasoningEffort) {
+  Json body = Json::Object();
+  body.Set("reasoning_effort", Json::String("low"));
+  const std::vector<tessera::serve::jinja::Kwarg> resolved =
+      tessera::serve::RequestTemplateKwargs(body);
+  ASSERT_EQ(resolved.size(), 1u);
+  EXPECT_EQ(resolved[0].first, "reasoning_effort");
+  EXPECT_EQ(resolved[0].second.asStr(), "low");
+  // A non-string top-level value is ignored.
+  Json numeric = Json::Object();
+  numeric.Set("reasoning_effort", Json::Number(3));
+  EXPECT_TRUE(tessera::serve::RequestTemplateKwargs(numeric).empty());
+}
+
+// The difficulty selector reads the levels the template validates. A
+// template that never reads reasoning_effort reports none.
+TEST(ServeTest, ReasoningEffortsDetectedFromTemplate) {
+  EXPECT_TRUE(
+      tessera::serve::ReasoningEffortsFromTemplate("plain {{ x }}").empty());
+  const std::vector<std::string> levels =
+      tessera::serve::ReasoningEffortsFromTemplate(
+          "{%- set e = reasoning_effort|default('xhigh') %}"
+          "{% if e not in ('xhigh', 'medium', 'low') %}{{ 'x' }}{% endif %}");
+  ASSERT_EQ(levels.size(), 3u);
+  EXPECT_EQ(levels[0], "xhigh");
+  EXPECT_EQ(levels[1], "medium");
+  EXPECT_EQ(levels[2], "low");
 }
 
 namespace {

@@ -90,8 +90,9 @@ Json SessionPromptBody(const Json& body, const SessionView& view) {
   Json prompt_body = Json::Object();
   prompt_body.Set("messages", SessionHistoryJson(view));
   for (const char* key : {"system", "tools", "tool_choice",
-                          "enable_thinking", "stream",
-                          "max_completion_tokens", "max_thinking_tokens"}) {
+                          "enable_thinking", "reasoning_effort", "stream",
+                          "max_completion_tokens", "max_thinking_tokens",
+                          "chat_template_kwargs"}) {
     if (const Json* value = body.Find(key)) {
       prompt_body.Set(key, *value);
     }

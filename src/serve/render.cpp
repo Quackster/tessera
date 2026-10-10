@@ -1,6 +1,7 @@
 #include "serve/render.hpp"
 
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -9,6 +10,57 @@
 #include "tessera/model.hpp"
 
 namespace tessera::serve {
+
+std::vector<jinja::Kwarg> RequestTemplateKwargs(const core::Json& body) {
+  std::vector<jinja::Kwarg> kwargs;
+  bool has_reasoning = false;
+  if (const core::Json* nested = body.Find("chat_template_kwargs");
+      nested != nullptr && nested->isObject()) {
+    for (const auto& [key, value] : nested->AsObject()) {
+      if (key == "reasoning_effort") {
+        has_reasoning = true;
+      }
+      kwargs.emplace_back(key, ToJinja(value));
+    }
+  }
+  if (!has_reasoning) {
+    if (const core::Json* value = body.Find("reasoning_effort");
+        value != nullptr && value->isString()) {
+      kwargs.emplace_back("reasoning_effort",
+                          jinja::Value::Str(value->AsString()));
+    }
+  }
+  return kwargs;
+}
+
+std::vector<std::string> ReasoningEffortsFromTemplate(std::string_view tmpl) {
+  const std::size_t ref = tmpl.find("reasoning_effort");
+  if (ref == std::string_view::npos) {
+    return {};
+  }
+  std::vector<std::string> levels;
+  const std::size_t list = tmpl.find("not in (", ref);
+  if (list != std::string_view::npos) {
+    std::size_t pos = list + 8;
+    while (pos < tmpl.size() && tmpl[pos] != ')') {
+      const char quote = tmpl[pos];
+      if (quote != '\'' && quote != '"') {
+        ++pos;
+        continue;
+      }
+      const std::size_t end = tmpl.find(quote, pos + 1);
+      if (end == std::string_view::npos) {
+        break;
+      }
+      levels.emplace_back(tmpl.substr(pos + 1, end - pos - 1));
+      pos = end + 1;
+    }
+  }
+  if (levels.empty()) {
+    levels = {"xhigh", "medium", "low"};
+  }
+  return levels;
+}
 
 jinja::Value ToJinja(const core::Json& json) {
   switch (json.type()) {
@@ -68,7 +120,7 @@ std::string RenderPrompt(const Model& model, const core::Json& body,
   if (!error->empty()) {
     return {};
   }
-  std::vector<jinja::Kwarg> context;
+  std::vector<jinja::Kwarg> context = RequestTemplateKwargs(body);
   context.emplace_back("messages",
                        jinja::Value::List(std::move(message_items)));
   context.emplace_back("add_generation_prompt", jinja::Value::Bool(true));

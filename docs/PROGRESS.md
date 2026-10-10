@@ -133,6 +133,18 @@ RADV GFX1201, rocm through the system ROCm).
   loaded and its kernels warmed, then 200. The web UI polls it and
   keeps the composer disabled until ready. Unimplemented surfaces
   return 501.
+- Chat-template arguments pass through from a request:
+  `chat_template_kwargs` (any key) plus a top-level `reasoning_effort`
+  reach the renderer unchanged, so a caller sets the difficulty the
+  model template expects. `/props` reports `reasoning_efforts`, the
+  levels the template validates (for example `xhigh`, `medium`,
+  `low`), and the web UI builds its difficulty selector from that
+  list. The template's own default is left in place: `xhigh` on the
+  Qwen3.8 template injects a "think exhaustively" system message that
+  drives greedy decode into a repetition loop, so selecting `medium`
+  gives the short reference-style thinking. Covered by
+  `ServeTest.RequestTemplateKwargs*` and
+  `ServeTest.ReasoningEffortsDetectedFromTemplate`.
 - Vision: mmproj config and weight load, CLIP encoder stack,
   merger into language space, PPM load and resize, embedding
   injection at `<|image_pad|>` placeholders,

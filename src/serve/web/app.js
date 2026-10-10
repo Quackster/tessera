@@ -21,6 +21,9 @@ let cacheWriteFailed = false;
 // Server readiness: the HTTP API answers before the model finishes
 // loading, so the composer stays disabled until /health is ok.
 let serverReady = false;
+// The reasoning-effort levels the model template offers (from /props);
+// empty hides the difficulty selector.
+let reasoningEfforts = [];
 
 const $ = (id) => document.getElementById(id);
 
@@ -686,13 +689,16 @@ async function sendMessage() {
     messages: base,
   };
   writeCache();
-  await streamTurn('/api/sessions/' + sid + '/chat', {
+  const payload = {
     message: text,
     stream: true,
     max_completion_tokens: completionBudget(),
     max_thinking_tokens: thinkingBudget(),
     enable_thinking: $('thinking').checked,
-  }, base, sid);
+  };
+  const effort = reasoningEffort();
+  if (effort) payload.reasoning_effort = effort;
+  await streamTurn('/api/sessions/' + sid + '/chat', payload, base, sid);
 }
 
 async function retryTurn() {
@@ -711,12 +717,16 @@ async function retryTurn() {
     messages: base,
   };
   writeCache();
-  await streamTurn('/api/sessions/' + currentId + '/retry', {
+  const payload = {
     stream: true,
     max_completion_tokens: completionBudget(),
     max_thinking_tokens: thinkingBudget(),
     enable_thinking: $('thinking').checked,
-  }, base, currentId);
+  };
+  const effort = reasoningEffort();
+  if (effort) payload.reasoning_effort = effort;
+  await streamTurn('/api/sessions/' + currentId + '/retry', payload, base,
+                   currentId);
 }
 
 // Budgets from the composer inputs: 0 (including a cleared field)
@@ -729,6 +739,48 @@ function completionBudget() {
 function thinkingBudget() {
   const input = $('max-thinking-tokens');
   return Number(input.value) || 0;
+}
+
+// The selected reasoning effort, or '' to let the template use its own
+// default (an empty value must be omitted from the request, not sent).
+function reasoningEffort() {
+  const select = $('reasoning-effort');
+  return select ? select.value : '';
+}
+
+// Fill the difficulty selector from the levels the template validates
+// (/props.reasoning_efforts) and keep it hidden when the model template
+// has no reasoning_effort knob. The last choice is restored from
+// localStorage.
+function applyReasoningEfforts(efforts) {
+  reasoningEfforts = Array.isArray(efforts) ? efforts : [];
+  const row = $('effort-row');
+  const select = $('reasoning-effort');
+  if (!row || !select) return;
+  select.innerHTML = '';
+  for (const effort of reasoningEfforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort;
+    select.appendChild(option);
+  }
+  row.hidden = reasoningEfforts.length === 0;
+  if (reasoningEfforts.length) {
+    const saved = localStorage.getItem('tessera_effort');
+    if (saved && reasoningEfforts.includes(saved)) select.value = saved;
+    select.addEventListener('change', () => {
+      localStorage.setItem('tessera_effort', select.value);
+    });
+  }
+}
+
+async function loadProps() {
+  try {
+    const props = await api('GET', '/props');
+    if (props) applyReasoningEfforts(props.reasoning_efforts);
+  } catch (error) {
+    // The selector is optional; a props failure just hides it.
+  }
 }
 
 // Controls act on the open chat's live turn.
@@ -804,6 +856,7 @@ async function awaitServer() {
       updateControls();
       setStatus('Ready');
       try {
+        await loadProps();
         await refreshSessions();
         if (currentId) await openSession(currentId);
       } catch (error) {

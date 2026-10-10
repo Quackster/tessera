@@ -24,6 +24,7 @@ namespace {
 
 using serve::HttpRequest;
 using core::Json;
+using serve::ReasoningEffortsFromTemplate;
 using serve::ResponseWriter;
 using serve::RenderPrompt;
 using serve::SendError;
@@ -182,6 +183,18 @@ std::expected<void, StatusCode> ServeInternal(
       props.Set("n_ctx", Json::Number(
                              static_cast<double>(model.MaxContextLength())));
       props.Set("total_slots", Json::Number(1));
+      // The reasoning levels the chat template offers, in template order;
+      // absent when the template never reads reasoning_effort. The web UI
+      // builds its difficulty selector from this list.
+      const std::vector<std::string> efforts =
+          ReasoningEffortsFromTemplate(model.ChatTemplate());
+      if (!efforts.empty()) {
+        Json levels = Json::Array();
+        for (const std::string& effort : efforts) {
+          levels.Push(Json::String(effort));
+        }
+        props.Set("reasoning_efforts", std::move(levels));
+      }
       SendJson(writer, 200, props);
       return;
     }
