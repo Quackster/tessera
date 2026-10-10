@@ -127,6 +127,10 @@ bool RejectOversizePrompt(ResponseWriter& writer, std::size_t prompt,
   return false;
 }
 
+const char* FinishReasonName(FinishReason reason) {
+  return reason == FinishReason::Length ? "length" : "stop";
+}
+
 void WriteSse(ResponseWriter& writer, const std::string& event,
               const core::Json& data, bool with_event) {
   std::string chunk;

@@ -208,7 +208,7 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
     Json choice = Json::Object();
     choice.Set("text", Json::String(*text));
     choice.Set("index", Json::Number(0));
-    choice.Set("finish_reason", Json::String("length"));
+    choice.Set("finish_reason", Json::String(FinishReasonName(streamed->reason)));
     Json choices = Json::Array();
     choices.Push(std::move(choice));
     Json response = Json::Object();
@@ -268,7 +268,9 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
   Json choice = Json::Object();
   choice.Set("text", Json::String(""));
   choice.Set("index", Json::Number(0));
-  choice.Set("finish_reason", Json::String("length"));
+  choice.Set("finish_reason",
+             Json::String(streamed ? FinishReasonName(streamed->reason)
+                                   : "length"));
   choices.Push(std::move(choice));
   done.Set("choices", std::move(choices));
   WriteSse(writer, "", done, false);
@@ -389,7 +391,10 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
       response.Set("role", Json::String("assistant"));
       response.Set("model", Json::String(model_name));
       response.Set("content", std::move(content));
-      response.Set("stop_reason", Json::String("max_tokens"));
+      response.Set("stop_reason",
+                   Json::String(streamed->reason == FinishReason::Length
+                                    ? "max_tokens"
+                                    : "end_turn"));
       response.Set("usage", std::move(usage));
       SendJson(writer, 200, response);
       return;
@@ -414,7 +419,7 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     std::string text;
     std::size_t count = 0;
     const auto gen_started = std::chrono::steady_clock::now();
-    (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
+    auto streamed = engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
       if (writer.IsPeerGone()) {
         return false;
       }
@@ -447,7 +452,10 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     Json message_delta = Json::Object();
     message_delta.Set("type", Json::String("message_delta"));
     Json md = Json::Object();
-    md.Set("stop_reason", Json::String("end_turn"));
+    md.Set("stop_reason",
+           Json::String(streamed && streamed->reason == FinishReason::Length
+                            ? "max_tokens"
+                            : "end_turn"));
     message_delta.Set("delta", std::move(md));
     WriteSse(writer, "message_delta", message_delta, true);
     Json message_stop = Json::Object();
@@ -507,7 +515,7 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     Json choice = Json::Object();
     choice.Set("index", Json::Number(0));
     choice.Set("message", std::move(message));
-    choice.Set("finish_reason", Json::String("length"));
+    choice.Set("finish_reason", Json::String(FinishReasonName(streamed->reason)));
     Json choices = Json::Array();
     choices.Push(std::move(choice));
     Json response = Json::Object();
@@ -548,7 +556,7 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   std::string text;
   std::size_t count = 0;
   const auto chat_started = std::chrono::steady_clock::now();
-  (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
+  auto streamed = engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
     if (writer.IsPeerGone()) {
       return false;
     }
@@ -567,6 +575,24 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   if (session != nullptr) {
     session->Append(AssistantTurn(text, writer.IsPeerGone(), stats));
   }
+  // Final chunk carries the end reason; the deltas above leave it null
+  // (OpenAI convention) so a client that reads finish_reason sees "stop"
+  // for a completed turn and "length" only on a real truncation.
+  Json end_delta = Json::Object();
+  Json end_choice = Json::Object();
+  end_choice.Set("index", Json::Number(0));
+  end_choice.Set("delta", std::move(end_delta));
+  end_choice.Set("finish_reason",
+                 Json::String(streamed ? FinishReasonName(streamed->reason)
+                                       : "length"));
+  Json end_choices = Json::Array();
+  end_choices.Push(std::move(end_choice));
+  Json end_chunk = Json::Object();
+  end_chunk.Set("id", Json::String("chatcmpl-0"));
+  end_chunk.Set("object", Json::String("chat.completion.chunk"));
+  end_chunk.Set("model", Json::String(model_name));
+  end_chunk.Set("choices", std::move(end_choices));
+  WriteSse(writer, "", end_chunk, false);
   (void)writer.Write("data: [DONE]\n\n");
 }
 

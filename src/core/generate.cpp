@@ -69,7 +69,7 @@ std::expected<std::uint32_t, StatusCode> Engine::MtpDraft(
   return core::MtpDraftStep(*backend_, model, cache, hidden, *step, 1);
 }
 
-std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
+std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     Model& model, const GenerateOptions& options,
     const std::function<bool(std::uint32_t)>& on_token) {
   if (options.sample) {
@@ -92,7 +92,7 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   const std::size_t max_completion_tokens =
       model.EffectiveMaxTokens(prompt.size(), options.max_completion_tokens);
   if (max_completion_tokens == 0) {
-    return 0;
+    return GenerateOutcome{};
   }
   if (prompt.size() > model.MaxContextLength()) {
     diagnostics_.Warn("engine", std::string("prompt of ") +
@@ -214,6 +214,7 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
   std::size_t spec_accepted = 0;
   std::size_t spec_steps = 0;
   bool stopped = false;
+  bool aborted = false;
   // Thinking budget: resolve the tags once and scan the prompt, so a
   // prompt trailing an open think block starts inside thinking.
   auto [think, think_close] =
@@ -267,6 +268,7 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       }
       think.noteEmitted(id);
       if (!on_token(id)) {
+        aborted = true;
         return std::optional<std::uint32_t>{};
       }
       history.push_back(id);
@@ -300,6 +302,7 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
       break;
     }
     if (!emit(next)) {
+      aborted = true;
       break;
     }
     ++produced;
@@ -368,13 +371,13 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
           break;
         }
         if (!emit(drafts[i])) {
-          stopped = true;
+          aborted = true;
           break;
         }
         history.push_back(drafts[i]);
         ++produced;
       }
-      if (stopped || produced >= max_completion_tokens) {
+      if (stopped || aborted || produced >= max_completion_tokens) {
         break;
       }
       next = verify->next_token;
@@ -472,7 +475,10 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
                                      static_cast<long long>(produced)) +
                       " ms/token)");
   }
-  return produced;
+  const FinishReason reason = stopped    ? FinishReason::Stop
+                              : aborted  ? FinishReason::Aborted
+                                         : FinishReason::Length;
+  return GenerateOutcome{produced, reason};
 }
 
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(

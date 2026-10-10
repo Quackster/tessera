@@ -9,6 +9,7 @@
 
 #include "core/json.hpp"
 #include "serve/http.hpp"
+#include "tessera/engine.hpp"
 #include "tessera/log.hpp"
 #include "tessera/types.hpp"
 
@@ -59,6 +60,10 @@ void SendGenerationError(ResponseWriter& writer, StatusCode code);
 [[nodiscard]] bool RejectOversizePrompt(ResponseWriter& writer,
                                         std::size_t prompt,
                                         std::size_t context);
+// OpenAI `finish_reason` for a generation outcome: "stop" when the model
+// ended the turn (a declared stop token) or the caller cancelled, and
+// "length" when the completion budget ran out.
+[[nodiscard]] const char* FinishReasonName(FinishReason reason);
 // Append one SSE frame (`event: ...` only when `with_event`).
 void WriteSse(ResponseWriter& writer, const std::string& event,
               const core::Json& data, bool with_event);

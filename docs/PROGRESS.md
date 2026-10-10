@@ -102,7 +102,12 @@ RADV GFX1201, rocm through the system ROCm).
   streamed path emits live `reasoning_content` and `content` deltas.
   The web UI keeps one live stream per chat, so switching chats
   while one generates shows the open chat and queues another turn.
-  Completion and thinking token budgets are enforced.
+  Completion and thinking token budgets are enforced. The reply
+  `finish_reason` is accurate: "stop" when the model emits a declared
+  stop token, "length" when the completion budget runs out, and
+  "tool_calls" on a tool call (the engine returns the reason via
+  `GenerateOutcome`; the streamed path ends with a final
+  `finish_reason` chunk before `[DONE]`).
   The server binds before the model finishes loading: `/health`
   answers 503 with a JSON `status`/`detail` body until the model is
   loaded and its kernels warmed, then 200. The web UI polls it and

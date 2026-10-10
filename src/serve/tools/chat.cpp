@@ -95,7 +95,7 @@ bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
         has_calls ? ToolCallsJson(calls).Dump() : std::string();
     out_turn->stopped = writer.IsPeerGone();
     out_turn->stats.prompt_tokens = prompt_size;
-    out_turn->stats.completion_tokens = *streamed;
+    out_turn->stats.completion_tokens = streamed->produced;
     out_turn->stats.elapsed_ms = elapsed_ms;
   }
   core::Json message = core::Json::Object();
@@ -112,7 +112,8 @@ bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
   choice.Set("index", core::Json::Number(0));
   choice.Set("message", std::move(message));
   choice.Set("finish_reason",
-             core::Json::String(has_calls ? "tool_calls" : "length"));
+             core::Json::String(has_calls ? "tool_calls"
+                                          : FinishReasonName(streamed->reason)));
   core::Json choices = core::Json::Array();
   choices.Push(std::move(choice));
   core::Json response = core::Json::Object();
@@ -120,7 +121,7 @@ bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
   response.Set("object", core::Json::String("chat.completion"));
   response.Set("model", core::Json::String(model_name));
   response.Set("choices", std::move(choices));
-  response.Set("usage", UsageJson(prompt_size, *streamed));
+  response.Set("usage", UsageJson(prompt_size, streamed->produced));
   SendJson(writer, 200, response);
   return true;
 }
@@ -168,7 +169,7 @@ bool ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
         calls.empty() ? std::string() : ToolCallsJson(calls).Dump();
     out_turn->stopped = writer.IsPeerGone();
     out_turn->stats.prompt_tokens = options.prompt_tokens.size();
-    out_turn->stats.completion_tokens = *streamed;
+    out_turn->stats.completion_tokens = streamed->produced;
     out_turn->stats.elapsed_ms = elapsed_ms;
   }
   if (!reasoning.empty()) {
@@ -199,7 +200,8 @@ bool ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
   core::Json end = core::Json::Object();
   WriteSse(writer, "",
            StreamChunk(model_name, std::move(end),
-                       calls.empty() ? "length" : "tool_calls"),
+                       calls.empty() ? FinishReasonName(streamed->reason)
+                                     : "tool_calls"),
            false);
   (void)writer.Write("data: [DONE]\n\n");
   return true;

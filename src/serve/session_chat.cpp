@@ -353,7 +353,7 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
       WriteSse(writer, "", chunk, false);
       return;
     }
-    stats.completion_tokens = *streamed;
+    stats.completion_tokens = streamed->produced;
     const ThinkStreamer::Deltas tail = streamer.Finish();
     reasoning_text += tail.reasoning;
     content_text += tail.content;
@@ -369,7 +369,8 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     }
     Json end = Json::Object();
     WriteSse(writer, "",
-             SseDelta(std::move(end), saw_stop ? "stop" : "length"), false);
+             SseDelta(std::move(end), FinishReasonName(streamed->reason)),
+             false);
     (void)writer.Write("data: [DONE]\n\n");
   } else {
     const auto gen_started = std::chrono::steady_clock::now();
@@ -382,7 +383,7 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
       SendGenerationError(writer, streamed.error());
       return;
     }
-    const std::size_t produced = *streamed;
+    const std::size_t produced = streamed->produced;
     stats.completion_tokens = produced;
     const ThinkStreamer::Deltas tail = streamer.Finish();
     reasoning_text += tail.reasoning;

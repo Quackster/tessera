@@ -131,6 +131,19 @@ constexpr std::size_t kDefaultPrefillChunkTokens = 512;
   return kDefaultPrefillChunkTokens;
 }
 
+// Why a generation loop ended. `Stop` is the model emitting one of its
+// declared stop tokens (a complete turn); `Length` is the completion
+// budget running out; `Aborted` is the on_token callback returning false
+// to cancel. The serving layer maps this to the OpenAI `finish_reason`.
+enum class FinishReason { Stop, Length, Aborted };
+
+// Outcome of Engine::GenerateStreaming: how many tokens were produced and
+// why the loop ended.
+struct GenerateOutcome {
+  std::size_t produced = 0;
+  FinishReason reason = FinishReason::Length;
+};
+
 // Top-level facade: owns the backend and the loaded models.
 //
 // Usage:
@@ -165,8 +178,9 @@ class Engine {
   Generate(Model& model, const GenerateOptions& options = {});
 
   // Streaming variant: call `on_token` for each produced token; stop
-  // early when it returns false. Returns the produced count.
-  [[nodiscard]] std::expected<std::size_t, StatusCode> GenerateStreaming(
+  // early when it returns false. Returns the produced count and why the
+  // loop ended (a declared stop token, the budget, or a cancel).
+  [[nodiscard]] std::expected<GenerateOutcome, StatusCode> GenerateStreaming(
       Model& model, const GenerateOptions& options,
       const std::function<bool(std::uint32_t)>& on_token);
 

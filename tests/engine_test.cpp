@@ -322,6 +322,12 @@ TEST(EngineTest, GenerateStopsAtStopToken) {
   ASSERT_EQ(stopped->size(), 2u);
   EXPECT_EQ((*stopped)[0], (*ids)[0]);
   EXPECT_EQ((*stopped)[1], (*ids)[1]);
+  // The streaming path reports the end reason: the model's stop token.
+  auto streamed = engine->GenerateStreaming(
+      **model, stop_opts, [](std::uint32_t) { return true; });
+  ASSERT_TRUE(streamed.has_value()) << tessera::ToString(streamed.error());
+  EXPECT_EQ(streamed->produced, 2u);
+  EXPECT_EQ(streamed->reason, tessera::FinishReason::Stop);
 }
 
 // A zero max_completion_tokens fills the remaining context: context minus prompt,
@@ -433,7 +439,8 @@ TEST(EngineTest, GenerateStreamingEmitsIncrementally) {
         return true;
       });
   ASSERT_TRUE(count.has_value()) << tessera::ToString(count.error());
-  EXPECT_EQ(*count, 4u);
+  EXPECT_EQ(count->produced, 4u);
+  EXPECT_EQ(count->reason, tessera::FinishReason::Length);
   EXPECT_EQ(streamed, *blocked);
   // Early stop after two tokens reports the produced prefix only.
   std::vector<std::uint32_t> prefix;
@@ -446,7 +453,8 @@ TEST(EngineTest, GenerateStreamingEmitsIncrementally) {
         return true;
       });
   ASSERT_TRUE(partial.has_value()) << tessera::ToString(partial.error());
-  EXPECT_EQ(*partial, 2u);
+  EXPECT_EQ(partial->produced, 2u);
+  EXPECT_EQ(partial->reason, tessera::FinishReason::Aborted);
   ASSERT_EQ(prefix.size(), 2u);
   EXPECT_EQ(prefix[0], (*blocked)[0]);
   EXPECT_EQ(prefix[1], (*blocked)[1]);
