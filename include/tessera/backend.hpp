@@ -813,6 +813,10 @@ class Backend {
   // after construction; before Init).
   virtual void SetDiagnostics(log::Diagnostics* diagnostics);
 
+  // The channel set by SetDiagnostics; null before that. Core load code
+  // uses it to report phase timings through the engine's diagnostics.
+  [[nodiscard]] const log::Diagnostics* Diagnostics() const;
+
   // Select the GPU index this backend uses. Default 0 (the first GPU).
   // Call before Init; Init fails with InvalidArgument when the index is
   // out of range. The selected index and device name are logged.

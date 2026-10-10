@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -10,10 +11,17 @@
 #include <vector>
 
 #include "backends/rocm/rocm_kernels.hpp"
+#include "core/timing.hpp"
 
 namespace tessera::backends::rocm {
 
 namespace {
+
+// Host-visible staging window for a batched upload, the same bound the
+// vulkan backend uses. A large checkpoint is copied through one reusable
+// pinned buffer of this size, so pinned host memory stays bounded
+// regardless of the total weight bytes.
+constexpr std::size_t kUploadStagingBytes = 256ull << 20;
 
 StatusCode FromHip(hipError_t error) {
   switch (error) {
@@ -130,14 +138,7 @@ int LookupBuiltIn(std::string_view name) {
 class RocmBackend final : public Backend {
  public:
   ~RocmBackend() override {
-    if (staging_ != nullptr) {
-      auto freed = hipHostFree(staging_);
-      if (freed != hipSuccess) {
-        LogError(std::string("hipHostFree of the staging buffer failed (") +
-                 HipErrorName(freed) + "); the memory may leak");
-      }
-      staging_ = nullptr;
-    }
+    ReleaseStaging();
     if (stream_ != nullptr) {
       auto error = hipStreamDestroy(stream_);
       if (error != hipSuccess) {
@@ -283,28 +284,69 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyH2DBatch(
       std::span<const Backend::HostCopy> copies) override {
-    // Queue every copy on the stream, then drain once. A synchronous
-    // hipMemcpy per tensor paid the full round-trip latency on each of the
-    // hundreds of weight tensors; the async form pays it once.
     for (const Backend::HostCopy& copy : copies) {
       if (copy.dst == nullptr || copy.src.size() > copy.dst->Size()) {
         return std::unexpected(StatusCode::InvalidArgument);
       }
-      auto error = hipMemcpyAsync(copy.dst->Handle(), copy.src.data(),
-                                  copy.src.size(), hipMemcpyHostToDevice,
-                                  stream_);
+    }
+    // Drain the batch through one bounded pinned staging window at a time,
+    // then release it. Handing hipMemcpyAsync the pageable weight bytes (the
+    // mapped model file) directly grows the runtime's pinned set to the whole
+    // checkpoint; a 16 GB load stalled past 5 minutes. A bounded window keeps
+    // the pinned set at one window and leaves the source pages reclaimable.
+    const auto started = core::PhaseClock::now();
+    std::size_t total_bytes = 0;
+    std::size_t index = 0;
+    while (index < copies.size()) {
+      std::size_t staging_size = 0;
+      std::size_t end = index;
+      while (end < copies.size() &&
+             staging_size + copies[end].src.size() <= kUploadStagingBytes) {
+        staging_size += copies[end].src.size();
+        ++end;
+      }
+      if (end == index) {  // one copy larger than the whole window
+        staging_size = copies[index].src.size();
+        end = index + 1;
+      }
+      auto staging = EnsureStaging(staging_size);
+      if (!staging) {
+        return std::unexpected(staging.error());
+      }
+      std::size_t offset = 0;
+      for (std::size_t i = index; i < end; ++i) {
+        std::memcpy(*staging + offset, copies[i].src.data(),
+                    copies[i].src.size());
+        offset += copies[i].src.size();
+      }
+      offset = 0;
+      for (std::size_t i = index; i < end; ++i) {
+        auto error = hipMemcpyAsync(copies[i].dst->Handle(), *staging + offset,
+                                    copies[i].src.size(),
+                                    hipMemcpyHostToDevice, stream_);
+        if (error != hipSuccess) {
+          LogError(std::string("hipMemcpyAsync H2D of ") +
+                   std::to_string(copies[i].src.size()) + " bytes failed (" +
+                   HipErrorName(error) + ")");
+          return std::unexpected(FromHip(error));
+        }
+        total_bytes += copies[i].src.size();
+        offset += copies[i].src.size();
+      }
+      auto error = hipStreamSynchronize(stream_);
       if (error != hipSuccess) {
-        LogError(std::string("hipMemcpyAsync H2D of ") +
-                 std::to_string(copy.src.size()) + " bytes failed (" +
-                 HipErrorName(error) + ")");
+        LogError(
+            std::string("hipStreamSynchronize after batch upload failed (") +
+            HipErrorName(error) + ")");
         return std::unexpected(FromHip(error));
       }
+      index = end;
     }
-    auto error = hipStreamSynchronize(stream_);
-    if (error != hipSuccess) {
-      LogError(std::string("hipStreamSynchronize after batch upload failed (") +
-               HipErrorName(error) + ")");
-      return std::unexpected(FromHip(error));
+    ReleaseStaging();
+    if (diagnostics_ != nullptr) {
+      LogInfo(core::FormatTransferSummary(
+          total_bytes, copies.size(),
+          core::ElapsedMs(started, core::PhaseClock::now())));
     }
     return {};
   }
@@ -467,15 +509,7 @@ class RocmBackend final : public Backend {
       return std::unexpected(StatusCode::InvalidArgument);
     }
     if (staging_ == nullptr || staging_bytes_ < bytes) {
-      if (staging_ != nullptr) {
-        auto freed = hipHostFree(staging_);
-        if (freed != hipSuccess) {
-          LogError(std::string("hipHostFree of the staging buffer failed (") +
-                   HipErrorName(freed) + "); the memory may leak");
-        }
-        staging_ = nullptr;
-        staging_bytes_ = 0;
-      }
+      ReleaseStaging();
       void* pinned = nullptr;
       auto error = hipHostMalloc(&pinned, bytes, hipHostMallocDefault);
       if (error != hipSuccess) {
@@ -488,6 +522,21 @@ class RocmBackend final : public Backend {
       staging_bytes_ = bytes;
     }
     return staging_;
+  }
+
+  // Free the reusable staging buffer. A batched upload releases it when
+  // done, so a loaded model does not hold a large pinned block.
+  void ReleaseStaging() {
+    if (staging_ == nullptr) {
+      return;
+    }
+    auto freed = hipHostFree(staging_);
+    if (freed != hipSuccess) {
+      LogError(std::string("hipHostFree of the staging buffer failed (") +
+               HipErrorName(freed) + "); the memory may leak");
+    }
+    staging_ = nullptr;
+    staging_bytes_ = 0;
   }
 
   std::string device_name_;

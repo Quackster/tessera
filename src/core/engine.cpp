@@ -4,6 +4,8 @@
 #include <string>
 #include <utility>
 
+#include "core/timing.hpp"
+
 namespace tessera {
 
 Engine::Engine(std::unique_ptr<Backend> backend, log::Diagnostics diagnostics,
@@ -25,7 +27,11 @@ std::expected<std::unique_ptr<Engine>, StatusCode> Engine::Create(
   // The backend logs through the engine's diagnostics copy.
   engine->backend_->SetDiagnostics(&engine->diagnostics_);
   engine->backend_->SetDeviceIndex(options.device_index);
-  auto init = engine->backend_->Init();
+  std::expected<void, StatusCode> init;
+  {
+    core::PhaseTimer timer(&engine->diagnostics_, "engine", "backend init");
+    init = engine->backend_->Init();
+  }
   if (!init) {
     engine->diagnostics_.Error(
         "engine", std::string("backend init failed: ") +

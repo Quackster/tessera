@@ -15,6 +15,7 @@
 #include "core/loaders/hf_tokenizer.hpp"
 #include "core/loaders/mxfp4.hpp"
 #include "core/loaders/safetensors.hpp"
+#include "core/timing.hpp"
 
 namespace tessera {
 
@@ -375,40 +376,53 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
 const Architecture* Model::Arch() const { return module_.get(); }
 
 // Upload every manifest tensor to a device buffer. `bytes` is the
-// whole file; offsets come from the parsed manifest.
+// whole file; offsets come from the parsed manifest. `log` receives one
+// phase line per upload stage (allocation, transfer) so a slow load is
+// traceable to a stage; it may be null.
 std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
     Backend& backend, const std::vector<TensorEntry>& tensors,
     const std::vector<std::uint64_t>& offsets, std::uint64_t data_start,
-    std::span<const std::byte> bytes) {
+    std::span<const std::byte> bytes, const log::Diagnostics* log) {
   std::vector<DeviceTensor> weights;
   weights.reserve(tensors.size());
   std::vector<Backend::HostCopy> copies;
   copies.reserve(tensors.size());
-  for (std::size_t i = 0; i < tensors.size(); ++i) {
-    const auto& entry = tensors[i];
-    auto sized = TensorBytes(entry.dtype, entry.shape.Numel());
-    if (!sized) {
-      return std::unexpected(sized.error());
+  std::uint64_t total_bytes = 0;
+  {
+    core::PhaseTimer timer(log, "model", "allocate device buffers");
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+      const auto& entry = tensors[i];
+      auto sized = TensorBytes(entry.dtype, entry.shape.Numel());
+      if (!sized) {
+        return std::unexpected(sized.error());
+      }
+      const std::size_t count = *sized;
+      const std::uint64_t begin = data_start + offsets[i];
+      if (begin > bytes.size() ||
+          static_cast<std::uint64_t>(count) > bytes.size() - begin) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      auto buffer = backend.AllocateBuffer(count, MemoryKind::Device);
+      if (!buffer) {
+        return std::unexpected(buffer.error());
+      }
+      total_bytes += count;
+      weights.push_back(DeviceTensor{entry, std::move(*buffer)});
+      copies.push_back(Backend::HostCopy{
+          weights.back().device.get(),
+          bytes.subspan(static_cast<std::size_t>(begin), count)});
     }
-    const std::size_t count = *sized;
-    const std::uint64_t begin = data_start + offsets[i];
-    if (begin > bytes.size() ||
-        static_cast<std::uint64_t>(count) > bytes.size() - begin) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    auto buffer = backend.AllocateBuffer(count, MemoryKind::Device);
-    if (!buffer) {
-      return std::unexpected(buffer.error());
-    }
-    weights.push_back(DeviceTensor{entry, std::move(*buffer)});
-    copies.push_back(Backend::HostCopy{
-        weights.back().device.get(),
-        bytes.subspan(static_cast<std::size_t>(begin), count)});
+    timer.Stop(std::to_string(tensors.size()) + " tensors");
   }
   // One batched upload: backends pipeline the copies and synchronize once
   // per chunk instead of a round trip per tensor.
-  if (auto uploaded = backend.CopyH2DBatch(copies); !uploaded) {
-    return std::unexpected(uploaded.error());
+  {
+    core::PhaseTimer timer(log, "model", "upload weights to device");
+    if (auto uploaded = backend.CopyH2DBatch(copies); !uploaded) {
+      return std::unexpected(uploaded.error());
+    }
+    timer.Stop(std::to_string(total_bytes) + " bytes in " +
+               std::to_string(copies.size()) + " copies");
   }
   return weights;
 }
@@ -423,6 +437,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
   if (!std::filesystem::exists(path, ec) || ec) {
     return std::unexpected(StatusCode::FileNotFound);
   }
+  const log::Diagnostics* log = backend.Diagnostics();
   if (std::filesystem::is_regular_file(path, ec) && !ec) {
     // Map the file instead of reading it: a multi-gigabyte GGUF would
     // otherwise be copied into a zero-filled host vector (a full memset
@@ -432,10 +447,12 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       return std::unexpected(mapped.error());
     }
     const std::span<const std::byte> bytes = mapped->bytes();
+    core::PhaseTimer gguf_timer(log, "model", "parse gguf");
     auto gguf = core::ParseGguf(bytes);
     if (!gguf) {
       return std::unexpected(gguf.error());
     }
+    gguf_timer.Stop(std::to_string(gguf->tensors.size()) + " tensors");
     std::string name;
     if (const auto* value = gguf->Find("general.name"); value != nullptr) {
       if (const auto* name_str = std::get_if<std::string>(value)) {
@@ -453,17 +470,25 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!attention) {
       return std::unexpected(attention.error());
     }
-    auto config = ParseConfig(*gguf, architecture);
+    std::expected<std::optional<TransformerConfig>, StatusCode> config;
+    {
+      core::PhaseTimer config_timer(log, "model", "parse config");
+      config = ParseConfig(*gguf, architecture);
+    }
     if (!config) {
       return std::unexpected(config.error());
     }
     auto weights =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
-                      gguf->tensor_data_start, bytes);
+                      gguf->tensor_data_start, bytes, log);
     if (!weights) {
       return std::unexpected(weights.error());
     }
-    auto tokenizer = ParseTokenizer(*gguf);
+    std::expected<std::optional<Tokenizer>, StatusCode> tokenizer;
+    {
+      core::PhaseTimer tokenizer_timer(log, "model", "build tokenizer");
+      tokenizer = ParseTokenizer(*gguf);
+    }
     if (!tokenizer) {
       return std::unexpected(tokenizer.error());
     }
@@ -491,7 +516,11 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       return std::unexpected(mapped.error());
     }
     const std::span<const std::byte> file_bytes = mapped->bytes();
-    auto parsed = core::ParseSafetensorsMap(file_bytes);
+    std::expected<std::vector<core::SafetensorsTensor>, StatusCode> parsed;
+    {
+      core::PhaseTimer map_timer(log, "model", "parse safetensors map");
+      parsed = core::ParseSafetensorsMap(file_bytes);
+    }
     if (!parsed) {
       return std::unexpected(parsed.error());
     }
@@ -511,8 +540,12 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         if (!config) {
           return std::unexpected(config.error());
         }
-        auto weights = core::BuildMxFp4Weights(
-            backend, file_bytes, *parsed, *module, *config);
+        std::expected<std::vector<DeviceTensor>, StatusCode> weights;
+        {
+          core::PhaseTimer build_timer(log, "model", "build mxfp4 weights");
+          weights = core::BuildMxFp4Weights(backend, file_bytes, *parsed,
+                                            *module, *config);
+        }
         if (!weights) {
           return std::unexpected(weights.error());
         }
@@ -546,7 +579,8 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       offsets.push_back(tensor.begin);
     }
     // Map offsets count from the file start, so the base is zero.
-    auto weights = UploadWeights(backend, tensors, offsets, 0, file_bytes);
+    auto weights =
+        UploadWeights(backend, tensors, offsets, 0, file_bytes, log);
     if (!weights) {
       return std::unexpected(weights.error());
     }

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <cstdio>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -14,6 +15,7 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/sampling.hpp"
+#include "core/timing.hpp"
 #include "test_helpers.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/engine.hpp"
@@ -1618,4 +1620,103 @@ TEST(EngineTest, ImageLoadAndResize) {
   auto bad = tessera::LoadPpm(bad_path);
   ASSERT_FALSE(bad.has_value());
   EXPECT_EQ(bad.error(), StatusCode::MalformedFile);
+}
+
+// Load instrumentation: the phase timer reports name, milliseconds and
+// detail through the diagnostics sink exactly once.
+TEST(EngineTest, PhaseTimerReportsElapsedPhaseOnce) {
+  tessera::log::Diagnostics log;
+  std::vector<std::string> lines;
+  log.SetSink([&lines](tessera::log::Level, std::string_view prefix,
+                       std::string_view message) {
+    lines.emplace_back(std::string(prefix) + ": " + std::string(message));
+  });
+  {
+    tessera::core::PhaseTimer timer(&log, "model", "parse gguf");
+    timer.Stop("32 tensors");
+    timer.Stop("second stop is ignored");
+  }
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("model: phase 'parse gguf' done in"),
+            std::string::npos)
+      << lines[0];
+  EXPECT_NE(lines[0].find("(32 tensors)"), std::string::npos) << lines[0];
+}
+
+// A null diagnostics channel makes the timer a no-op (tests and tools
+// that build an engine without a sink).
+TEST(EngineTest, PhaseTimerNullLogIsQuiet) {
+  tessera::core::PhaseTimer timer(nullptr, "model", "no sink");
+}
+
+TEST(EngineTest, ElapsedMsCountsWholeMilliseconds) {
+  const auto start = tessera::core::PhaseClock::time_point{};
+  EXPECT_EQ(tessera::core::ElapsedMs(
+                start, start + std::chrono::milliseconds(7)),
+            7);
+  EXPECT_EQ(tessera::core::ElapsedMs(
+                start, start + std::chrono::microseconds(999)),
+            0);
+}
+
+// The shared transfer summary reports bytes, copies, time and MiB/s; a
+// zero duration reports a zero rate instead of dividing by zero.
+TEST(EngineTest, FormatTransferSummaryReportsRate) {
+  const std::string line =
+      tessera::core::FormatTransferSummary(2048ull * 1024 * 1024, 8, 2000);
+  EXPECT_NE(line.find("batched H2D upload of 2147483648 bytes in 8 copies "
+                      "took 2000 ms (1024 MiB/s)"),
+            std::string::npos)
+      << line;
+  const std::string zero_ms = tessera::core::FormatTransferSummary(1024, 1, 0);
+  EXPECT_NE(zero_ms.find("(0 MiB/s)"), std::string::npos) << zero_ms;
+}
+
+// A GGUF load reports one line per phase through the engine diagnostics,
+// so a slow load is traceable from the log alone.
+TEST(EngineTest, LoadGgufModelReportsPhaseTimings) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  std::vector<std::string> lines;
+  engine->Diagnostics().SetSink(
+      [&lines](tessera::log::Level, std::string_view prefix,
+               std::string_view message) {
+        lines.emplace_back(std::string(prefix) + ": " + std::string(message));
+      });
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 1);
+  builder.KvString("general.name", "test-model");
+  builder.Tensor("w_a", 1, {4}, 0, 0);
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  builder.PushF32(1.0f);
+  builder.PushF32(2.0f);
+  builder.PushF32(3.0f);
+  builder.PushF32(4.0f);
+  auto dir = FreshTempDir("tessera_tests_timing");
+  auto path = dir / "timed.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const auto has_phase = [&lines](std::string_view name) {
+    for (const std::string& line : lines) {
+      if (line.find("phase '" + std::string(name) + "' done in") !=
+          std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+  EXPECT_TRUE(has_phase("parse gguf"));
+  EXPECT_TRUE(has_phase("allocate device buffers"));
+  EXPECT_TRUE(has_phase("upload weights to device"));
+  EXPECT_TRUE(has_phase("build tokenizer"));
+  // The upload line carries the transferred bytes and the copy count.
+  bool upload_detailed = false;
+  for (const std::string& line : lines) {
+    if (line.find("phase 'upload weights to device'") != std::string::npos &&
+        line.find("(16 bytes in 1 copies)") != std::string::npos) {
+      upload_detailed = true;
+    }
+  }
+  EXPECT_TRUE(upload_detailed);
 }

@@ -3,9 +3,9 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 383/383 `ctest` on vulkan. 383/383 `ctest` on ROCm.
-Both builds verified on AMD Radeon AI PRO R9700 (vulkan through
-RADV GFX1201, rocm through the system ROCm).
+Latest suite: 391/391 `ctest` on vulkan. 391/391 `ctest` on ROCm.
+Both builds verified on AMD Radeon RX 7900 XTX (vulkan through
+RADV GFX1100, rocm through the system ROCm).
 
 ## Current status
 
@@ -23,6 +23,19 @@ RADV GFX1201, rocm through the system ROCm).
 - Vulkan and ROCm backends: device init, buffer alloc/free,
   H2D/D2H copy, D2D copy, synchronize. `CopyD2HAt` reads byte
   slices for embedding rows.
+- Model load reports one timing line per phase through the engine
+  diagnostics (`model: phase 'parse gguf' done in 25 ms (866
+  tensors)`, then config, device allocation, weight upload,
+  tokenizer). The ROCm batched weight upload stages through a
+  bounded pinned window (256 MiB) with one stream sync per chunk
+  and releases the window after the transfer. Before, hipMemcpyAsync
+  received the pageable mapped file directly, the runtime's pinned
+  set grew to the whole checkpoint, and a 16.4 GB GGUF load ran past
+  five minutes on an RX 7900 XTX. The same file now loads in about
+  8 s, with the upload at about 2.1 GiB/s. Covered by a load test
+  that checks the phase lines and a test for the shared transfer
+  summary; the existing copy tests cover the staged upload on both
+  backends.
 - Kernel launch plumbing on both backends. `LaunchKernel` binds
   buffers and 64-bit scalars in parameter order. Vulkan defers the
   submission: every dispatch and device copy of a decode step records

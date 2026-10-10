@@ -127,6 +127,8 @@ void Backend::SetDiagnostics(log::Diagnostics* diagnostics) {
   diagnostics_ = diagnostics;
 }
 
+const log::Diagnostics* Backend::Diagnostics() const { return diagnostics_; }
+
 void Backend::SetDeviceIndex(int index) {
   device_index_ = index;
 }

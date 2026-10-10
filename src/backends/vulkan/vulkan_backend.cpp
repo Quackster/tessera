@@ -7,11 +7,14 @@
 // convention (explicit Dispatch) in 2025-2026.
 #include <vulkan/vulkan.h>
 
+#include <cstddef>
 #include <cstring>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "core/timing.hpp"
 
 namespace tessera::backends::vulkan {
 
@@ -449,6 +452,8 @@ class VulkanBackend final : public Backend {
     // copy in a chunk is recorded into a single command buffer: the whole
     // upload submits once per chunk instead of once per tensor, which is
     // the difference between hundreds of fence waits and a few.
+    const auto started = core::PhaseClock::now();
+    std::size_t total_bytes = 0;
     std::size_t index = 0;
     while (index < copies.size()) {
       std::size_t staging_size = 0;
@@ -486,7 +491,15 @@ class VulkanBackend final : public Backend {
       if (!submitted) {
         return submitted;
       }
+      for (std::size_t i = index; i < end; ++i) {
+        total_bytes += copies[i].src.size();
+      }
       index = end;
+    }
+    if (diagnostics_ != nullptr) {
+      LogInfo(core::FormatTransferSummary(
+          total_bytes, copies.size(),
+          core::ElapsedMs(started, core::PhaseClock::now())));
     }
     return {};
   }
