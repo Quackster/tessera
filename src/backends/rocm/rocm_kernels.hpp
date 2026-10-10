@@ -482,6 +482,20 @@ __global__ void DeltaStepHeadsKernel(
     unsigned long long abase);
 __global__ void SiluMulKernel(const float* g, const float* u, float* o,
                               unsigned long long n);
+// Built-in "moe_gate": softmax weights over the selected experts plus the
+// shared-expert sigmoid. Buffer 0 router logits (ne fp32), 1 the selected
+// logits (top_k fp32), 2 the shared-expert logit (1 fp32), 3 the weights
+// output (top_k fp32), 4 the sigmoid output (1 fp32); scalars are ne,
+// top_k, renorm.
+__global__ void MoeGateKernel(const float* logits, const float* vals,
+                              const float* gate, float* wts, float* sig,
+                              unsigned long long ne, unsigned long long top_k,
+                              unsigned long long renorm);
+// Built-in "moe_scale_add": o = a + f[idx] * b, elementwise, n fp32.
+__global__ void MoeScaleAddKernel(const float* a, const float* b,
+                                  const float* f, float* o,
+                                  unsigned long long n,
+                                  unsigned long long idx);
 // Built-in "embedding_f32"/"embedding_bf16"/"embedding_q4k": buffer 0
 // token ids (u32, rows), buffer 1 the embedding table (vocab x cols),
 // buffer 2 the fp32 output (rows x cols); scalars are rows, cols, vocab.

@@ -25,6 +25,7 @@ add_library(tessera STATIC
     src/models/qwen3_5/trunk.cpp
     src/models/qwen3_5/trunk_batch.cpp
     src/models/qwen3_5/project.cpp
+    src/models/qwen3_5/moe.cpp
     src/models/qwen3_5/mtp.cpp
     src/models/qwen3_5/config.cpp
     src/models/qwen3_5/weights.cpp
@@ -138,11 +139,11 @@ if(TESSERA_BACKEND STREQUAL "vulkan")
     set(TESSERA_KERNEL_STEMS fill gemm_q4k attention rope gemm_fp8 gemm_fp8_block gemm_f32 gemm_bf16
         gemm_mxfp4 gemm_q5k gemm_q6k gemm_q3k gemm_iq4nl gemm_iq4xs
         gemm_iq3s gemm_q80 rmsnorm sigmoid_gate l2norm rmsnorm_gated
-        conv1d conv1d_step conv1d_state dflash_conv selector_edge_score top_k_rows delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads concat_features cast_f32_f16 round_bf16 quantize_q8 quantize_fp8 quantize_fp8_pack attention_quant quantize_q4 attention_split attention_quant_split attention_combine layernorm gelu bias_add image_patchify spatial_merge embedding_f32 embedding_bf16 embedding_q4k gemm_q4k_batched gemm_mxfp4_batched gemm_q4k_row gemm_q5k_batched gemm_q6k_batched gemm_iq4xs_batched gemm_f32_batched gemm_bf16_batched gemm_mxfp4_rows gemm_q4k_vec gemm_q5k_vec gemm_q6k_vec gemm_iq4xs_vec gemm_vec_reduce gemm_q4k_rows2 gemm_q4k_rows3 gemm_q4k_rows4 gemm_q5k_rows2 gemm_q5k_rows3 gemm_q5k_rows4 gemm_q6k_rows2 gemm_q6k_rows3 gemm_q6k_rows4 gemm_iq4xs_rows2 gemm_iq4xs_rows3 gemm_iq4xs_rows4)
+        conv1d conv1d_step conv1d_state dflash_conv selector_edge_score top_k_rows delta_step mrope qgate_split add silu_mul repeat_heads ssm_gate delta_step_heads concat_features cast_f32_f16 round_bf16 quantize_q8 quantize_fp8 quantize_fp8_pack attention_quant quantize_q4 attention_split attention_quant_split attention_combine layernorm gelu bias_add image_patchify spatial_merge embedding_f32 embedding_bf16 embedding_q4k gemm_q4k_batched gemm_mxfp4_batched gemm_q4k_row gemm_q5k_batched gemm_q6k_batched gemm_iq4xs_batched gemm_f32_batched gemm_bf16_batched gemm_mxfp4_rows gemm_q4k_vec gemm_q5k_vec gemm_q6k_vec gemm_iq4xs_vec gemm_vec_reduce         gemm_q4k_rows2 gemm_q4k_rows3 gemm_q4k_rows4 gemm_q5k_rows2 gemm_q5k_rows3 gemm_q5k_rows4 gemm_q6k_rows2 gemm_q6k_rows3 gemm_q6k_rows4 gemm_iq4xs_rows2 gemm_iq4xs_rows3 gemm_iq4xs_rows4 moe_gate moe_scale_add)
     set(TESSERA_KERNEL_NAMES Fill GemmQ4k Attention Rope GemmFp8 GemmFp8Block GemmF32 GemmBf16
         GemmMxfp4 GemmQ5K GemmQ6K GemmQ3K GemmIq4Nl GemmIq4Xs GemmIq3S
         GemmQ80 Rmsnorm SigmoidGate L2Norm RmsnormGated Conv1d Conv1dStep Conv1dState DflashConv SelectorEdgeScore TopKRows DeltaStep
-        Mrope QgateSplit Add SiluMul RepeatHeads SsmGate DeltaStepHeads ConcatFeatures CastF32F16 RoundBf16 QuantizeQ8 QuantizeFp8 QuantizeFp8Pack AttentionQuant QuantizeQ4 AttentionSplit AttentionQuantSplit AttentionCombine Layernorm Gelu BiasAdd ImagePatchify SpatialMerge EmbeddingF32 EmbeddingBf16 EmbeddingQ4k GemmQ4kBatched GemmMxfp4Batched GemmQ4kRow GemmQ5kBatched GemmQ6kBatched GemmIq4XsBatched GemmF32Batched GemmBf16Batched GemmMxfp4Rows GemmQ4kVec GemmQ5kVec GemmQ6kVec GemmIq4XsVec GemmVecReduce GemmQ4kRows2 GemmQ4kRows3 GemmQ4kRows4 GemmQ5kRows2 GemmQ5kRows3 GemmQ5kRows4 GemmQ6kRows2 GemmQ6kRows3 GemmQ6kRows4 GemmIq4XsRows2 GemmIq4XsRows3 GemmIq4XsRows4)
+        Mrope QgateSplit Add SiluMul RepeatHeads SsmGate DeltaStepHeads ConcatFeatures CastF32F16 RoundBf16 QuantizeQ8 QuantizeFp8 QuantizeFp8Pack AttentionQuant QuantizeQ4 AttentionSplit AttentionQuantSplit AttentionCombine Layernorm Gelu BiasAdd ImagePatchify SpatialMerge EmbeddingF32 EmbeddingBf16 EmbeddingQ4k GemmQ4kBatched GemmMxfp4Batched GemmQ4kRow GemmQ5kBatched GemmQ6kBatched GemmIq4XsBatched GemmF32Batched GemmBf16Batched GemmMxfp4Rows GemmQ4kVec GemmQ5kVec GemmQ6kVec GemmIq4XsVec GemmVecReduce         GemmQ4kRows2 GemmQ4kRows3 GemmQ4kRows4 GemmQ5kRows2 GemmQ5kRows3 GemmQ5kRows4 GemmQ6kRows2 GemmQ6kRows3 GemmQ6kRows4 GemmIq4XsRows2 GemmIq4XsRows3 GemmIq4XsRows4 MoeGate MoeScaleAdd)
     set(TESSERA_KERNEL_HEADER
 "#pragma once
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.

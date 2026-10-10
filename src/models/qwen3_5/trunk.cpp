@@ -49,6 +49,9 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
                                             const LinearGeometry& g) {
   const std::size_t q_dim = cfg.attention.heads * cfg.attention.head_dim;
   const std::size_t kv_dim = cfg.attention.kv_heads * cfg.attention.head_dim;
+  // The dense FFN scratch is present even for a mixture-of-experts model
+  // (where ffn_dim is 0) so the allocation never asks for zero bytes.
+  const std::size_t ffn = cfg.ffn_dim != 0 ? cfg.ffn_dim : 1;
   auto alloc = [&backend](std::size_t bytes) {
     return backend.AllocateBuffer(bytes, MemoryKind::Device);
   };
@@ -65,8 +68,8 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
       !make(h.proj, cfg.hidden_dim) || !make(h.logits, cfg.vocab_size) ||
       !make(h.fused, q_dim * 2) || !make(h.q, q_dim) || !make(h.gate, q_dim) ||
       !make(h.kf, kv_dim) || !make(h.vf, kv_dim) || !make(h.attn, q_dim) ||
-      !make(h.fgate, cfg.ffn_dim) || !make(h.fup, cfg.ffn_dim) ||
-      !make(h.fmlp, cfg.ffn_dim) || !make(h.qkv, g.conv_dim) ||
+      !make(h.fgate, ffn) || !make(h.fup, ffn) || !make(h.fmlp, ffn) ||
+      !make(h.qkv, g.conv_dim) ||
       !make(h.z, g.value_dim) || !make(h.alpha_raw, g.num_v_heads) ||
       !make(h.beta_raw, g.num_v_heads) || !make(h.alpha, g.num_v_heads) ||
       !make(h.beta, g.num_v_heads) ||
@@ -189,6 +192,9 @@ std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
                                        const TransformerConfig& cfg,
                                        Qwen35State& h,
                                        std::size_t layer) {
+  if (cfg.IsMoe()) {
+    return RunMoeFfn(backend, model, cfg, h, layer);
+  }
   core::Profile* const deep =
       h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
   core::PhaseScope ffn_scope(deep, core::Phase::kFfn);

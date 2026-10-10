@@ -89,6 +89,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"ssm_gate", kSsmGateSpirV, sizeof(kSsmGateSpirV)},
     {"delta_step_heads", kDeltaStepHeadsSpirV, sizeof(kDeltaStepHeadsSpirV)},
     {"silu_mul", kSiluMulSpirV, sizeof(kSiluMulSpirV)},
+    {"moe_gate", kMoeGateSpirV, sizeof(kMoeGateSpirV)},
+    {"moe_scale_add", kMoeScaleAddSpirV, sizeof(kMoeScaleAddSpirV)},
     {"embedding_f32", kEmbeddingF32SpirV, sizeof(kEmbeddingF32SpirV)},
     {"embedding_bf16", kEmbeddingBf16SpirV, sizeof(kEmbeddingBf16SpirV)},
     {"embedding_q4k", kEmbeddingQ4kSpirV, sizeof(kEmbeddingQ4kSpirV)},

@@ -135,6 +135,8 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"ssm_gate", reinterpret_cast<void*>(&SsmGateKernel)},
     {"delta_step_heads", reinterpret_cast<void*>(&DeltaStepHeadsKernel)},
     {"silu_mul", reinterpret_cast<void*>(&SiluMulKernel)},
+    {"moe_gate", reinterpret_cast<void*>(&MoeGateKernel)},
+    {"moe_scale_add", reinterpret_cast<void*>(&MoeScaleAddKernel)},
     {"embedding_f32", reinterpret_cast<void*>(&EmbeddingF32Kernel)},
     {"embedding_bf16", reinterpret_cast<void*>(&EmbeddingBf16Kernel)},
     {"embedding_q4k", reinterpret_cast<void*>(&EmbeddingQ4KKernel)},

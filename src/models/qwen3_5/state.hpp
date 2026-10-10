@@ -40,6 +40,9 @@ struct Qwen35BatchScratch {
   // and the matching device conv-history snapshots.
   std::vector<std::unique_ptr<Buffer>> state_hist;
   std::vector<std::unique_ptr<Buffer>> conv_hist_hist;
+  // Batched mixture-of-experts FFN output (rows x hidden), for the row-serial
+  // MoE batch path.
+  std::unique_ptr<Buffer> moe_out;
 };
 
 // The Qwen3.5 decode state: the loaded kernels, scratch device buffers,
@@ -131,6 +134,31 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> q_exp, k_exp, v_l, core, out;
   // MTP head scratch (fused embedding+hidden, hidden norms).
   std::unique_ptr<Buffer> mtp_fused, mtp_h;
+  // Mixture-of-experts FFN scratch, allocated on first MoE use. The expert
+  // projections run one routed expert at a time through the generic GEMM
+  // helpers, so a single expert-slice scratch holds the gathered weights.
+  std::unique_ptr<Kernel> moe_gate_kernel;
+  std::unique_ptr<Kernel> moe_scale_kernel;
+  std::unique_ptr<Kernel> moe_topk_kernel;
+  std::unique_ptr<Kernel> moe_fill_kernel;
+  std::unique_ptr<Buffer> moe_logits;      // num_experts fp32
+  std::unique_ptr<Buffer> moe_shexp_gate;  // 1 fp32 (shared-expert logit)
+  std::unique_ptr<Buffer> moe_sig;         // 1 fp32 (shared-expert gate)
+  std::unique_ptr<Buffer> moe_ids;         // experts_per_tok u32
+  std::unique_ptr<Buffer> moe_vals;        // experts_per_tok fp32
+  std::unique_ptr<Buffer> moe_wts;         // experts_per_tok fp32
+  std::unique_ptr<Buffer> moe_acc;         // hidden fp32
+  std::unique_ptr<Buffer> moe_gate_w;      // one expert gate slice (bytes)
+  std::unique_ptr<Buffer> moe_up_w;        // one expert up slice (bytes)
+  std::unique_ptr<Buffer> moe_down_w;      // one expert down slice (bytes)
+  std::unique_ptr<Buffer> moe_gate_out;    // moe_intermediate fp32
+  std::unique_ptr<Buffer> moe_up_out;      // moe_intermediate fp32
+  std::unique_ptr<Buffer> moe_inter;       // moe_intermediate fp32
+  std::unique_ptr<Buffer> moe_down_out;    // hidden fp32
+  std::unique_ptr<Buffer> moe_shared;      // hidden fp32
+  std::unique_ptr<Buffer> moe_row_in;      // hidden fp32 (batch row staging)
+  std::unique_ptr<Buffer> moe_row_out;     // hidden fp32 (batch row staging)
+  bool moe_ready = false;
   // On-device per-row argmax (top-1) over a logits buffer, so the MTP draft
   // and the batched verifier do not download the whole vocabulary. The ids
   // and values scratch grows to the requested row count.

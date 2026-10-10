@@ -1,0 +1,26 @@
+#version 450
+
+// o = a + f[idx] * b, elementwise. One thread per element; the dispatch is
+// ceil(n / 256) workgroups.
+layout(local_size_x = 256) in;
+
+// "moe_scale_add" contract: buffers A, B, F (fp32), O (fp32); F is a
+// per-index weight table, O[i] = A[i] + F[idx] * B[i]. A and O may alias.
+// Scalars: n v[0], idx v[2].
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) readonly buffer F { float f[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= pc.v[0]) {
+    return;
+  }
+  uint idx = pc.v[2];
+  o[i] = a[i] + f[idx] * b[i];
+}

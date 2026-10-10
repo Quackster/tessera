@@ -94,6 +94,7 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
   b->snapshot_states = need_state_hist;
   const std::size_t q_dim = cfg.attention.heads * cfg.attention.head_dim;
   const std::size_t kv_dim = cfg.attention.kv_heads * cfg.attention.head_dim;
+  const std::size_t ffn = cfg.ffn_dim != 0 ? cfg.ffn_dim : 1;
   if (!alloc(b->x, rows * cfg.hidden_dim) ||
       !alloc(b->xn, rows * cfg.hidden_dim) ||
       !alloc(b->proj, rows * cfg.hidden_dim) ||
@@ -101,9 +102,9 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
       !alloc(b->fused, rows * q_dim * 2) || !alloc(b->q, rows * q_dim) ||
       !alloc(b->gate, rows * q_dim) || !alloc(b->kf, rows * kv_dim) ||
       !alloc(b->vf, rows * kv_dim) || !alloc(b->attn, rows * q_dim) ||
-      !alloc(b->fgate, rows * cfg.ffn_dim) ||
-      !alloc(b->fup, rows * cfg.ffn_dim) ||
-      !alloc(b->fmlp, rows * cfg.ffn_dim) ||
+      !alloc(b->fgate, rows * ffn) ||
+      !alloc(b->fup, rows * ffn) ||
+      !alloc(b->fmlp, rows * ffn) ||
       !alloc(b->qkv, rows * g.conv_dim) ||
       !alloc(b->z, rows * g.value_dim) ||
       !alloc(b->alpha_raw, rows * g.num_v_heads) ||
@@ -116,7 +117,8 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
       !alloc(b->v_all, rows * g.value_dim) ||
       !alloc(b->q_exp_all, rows * g.num_v_heads * g.head_k_dim) ||
       !alloc(b->k_exp_all, rows * g.num_v_heads * g.head_k_dim) ||
-      !alloc(b->core_all, rows * g.value_dim)) {
+      !alloc(b->core_all, rows * g.value_dim) ||
+      (cfg.IsMoe() && !alloc(b->moe_out, rows * cfg.hidden_dim))) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   auto pos = backend.AllocateBuffer(rows * 3 * 8, MemoryKind::Device);
@@ -138,6 +140,9 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
                                             Qwen35State& h,
                                             std::size_t layer,
                                             std::size_t rows) {
+  if (cfg.IsMoe()) {
+    return RunMoeFfnBatch(backend, model, cfg, h, layer, rows);
+  }
   core::Profile* const deep =
       h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
   core::PhaseScope ffn_scope(deep, core::Phase::kFfn);

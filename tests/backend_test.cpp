@@ -2458,6 +2458,123 @@ TEST(BackendTest, SiluMulDeviceMatchesRef) {
   }
 }
 
+// Device: moe_scale_add computes o = a + f[idx] * b elementwise.
+TEST(BackendTest, MoeScaleAddDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(91);
+  constexpr std::size_t kN = 200;
+  constexpr std::size_t kF = 8;
+  constexpr std::size_t kIdx = 3;
+  std::vector<float> a(kN);
+  std::vector<float> b(kN);
+  std::vector<float> f(kF);
+  for (auto& v : a) v = DrawValue(rng);
+  for (auto& v : b) v = DrawValue(rng);
+  for (auto& v : f) v = DrawValue(rng);
+  auto a_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto b_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  auto f_buf = backend->AllocateBuffer(kF * 4, MemoryKind::Device);
+  auto o_buf = backend->AllocateBuffer(kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && b_buf && f_buf && o_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(a_buf, a).has_value());
+  ASSERT_TRUE(upload(b_buf, b).has_value());
+  ASSERT_TRUE(upload(f_buf, f).has_value());
+  auto kernel = backend->LoadKernel("moe_scale_add", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((kN + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*b_buf).get(), (*f_buf).get(),
+                    (*o_buf).get()};
+  launch.scalars = {kN, kIdx};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**o_buf, readback.data(), readback.size())
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < kN; ++i) {
+    EXPECT_NEAR(got[i], a[i] + f[kIdx] * b[i], tol.abs);
+  }
+}
+
+// Device: moe_gate softmaxes the router logits over the selected experts
+// and applies the shared-expert sigmoid.
+TEST(BackendTest, MoeGateDeviceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(92);
+  constexpr std::size_t kNe = 64;
+  constexpr std::size_t kTopK = 4;
+  std::vector<float> logits(kNe);
+  for (auto& v : logits) v = DrawValue(rng);
+  std::vector<std::size_t> order(kNe);
+  std::iota(order.begin(), order.end(), 0u);
+  std::sort(order.begin(), order.end(),
+            [&](std::size_t x, std::size_t y) {
+              return logits[x] > logits[y];
+            });
+  std::vector<float> vals(kTopK);
+  for (std::size_t p = 0; p < kTopK; ++p) {
+    vals[p] = logits[order[p]];
+  }
+  const float gate_logit = 0.75f;
+  auto logits_buf = backend->AllocateBuffer(kNe * 4, MemoryKind::Device);
+  auto vals_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+  auto gate_buf = backend->AllocateBuffer(4, MemoryKind::Device);
+  auto wts_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+  auto sig_buf = backend->AllocateBuffer(4, MemoryKind::Device);
+  ASSERT_TRUE(logits_buf && vals_buf && gate_buf && wts_buf && sig_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(logits_buf, logits).has_value());
+  ASSERT_TRUE(upload(vals_buf, vals).has_value());
+  ASSERT_TRUE(upload(gate_buf, std::vector<float>{gate_logit}).has_value());
+  auto kernel = backend->LoadKernel("moe_gate", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = 1;
+  launch.block_x = 256;
+  launch.buffers = {(*logits_buf).get(), (*vals_buf).get(), (*gate_buf).get(),
+                    (*wts_buf).get(), (*sig_buf).get()};
+  launch.scalars = {kNe, kTopK, 1};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<std::byte> wts_read(kTopK * 4);
+  std::vector<std::byte> sig_read(4);
+  ASSERT_TRUE(backend->CopyD2H(**wts_buf, wts_read.data(), wts_read.size())
+                  .has_value());
+  ASSERT_TRUE(backend->CopyD2H(**sig_buf, sig_read.data(), sig_read.size())
+                  .has_value());
+  const float maxv = *std::max_element(logits.begin(), logits.end());
+  float denom = 0.0f;
+  for (float l : logits) {
+    denom += std::exp(l - maxv);
+  }
+  float total = 0.0f;
+  for (std::size_t p = 0; p < kTopK; ++p) {
+    total += std::exp(vals[p] - maxv) / denom;
+  }
+  const auto* wts_got = reinterpret_cast<const float*>(wts_read.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  for (std::size_t p = 0; p < kTopK; ++p) {
+    const float expected = (std::exp(vals[p] - maxv) / denom) / total;
+    EXPECT_NEAR(wts_got[p], expected, tol.abs);
+  }
+  const auto* sig_got = reinterpret_cast<const float*>(sig_read.data());
+  EXPECT_NEAR(sig_got[0], 1.0f / (1.0f + std::exp(-gate_logit)), tol.abs);
+}
+
 // Device: chained device-to-device kernels (gemm_q4k -> rmsnorm -> add)
 // with no host round-trips match the host references.
 TEST(BackendTest, DeviceChainMatchesRef) {

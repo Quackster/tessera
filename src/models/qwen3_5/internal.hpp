@@ -194,6 +194,20 @@ void InvalidateActivationPack(Qwen35State& h);
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     Qwen35State& h, std::size_t layer);
 
+// Runs the block's sparse mixture-of-experts feed-forward (post-attention
+// norm, router, routed experts, shared expert, residual add) on h.x in
+// place. The attention output must already be added to h.x. Used when the
+// config carries an MoE definition (config.IsMoe()); RunFfn dispatches here.
+[[nodiscard]] std::expected<void, StatusCode> RunMoeFfn(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen35State& h, std::size_t layer);
+
+// The batched form of RunMoeFfn over `rows` rows of h.batch->x, adding the
+// feed-forward output to h.batch->x in place.
+[[nodiscard]] std::expected<void, StatusCode> RunMoeFfnBatch(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen35State& h, std::size_t layer, std::size_t rows);
+
 // Runs one full-attention block (attn_norm, gated attention, gated MLP) on
 // h.x in place, using `kv` for the key/value cache at position `pos`.
 [[nodiscard]] std::expected<void, StatusCode> RunFullBlock(

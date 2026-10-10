@@ -182,16 +182,49 @@ Status legend: done, in progress, todo.
 1. Recon and architecture analysis. **done**.
 2. Move the model files into `~/models/`. **done**.
 3. `TransformerConfig` MoE fields and GGUF/config.json parsing, with
-   tests. **todo**.
-4. Router kernels: projection reuse plus top-k and softmax. **todo**.
-5. Expert kernels: per-expert GEMV and weighted combine on Vulkan and
-   ROCm. **todo**.
+   tests. **done**.
+4. Router kernels: projection reuse plus top-k and softmax. **done**
+   (`top_k_rows` plus the new `moe_gate`).
+5. Expert kernels: per-expert GEMV gather and weighted combine on Vulkan
+   and ROCm. **done** (device-to-device gather reusing the generic GEMM
+   helpers, plus the new `moe_scale_add`). Kernel unit tests pass on
+   both backends.
 6. Shared-expert assembly (reuses the dense FFN path plus a sigmoid
-   gate). **todo**.
-7. `RunFfn` and `RunFfnBatch` dispatch and `moe.cpp`. **todo**.
-8. Registry entry, CLI check, tests. **todo**.
+   gate). **done**.
+7. `RunFfn` and `RunFfnBatch` dispatch and `moe.cpp`. **done**.
+8. Registry entry, CLI check, tests. **done** (the CLI needs no change).
 9. End-to-end run on the Q4_K_M GGUF and comparison against the
-   reference. **todo**.
+   reference. **first pass done** (see the verification log).
+
+### First end-to-end result
+
+On ROCm, device 0, greedy decode of the Q4_K_M GGUF:
+
+```
+prompt: The capital of France is
+output:  Paris.
+```
+
+The model loads (753 tensors, 21.7 GB), prefills 5 tokens in 179 ms,
+and decodes at about 36 tokens per second. The answer is correct, which
+shows the router, the routed experts and the shared expert all agree
+with the reference ordering.
+
+### Current implementation and known debt
+
+- Routing is on the device: `top_k_rows` selects the experts and
+  `moe_gate` softmaxes the selected logits and applies the shared-expert
+  sigmoid. The selected expert ids are copied back to the host once per
+  layer so the generic GEMM helpers can run each expert slice.
+- The expert projection reuses the existing GEMM helpers: one expert
+  slice is gathered with a device-to-device copy and projected as a
+  dense matrix. This keeps the numerics identical to the dense path and
+  avoids new quantized-decode code, at the cost of a device copy and
+  several launches per expert.
+- The batch (prefill and verify) path is row-serial: it loops over rows
+  and reuses the single-row kernel. This is correct but slow for large
+  prefill chunks (about 27 prompt tokens per second). A grouped-expert
+  GEMM is the performance follow-up.
 
 ## Open questions
 
@@ -208,3 +241,9 @@ Status legend: done, in progress, todo.
 
 - Date 2026-10-10: GGUF header parsed. Architecture `qwen35moe`, 753
   tensors, 49 metadata keys. Tensor naming and metadata recorded above.
+- Date 2026-10-10: `moe_gate` and `moe_scale_add` kernel unit tests pass
+  on Vulkan and ROCm against host references.
+- Date 2026-10-10: full test suite passes on ROCm (204 tests, no
+  failures).
+- Date 2026-10-10: end-to-end greedy decode on the Q4_K_M GGUF returns
+  "Paris." for "The capital of France is" on ROCm device 0.

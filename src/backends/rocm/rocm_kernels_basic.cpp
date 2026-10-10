@@ -1460,6 +1460,74 @@ __global__ void SiluMulKernel(const float* g, const float* u, float* o,
   o[i] = (gate / (1.0f + expf(-gate))) * u[i];
 }
 
+// Built-in "moe_gate": one workgroup. Reduces the router logits to a max
+// and a sum of exponentials, then thread 0 writes the softmax weights of
+// the selected experts (optionally renormalized) and the shared-expert
+// sigmoid. See rocm_kernels.hpp for the contract.
+__global__ void MoeGateKernel(const float* logits, const float* vals,
+                              const float* gate, float* wts, float* sig,
+                              unsigned long long ne, unsigned long long top_k,
+                              unsigned long long renorm) {
+  constexpr float kNegInf = -3.402823466e+38f;
+  __shared__ float red[256];
+  const unsigned int tid = threadIdx.x;
+  const unsigned int stride = blockDim.x;
+  float m = kNegInf;
+  for (unsigned long long c = tid; c < ne; c += stride) {
+    m = fmaxf(m, logits[c]);
+  }
+  red[tid] = m;
+  __syncthreads();
+  for (unsigned int s = stride / 2u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      red[tid] = fmaxf(red[tid], red[tid + s]);
+    }
+    __syncthreads();
+  }
+  const float maxv = red[0];
+  __syncthreads();
+  float sum = 0.0f;
+  for (unsigned long long c = tid; c < ne; c += stride) {
+    sum += expf(logits[c] - maxv);
+  }
+  red[tid] = sum;
+  __syncthreads();
+  for (unsigned int s = stride / 2u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      red[tid] += red[tid + s];
+    }
+    __syncthreads();
+  }
+  const float denom = red[0];
+  if (tid == 0u) {
+    float total = 0.0f;
+    for (unsigned long long p = 0; p < top_k; ++p) {
+      const float w = expf(vals[p] - maxv) / denom;
+      wts[p] = w;
+      total += w;
+    }
+    if (renorm != 0ull && total > 0.0f) {
+      for (unsigned long long p = 0; p < top_k; ++p) {
+        wts[p] = wts[p] / total;
+      }
+    }
+    sig[0] = 1.0f / (1.0f + expf(-gate[0]));
+  }
+}
+
+// Built-in "moe_scale_add": o = a + f[idx] * b, elementwise.
+__global__ void MoeScaleAddKernel(const float* a, const float* b,
+                                  const float* f, float* o,
+                                  unsigned long long n,
+                                  unsigned long long idx) {
+  const unsigned long long i =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  o[i] = a[i] + f[idx] * b[i];
+}
+
 // Built-in "repeat_heads": expand q/k to the value heads. One thread
 // per output element.
 __global__ void RepeatHeadsKernel(const float* in, float* out,
