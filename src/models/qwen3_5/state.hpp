@@ -49,6 +49,17 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Kernel> qgate_split_kernel;
   std::unique_ptr<Kernel> mrope_kernel;
   std::unique_ptr<Kernel> attention_kernel;
+  // Split-N kernels for the latency-bound single-token path: the split
+  // kernel by KV type plus the shared combine kernel, loaded on demand
+  // with the partial scratch below.
+  std::unique_ptr<Kernel> attention_split_kernel;
+  std::unique_ptr<Kernel> attention_combine_kernel;
+  // Split-N partial scratch (pacc/pmax/psum), grown on demand to cover
+  // split_heads * split chunks of split_dim floats.
+  std::unique_ptr<Buffer> split_acc, split_max, split_sum;
+  std::size_t split_heads = 0;
+  std::size_t split_dim = 0;
+  std::size_t split_chunks = 0;
   std::unique_ptr<Kernel> conv1d_state_kernel;
   std::unique_ptr<Kernel> repeat_heads_kernel;
   std::unique_ptr<Kernel> l2norm_kernel;

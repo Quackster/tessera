@@ -283,6 +283,24 @@ class Kernel {
 // the fp8 KV cache quantization. One thread per row.
 // "attention_fp8": like attention_q8 but keys and values are OCP FP8 E4M3,
 // same buffers, scalars and tiled dispatch.
+// "attention_split": split-N (flash-decoding) variant of attention for the
+// latency-bound single-token path. The key range splits into `split`
+// chunks; workgroup (i, h, s) writes the unnormalized partial acc plus
+// the local max/sum for chunk s into pacc/pmax/psum, and
+// "attention_combine" merges them. Buffers are q, k, v (as in
+// attention), pacc (m*heads*split x head_dim fp32), pmax and psum
+// (m*heads*split fp32 each); scalars are m, n, heads, kv_heads,
+// head_dim, q_base, window, kv_f16, causal and split. The dispatch is
+// m*heads*split workgroups of 256.
+// "attention_q8_split", "attention_q4_split", "attention_fp8_split":
+// split-N variants of the quantized attentions (same kind rule as
+// attention_q8). Buffers are q, k, v, ks, vs (as in attention_q8) plus
+// pacc, pmax, psum; scalars are m, n, heads, kv_heads, head_dim,
+// q_base, window, kind and split.
+// "attention_combine": merges split-N partials into the output.
+// Buffers are pacc, pmax, psum and out (m*heads*head_dim fp32);
+// scalars are m, heads, head_dim and split. One workgroup per
+// (query row, head) of 256 threads.
 // "cast_f32_f16": buffer 0 is In (fp32, n elements), buffer 1 the
 // output (fp16, n elements, two per uint); scalar n (must be even). The
 // dispatch is ceil(n/2 / 256).
@@ -387,6 +405,27 @@ class Kernel {
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
         kv_heads == 0 || launch.scalars[4] == 0 ||
         (heads % kv_heads) != 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "attention_split") {
+    if (launch.buffers.size() != 6 || launch.scalars.size() != 10) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t heads = launch.scalars[2];
+    const std::uint64_t kv_heads = launch.scalars[3];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
+        kv_heads == 0 || launch.scalars[4] == 0 ||
+        (heads % kv_heads) != 0 || launch.scalars[9] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "attention_combine") {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 4) {
+      return StatusCode::InvalidArgument;
+    }
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 ||
+        launch.scalars[2] == 0 || launch.scalars[3] == 0) {
       return StatusCode::InvalidArgument;
     }
   }
@@ -603,6 +642,20 @@ class Kernel {
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
         kv_heads == 0 || launch.scalars[4] == 0 || heads % kv_heads != 0 ||
         launch.scalars[7] > 2) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "attention_q8_split" ||
+      kernel.Id() == "attention_q4_split" ||
+      kernel.Id() == "attention_fp8_split") {
+    if (launch.buffers.size() != 8 || launch.scalars.size() != 9) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t heads = launch.scalars[2];
+    const std::uint64_t kv_heads = launch.scalars[3];
+    if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
+        kv_heads == 0 || launch.scalars[4] == 0 || heads % kv_heads != 0 ||
+        launch.scalars[7] > 2 || launch.scalars[8] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

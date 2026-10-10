@@ -1,0 +1,213 @@
+#version 450
+
+// Split-N (flash-decoding) variant of "attention" for the latency-bound
+// single-token path: workgroup (i, h, s) runs the tiled online softmax
+// over its key chunk and writes the unnormalized partial (acc, max,
+// sum); "attention_combine" merges the chunks.
+layout(local_size_x = 256) in;
+
+// Buffers: q, k, v (as in attention), pacc (m*heads*split x head_dim),
+// pmax and psum (m*heads*split each). Scalars (64-bit, field k at
+// pc.v[2k]): m v[0], n v[2], heads v[4], kv_heads v[6], head_dim v[8],
+// q_base v[10], window v[12], kv_f16 v[14], causal v[16], split v[18].
+// The dispatch is m * heads * split workgroups of 256.
+layout(push_constant) uniform PushConstants {
+  uint v[24];
+} pc;
+
+layout(set = 0, binding = 0) buffer Q {
+  float q[];
+};
+
+layout(set = 0, binding = 1) buffer K {
+  uint k[];
+};
+
+layout(set = 0, binding = 2) buffer V {
+  uint v[];
+};
+
+layout(set = 0, binding = 3) buffer PAcc {
+  float pacc[];
+};
+
+layout(set = 0, binding = 4) buffer PMax {
+  float pmax[];
+};
+
+layout(set = 0, binding = 5) buffer PSum {
+  float psum[];
+};
+
+const uint kTile = 256;
+
+shared float q_s[256];
+shared float sc[256];
+shared float wt[256];
+shared float tile_bc[3];
+
+float load_k(uint idx, uint kv_f16) {
+  if (kv_f16 != 0u) {
+    return unpackHalf2x16(k[idx >> 1])[int(idx & 1u)];
+  }
+  return uintBitsToFloat(k[idx]);
+}
+
+float load_v(uint idx, uint kv_f16) {
+  if (kv_f16 != 0u) {
+    return unpackHalf2x16(v[idx >> 1])[int(idx & 1u)];
+  }
+  return uintBitsToFloat(v[idx]);
+}
+
+void main() {
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint heads = pc.v[4];
+  uint kv_heads = pc.v[6];
+  uint head_dim = pc.v[8];
+  uint q_base = pc.v[10];
+  uint window = pc.v[12];
+  uint kv_f16 = pc.v[14];
+  uint causal = pc.v[16];
+  uint split = pc.v[18];
+  uint g = gl_WorkGroupID.x;
+  if (g >= m * heads * split) {
+    return;
+  }
+  uint s_idx = g % split;
+  uint rest = g / split;
+  uint e = gl_LocalInvocationID.x;
+  uint i = rest / heads;
+  uint h = rest % heads;
+  uint kv = h / (heads / kv_heads);
+  uint pos = q_base + i;
+  uint last = causal != 0u ? (pos >= n ? n - 1u : pos) : n - 1u;
+  uint start = 0u;
+  if (causal != 0u) {
+    start = (window != 0u && pos + 1u > window) ? pos + 1u - window : 0u;
+    if (start > last) {
+      start = last;
+    }
+  }
+  uint base = rest * split + s_idx;
+  uint span = last + 1u - start;
+  uint chunk = (span + split - 1u) / split;
+  uint cstart = start + s_idx * chunk;
+  uint cend = cstart + chunk - 1u;
+  if (cend > last) {
+    cend = last;
+  }
+  if (cstart > last) {
+    if (e < head_dim) {
+      pacc[base * head_dim + e] = 0.0;
+    }
+    if (e == 0u) {
+      pmax[base] = -1e30;
+      psum[base] = 0.0;
+    }
+    return;
+  }
+  float scale = inversesqrt(float(head_dim));
+  uint qb = (i * heads + h) * head_dim;
+  if (e < head_dim) {
+    q_s[e] = q[qb + e];
+  }
+  barrier();
+  float run_max = -1e30;
+  float run_sum = 0.0;
+  float acc = 0.0;
+  uint tile = cstart;
+  while (true) {
+    uint tile_last = min(tile + kTile - 1u, cend);
+    float s = -1e30;
+    if (tile + e <= cend) {
+      uint j = tile + e;
+      uint kb = (j * kv_heads + kv) * head_dim;
+      float dot0 = 0.0, dot1 = 0.0, dot2 = 0.0, dot3 = 0.0;
+      uint d = 0u;
+      for (; d + 3u < head_dim; d += 4u) {
+        dot0 = fma(q_s[d], load_k(kb + d, kv_f16), dot0);
+        dot1 = fma(q_s[d + 1u], load_k(kb + d + 1u, kv_f16), dot1);
+        dot2 = fma(q_s[d + 2u], load_k(kb + d + 2u, kv_f16), dot2);
+        dot3 = fma(q_s[d + 3u], load_k(kb + d + 3u, kv_f16), dot3);
+      }
+      float dot = (dot0 + dot1) + (dot2 + dot3);
+      for (; d < head_dim; ++d) {
+        dot = fma(q_s[d], load_k(kb + d, kv_f16), dot);
+      }
+      s = dot * scale;
+    }
+    sc[e] = s;
+    barrier();
+    // One thread reduces the tile so a long context pays one scan.
+    if (e == 0u) {
+      float tmax = -1e30;
+      for (uint t = 0u; t < kTile; ++t) {
+        tmax = max(tmax, sc[t]);
+      }
+      float m_new = max(run_max, tmax);
+      float corr = exp(run_max - m_new);
+      float l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
+      for (uint t = 0u; t < kTile; t += 4u) {
+        float w0 = exp(sc[t] - m_new);
+        float w1 = exp(sc[t + 1u] - m_new);
+        float w2 = exp(sc[t + 2u] - m_new);
+        float w3 = exp(sc[t + 3u] - m_new);
+        wt[t] = w0;
+        wt[t + 1u] = w1;
+        wt[t + 2u] = w2;
+        wt[t + 3u] = w3;
+        l0 += w0;
+        l1 += w1;
+        l2 += w2;
+        l3 += w3;
+      }
+      tile_bc[0] = m_new;
+      tile_bc[1] = corr;
+      tile_bc[2] = (l0 + l1) + (l2 + l3);
+    }
+    barrier();
+    float m_new = tile_bc[0];
+    float corr = tile_bc[1];
+    float l = tile_bc[2];
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    float a = 0.0;
+    // Only lanes below head_dim have an output element; the others would
+    // read past the value row, so guard the loop.
+    if (e < head_dim) {
+      uint count = (tile + kTile - 1u <= cend) ? kTile : (cend - tile + 1u);
+      uint t = 0u;
+      for (; t + 3u < count; t += 4u) {
+        uint b0 = (tile + t) * kv_heads + kv;
+        uint b1 = (tile + t + 1u) * kv_heads + kv;
+        uint b2 = (tile + t + 2u) * kv_heads + kv;
+        uint b3 = (tile + t + 3u) * kv_heads + kv;
+        a0 = fma(wt[t], load_v(b0 * head_dim + e, kv_f16), a0);
+        a1 = fma(wt[t + 1u], load_v(b1 * head_dim + e, kv_f16), a1);
+        a2 = fma(wt[t + 2u], load_v(b2 * head_dim + e, kv_f16), a2);
+        a3 = fma(wt[t + 3u], load_v(b3 * head_dim + e, kv_f16), a3);
+      }
+      a = (a0 + a1) + (a2 + a3);
+      for (; t < count; ++t) {
+        uint vb = (tile + t) * kv_heads + kv;
+        a = fma(wt[t], load_v(vb * head_dim + e, kv_f16), a);
+      }
+    }
+    acc = fma(corr, acc, a);
+    run_sum = fma(corr, run_sum, l);
+    run_max = m_new;
+    barrier();
+    if (tile_last >= cend) {
+      break;
+    }
+    tile += kTile;
+  }
+  if (e < head_dim) {
+    pacc[base * head_dim + e] = acc;
+  }
+  if (e == 0u) {
+    pmax[base] = run_max;
+    psum[base] = run_sum;
+  }
+}

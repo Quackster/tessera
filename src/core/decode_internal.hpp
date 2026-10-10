@@ -220,6 +220,83 @@ inline std::expected<void, StatusCode> AttentionQuantDevice(
   return backend.LaunchKernel(kernel, launch);
 }
 
+// Split-N flash decoding: 16 chunks for one query row over a long key
+// range, the base kernel otherwise. Measured 2.6-4.5x faster than the
+// base kernel for rows == 1 and n >= 1024, and slower for rows == 7, so
+// only the latency-bound single-token path splits.
+constexpr std::size_t kSplitChunks = 16;
+constexpr std::size_t kSplitMinKeys = 1024;
+
+// Split chunk count for an attention call, or 0 for the base kernel.
+[[nodiscard]] inline std::size_t SplitFor(std::size_t rows, std::size_t n) {
+  if (rows == 1 && n >= kSplitMinKeys) {
+    return kSplitChunks;
+  }
+  return 0;
+}
+
+// Split-N attention over `n` keys: the split kernel writes one
+// unnormalized partial per (query row, head, chunk) into pacc/pmax/psum,
+// then the combine kernel merges them into `out`.
+inline std::expected<void, StatusCode> AttentionSplitDevice(
+    Backend& backend, const Kernel& split_kernel, const Kernel& combine_kernel,
+    const Buffer& q, const Buffer& k, const Buffer& v, Buffer& out,
+    Buffer& pacc, Buffer& pmax, Buffer& psum, std::size_t n,
+    std::size_t heads, std::size_t kv_heads, std::size_t head_dim,
+    std::uint64_t q_base, std::uint64_t window, std::size_t rows,
+    std::size_t split, bool kv_f16 = false, bool causal = true) {
+  if (head_dim == 0 || head_dim > 256 || split == 0) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(rows * heads * split);
+  launch.block_x = 256;
+  launch.buffers = {&q, &k, &v, &pacc, &pmax, &psum};
+  launch.scalars = {rows, n, heads, kv_heads, head_dim,
+                    q_base, window, kv_f16 ? 1u : 0u, causal ? 1u : 0u, split};
+  if (!backend.LaunchKernel(split_kernel, launch)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  KernelLaunch combine;
+  combine.grid_x = static_cast<std::uint32_t>(rows * heads);
+  combine.block_x = 256;
+  combine.buffers = {&pacc, &pmax, &psum, &out};
+  combine.scalars = {rows, heads, head_dim, split};
+  return backend.LaunchKernel(combine_kernel, combine);
+}
+
+// Split-N variant of AttentionQuantDevice; `kind` comes from the split
+// kernel id exactly as in AttentionQuantDevice.
+inline std::expected<void, StatusCode> AttentionQuantSplitDevice(
+    Backend& backend, const Kernel& split_kernel, const Kernel& combine_kernel,
+    const Buffer& q, const Buffer& k, const Buffer& v, const Buffer& k_scale,
+    const Buffer& v_scale, Buffer& out, Buffer& pacc, Buffer& pmax,
+    Buffer& psum, std::size_t n, std::size_t heads, std::size_t kv_heads,
+    std::size_t head_dim, std::uint64_t q_base, std::uint64_t window,
+    std::size_t rows, std::size_t split) {
+  if (head_dim == 0 || head_dim > 256 || split == 0) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  const std::uint64_t kind = split_kernel.Id() == "attention_q4_split"   ? 1
+                             : split_kernel.Id() == "attention_fp8_split" ? 2
+                                                                          : 0;
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(rows * heads * split);
+  launch.block_x = 256;
+  launch.buffers = {&q, &k, &v, &k_scale, &v_scale, &pacc, &pmax, &psum};
+  launch.scalars = {rows, n, heads, kv_heads, head_dim,
+                    q_base, window, kind, split};
+  if (!backend.LaunchKernel(split_kernel, launch)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  KernelLaunch combine;
+  combine.grid_x = static_cast<std::uint32_t>(rows * heads);
+  combine.block_x = 256;
+  combine.buffers = {&pacc, &pmax, &psum, &out};
+  combine.scalars = {rows, heads, head_dim, split};
+  return backend.LaunchKernel(combine_kernel, combine);
+}
+
 // Append one key/value row. `kv.type` selects fp32, fp16 (via `cast` into
 // `f16_scratch`) or int8 (via `quant` into `q8_scratch`/`scale_scratch`).
 template <typename Kv>

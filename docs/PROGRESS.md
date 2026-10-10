@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 373/373 `ctest` on vulkan. 373/373 `ctest` on ROCm.
+Latest suite: 375/375 `ctest` on vulkan. 375/375 `ctest` on ROCm.
 Both builds verified on AMD Radeon AI PRO R9700 (vulkan through
 RADV GFX1201, rocm through the system ROCm).
 
@@ -86,6 +86,8 @@ RADV GFX1201, rocm through the system ROCm).
   in arrival order on the single device. Chats live in server
   sessions. OpenAI endpoints continue a session through
   `session_id`. Tool calling and live thinking streams work.
+  The web UI keeps one live stream per chat, so switching chats
+  while one generates shows the open chat and queues another turn.
   Completion and thinking token budgets are enforced.
   The server binds before the model finishes loading: `/health`
   answers 503 with a JSON `status`/`detail` body until the model is
@@ -188,6 +190,20 @@ RADV GFX1201, rocm through the system ROCm).
   4.8 ms per layer and fp32 from 13.1 to 7.7 ms. Order changes,
   so results match within tolerance and DFlash2 still equals
   greedy on the 27B target.
+- Split-N (flash-decoding) attention for the single-token path.
+  One workgroup per (query row, head) leaves the GPU mostly idle
+  at the greedy row count and runs one serial 128-tile online
+  softmax, so long context is latency-bound. The new
+  `attention_split`/`attention_q8_split`/`attention_q4_split`/
+  `attention_fp8_split` kernels split the key range into 16
+  chunks (one partial acc/max/sum each) and `attention_combine`
+  merges them. The engine splits only the m = 1 path with
+  n >= 1024; batches (prefill, DFlash2 verify at m = 7, the
+  draft) keep the tiled kernel, which is faster there. Measured
+  4.5x faster at m = 1, n = 32768 (3.0 to 0.8 ms per layer Q8),
+  and bit-exact: 24 greedy tokens at n = 1170 are byte-identical
+  with the split on and off, and DFlash2 still equals greedy.
+  Covered by split device tests on both backends.
 
 ## Next (in order)
 
@@ -197,8 +213,10 @@ RADV GFX1201, rocm through the system ROCm).
   projections). Next levers: fuse the draft context K/V with the
   q/k/v projections as the reference does, and raise small-n GEMM
   occupancy. The MTP chain default stays at one (each draft reads
-  the 2.5 GB output head). A FlashAttention class kernel is the
-  remaining verify speed work.
+  the 2.5 GB output head). Split-N flash decoding landed for the
+  m = 1 path (see Current status); the verify still runs the tiled
+  kernel at m = 7, where a batched or fused verify kernel is the
+  remaining speed work.
 - GEMM throughput. Next: wide-read treatment on the Q5_K, Q6_K,
   and IQ4_XS decode GEMVs. The tree holds uncommitted f32 and bf16
   rows kernels plus a top-k kernel. They need device tests and a

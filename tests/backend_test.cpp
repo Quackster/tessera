@@ -6612,6 +6612,90 @@ TEST(BackendTest, AttentionQ8DeviceMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
+// Device: the split-N (flash-decoding) quantized attention over a long
+// single-token key range matches the host reference. This is the
+// latency-bound path the single-token decode uses; n >= 1024 triggers it
+// in the engine, so the test pins n = 1024 across 16 chunks.
+TEST(BackendTest, AttentionQ8SplitMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(126);
+  constexpr std::size_t kM = 1, kN = 1024, kHeads = 4, kKvHeads = 2;
+  constexpr std::size_t kDim = 16, kSplit = 16;
+  constexpr std::uint64_t kQBase = kN - 1;
+  std::vector<float> q(kM * kHeads * kDim);
+  std::vector<float> k(kN * kKvHeads * kDim), v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  const std::size_t kv_dim = kKvHeads * kDim;
+  std::vector<std::byte> k8(k.size()), v8(v.size());
+  std::vector<float> ks(kN), vs(kN);
+  ASSERT_TRUE(core::QuantizeQ8Ref(std::span<const float>(k),
+                                  std::span<std::byte>(k8),
+                                  std::span<float>(ks), kN, kv_dim)
+                  .has_value());
+  ASSERT_TRUE(core::QuantizeQ8Ref(std::span<const float>(v),
+                                  std::span<std::byte>(v8),
+                                  std::span<float>(vs), kN, kv_dim)
+                  .has_value());
+  auto up = [&backend](const void* data, std::size_t bytes) {
+    auto b = backend->AllocateBuffer(bytes, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(data), bytes));
+    return std::move(*b);
+  };
+  auto q_buf = up(q.data(), q.size() * 4);
+  auto k_buf = up(k8.data(), k8.size());
+  auto v_buf = up(v8.data(), v8.size());
+  auto ks_buf = up(ks.data(), ks.size() * 4);
+  auto vs_buf = up(vs.data(), vs.size() * 4);
+  const std::size_t part = kM * kHeads * kSplit;
+  auto pacc_buf = backend->AllocateBuffer(part * kDim * 4, MemoryKind::Device);
+  auto pmax_buf = backend->AllocateBuffer(part * 4, MemoryKind::Device);
+  auto psum_buf = backend->AllocateBuffer(part * 4, MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(pacc_buf && pmax_buf && psum_buf && out_buf);
+  auto split_kernel = backend->LoadKernel("attention_q8_split", {});
+  auto combine_kernel = backend->LoadKernel("attention_combine", {});
+  ASSERT_TRUE(split_kernel.has_value());
+  ASSERT_TRUE(combine_kernel.has_value());
+  tessera::KernelLaunch split;
+  split.grid_x = kM * kHeads * kSplit;
+  split.block_x = 256;
+  split.buffers = {q_buf.get(),  k_buf.get(),  v_buf.get(), ks_buf.get(),
+                   vs_buf.get(), pacc_buf->get(), pmax_buf->get(),
+                   psum_buf->get()};
+  split.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, kSplit};
+  ASSERT_TRUE(backend->LaunchKernel(**split_kernel, split).has_value());
+  tessera::KernelLaunch combine;
+  combine.grid_x = kM * kHeads;
+  combine.block_x = 256;
+  combine.buffers = {pacc_buf->get(), pmax_buf->get(), psum_buf->get(),
+                     out_buf->get()};
+  combine.scalars = {kM, kHeads, kDim, kSplit};
+  ASSERT_TRUE(backend->LaunchKernel(**combine_kernel, combine).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(q.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(q.size());
+  ASSERT_TRUE(core::AttentionQ8Ref(
+                  std::span<const float>(q), std::span<const std::byte>(k8),
+                  std::span<const std::byte>(v8), std::span<const float>(ks),
+                  std::span<const float>(vs), std::span<float>(ref), kM, kN,
+                  kHeads, kKvHeads, kDim, kQBase, 0)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
 // Device: FP8 E4M3 packing (the fp8 KV quantize) matches the host
 // reference byte for byte.
 TEST(BackendTest, QuantizeFp8PackMatchesRef) {
@@ -6775,8 +6859,75 @@ TEST(BackendTest, AttentionMultiTileMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
-// Device: int8 KV attention over multiple tiles matches the host
-// reference. Same multi-tile coverage as above for the q8 path.
+// Device: the split-N (flash-decoding) fp32 attention over a long
+// single-token key range matches the host reference. Pins the fp32
+// split/combine path used by the single-token decode.
+TEST(BackendTest, AttentionSplitMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(127);
+  constexpr std::size_t kM = 1, kN = 1024, kHeads = 4, kKvHeads = 2;
+  constexpr std::size_t kDim = 16, kSplit = 16;
+  constexpr std::uint64_t kQBase = kN - 1;
+  std::vector<float> q(kM * kHeads * kDim), k(kN * kKvHeads * kDim);
+  std::vector<float> v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  auto up = [&backend](const void* data, std::size_t bytes) {
+    auto b = backend->AllocateBuffer(bytes, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(data), bytes));
+    return std::move(*b);
+  };
+  auto q_buf = up(q.data(), q.size() * 4);
+  auto k_buf = up(k.data(), k.size() * 4);
+  auto v_buf = up(v.data(), v.size() * 4);
+  const std::size_t part = kM * kHeads * kSplit;
+  auto pacc_buf = backend->AllocateBuffer(part * kDim * 4, MemoryKind::Device);
+  auto pmax_buf = backend->AllocateBuffer(part * 4, MemoryKind::Device);
+  auto psum_buf = backend->AllocateBuffer(part * 4, MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(pacc_buf && pmax_buf && psum_buf && out_buf);
+  auto split_kernel = backend->LoadKernel("attention_split", {});
+  auto combine_kernel = backend->LoadKernel("attention_combine", {});
+  ASSERT_TRUE(split_kernel.has_value());
+  ASSERT_TRUE(combine_kernel.has_value());
+  tessera::KernelLaunch split;
+  split.grid_x = kM * kHeads * kSplit;
+  split.block_x = 256;
+  split.buffers = {q_buf.get(),  k_buf.get(),   v_buf.get(),   pacc_buf->get(),
+                   pmax_buf->get(), psum_buf->get()};
+  split.scalars = {kM, kN, kHeads, kKvHeads, kDim,
+                   kQBase, 0, 0, 1, kSplit};
+  ASSERT_TRUE(backend->LaunchKernel(**split_kernel, split).has_value());
+  tessera::KernelLaunch combine;
+  combine.grid_x = kM * kHeads;
+  combine.block_x = 256;
+  combine.buffers = {pacc_buf->get(), pmax_buf->get(), psum_buf->get(),
+                     out_buf->get()};
+  combine.scalars = {kM, kHeads, kDim, kSplit};
+  ASSERT_TRUE(backend->LaunchKernel(**combine_kernel, combine).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(q.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(q.size());
+  ASSERT_TRUE(core::AttentionRef(std::span<const float>(q),
+                                 std::span<const float>(k),
+                                 std::span<const float>(v),
+                                 std::span<float>(ref), kM, kN, kHeads, kKvHeads,
+                                 kDim, kQBase)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
 TEST(BackendTest, AttentionQ8MultiTileMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);

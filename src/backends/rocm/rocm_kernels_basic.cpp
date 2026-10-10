@@ -208,6 +208,192 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
   }
 }
 
+// Built-in "attention_split": one workgroup per (query row, head, key
+// chunk) runs the tiled online softmax over its chunk and writes the
+// unnormalized partial (acc, max, sum); "attention_combine" merges them.
+__global__ void AttentionSplitKernel(
+    const float* q, const float* k, const float* v, float* pacc, float* pmax,
+    float* psum, unsigned long long m, unsigned long long n,
+    unsigned long long heads, unsigned long long kv_heads,
+    unsigned long long head_dim, unsigned long long q_base,
+    unsigned long long window, unsigned long long kv_f16,
+    unsigned long long causal, unsigned long long split) {
+  constexpr unsigned long long kTile = 256;
+  __shared__ float q_s[256];
+  __shared__ float sc[256];
+  __shared__ float wt[256];
+  __shared__ float tile_bc[3];
+  const std::uint16_t* kh = reinterpret_cast<const std::uint16_t*>(k);
+  const std::uint16_t* vh = reinterpret_cast<const std::uint16_t*>(v);
+  const auto kat = [&](unsigned long long idx) {
+    return kv_f16 ? Fp16ToFloatDev(kh[idx]) : k[idx];
+  };
+  const auto vat = [&](unsigned long long idx) {
+    return kv_f16 ? Fp16ToFloatDev(vh[idx]) : v[idx];
+  };
+  const unsigned long long g = blockIdx.x;
+  const unsigned long long total = m * heads * split;
+  if (g >= total) {
+    return;
+  }
+  const unsigned long long s_idx = g % split;
+  const unsigned long long rest = g / split;
+  const unsigned long long e = threadIdx.x;
+  const unsigned long long i = rest / heads;
+  const unsigned long long h = rest % heads;
+  const unsigned long long kv = h / (heads / kv_heads);
+  const unsigned long long pos = q_base + i;
+  const unsigned long long last =
+      causal != 0 ? (pos >= n ? n - 1 : pos) : n - 1;
+  unsigned long long start = 0;
+  if (causal != 0) {
+    start = (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+    if (start > last) {
+      start = last;
+    }
+  }
+  const unsigned long long base = rest * split + s_idx;
+  // Even chunk of [start, last] for this split (empty chunks stay null).
+  const unsigned long long span = last + 1 - start;
+  const unsigned long long chunk = (span + split - 1) / split;
+  const unsigned long long cstart = start + s_idx * chunk;
+  unsigned long long cend = cstart + chunk - 1;
+  if (cend > last) {
+    cend = last;
+  }
+  if (cstart > last) {
+    if (e < head_dim) {
+      pacc[base * head_dim + e] = 0.0f;
+    }
+    if (e == 0) {
+      pmax[base] = -1e30f;
+      psum[base] = 0.0f;
+    }
+    return;
+  }
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  const unsigned long long qb = (i * heads + h) * head_dim;
+  if (e < head_dim) {
+    q_s[e] = q[qb + e];
+  }
+  __syncthreads();
+  float run_max = -1e30f;
+  float run_sum = 0.0f;
+  float acc = 0.0f;
+  unsigned long long tile = cstart;
+  while (true) {
+    const unsigned long long tile_last =
+        (tile + kTile - 1 < cend) ? tile + kTile - 1 : cend;
+    float s = -1e30f;
+    if (tile + e <= cend) {
+      const unsigned long long j = tile + e;
+      const unsigned long long kb = (j * kv_heads + kv) * head_dim;
+      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+      unsigned long long d = 0;
+      for (; d + 3 < head_dim; d += 4) {
+        dot0 = fmaf(q_s[d], kat(kb + d), dot0);
+        dot1 = fmaf(q_s[d + 1], kat(kb + d + 1), dot1);
+        dot2 = fmaf(q_s[d + 2], kat(kb + d + 2), dot2);
+        dot3 = fmaf(q_s[d + 3], kat(kb + d + 3), dot3);
+      }
+      float dot = (dot0 + dot1) + (dot2 + dot3);
+      for (; d < head_dim; ++d) {
+        dot = fmaf(q_s[d], kat(kb + d), dot);
+      }
+      s = dot * scale;
+    }
+    sc[e] = s;
+    __syncthreads();
+    if (e == 0) {
+      float tmax = -1e30f;
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        tmax = fmaxf(tmax, sc[t]);
+      }
+      const float m_new = fmaxf(run_max, tmax);
+      const float corr = expf(run_max - m_new);
+      float l = 0.0f;
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        const float w = expf(sc[t] - m_new);
+        wt[t] = w;
+        l += w;
+      }
+      tile_bc[0] = m_new;
+      tile_bc[1] = corr;
+      tile_bc[2] = l;
+    }
+    __syncthreads();
+    const float m_new = tile_bc[0];
+    const float corr = tile_bc[1];
+    const float l = tile_bc[2];
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a = 0.0f;
+    if (e < head_dim) {
+      const unsigned long long count =
+          (tile + kTile - 1 <= cend) ? kTile : (cend - tile + 1);
+      unsigned long long t = 0;
+      for (; t + 3 < count; t += 4) {
+        const unsigned long long b0 = (tile + t) * kv_heads + kv;
+        const unsigned long long b1 = (tile + t + 1) * kv_heads + kv;
+        const unsigned long long b2 = (tile + t + 2) * kv_heads + kv;
+        const unsigned long long b3 = (tile + t + 3) * kv_heads + kv;
+        a0 = fmaf(wt[t], vat((b0 * head_dim) + e), a0);
+        a1 = fmaf(wt[t + 1], vat((b1 * head_dim) + e), a1);
+        a2 = fmaf(wt[t + 2], vat((b2 * head_dim) + e), a2);
+        a3 = fmaf(wt[t + 3], vat((b3 * head_dim) + e), a3);
+      }
+      a = (a0 + a1) + (a2 + a3);
+      for (; t < count; ++t) {
+        const unsigned long long vb = (tile + t) * kv_heads + kv;
+        a = fmaf(wt[t], vat(vb * head_dim + e), a);
+      }
+    }
+    acc = fmaf(corr, acc, a);
+    run_sum = fmaf(corr, run_sum, l);
+    run_max = m_new;
+    __syncthreads();
+    if (tile_last >= cend) {
+      break;
+    }
+    tile += kTile;
+  }
+  if (e < head_dim) {
+    pacc[base * head_dim + e] = acc;
+  }
+  if (e == 0) {
+    pmax[base] = run_max;
+    psum[base] = run_sum;
+  }
+}
+
+// Built-in "attention_combine": merges one split-N partial set per
+// (query row, head) into the normalized output.
+__global__ void AttentionCombineKernel(const float* pacc, const float* pmax,
+                                       const float* psum, float* out,
+                                       unsigned long long m,
+                                       unsigned long long heads,
+                                       unsigned long long head_dim,
+                                       unsigned long long split) {
+  const unsigned long long g = blockIdx.x;
+  if (g >= m * heads) {
+    return;
+  }
+  const unsigned long long e = threadIdx.x;
+  const unsigned long long base = g * split;
+  float M = -1e30f;
+  for (unsigned long long s = 0; s < split; ++s) {
+    M = fmaxf(M, pmax[base + s]);
+  }
+  if (e < head_dim) {
+    float num = 0.0f, den = 0.0f;
+    for (unsigned long long s = 0; s < split; ++s) {
+      const float w = expf(pmax[base + s] - M);
+      num = fmaf(w, pacc[(base + s) * head_dim + e], num);
+      den = fmaf(w, psum[base + s], den);
+    }
+    out[g * head_dim + e] = num / den;
+  }
+}
+
 // OCP FP8 E4M3 byte to fp32 (device port of the core Fp8E4M3ToFloat).
 __host__ __device__ float Fp8E4M3ToFloatDev(std::uint8_t bits) {
   const std::uint32_t sign = bits >> 7;
@@ -1715,6 +1901,172 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
                                   head_dim, q_base, window);
 }
 
+// Split-N variant of AttentionQuantTiled: one workgroup per (query row,
+// head, key chunk) writes the unnormalized partial for its chunk.
+template <int Kind>
+__device__ void AttentionQuantSplit(const float* q, const unsigned char* k,
+                                    const unsigned char* v, const float* ks,
+                                    const float* vs, float* pacc, float* pmax,
+                                    float* psum, unsigned long long m,
+                                    unsigned long long n,
+                                    unsigned long long heads,
+                                    unsigned long long kv_heads,
+                                    unsigned long long head_dim,
+                                    unsigned long long q_base,
+                                    unsigned long long window,
+                                    unsigned long long split) {
+  constexpr unsigned long long kTile = 256;
+  __shared__ float q_s[256];
+  __shared__ float sc[256];
+  __shared__ float wt[256];
+  __shared__ float tile_bc[3];
+  const unsigned long long g = blockIdx.x;
+  if (g >= m * heads * split) {
+    return;
+  }
+  const unsigned long long s_idx = g % split;
+  const unsigned long long rest = g / split;
+  const unsigned long long e = threadIdx.x;
+  const unsigned long long i = rest / heads;
+  const unsigned long long h = rest % heads;
+  const unsigned long long kv = h / (heads / kv_heads);
+  const unsigned long long pos = q_base + i;
+  const unsigned long long last = pos >= n ? n - 1 : pos;
+  unsigned long long start =
+      (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+  if (start > last) {
+    start = last;
+  }
+  const unsigned long long base = rest * split + s_idx;
+  const unsigned long long span = last + 1 - start;
+  const unsigned long long chunk = (span + split - 1) / split;
+  const unsigned long long cstart = start + s_idx * chunk;
+  unsigned long long cend = cstart + chunk - 1;
+  if (cend > last) {
+    cend = last;
+  }
+  if (cstart > last) {
+    if (e < head_dim) {
+      pacc[base * head_dim + e] = 0.0f;
+    }
+    if (e == 0) {
+      pmax[base] = -1e30f;
+      psum[base] = 0.0f;
+    }
+    return;
+  }
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  const unsigned long long qb = (i * heads + h) * head_dim;
+  if (e < head_dim) {
+    q_s[e] = q[qb + e];
+  }
+  __syncthreads();
+  float run_max = -1e30f;
+  float run_sum = 0.0f;
+  float acc = 0.0f;
+  unsigned long long tile = cstart;
+  while (true) {
+    const unsigned long long tile_last =
+        (tile + kTile - 1 < cend) ? tile + kTile - 1 : cend;
+    float s = -1e30f;
+    if (tile + e <= cend) {
+      const unsigned long long j = tile + e;
+      const unsigned long long kb = (j * kv_heads + kv) * head_dim;
+      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+      unsigned long long d = 0;
+      for (; d + 3 < head_dim; d += 4) {
+        dot0 = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot0);
+        dot1 = fmaf(q_s[d + 1], QuantKvAt<Kind>(k, kb + d + 1, ks[j]), dot1);
+        dot2 = fmaf(q_s[d + 2], QuantKvAt<Kind>(k, kb + d + 2, ks[j]), dot2);
+        dot3 = fmaf(q_s[d + 3], QuantKvAt<Kind>(k, kb + d + 3, ks[j]), dot3);
+      }
+      float dot = (dot0 + dot1) + (dot2 + dot3);
+      for (; d < head_dim; ++d) {
+        dot = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot);
+      }
+      s = dot * scale;
+    }
+    sc[e] = s;
+    __syncthreads();
+    if (e == 0) {
+      float tmax = -1e30f;
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        tmax = fmaxf(tmax, sc[t]);
+      }
+      const float m_new = fmaxf(run_max, tmax);
+      const float corr = expf(run_max - m_new);
+      float l = 0.0f;
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        const float w = expf(sc[t] - m_new);
+        wt[t] = w;
+        l += w;
+      }
+      tile_bc[0] = m_new;
+      tile_bc[1] = corr;
+      tile_bc[2] = l;
+    }
+    __syncthreads();
+    const float m_new = tile_bc[0];
+    const float corr = tile_bc[1];
+    const float l = tile_bc[2];
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float a = 0.0f;
+    if (e < head_dim) {
+      const unsigned long long count =
+          (tile + kTile - 1 <= cend) ? kTile : (cend - tile + 1);
+      unsigned long long t = 0;
+      for (; t + 3 < count; t += 4) {
+        const unsigned long long b0 = (tile + t) * kv_heads + kv;
+        const unsigned long long b1 = (tile + t + 1) * kv_heads + kv;
+        const unsigned long long b2 = (tile + t + 2) * kv_heads + kv;
+        const unsigned long long b3 = (tile + t + 3) * kv_heads + kv;
+        a0 = fmaf(wt[t], QuantKvAt<Kind>(v, b0 * head_dim + e, vs[tile + t]),
+                  a0);
+        a1 = fmaf(wt[t + 1],
+                  QuantKvAt<Kind>(v, b1 * head_dim + e, vs[tile + t + 1]), a1);
+        a2 = fmaf(wt[t + 2],
+                  QuantKvAt<Kind>(v, b2 * head_dim + e, vs[tile + t + 2]), a2);
+        a3 = fmaf(wt[t + 3],
+                  QuantKvAt<Kind>(v, b3 * head_dim + e, vs[tile + t + 3]), a3);
+      }
+      a = (a0 + a1) + (a2 + a3);
+      for (; t < count; ++t) {
+        const unsigned long long vb = (tile + t) * kv_heads + kv;
+        a = fmaf(wt[t], QuantKvAt<Kind>(v, vb * head_dim + e, vs[tile + t]),
+                 a);
+      }
+    }
+    acc = fmaf(corr, acc, a);
+    run_sum = fmaf(corr, run_sum, l);
+    run_max = m_new;
+    __syncthreads();
+    if (tile_last >= cend) {
+      break;
+    }
+    tile += kTile;
+  }
+  if (e < head_dim) {
+    pacc[base * head_dim + e] = acc;
+  }
+  if (e == 0) {
+    pmax[base] = run_max;
+    psum[base] = run_sum;
+  }
+}
+
+__global__ void AttentionQ8SplitKernel(
+    const float* q, const unsigned char* k, const unsigned char* v,
+    const float* ks, const float* vs, float* pacc, float* pmax, float* psum,
+    unsigned long long m, unsigned long long n, unsigned long long heads,
+    unsigned long long kv_heads, unsigned long long head_dim,
+    unsigned long long q_base, unsigned long long window,
+    unsigned long long kind, unsigned long long split) {
+  (void)kind;
+  AttentionQuantSplit<kQuantKvQ8>(q, k, v, ks, vs, pacc, pmax, psum, m, n,
+                                  heads, kv_heads, head_dim, q_base, window,
+                                  split);
+}
+
 // Built-in "quantize_fp8_pack": one thread per row; OCP FP8 E4M3 bytes
 // packed four per word with the dynamic per-token W4A8 scale.
 __global__ void QuantizeFp8PackKernel(const float* in, unsigned int* packed,
@@ -1810,6 +2162,19 @@ __global__ void AttentionFp8Kernel(const float* q, const unsigned char* k,
   (void)kind;
   AttentionQuantTiled<kQuantKvFp8>(q, k, v, ks, vs, out, m, n, heads, kv_heads,
                                    head_dim, q_base, window);
+}
+
+__global__ void AttentionFp8SplitKernel(
+    const float* q, const unsigned char* k, const unsigned char* v,
+    const float* ks, const float* vs, float* pacc, float* pmax, float* psum,
+    unsigned long long m, unsigned long long n, unsigned long long heads,
+    unsigned long long kv_heads, unsigned long long head_dim,
+    unsigned long long q_base, unsigned long long window,
+    unsigned long long kind, unsigned long long split) {
+  (void)kind;
+  AttentionQuantSplit<kQuantKvFp8>(q, k, v, ks, vs, pacc, pmax, psum, m, n,
+                                   heads, kv_heads, head_dim, q_base, window,
+                                   split);
 }
 
 // Built-in "spatial_merge": group merge x merge patches, concatenating
@@ -1963,6 +2328,19 @@ __global__ void AttentionQ4Kernel(const float* q, const unsigned char* k,
   (void)kind;
   AttentionQuantTiled<kQuantKvQ4>(q, k, v, ks, vs, out, m, n, heads, kv_heads,
                                   head_dim, q_base, window);
+}
+
+__global__ void AttentionQ4SplitKernel(
+    const float* q, const unsigned char* k, const unsigned char* v,
+    const float* ks, const float* vs, float* pacc, float* pmax, float* psum,
+    unsigned long long m, unsigned long long n, unsigned long long heads,
+    unsigned long long kv_heads, unsigned long long head_dim,
+    unsigned long long q_base, unsigned long long window,
+    unsigned long long kind, unsigned long long split) {
+  (void)kind;
+  AttentionQuantSplit<kQuantKvQ4>(q, k, v, ks, vs, pacc, pmax, psum, m, n,
+                                  heads, kv_heads, head_dim, q_base, window,
+                                  split);
 }
 
 // Built-in "cast_f32_f16": two fp32 -> one packed fp16 word.

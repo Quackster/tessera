@@ -1,0 +1,44 @@
+#version 450
+
+// Merges one split-N partial set per (query row, head) into the
+// normalized output. Shared by the fp32 and quantized split paths.
+layout(local_size_x = 256) in;
+
+// Buffers are pacc (m*heads*split x head_dim), pmax and psum
+// (m*heads*split each) and out (m*heads*head_dim). Scalars:
+// m v[0], heads v[2], head_dim v[4], split v[6]. One workgroup
+// per (query row, head) of 256 threads.
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer PAcc { float pacc[]; };
+layout(set = 0, binding = 1) buffer PMax { float pmax[]; };
+layout(set = 0, binding = 2) buffer PSum { float psum[]; };
+layout(set = 0, binding = 3) buffer Out { float out_values[]; };
+
+void main() {
+  uint m = pc.v[0];
+  uint heads = pc.v[2];
+  uint head_dim = pc.v[4];
+  uint split = pc.v[6];
+  uint g = gl_WorkGroupID.x;
+  if (g >= m * heads) {
+    return;
+  }
+  uint e = gl_LocalInvocationID.x;
+  uint base = g * split;
+  float M = -1e30;
+  for (uint s = 0u; s < split; ++s) {
+    M = max(M, pmax[base + s]);
+  }
+  if (e < head_dim) {
+    float num = 0.0, den = 0.0;
+    for (uint s = 0u; s < split; ++s) {
+      float w = exp(pmax[base + s] - M);
+      num = fma(w, pacc[(base + s) * head_dim + e], num);
+      den = fma(w, psum[base + s], den);
+    }
+    out_values[g * head_dim + e] = num / den;
+  }
+}

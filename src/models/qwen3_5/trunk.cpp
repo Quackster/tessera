@@ -114,6 +114,53 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
   return {};
 }
 
+// Load the split-N kernels and (re)allocate the partial scratch for the
+// single-token path. The kernels and scratch live in the state and are
+// reused by every full-attention layer.
+std::expected<void, StatusCode> EnsureSplitReady(Backend& backend,
+                                                 const TransformerConfig& cfg,
+                                                 Qwen35State& h,
+                                                 KvCacheType type) {
+  const std::size_t heads = cfg.attention.heads;
+  const std::size_t head_dim = cfg.attention.head_dim;
+  const std::size_t chunks = detail::kSplitChunks;
+  if (h.split_acc == nullptr || h.split_heads != heads ||
+      h.split_dim != head_dim || h.split_chunks != chunks) {
+    const std::size_t part = heads * chunks;
+    auto acc = backend.AllocateBuffer(part * head_dim * 4, MemoryKind::Device);
+    auto mx = backend.AllocateBuffer(part * 4, MemoryKind::Device);
+    auto sm = backend.AllocateBuffer(part * 4, MemoryKind::Device);
+    if (!acc || !mx || !sm) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    h.split_acc = std::move(*acc);
+    h.split_max = std::move(*mx);
+    h.split_sum = std::move(*sm);
+    h.split_heads = heads;
+    h.split_dim = head_dim;
+    h.split_chunks = chunks;
+  }
+  if (h.attention_combine_kernel == nullptr) {
+    auto kernel = backend.LoadKernel("attention_combine", {});
+    if (!kernel) {
+      return std::unexpected(kernel.error());
+    }
+    h.attention_combine_kernel = std::move(*kernel);
+  }
+  if (h.attention_split_kernel == nullptr) {
+    const char* name = type == KvCacheType::Q8    ? "attention_q8_split"
+                       : type == KvCacheType::Q4  ? "attention_q4_split"
+                       : type == KvCacheType::FP8 ? "attention_fp8_split"
+                                                  : "attention_split";
+    auto kernel = backend.LoadKernel(name, {});
+    if (!kernel) {
+      return std::unexpected(kernel.error());
+    }
+    h.attention_split_kernel = std::move(*kernel);
+  }
+  return {};
+}
+
 }  // namespace
 
 std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
@@ -200,17 +247,46 @@ std::expected<void, StatusCode> RunFullBlock(
   const bool quantized = kv.type == KvCacheType::Q8 ||
                          kv.type == KvCacheType::Q4 ||
                          kv.type == KvCacheType::FP8;
-  const bool attention_ok =
-      quantized
-          ? detail::AttentionQuantDevice(backend, *h.attention_kernel, *h.q,
-                                         *kv.k, *kv.v, *kv.k_scale,
-                                         *kv.v_scale, *h.attn, kv.rows, heads,
-                                         kv_heads, head_dim, pos, 0, 1)
-                .has_value()
-          : AttentionDevice(backend, *h.attention_kernel, *h.q, *kv.k, *kv.v,
-                            *h.attn, kv.rows, heads, kv_heads, head_dim, pos,
-                            0, 1, kv.type == KvCacheType::F16)
-                .has_value();
+  // The single-token path splits the key range (flash decoding): the key
+  // range is one serial 128-tile dependency chain per workgroup, so a long
+  // context is latency-bound. Batches (prefill, verify) keep the tiled
+  // kernel, which is faster at their row counts.
+  const std::size_t split = detail::SplitFor(1, kv.rows);
+  bool attention_ok = false;
+  if (split > 0) {
+    auto ready = EnsureSplitReady(backend, cfg, h, kv.type);
+    if (!ready) {
+      return std::unexpected(ready.error());
+    }
+    attention_ok =
+        quantized
+            ? detail::AttentionQuantSplitDevice(
+                  backend, *h.attention_split_kernel,
+                  *h.attention_combine_kernel, *h.q, *kv.k, *kv.v, *kv.k_scale,
+                  *kv.v_scale, *h.attn, *h.split_acc, *h.split_max,
+                  *h.split_sum, kv.rows, heads, kv_heads, head_dim, pos, 0, 1,
+                  split)
+                  .has_value()
+            : detail::AttentionSplitDevice(
+                  backend, *h.attention_split_kernel,
+                  *h.attention_combine_kernel, *h.q, *kv.k, *kv.v, *h.attn,
+                  *h.split_acc, *h.split_max, *h.split_sum, kv.rows, heads,
+                  kv_heads, head_dim, pos, 0, 1, split,
+                  kv.type == KvCacheType::F16)
+                  .has_value();
+  } else {
+    attention_ok =
+        quantized
+            ? detail::AttentionQuantDevice(backend, *h.attention_kernel, *h.q,
+                                           *kv.k, *kv.v, *kv.k_scale,
+                                           *kv.v_scale, *h.attn, kv.rows, heads,
+                                           kv_heads, head_dim, pos, 0, 1)
+                  .has_value()
+            : AttentionDevice(backend, *h.attention_kernel, *h.q, *kv.k, *kv.v,
+                              *h.attn, kv.rows, heads, kv_heads, head_dim, pos,
+                              0, 1, kv.type == KvCacheType::F16)
+                  .has_value();
+  }
   if (!attention_ok ||
       !SigmoidGateDevice(backend, *h.sigmoid_gate_kernel, *h.attn, *h.gate,
                          *h.attn, heads * head_dim) ||
