@@ -529,22 +529,25 @@ constexpr std::size_t kGemmVecOutputsPerBlock = 8;
 // the resident workgroup count. The split targets this many output
 // blocks, is capped, and must divide k/256 so every chunk covers whole
 // quant superblocks.
-constexpr std::size_t kGemmVecSplitTargetBlocks = 4096;
+constexpr std::size_t kGemmVecSplitTargetBlocks = 2048;
+// The multi-row family starts from half the workgroups (one per column),
+// so it wants more split to recover occupancy.
+constexpr std::size_t kGemmRowsSplitTargetBlocks = 2048;
 constexpr std::size_t kGemmVecMaxSplit = 8;
 
-// Split factor for one "_vec" GEMV launch: 1 keeps the plain
+// Split factor for one "_vec"/"_rows" GEMV launch: 1 keeps the plain
 // one-workgroup-per-output grid. Uses the largest divisor of the
-// superblock count that reaches the target block count.
-[[nodiscard]] inline std::size_t GemmVecSplit(std::size_t outputs,
-                                              std::size_t k) {
+// superblock count that reaches the target workgroup count.
+[[nodiscard]] inline std::size_t GemmVecSplit(
+    std::size_t outputs, std::size_t k,
+    std::size_t target = kGemmVecSplitTargetBlocks) {
   const std::size_t blocks_x =
       (outputs + kGemmVecOutputsPerBlock - 1) / kGemmVecOutputsPerBlock;
-  if (blocks_x == 0 || blocks_x >= kGemmVecSplitTargetBlocks) {
+  if (blocks_x == 0 || blocks_x >= target) {
     return 1;
   }
   const std::size_t superblocks = k / 256;
-  std::size_t split =
-      (kGemmVecSplitTargetBlocks + blocks_x - 1) / blocks_x;
+  std::size_t split = (target + blocks_x - 1) / blocks_x;
   if (split > kGemmVecMaxSplit) {
     split = kGemmVecMaxSplit;
   }
@@ -574,8 +577,9 @@ inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
   if (gemm.Id().ends_with("_row")) {
     return static_cast<std::uint32_t>(m * n);
   }
-  if (gemm.Id() == "gemm_mxfp4_rows") {
-    // One warp per weight column (GemmMxFp4RowsKernel).
+  if (gemm.Id().ends_with("_rows")) {
+    // One warp per weight column, each column's block decoded once for all
+    // m rows (GemmMxFp4RowsKernel and the GGUF multi-row family).
     return static_cast<std::uint32_t>((n + 7) / 8);
   }
   if (gemm.Id() == "gemm_bf16_wmma") {
@@ -978,6 +982,37 @@ constexpr std::size_t kGemmTiledMinRows = 16;
 // even for a draft-sized batch: reading the weight matrix once beats the
 // GEMV's once-per-row re-read, which dominates when n is this large.
 constexpr std::size_t kGemmTiledMinCols = 65536;
+
+// Multi-row GEMV kernel id ("gemm_<fmt>_rows<rows>") for a dtype and a
+// row count, or empty when there is no specialization (the caller uses the
+// per-row GEMV). The row count is baked into the kernel so its row loop
+// unrolls; the verify batches the engine runs are m = 2, 3 or 4.
+inline std::string_view GemmRowsKernelName(DType dtype, std::size_t rows) {
+  switch (dtype) {
+    case DType::Q4K:
+      return rows == 2   ? "gemm_q4k_rows2"
+             : rows == 3 ? "gemm_q4k_rows3"
+             : rows == 4 ? "gemm_q4k_rows4"
+                         : "";
+    case DType::Q5K:
+      return rows == 2   ? "gemm_q5k_rows2"
+             : rows == 3 ? "gemm_q5k_rows3"
+             : rows == 4 ? "gemm_q5k_rows4"
+                         : "";
+    case DType::Q6K:
+      return rows == 2   ? "gemm_q6k_rows2"
+             : rows == 3 ? "gemm_q6k_rows3"
+             : rows == 4 ? "gemm_q6k_rows4"
+                         : "";
+    case DType::IQ4_XS:
+      return rows == 2   ? "gemm_iq4xs_rows2"
+             : rows == 3 ? "gemm_iq4xs_rows3"
+             : rows == 4 ? "gemm_iq4xs_rows4"
+                         : "";
+    default:
+      return {};
+  }
+}
 
 // Tiled batched GEMM kernel id for a dtype, or empty when the dtype has
 // no tiled kernel (the caller uses the GEMV kernel).

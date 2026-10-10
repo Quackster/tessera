@@ -354,4 +354,98 @@ __global__ void GemmIq3SKernel(const float* a, const unsigned char* w,
   }
   c[idx] = acc;
 }
+// Built-in "gemm_iq4xs_rows{R}": R-row IQ4_XS GEMV. One warp per weight
+// column decodes each 136-byte block once and applies it to all R
+// activation rows (the folding MTP verify at R = 2). The row count is a
+// template parameter so the row loop unrolls. Scalars: m (= R), n, k,
+// split; grid_x is ceil(n / 8).
+template <int R>
+__global__ void GemmIq4XsRowsKernel(const float* a, const unsigned char* w,
+                                    float* c, unsigned long long m,
+                                    unsigned long long n, unsigned long long k,
+                                    unsigned long long split) {
+  constexpr int kRowsMax = R;
+  const unsigned long long warp =
+      (static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
+       threadIdx.x) /
+      32;
+  const unsigned int lane = threadIdx.x & 31u;
+  if (warp >= n) {
+    return;
+  }
+  constexpr unsigned long long rows = kRowsMax;
+  const unsigned long long blocks = k / 256;
+  const unsigned long long per = blocks / split;
+  const unsigned long long b0 =
+      static_cast<unsigned long long>(blockIdx.y) * per;
+  const unsigned char* wr = w + warp * blocks * 136 + b0 * 136;
+  const unsigned int ib = lane >> 2;
+  const unsigned int jj = (lane & 3u) * 4u;
+  float acc[kRowsMax] = {};
+  for (unsigned long long b = 0; b < per; ++b) {
+    const unsigned char* base = wr + b * 136;
+    std::uint16_t d_bits = 0;
+    std::uint16_t scales_h = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&scales_h, base + 2, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    const unsigned char packed = base[4 + ib / 2];
+    const int ls = ((packed >> (4 * (ib % 2))) & 15) |
+                   (((scales_h >> (2 * ib)) & 3) << 4);
+    const float dl = d * (ls - 32);
+    unsigned int word = 0;
+    std::memcpy(&word, base + 8 + ib * 16 + jj, 4);
+    // Byte jj+j low nibble is element ib*32+jj+j; its high nibble is +16.
+    const float wl0 = dl * static_cast<float>(kIq4NlValuesDev[word & 15u]);
+    const float wl1 = dl * static_cast<float>(kIq4NlValuesDev[(word >> 8) & 15u]);
+    const float wl2 = dl * static_cast<float>(kIq4NlValuesDev[(word >> 16) & 15u]);
+    const float wl3 = dl * static_cast<float>(kIq4NlValuesDev[(word >> 24) & 15u]);
+    const float wh0 = dl * static_cast<float>(kIq4NlValuesDev[(word >> 4) & 15u]);
+    const float wh1 = dl * static_cast<float>(kIq4NlValuesDev[(word >> 12) & 15u]);
+    const float wh2 = dl * static_cast<float>(kIq4NlValuesDev[(word >> 20) & 15u]);
+    const float wh3 = dl * static_cast<float>(kIq4NlValuesDev[(word >> 28) & 15u]);
+#pragma unroll
+    for (unsigned int r = 0; r < kRowsMax; ++r) {
+      if (static_cast<unsigned long long>(r) >= rows) {
+        break;
+      }
+      const float* e = a + static_cast<unsigned long long>(r) * k +
+                       (b0 + b) * 256 + ib * 32 + jj;
+      acc[r] = fmaf(e[0], wl0, acc[r]);
+      acc[r] = fmaf(e[1], wl1, acc[r]);
+      acc[r] = fmaf(e[2], wl2, acc[r]);
+      acc[r] = fmaf(e[3], wl3, acc[r]);
+      acc[r] = fmaf(e[16], wh0, acc[r]);
+      acc[r] = fmaf(e[17], wh1, acc[r]);
+      acc[r] = fmaf(e[18], wh2, acc[r]);
+      acc[r] = fmaf(e[19], wh3, acc[r]);
+    }
+  }
+#pragma unroll
+  for (unsigned int r = 0; r < kRowsMax; ++r) {
+    if (static_cast<unsigned long long>(r) >= rows) {
+      break;
+    }
+    float v = acc[r];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_down_sync(~0ull, v, off, 32);
+    }
+    if (lane == 0u) {
+      c[static_cast<unsigned long long>(blockIdx.y) * m * n +
+        static_cast<unsigned long long>(r) * n + warp] = v;
+    }
+  }
+}
+
+template __global__ void GemmIq4XsRowsKernel<2>(
+    const float*, const unsigned char*, float*, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long);
+template __global__ void GemmIq4XsRowsKernel<3>(
+    const float*, const unsigned char*, float*, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long);
+template __global__ void GemmIq4XsRowsKernel<4>(
+    const float*, const unsigned char*, float*, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long);
+
 }  // namespace tessera::backends::rocm

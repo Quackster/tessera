@@ -240,15 +240,30 @@ std::expected<void, StatusCode> ProjectBatch(
   // The speculative verifier runs the target trunk at a small m (about 2 to
   // 7). The warp-per-column multi-row GEMV reads each weight column once for
   // all m rows, unlike the single-row GEMV, which re-reads it per row.
-  // The speculative verifier runs the target trunk at a small m (about 2 to
-  // 7). The warp-per-column multi-row GEMV reads each weight column once for
-  // all m rows, unlike the single-row GEMV, which re-reads it per row.
   if (dtype == DType::F4E2M1 && m >= 2 && m <= 16) {
     auto rows = detail::CachedKernel(
         backend, h.gemms, static_cast<int>(DType::F4E2M1) + 0x2000,
         "gemm_mxfp4_rows");
     if (rows) {
       projected = detail::ProjectDevice(backend, **rows, a, w, out, m, n, k);
+      projected_done = true;
+    } else if (rows.error() != StatusCode::UnsupportedFeature) {
+      return std::unexpected(rows.error());
+    }
+  }
+  // The small verify batch (m = 2..4) prefers the multi-row GEMV: one
+  // warp per weight column decodes each block once for all rows, so the
+  // folding MTP verify reads the weight matrix about once instead of once
+  // per row. ProjectGemvRowsDevice adds the split-K pass the narrow
+  // projections need.
+  if (!projected_done && m >= 2 && m <= 4 &&
+      !detail::GemmRowsKernelName(dtype, m).empty()) {
+    auto rows = detail::CachedKernel(
+        backend, h.gemms, static_cast<int>(dtype) + 0x1000 + static_cast<int>(m),
+        detail::GemmRowsKernelName(dtype, m));
+    if (rows) {
+      projected =
+          ProjectGemvRowsDevice(backend, h, **rows, a, w, out, m, n, k);
       projected_done = true;
     } else if (rows.error() != StatusCode::UnsupportedFeature) {
       return std::unexpected(rows.error());

@@ -240,7 +240,8 @@ This is the full catalogue. Each phase below turns part of it into cards.
 
 ### P1: GEMM
 
-**P1.5 Multi-row GGUF GEMV for the small-batch verify**
+**P1.5 Multi-row GGUF GEMV for the small-batch verify** (done for ROCm
+and Vulkan; see the Done section)
 
 - Objective: a decode verify batch (m = 2..8) reads each weight block once
   instead of once per row. The folding MTP cycle batches [anchor, drafts]
@@ -511,6 +512,13 @@ This is the full catalogue. Each phase below turns part of it into cards.
 
 Move a card here with its commit hash and the measured result.
 
+- Multi-row GGUF GEMV (P1.5). `gemm_q4k_rows{r}`/`gemm_q5k_rows{r}`/
+  `gemm_q6k_rows{r}`/`gemm_iq4xs_rows{r}` decode each weight block once
+  per column for all `r` rows of a verify batch (r = 2, 3, 4, templated),
+  with a split-K pass for narrow output counts. A 2-row pass at n=10240,
+  k=5120 fell from 0.146 to 0.098 ms. This made GGUF MTP beat greedy:
+  30-37 tok/s against 18 greedy on the 27B Q4_K_M target (ROCm, 7900
+  XTX). Remaining: the Vulkan shaders are ~1.5x slower per kernel.
 - Warp-per-output decode GEMVs (tessera-native, not a radiance card):
   `gemm_q4k_vec`/`gemm_q5k_vec`/`gemm_q6k_vec`/`gemm_iq4xs_vec` plus the
   deterministic split-K pass (`gemm_vec_reduce`) replaced the coalesced

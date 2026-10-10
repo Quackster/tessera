@@ -126,6 +126,60 @@ void InvalidateActivationPack(Qwen35State& h);
   return backend.LaunchKernel(*h.gemv_reduce_kernel, reduce);
 }
 
+// C = A x dequant(W)^T through the multi-row GEMV family ("_rows"): one
+// warp per weight column decodes each quant block once for all `m` rows,
+// so a small verify batch (m = 2..8) reads the weight matrix about once
+// instead of once per row. A split-K factor raises the warp count for
+// narrow output counts (the same deterministic second pass as the single-
+// row family); split == 1 writes the output directly. Use only with a
+// "_rows" kernel whose last scalar is the split.
+[[nodiscard]] inline std::expected<void, StatusCode> ProjectGemvRowsDevice(
+    Backend& backend, Qwen35State& h, const Kernel& gemm, const Buffer& a,
+    const Buffer& w, Buffer& out, std::size_t m, std::size_t n,
+    std::size_t k) {
+  const std::size_t total = m * n;
+  const std::size_t split = core::detail::GemmVecSplit(
+      n, k, core::detail::kGemmRowsSplitTargetBlocks);
+  const std::uint32_t blocks_x = static_cast<std::uint32_t>(
+      (n + core::detail::kGemmVecOutputsPerBlock - 1) /
+      core::detail::kGemmVecOutputsPerBlock);
+  if (split > 1) {
+    if (h.gemv_part == nullptr || h.gemv_part->Size() < split * total * 4) {
+      auto buffer =
+          backend.AllocateBuffer(split * total * 4, MemoryKind::Device);
+      if (!buffer) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      h.gemv_part = std::move(*buffer);
+    }
+    if (h.gemv_reduce_kernel == nullptr) {
+      auto kernel = backend.LoadKernel("gemm_vec_reduce", {});
+      if (!kernel) {
+        return std::unexpected(kernel.error());
+      }
+      h.gemv_reduce_kernel = std::move(*kernel);
+    }
+  }
+  KernelLaunch launch;
+  launch.grid_x = blocks_x;
+  launch.grid_y = static_cast<std::uint32_t>(split);
+  launch.block_x = 256;
+  launch.buffers = {&a, &w, split > 1 ? h.gemv_part.get() : &out};
+  launch.scalars = {m, n, k, split};
+  if (!backend.LaunchKernel(gemm, launch)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (split <= 1) {
+    return {};
+  }
+  KernelLaunch reduce;
+  reduce.grid_x = static_cast<std::uint32_t>((total + 255) / 256);
+  reduce.block_x = 256;
+  reduce.buffers = {h.gemv_part.get(), &out};
+  reduce.scalars = {total, split};
+  return backend.LaunchKernel(*h.gemv_reduce_kernel, reduce);
+}
+
 // Gather `tokens` embedding rows of the model's token_embd.weight into
 // `out` (rows x hidden fp32) on the device. Uses a device gather kernel
 // for the formats it covers (f32, bf16, Q4_K) and a host dequantize plus

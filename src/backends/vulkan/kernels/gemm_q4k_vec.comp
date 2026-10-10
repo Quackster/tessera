@@ -1,5 +1,8 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_clustered : require
+
+
 // Warp-per-output Q4_K GEMV ("gemm_q4k_vec" contract): one 32-lane group
 // per output element, eight groups per 256-thread workgroup, grid_x =
 // ceil(m n / 8) and grid_y = the split-K chunk. Lane l owns byte l of
@@ -26,6 +29,14 @@ layout(set = 0, binding = 1) buffer W {
 layout(set = 0, binding = 2) buffer C {
   float c[];
 };
+
+// 32-lane (warp-equivalent) reduction; the cluster leader writes the
+// result. Replaces a shared-memory tree with five barriers per output.
+float reduce32(float v) {
+  return subgroupClusteredAdd(v, 32u);
+}
+
+
 
 uint wbyte(uint offset) {
   return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
@@ -58,8 +69,6 @@ void scale_min4(uint j, uint base, out uint scale, out uint min) {
     min = (sj4 >> 4) | ((sj >> 6) << 4);
   }
 }
-
-shared float sh[256];
 
 void main() {
   uint m = pc.v[0];
@@ -95,16 +104,8 @@ void main() {
              (d * float(sc1) * float(q >> 4) - dm * float(mn1));
     }
   }
-  uint t = gl_LocalInvocationID.x;
-  sh[t] = acc;
-  barrier();
-  for (uint off = 16u; off > 0u; off >>= 1u) {
-    if ((t & 31u) < off) {
-      sh[t] += sh[t + off];
-    }
-    barrier();
-  }
-  if (lane == 0u) {
-    c[gl_WorkGroupID.y * (m * n) + idx] = sh[t];
+  float sum = reduce32(acc);
+  if ((gl_SubgroupInvocationID % 32u) == 0u) {
+    c[gl_WorkGroupID.y * (m * n) + idx] = sum;
   }
 }

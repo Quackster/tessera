@@ -220,6 +220,26 @@ __global__ void GemmIq4XsVecKernel(const float* a, const unsigned char* w,
 __global__ void GemmVecReduceKernel(const float* part, float* c,
                                     unsigned long long total,
                                     unsigned long long split);
+template <int R>
+__global__ void GemmQ4KRowsKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k,
+                                  unsigned long long split);
+template <int R>
+__global__ void GemmQ5KRowsKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k,
+                                  unsigned long long split);
+template <int R>
+__global__ void GemmQ6KRowsKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k,
+                                  unsigned long long split);
+template <int R>
+__global__ void GemmIq4XsRowsKernel(const float* a, const unsigned char* w,
+                                    float* c, unsigned long long m,
+                                    unsigned long long n, unsigned long long k,
+                                    unsigned long long split);
 __global__ void GemmQ5KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);

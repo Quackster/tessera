@@ -13,12 +13,18 @@ namespace tessera::spec {
 
 namespace {
 
-// MTP drafts per batched verification when the caller sets no block. One is
-// fastest on the 27B: a longer chain both lowers the accept rate (later
-// drafts in the chain are wrong more often) and multiplies the per-draft
-// MTP-head cost, so the measured decode was 21 tok/s at block 1, 18 at 2 and
-// 15 at 4. Callers can still override with `--draft-block`.
-constexpr std::size_t kDefaultMtpBlock = 1;
+// MTP drafts per batched verification when the caller sets no block.
+// Two is the measured balance on the 27B Q4_K_M GGUF (ROCm, 7900 XTX)
+// after the anchor folds into the verify and the multi-row GEMV reads each
+// weight block once per column: a 2-row verify costs about 1.1x a one-row
+// forward, and the second draft verifies for almost free, so the decode is
+// about 30-34 tok/s at block 2 against 27-30 at block 1 on prose, a
+// planet list, and a repetitive loop. Block 3 wins slightly more on
+// structured text (35) but wastes drafts on uncertain text; block 4 both
+// falls off the multi-row kernel's row range and accepts under half its
+// drafts, so it is much slower. Callers can still override with
+// `--draft-block`.
+constexpr std::size_t kDefaultMtpBlock = 2;
 
 // Multi-token-prediction strategy. Stateless beyond the draft KV row base and
 // the anchor hidden: the MTP head lives in the target model (Qwen3.5 module).

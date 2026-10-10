@@ -66,7 +66,9 @@ TEST(SpecTest, AttachBlockSize) {
 TEST(SpecTest, DraftDefaultsToAuto) {
   EXPECT_EQ(tessera::GenerateOptions{}.draft_tokens, 0u);
   EXPECT_EQ(StrategyOptions{}.draft_block_size, 0u);
-  EXPECT_EQ(tessera::CreateMtpStrategy()->DraftBlock(), 1u);
+  // Two drafts is the measured balance for the 27B GGUF: a 2-row verify
+  // reads each weight block once, so the second draft is nearly free.
+  EXPECT_EQ(tessera::CreateMtpStrategy()->DraftBlock(), 2u);
 }
 
 // The MTP override flows through Attach (GenerateSpeculative attaches

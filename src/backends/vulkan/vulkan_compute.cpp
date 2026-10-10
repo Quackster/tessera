@@ -104,6 +104,18 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_q6k_vec", kGemmQ6kVecSpirV, sizeof(kGemmQ6kVecSpirV)},
     {"gemm_iq4xs_vec", kGemmIq4XsVecSpirV, sizeof(kGemmIq4XsVecSpirV)},
     {"gemm_vec_reduce", kGemmVecReduceSpirV, sizeof(kGemmVecReduceSpirV)},
+    {"gemm_q4k_rows2", kGemmQ4kRowsSpirV, sizeof(kGemmQ4kRowsSpirV)},
+    {"gemm_q4k_rows3", kGemmQ4kRowsSpirV, sizeof(kGemmQ4kRowsSpirV)},
+    {"gemm_q4k_rows4", kGemmQ4kRowsSpirV, sizeof(kGemmQ4kRowsSpirV)},
+    {"gemm_q5k_rows2", kGemmQ5kRowsSpirV, sizeof(kGemmQ5kRowsSpirV)},
+    {"gemm_q5k_rows3", kGemmQ5kRowsSpirV, sizeof(kGemmQ5kRowsSpirV)},
+    {"gemm_q5k_rows4", kGemmQ5kRowsSpirV, sizeof(kGemmQ5kRowsSpirV)},
+    {"gemm_q6k_rows2", kGemmQ6kRowsSpirV, sizeof(kGemmQ6kRowsSpirV)},
+    {"gemm_q6k_rows3", kGemmQ6kRowsSpirV, sizeof(kGemmQ6kRowsSpirV)},
+    {"gemm_q6k_rows4", kGemmQ6kRowsSpirV, sizeof(kGemmQ6kRowsSpirV)},
+    {"gemm_iq4xs_rows2", kGemmIq4XsRowsSpirV, sizeof(kGemmIq4XsRowsSpirV)},
+    {"gemm_iq4xs_rows3", kGemmIq4XsRowsSpirV, sizeof(kGemmIq4XsRowsSpirV)},
+    {"gemm_iq4xs_rows4", kGemmIq4XsRowsSpirV, sizeof(kGemmIq4XsRowsSpirV)},
 };
 
 int LookupBuiltIn(std::string_view name) {

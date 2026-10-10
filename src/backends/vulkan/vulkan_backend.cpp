@@ -81,6 +81,10 @@ std::expected<VkInstance, StatusCode> CreateInstance() {
   VkApplicationInfo app_info{};
   app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app_info.pApplicationName = "tessera";
+  // Vulkan 1.1 / SPIR-V 1.3: the decode GEMV shaders reduce within a
+  // 32-lane subgroup (GL_KHR_shader_subgroup_clustered), which needs
+  // SPIR-V 1.3.
+  app_info.apiVersion = VK_API_VERSION_1_1;
   VkInstanceCreateInfo instance_info{};
   instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   instance_info.pApplicationInfo = &app_info;

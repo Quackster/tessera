@@ -241,12 +241,12 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
     return std::unexpected(config.error());
   }
   // An architecture that batches the scoring owns the cache rollback;
-  // everything else feeds one token at a time and never over-advances. A
-  // single draft with an anchor stays on the feed-one-token path: its two
-  // sequential forwards cost less than a two-row batch while the GGUF
-  // projections have no multi-row GEMV.
+  // everything else feeds one token at a time and never over-advances. An
+  // anchor always takes the batch path: [anchor, drafts...] is one forward,
+  // and the multi-row GEMV family reads each weight block once for the
+  // whole small batch.
   const Architecture* arch = model.Arch();
-  if (draft.size() > 1 && arch != nullptr) {
+  if (arch != nullptr && (draft.size() > 1 || anchor.has_value())) {
     return arch->Verify(backend, model, cache, draft, prefix_logits, anchor,
                         hidden_out, capture_layers, capture);
   }
