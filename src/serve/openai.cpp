@@ -335,6 +335,14 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   const std::string model_name(model.Name());
   TurnStats stats;
   stats.prompt_tokens = ids->size();
+  // Thinking is on unless the request turns it off. The chat template
+  // then opens the <think> block in the prompt, so the model streams
+  // reasoning with no opening tag in its output; ThinkExpected tells
+  // the streamer to treat that leading text as reasoning.
+  const Json* thinking_flag = prompt_body.Find("enable_thinking");
+  const bool enable_thinking =
+      thinking_flag == nullptr ||
+      thinking_flag->type() != Json::Type::Bool || thinking_flag->AsBool();
   if (anthropic) {
     if (!stream) {
       // GenerateStreaming with a liveness hook instead of Generate:
@@ -478,12 +486,24 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
       SendError(writer, 500, "detokenization failed");
       return;
     }
+    // Split the model's thinking out of the reply: the template opened
+    // the <think> block, so `SplitThink` (via the streamer) recovers the
+    // reasoning before the `</think>` closer. Without this the reasoning
+    // is returned as `content` and the real answer never surfaces.
+    ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
+    const ThinkStreamer::Deltas part = streamer.Push(*text);
+    const ThinkStreamer::Deltas tail = streamer.Finish();
+    const std::string reasoning_text = part.reasoning + tail.reasoning;
+    const std::string content_text = part.content + tail.content;
     if (session != nullptr) {
       session->Append(AssistantTurn(*text, writer.IsPeerGone(), stats));
     }
     Json message = Json::Object();
     message.Set("role", Json::String("assistant"));
-    message.Set("content", Json::String(*text));
+    if (!reasoning_text.empty()) {
+      message.Set("reasoning_content", Json::String(reasoning_text));
+    }
+    message.Set("content", Json::String(content_text));
     Json choice = Json::Object();
     choice.Set("index", Json::Number(0));
     choice.Set("message", std::move(message));
@@ -500,20 +520,18 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     return;
   }
   (void)writer.SendHeaders(200, "text/event-stream", true);
-  std::string text;
-  std::size_t count = 0;
-  const auto chat_started = std::chrono::steady_clock::now();
-  (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
-    if (writer.IsPeerGone()) {
-      return false;
+  ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
+  const auto stream_piece = [&](const ThinkStreamer::Deltas& part) {
+    if (part.reasoning.empty() && part.content.empty()) {
+      return;
     }
-    auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
-    if (piece) {
-      text += *piece;
-    }
-    ++count;
     Json delta = Json::Object();
-    delta.Set("content", Json::String(piece ? *piece : std::string()));
+    if (!part.reasoning.empty()) {
+      delta.Set("reasoning_content", Json::String(part.reasoning));
+    }
+    if (!part.content.empty()) {
+      delta.Set("content", Json::String(part.content));
+    }
     Json choice = Json::Object();
     choice.Set("index", Json::Number(0));
     choice.Set("delta", std::move(delta));
@@ -526,8 +544,23 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     chunk.Set("model", Json::String(model_name));
     chunk.Set("choices", std::move(choices));
     WriteSse(writer, "", chunk, false);
+  };
+  std::string text;
+  std::size_t count = 0;
+  const auto chat_started = std::chrono::steady_clock::now();
+  (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
+    if (writer.IsPeerGone()) {
+      return false;
+    }
+    auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
+    if (piece) {
+      text += *piece;
+    }
+    ++count;
+    stream_piece(streamer.Push(piece ? *piece : std::string()));
     return true;
   });
+  stream_piece(streamer.Finish());
   stats.elapsed_ms = MillisBetween(chat_started,
                                    std::chrono::steady_clock::now());
   stats.completion_tokens = count;

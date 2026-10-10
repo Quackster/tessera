@@ -88,6 +88,11 @@ RADV GFX1201, rocm through the system ROCm).
   in arrival order on the single device. Chats live in server
   sessions. OpenAI endpoints continue a session through
   `session_id`. Tool calling and live thinking streams work.
+  The `/v1/chat/completions` reply splits the model's thinking into
+  `reasoning_content` (the chat template opens `<think>` in the
+  prompt, so the streamer recovers the reasoning before the closer)
+  and the answer into `content`, matching the reference runtime; the
+  streamed path emits live `reasoning_content` and `content` deltas.
   The web UI keeps one live stream per chat, so switching chats
   while one generates shows the open chat and queues another turn.
   Completion and thinking token budgets are enforced.
