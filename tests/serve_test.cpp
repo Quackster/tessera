@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -14,6 +15,7 @@
 
 #include "serve/auto_title.hpp"
 #include "serve/http.hpp"
+#include "serve/readiness.hpp"
 #include "serve/respond.hpp"
 #include "serve/session.hpp"
 #include "serve/session_chat.hpp"
@@ -1178,4 +1180,66 @@ TEST(ServeTest, TitlePromptBodyDisablesThinking) {
 // Serve options default to model-generated titles.
 TEST(ServeTest, ServeOptionsDefaultAutoTitle) {
   EXPECT_TRUE(tessera::ServeOptions{}.auto_title);
+}
+
+// A fresh readiness starts loading with no model, so /health answers 503.
+TEST(ServeTest, ReadinessStartsLoading) {
+  tessera::serve::Readiness readiness;
+  const auto status = readiness.Get();
+  EXPECT_EQ(status.phase, tessera::serve::Readiness::Phase::kLoading);
+  EXPECT_EQ(status.model, nullptr);
+  EXPECT_EQ(status.tokenizer, nullptr);
+}
+
+// Loading, ready and failed each publish the matching phase and detail,
+// and ready is the only phase that names a model.
+TEST(ServeTest, ReadinessTracksPhasesAndDetail) {
+  tessera::serve::Readiness readiness;
+  readiness.Loading("loading weights");
+  auto status = readiness.Get();
+  EXPECT_EQ(status.phase, tessera::serve::Readiness::Phase::kLoading);
+  EXPECT_EQ(status.detail, "loading weights");
+  EXPECT_EQ(status.model, nullptr);
+
+  auto* model = reinterpret_cast<tessera::Model*>(std::uintptr_t{0x10});
+  auto* tokenizer =
+      reinterpret_cast<const tessera::Tokenizer*>(std::uintptr_t{0x20});
+  readiness.Ready(model, tokenizer);
+  status = readiness.Get();
+  EXPECT_EQ(status.phase, tessera::serve::Readiness::Phase::kReady);
+  EXPECT_TRUE(status.detail.empty());
+  EXPECT_EQ(status.model, model);
+  EXPECT_EQ(status.tokenizer, tokenizer);
+
+  readiness.Failed("bad header");
+  status = readiness.Get();
+  EXPECT_EQ(status.phase, tessera::serve::Readiness::Phase::kFailed);
+  EXPECT_EQ(status.detail, "bad header");
+  EXPECT_EQ(status.model, nullptr);
+  EXPECT_EQ(status.tokenizer, nullptr);
+}
+
+// A reader running while the loader flips phases always sees a
+// consistent snapshot (never ready without a model).
+TEST(ServeTest, ReadinessSafeUnderConcurrentAccess) {
+  tessera::serve::Readiness readiness;
+  std::atomic<bool> stop{false};
+  std::atomic<bool> inconsistent{false};
+  std::thread reader([&] {
+    while (!stop.load()) {
+      const auto status = readiness.Get();
+      if (status.phase == tessera::serve::Readiness::Phase::kReady &&
+          status.model == nullptr) {
+        inconsistent = true;
+      }
+    }
+  });
+  auto* model = reinterpret_cast<tessera::Model*>(std::uintptr_t{0x1});
+  for (int i = 0; i < 1000; ++i) {
+    readiness.Loading("step");
+    readiness.Ready(model, nullptr);
+  }
+  stop = true;
+  reader.join();
+  EXPECT_FALSE(inconsistent.load());
 }

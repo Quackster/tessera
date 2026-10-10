@@ -1,12 +1,16 @@
 #include "tessera/serve.hpp"
 
 #include <atomic>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "serve/http.hpp"
 #include "serve/openai.hpp"
+#include "serve/readiness.hpp"
 #include "serve/render.hpp"
 #include "serve/respond.hpp"
 #include "serve/session.hpp"
@@ -31,18 +35,34 @@ bool Bridge(const HttpRequest& request, const std::string& path) {
   return request.path == path || request.path == path + "/";
 }
 
-}  // namespace
+// The 503 body a not-ready server returns: status "loading" while the
+// loader works, "failed" when it returned an error, plus the step.
+void SendNotReady(ResponseWriter& writer,
+                  const serve::Readiness::Status& status) {
+  const bool failed = status.phase == serve::Readiness::Phase::kFailed;
+  Json body = Json::Object();
+  body.Set("error",
+           Json::String(failed ? "model failed to load" : "model is loading"));
+  body.Set("status", Json::String(failed ? "failed" : "loading"));
+  body.Set("detail", Json::String(status.detail));
+  SendJson(writer, 503, body);
+}
 
-std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
-                                      const ServeOptions& options) {
-  const Tokenizer* tokenizer = model.GetTokenizer();
+// Shared serving core. `readiness` is already seeded (ready for a
+// pre-loaded model; loading otherwise). A non-null `loader` runs on a
+// background thread while the socket serves, publishing the model
+// through `readiness`.
+std::expected<void, StatusCode> ServeInternal(
+    Engine& engine, const ServeOptions& options, serve::Readiness& readiness,
+    ModelLoader loader) {
   serve::SessionStore sessions;
   // One generation at a time on the device; connection threads queue
   // on it in arrival order, so parallel chats wait their turn.
   std::mutex generation;
-  const auto handler = [&engine, &model, tokenizer, &options, &sessions,
-                        &generation](const HttpRequest& request,
-                                     ResponseWriter& writer) {
+  std::unique_ptr<Model> owned_model;
+  const auto handler = [&engine, &options, &sessions, &generation,
+                        &readiness](const HttpRequest& request,
+                                    ResponseWriter& writer) {
     ++g_requests;
     // CORS.
     const std::string origin = request.Header("origin");
@@ -96,13 +116,18 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
         return;
       }
     }
+    // Health reports readiness so a client can wait instead of failing
+    // to connect while a slow model load runs.
     if (request.method == "GET" && Bridge(request, "/health")) {
-      SendJson(writer, 200, Json::String("ok"));
+      const serve::Readiness::Status status = readiness.Get();
+      if (status.phase == serve::Readiness::Phase::kReady) {
+        SendJson(writer, 200, Json::String("ok"));
+      } else {
+        SendNotReady(writer, status);
+      }
       return;
     }
     if (request.method == "GET" && Bridge(request, "/metrics")) {
-      Json unused = Json::Object();
-      (void)unused;
       (void)writer.SendHeaders(200, "text/plain; version=0.0.4");
       (void)writer.Write("# HELP tessera_requests_total Requests served.\n"
                          "# TYPE tessera_requests_total counter\n"
@@ -127,6 +152,15 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
           serve::InjectWebDefaults(std::string_view(serve::web::kWebIndexHtml)));
       return;
     }
+    // Every endpoint below needs the model. Wait until it is loaded and
+    // warm, and say why when it is not.
+    const serve::Readiness::Status status = readiness.Get();
+    if (status.phase != serve::Readiness::Phase::kReady) {
+      SendNotReady(writer, status);
+      return;
+    }
+    Model& model = *status.model;
+    const Tokenizer* tokenizer = status.tokenizer;
     if (request.method == "GET" &&
         (Bridge(request, "/v1/models") || Bridge(request, "/models"))) {
       Json entry = Json::Object();
@@ -375,8 +409,52 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
     SendError(writer, 501, "endpoint not implemented");
   };
   std::atomic<bool> stop{false};
-  return serve::RunHttpServer(options.host, options.port, handler, &stop,
-                              engine.Diagnostics());
+  std::thread loader_thread;
+  if (loader) {
+    // Bind and serve first, then load: a client reaches /health during
+    // a slow load instead of finding the port closed.
+    loader_thread = std::thread([&engine, &readiness, &owned_model,
+                                 loader = std::move(loader)] {
+      const ServeProgress report = [&readiness](std::string_view detail) {
+        readiness.Loading(std::string(detail));
+      };
+      auto loaded = loader(report);
+      if (!loaded) {
+        const std::string detail = std::string(ToString(loaded.error()));
+        readiness.Failed(detail);
+        engine.Diagnostics().Error(
+            "serve", "model load failed (" + detail +
+                         "); /health reports the failure and no request is served");
+        return;
+      }
+      owned_model = std::move(*loaded);
+      readiness.Ready(owned_model.get(), owned_model->GetTokenizer());
+      engine.Diagnostics().Info("serve", "model ready");
+    });
+  }
+  auto served = serve::RunHttpServer(options.host, options.port, handler, &stop,
+                                     engine.Diagnostics());
+  if (loader_thread.joinable()) {
+    loader_thread.join();
+  }
+  return served;
+}
+
+}  // namespace
+
+std::expected<void, StatusCode> Serve(Engine& engine,
+                                      const ServeOptions& options,
+                                      ModelLoader loader) {
+  serve::Readiness readiness;
+  readiness.Loading("waiting for the model");
+  return ServeInternal(engine, options, readiness, std::move(loader));
+}
+
+std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
+                                      const ServeOptions& options) {
+  serve::Readiness readiness;
+  readiness.Ready(&model, model.GetTokenizer());
+  return ServeInternal(engine, options, readiness, nullptr);
 }
 
 }  // namespace tessera

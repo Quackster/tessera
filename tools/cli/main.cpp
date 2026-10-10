@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <expected>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -30,6 +32,35 @@ constexpr std::size_t kDefaultDraftBlock = 0;
 // 0 resolves automatically to kDefaultPrefillChunkTokens (512):
 // long prompts prefill in chunk-sized forwards.
 constexpr std::size_t kDefaultPrefillChunk = 0;
+
+// One summary line plus the first few tensor names for a loaded model,
+// so both `run` and the deferred `serve` loader report it identically.
+void LogModelSummary(tessera::Engine& engine, tessera::Model& model) {
+  const auto& tensors = model.Tensors();
+  std::size_t total_numel = 0;
+  for (const auto& tensor : tensors) {
+    total_numel += tensor.shape.Numel();
+  }
+  std::size_t device_bytes = 0;
+  for (const auto& weight : model.Weights()) {
+    device_bytes += weight.device->Size();
+  }
+  std::string summary =
+      std::string(model.Format() == tessera::ModelFormat::Gguf ? "gguf"
+                                                               : "mxfp4") +
+      " model, " + std::to_string(tensors.size()) + " tensors, " +
+      std::to_string(total_numel) + " total elements, " +
+      std::to_string(device_bytes) + " bytes on device";
+  if (!model.Name().empty()) {
+    summary = std::string(model.Name()) + " (" + summary + ")";
+  }
+  auto& log = engine.Diagnostics();
+  log.Info("cli", summary);
+  for (std::size_t i = 0; i < tensors.size() && i < kPrintedTensorNames; ++i) {
+    log.Info("cli", "tensor " + std::to_string(i) + ": " + tensors[i].name +
+                        " [" + std::to_string(tensors[i].shape.Numel()) + "]");
+  }
+}
 
 void PrintUsage() {
   std::fprintf(stderr,
@@ -245,37 +276,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  auto model = engine.LoadModel(tessera::ModelOptions{model_path, context});
-  if (!model) {
-    std::fprintf(stderr, "cli: model load failed (%s)\n",
-                 tessera::ToString(model.error()).data());
-    return kExitError;
-  }
-  tessera::Model& loaded = **model;
-  const auto& tensors = loaded.Tensors();
-  std::size_t total_numel = 0;
-  for (const auto& tensor : tensors) {
-    total_numel += tensor.shape.Numel();
-  }
-  std::size_t device_bytes = 0;
-  for (const auto& weight : loaded.Weights()) {
-    device_bytes += weight.device->Size();
-  }
-  std::string summary =
-      std::string(loaded.Format() == tessera::ModelFormat::Gguf ? "gguf"
-                                                               : "mxfp4") +
-      " model, " + std::to_string(tensors.size()) + " tensors, " +
-      std::to_string(total_numel) + " total elements, " +
-      std::to_string(device_bytes) + " bytes on device";
-  if (!loaded.Name().empty()) {
-    summary = std::string(loaded.Name()) + " (" + summary + ")";
-  }
-  log.Info("cli", summary);
-  for (std::size_t i = 0; i < tensors.size() && i < kPrintedTensorNames; ++i) {
-    log.Info("cli", "tensor " + std::to_string(i) + ": " +
-                        tensors[i].name + " [" +
-                        std::to_string(tensors[i].shape.Numel()) + "]");
-  }
   if (command == "serve") {
     tessera::ServeOptions serve_options;
     serve_options.host = host;
@@ -283,7 +283,32 @@ int main(int argc, char** argv) {
     serve_options.api_keys = api_keys;
     serve_options.allow_origins = allow_origins;
     serve_options.auto_title = auto_title;
-    auto served = tessera::Serve(engine, loaded, serve_options);
+    // Load and warm on the serve thread: the server binds first, so a
+    // client can reach /health while the weights and kernels load.
+    auto loader = [&](const tessera::ServeProgress& report)
+        -> std::expected<std::unique_ptr<tessera::Model>,
+                         tessera::StatusCode> {
+      report("loading weights");
+      auto loaded = engine.LoadModel(tessera::ModelOptions{model_path, context});
+      if (!loaded) {
+        return std::unexpected(loaded.error());
+      }
+      LogModelSummary(engine, **loaded);
+      report("warming up kernels");
+      tessera::GenerateOptions warm;
+      warm.max_completion_tokens = 1;
+      warm.progress_every = 0;
+      auto warmed = engine.Generate(**loaded, warm);
+      if (!warmed) {
+        log.Error("cli", std::string("kernel warmup failed (") +
+                             std::string(tessera::ToString(warmed.error())) +
+                             "); the model cannot serve");
+        return std::unexpected(warmed.error());
+      }
+      report("ready");
+      return std::move(*loaded);
+    };
+    auto served = tessera::Serve(engine, serve_options, std::move(loader));
     if (!served) {
       log.Warn("cli", std::string("serve failed (") +
                           std::string(tessera::ToString(served.error())) + ")");
@@ -291,6 +316,15 @@ int main(int argc, char** argv) {
     }
     return kExitOk;
   }
+
+  auto model = engine.LoadModel(tessera::ModelOptions{model_path, context});
+  if (!model) {
+    std::fprintf(stderr, "cli: model load failed (%s)\n",
+                 tessera::ToString(model.error()).data());
+    return kExitError;
+  }
+  tessera::Model& loaded = **model;
+  LogModelSummary(engine, loaded);
   if (!prompt_text.empty() || !image_path.empty() ||
       max_completion_tokens > 0 || max_thinking_tokens > 0) {
     tessera::GenerateOptions gen;

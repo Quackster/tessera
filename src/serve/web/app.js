@@ -16,6 +16,9 @@ let streamingId = null;
 // longer knows, falls back to fetching (the prefill path).
 let cachedFull = {};
 let cacheWriteFailed = false;
+// Server readiness: the HTTP API answers before the model finishes
+// loading, so the composer stays disabled until /health is ok.
+let serverReady = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -371,8 +374,10 @@ function renderSidebar() {
 }
 
 function updateControls() {
-  $('send').disabled = streaming;
-  $('retry').disabled = streaming || !currentId;
+  $('send').disabled = streaming || !serverReady;
+  $('retry').disabled = streaming || !serverReady || !currentId;
+  $('new-chat').disabled = !serverReady;
+  $('input').disabled = !serverReady;
   $('stop').hidden = !streaming;
   $('pause').hidden = !streaming || paused;
   $('resume').hidden = !streaming || !paused;
@@ -471,7 +476,7 @@ function paintCached(id) {
   renderMessages(currentMessages, false, 'bottom');
   renderSidebar();
   updateControls();
-  setStatus('Ready');
+  setStatus('Connecting\u2026');
   return true;
 }
 
@@ -584,7 +589,7 @@ async function streamTurn(path, payload, base, sid) {
 async function sendMessage() {
   const input = $('input');
   const text = input.value.trim();
-  if (!text || streaming) return;
+  if (!text || streaming || !serverReady) return;
   // Claim the turn synchronously: a second Enter/click while the
   // session opens must not start a duplicate generation.
   streaming = true;
@@ -695,6 +700,56 @@ async function newSession() {
   await openSession(created.id);
 }
 
+// Ask /health: 200 means the model is loaded and warm. While loading,
+// show the loader's step and keep polling; a failed load is final.
+async function checkHealth() {
+  try {
+    const response = await fetch('/health');
+    if (response.ok) return true;
+    let status = 'loading';
+    let detail = '';
+    try {
+      const data = await response.json();
+      status = data.status || 'loading';
+      detail = data.detail || '';
+    } catch (e) { /* plain text body */ }
+    if (status === 'failed') {
+      setStatus('Load failed');
+      showError(detail || 'The model failed to load.');
+      return 'failed';
+    }
+    setStatus(detail ? 'Loading: ' + detail + '\u2026' : 'Loading\u2026');
+    return false;
+  } catch (error) {
+    setStatus('Connecting\u2026');
+    return false;
+  }
+}
+
+// Poll until the model is ready, then enable the composer and load the
+// session list. A failed load stops the wait and shows the reason.
+async function awaitServer() {
+  for (;;) {
+    const state = await checkHealth();
+    if (state === true) {
+      serverReady = true;
+      updateControls();
+      setStatus('Ready');
+      try {
+        await refreshSessions();
+        if (currentId) await openSession(currentId);
+      } catch (error) {
+        showError(String(error));
+      }
+      return;
+    }
+    serverReady = false;
+    updateControls();
+    if (state === 'failed') return;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
 function init() {
   // Script errors surface in the UI instead of silent buttons.
   window.addEventListener('error', (event) => {
@@ -722,9 +777,9 @@ function init() {
   $('retry').addEventListener('click', () => {
     retryTurn().catch((error) => showError(String(error)));
   });
-  // Cache-aside boot: paint the browser cache instantly, then refresh
-  // from the server (a miss falls back to fetching). A dead server
-  // keeps the cached view instead of an error page.
+  // Cache-aside boot: paint the browser cache instantly, then poll
+  // /health. The composer stays disabled until the model is ready, then
+  // the session list refreshes from the server (a miss fetches).
   const cached = readCache();
   if (cached) {
     cachedFull = cached.full;
@@ -746,12 +801,9 @@ function init() {
     updateControls();
     if (currentId) paintCached(currentId);
   }
-  refreshSessions()
-      .then(() => { if (currentId) return openSession(currentId); })
-      .catch((error) => {
-        if (!sessions.length) showError(String(error));
-        else setStatus('Offline: showing cached chats');
-      });
+  setStatus('Connecting\u2026');
+  updateControls();
+  awaitServer();
 }
 
 document.addEventListener('DOMContentLoaded', init);

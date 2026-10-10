@@ -87,7 +87,11 @@ RADV GFX1201, rocm through the system ROCm).
   sessions. OpenAI endpoints continue a session through
   `session_id`. Tool calling and live thinking streams work.
   Completion and thinking token budgets are enforced.
-  Unimplemented surfaces return 501.
+  The server binds before the model finishes loading: `/health`
+  answers 503 with a JSON `status`/`detail` body until the model is
+  loaded and its kernels warmed, then 200. The web UI polls it and
+  keeps the composer disabled until ready. Unimplemented surfaces
+  return 501.
 - Vision: mmproj config and weight load, CLIP encoder stack,
   merger into language space, PPM load and resize, embedding
   injection at `<|image_pad|>` placeholders,
