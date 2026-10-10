@@ -219,12 +219,26 @@ struct TransformerConfig {
   std::size_t ffn_dim = 0;
   std::size_t vocab_size = 0;
   double norm_eps = 1e-5;
+  // Sparse mixture-of-experts feed-forward. num_experts == 0 means a dense
+  // FFN sized by ffn_dim. When num_experts > 0 the block FFN is the sum of
+  // `experts_per_tok` routed experts with width moe_intermediate plus one
+  // always-on shared expert with width shared_expert_intermediate; ffn_dim
+  // is then unused and may be 0.
+  std::size_t num_experts = 0;
+  std::size_t experts_per_tok = 0;
+  std::size_t moe_intermediate = 0;
+  std::size_t shared_expert_intermediate = 0;
   // True for hybrid attention/SSM definitions (recurrent linear layers
   // interleaved with full attention). The vanilla decode path rejects
   // these as UnsupportedFeature until the recurrent kernels land.
   bool hybrid = false;
   // SSM dimensions, valid only when hybrid is true.
   SsmParams ssm;
+  // True when the feed-forward is a sparse mixture of experts.
+  //
+  // Usage:
+  //   if (config.IsMoe()) { /* routed experts plus shared expert */ }
+  [[nodiscard]] bool IsMoe() const { return num_experts > 0; }
   // Trunk layer l is full attention iff (l + 1) % interval == 0.
   // Zero means every layer is full attention (vanilla).
   std::size_t full_attention_interval = 0;

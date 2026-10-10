@@ -160,6 +160,47 @@ std::expected<std::optional<HybridDef>, StatusCode> ParseHybrid(
   return std::optional<HybridDef>{def};
 }
 
+// Sparse mixture-of-experts definition (expert_count and friends).
+// Nullopt without any expert key, MalformedFile when partial or invalid.
+struct MoeDef {
+  std::uint64_t num_experts = 0;
+  std::uint64_t experts_per_tok = 0;
+  std::uint64_t intermediate = 0;
+  std::uint64_t shared_intermediate = 0;
+};
+
+std::expected<std::optional<MoeDef>, StatusCode> ParseMoe(
+    const core::GgufFile& gguf, std::string_view architecture) {
+  const std::string prefix = std::string(architecture);
+  const auto* count = gguf.Find(prefix + ".expert_count");
+  const auto* used = gguf.Find(prefix + ".expert_used_count");
+  const auto* inter = gguf.Find(prefix + ".expert_feed_forward_length");
+  const auto* shared =
+      gguf.Find(prefix + ".expert_shared_feed_forward_length");
+  if (count == nullptr && used == nullptr && inter == nullptr &&
+      shared == nullptr) {
+    return std::optional<MoeDef>{};
+  }
+  if (count == nullptr || used == nullptr || inter == nullptr ||
+      shared == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto c = AsU64(*count);
+  const auto u = AsU64(*used);
+  const auto i = AsU64(*inter);
+  const auto s = AsU64(*shared);
+  if (!c || !u || !i || !s || *c == 0 || *u == 0 || *i == 0 || *s == 0 ||
+      *u > *c) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  MoeDef def;
+  def.num_experts = *c;
+  def.experts_per_tok = *u;
+  def.intermediate = *i;
+  def.shared_intermediate = *s;
+  return std::optional<MoeDef>{def};
+}
+
 // mRoPE section pair counts from the section array; nullopt when the
 // file carries none. Three integer entries, or four with a zero pad
 // (the file convention); the leading three cover at most rope_dim/2
@@ -271,17 +312,27 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
   if (!*attention) {
     return std::unexpected(StatusCode::MalformedFile);
   }
+  auto moe = ParseMoe(gguf, architecture);
+  if (!moe) {
+    return std::unexpected(moe.error());
+  }
   const auto* embed_key = gguf.Find(prefix + ".embedding_length");
-  if (layers_key == nullptr || ffn_key == nullptr || eps_key == nullptr ||
-      embed_key == nullptr) {
+  // A dense definition carries feed_forward_length; an MoE definition
+  // carries the expert widths instead and may omit it.
+  if (layers_key == nullptr || eps_key == nullptr || embed_key == nullptr ||
+      (ffn_key == nullptr && !*moe)) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   const auto layers = AsU64(*layers_key);
-  const auto ffn = AsU64(*ffn_key);
   const auto eps = AsDouble(*eps_key);
   const auto hidden = AsU64(*embed_key);
-  if (!layers || !ffn || !eps || !hidden || *layers == 0 || *ffn == 0 ||
-      *hidden == 0 || !(*eps > 0.0)) {
+  if (!layers || !eps || !hidden || *layers == 0 || *hidden == 0 ||
+      !(*eps > 0.0)) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto ffn = ffn_key == nullptr ? std::optional<std::uint64_t>{}
+                                      : AsU64(*ffn_key);
+  if (ffn_key != nullptr && (!ffn || *ffn == 0)) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   auto hybrid = ParseHybrid(gguf, architecture);
@@ -324,9 +375,16 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
   config.attention = **attention;
   config.layers = static_cast<std::size_t>(trunk);
   config.hidden_dim = static_cast<std::size_t>(*hidden);
-  config.ffn_dim = static_cast<std::size_t>(*ffn);
+  config.ffn_dim = ffn ? static_cast<std::size_t>(*ffn) : 0;
   config.vocab_size = vocab;
   config.norm_eps = *eps;
+  if (*moe) {
+    config.num_experts = static_cast<std::size_t>((*moe)->num_experts);
+    config.experts_per_tok = static_cast<std::size_t>((*moe)->experts_per_tok);
+    config.moe_intermediate = static_cast<std::size_t>((*moe)->intermediate);
+    config.shared_expert_intermediate =
+        static_cast<std::size_t>((*moe)->shared_intermediate);
+  }
   if (*hybrid) {
     config.hybrid = true;
     config.ssm = (*hybrid)->ssm;

@@ -501,21 +501,85 @@ TEST(EngineTest, GgufGeneratesWhenProvided) {
 
 
 
-// The Qwen3.5 module parses a HuggingFace MXFP4 config.json into the
-// generic TransformerConfig.
+TEST(EngineTest, ParsesMoeTextConfigJson) {
+  auto arch = tessera::CreateArchitecture("qwen35moe");
+  ASSERT_NE(arch, nullptr);
+  const std::string json = R"({
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "text_config": {
+      "hidden_size": 2048, "num_hidden_layers": 40,
+      "num_attention_heads": 16, "num_key_value_heads": 2,
+      "head_dim": 256, "vocab_size": 248320, "rms_norm_eps": 1e-6,
+      "full_attention_interval": 4, "partial_rotary_factor": 0.25,
+      "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16, "linear_num_value_heads": 32,
+      "linear_value_head_dim": 128,
+      "moe_intermediate_size": 512, "num_experts": 256,
+      "num_experts_per_tok": 8, "shared_expert_intermediate_size": 512,
+      "rope_parameters": {"rope_theta": 10000000.0,
+        "mrope_section": [11, 11, 10]}
+    }
+  })";
+  auto config = arch->ParseConfigJson(json);
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_TRUE(config->IsMoe());
+  EXPECT_EQ(config->num_experts, 256u);
+  EXPECT_EQ(config->experts_per_tok, 8u);
+  EXPECT_EQ(config->moe_intermediate, 512u);
+  EXPECT_EQ(config->shared_expert_intermediate, 512u);
+  EXPECT_EQ(config->ffn_dim, 0u);
+  EXPECT_TRUE(config->hybrid);
+}
 
-// The Qwen3.5 module maps HuggingFace MXFP4 tensor names to the internal
-// names, and ignores vision and unknown tensors.
-
-// The Qwen3.5 module reports the MXFP4 value-head permutation and the
-// A_log -> F32 -exp conversion for the linear-attention tensors.
-
-// The MXFP4 loader, driven by a config.json with a known architecture,
-// renames, value-converts (value-head reorder) and packs the weights.
-
-// The MXFP4 MTP head ships in FP8 E4M3 with one F32 scale per output
-// channel (fp8_mtp.py); the loader dequantizes it to F32 so the head's
-// gemms run.
+TEST(EngineTest, LoadGgufModelMoeConfig) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 22);
+  builder.KvString("general.name", "tiny-moe");
+  builder.KvString("general.architecture", "qwen35moe");
+  builder.KvU32("qwen35moe.block_count", 2);
+  builder.KvU32("qwen35moe.embedding_length", 64);
+  builder.KvF32("qwen35moe.attention.layer_norm_rms_epsilon", 1e-5f);
+  builder.KvU32("qwen35moe.attention.head_count", 4);
+  builder.KvU32("qwen35moe.attention.head_count_kv", 2);
+  builder.KvU32("qwen35moe.attention.key_length", 16);
+  builder.KvU32("qwen35moe.attention.value_length", 16);
+  builder.KvU32("qwen35moe.rope.dimension_count", 8);
+  builder.KvF32("qwen35moe.rope.freq_base", 10000.0f);
+  builder.PushString("qwen35moe.rope.dimension_sections");
+  builder.PushU32(9);
+  builder.PushU32(4);
+  builder.PushU64(4);
+  for (std::uint32_t s : {1u, 1u, 1u, 0u}) {
+    builder.PushU32(s);
+  }
+  builder.KvU32("qwen35moe.ssm.conv_kernel", 2);
+  builder.KvU32("qwen35moe.ssm.state_size", 4);
+  builder.KvU32("qwen35moe.ssm.group_count", 2);
+  builder.KvU32("qwen35moe.ssm.time_step_rank", 4);
+  builder.KvU32("qwen35moe.ssm.inner_size", 16);
+  builder.KvU32("qwen35moe.full_attention_interval", 2);
+  builder.KvU32("qwen35moe.expert_count", 4);
+  builder.KvU32("qwen35moe.expert_used_count", 2);
+  builder.KvU32("qwen35moe.expert_feed_forward_length", 8);
+  builder.KvU32("qwen35moe.expert_shared_feed_forward_length", 8);
+  builder.Tensor("output.weight", 2, {64, 8}, 0, 0);
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 4096);
+  auto dir = FreshTempDir("tessera_tests_moe_model");
+  auto path = dir / "moe.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto config = (*model)->Config();
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_TRUE(config->IsMoe());
+  EXPECT_EQ(config->num_experts, 4u);
+  EXPECT_EQ(config->experts_per_tok, 2u);
+  EXPECT_EQ(config->moe_intermediate, 8u);
+  EXPECT_EQ(config->shared_expert_intermediate, 8u);
+  EXPECT_EQ(config->ffn_dim, 0u);
+}
 
 TEST(EngineTest, LoadModelMissingFile) {
   std::unique_ptr<Engine> engine;

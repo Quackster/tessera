@@ -1,0 +1,210 @@
+# Ornith-1.5-35B-A3B support in tessera
+
+This file tracks the work to add full architecture support for
+`ornith-ai/Ornith-1.5-35B-A3B-GGUF` to tessera. It is the progress
+record for this task. See `AGENTS.md` for the working rules.
+
+## Target
+
+- Repository: `ornith-ai/Ornith-1.5-35B-A3B-GGUF`.
+- Local files: `~/models/Ornith-1.5-35B-A3B-GGUF/Q4_K_M.gguf` and the
+  bf16 safetensors reference in `~/models/Ornith-1.5-35B-A3B-BF16/`.
+- GGUF `general.architecture`: `qwen35moe`.
+- Model size: 36B parameters, about 3B active per token (mixture of
+  experts).
+
+The GGUF and the bf16 checkpoint were moved out of the Hugging Face
+cache into `~/models/` on 2026-10-10, per the AGENTS model-data rule.
+
+## Architecture summary
+
+Ornith-1.5-35B-A3B is a Qwen3.5-family hybrid model. The model card
+states it was built on Qwen3.5 and Gemma4 with continued pretraining.
+The text backbone is the Qwen3.5 hybrid design. The single difference
+from the dense Qwen3.5 model already supported by tessera is the
+feed-forward block: it is a sparse mixture of experts (MoE).
+
+### Text config (from `config.json`, `text_config`)
+
+| Field | Value |
+| --- | --- |
+| hidden_size | 2048 |
+| num_hidden_layers | 40 |
+| num_attention_heads | 16 |
+| num_key_value_heads | 2 |
+| head_dim | 256 |
+| partial_rotary_factor | 0.25 (rope_dim 64) |
+| rope_theta | 10000000 |
+| full_attention_interval | 4 (3 linear attention layers, then 1 full) |
+| linear_conv_kernel_dim | 4 |
+| linear_key_head_dim | 128 |
+| linear_num_key_heads | 16 |
+| linear_num_value_heads | 32 |
+| linear_value_head_dim | 128 |
+| moe_intermediate_size | 512 |
+| num_experts | 256 |
+| num_experts_per_tok | 8 |
+| shared_expert_intermediate_size | 512 |
+| rms_norm_eps | 1e-6 |
+| vocab_size | 248320 |
+| mtp_num_hidden_layers | 1 |
+| attn_output_gate | true |
+
+The attention and linear-attention parameters match the dense Qwen3.5
+config that the `qwen3_5` module already handles.
+
+### GGUF metadata (`qwen35moe.*`)
+
+| Key | Value |
+| --- | --- |
+| block_count | 41 (40 trunk plus 1 nextn) |
+| context_length | 262144 |
+| embedding_length | 2048 |
+| attention.head_count | 16 |
+| attention.head_count_kv | 2 |
+| attention.key_length | 256 |
+| attention.value_length | 256 |
+| rope.dimension_count | 64 |
+| rope.dimension_sections | [11, 11, 10, 0] |
+| rope.freq_base | 1e7 |
+| attention.layer_norm_rms_epsilon | 1e-6 |
+| expert_count | 256 |
+| expert_used_count | 8 |
+| expert_feed_forward_length | 512 |
+| expert_shared_feed_forward_length | 512 |
+| nextn_predict_layers | 1 |
+| ssm.conv_kernel | 4 |
+| ssm.state_size | 128 |
+| ssm.group_count | 16 |
+| ssm.time_step_rank | 32 |
+| ssm.inner_size | 4096 |
+| full_attention_interval | 4 |
+
+The dense Qwen3.5 GGUF uses `feed_forward_length`. The MoE GGUF omits
+that key and carries `expert_feed_forward_length`,
+`expert_shared_feed_forward_length`, `expert_count` and
+`expert_used_count` instead.
+
+### Layer structure
+
+Trunk layer `l` is a full-attention layer when `(l + 1) % 4 == 0`
+(layers 3, 7, ..., 39). All other trunk layers are linear-attention
+(gated-delta) layers. This matches the dense Qwen3.5 module. The nextn
+prediction block is `blk.40` and is a full-attention block.
+
+### MoE feed-forward
+
+Each block has a `post_attention_norm`, then a sparse MoE block:
+
+- Router: `ffn_gate_inp.weight` [hidden, num_experts] = [2048, 256] F32.
+- Per-expert weights, packed in rank-3 tensors:
+  - `ffn_gate_exps.weight` [hidden, inter, num_experts] = [2048, 512, 256]
+  - `ffn_up_exps.weight` [hidden, inter, num_experts] = [2048, 512, 256]
+  - `ffn_down_exps.weight` [inter, hidden, num_experts] = [512, 2048, 256]
+- Shared expert, dense rank-2 weights:
+  - `ffn_gate_shexp.weight` [hidden, inter] = [2048, 512]
+  - `ffn_up_shexp.weight` [hidden, inter] = [2048, 512]
+  - `ffn_down_shexp.weight` [inter, hidden] = [512, 2048]
+- Shared expert gate: `ffn_gate_inp_shexp.weight` [hidden] = [2048] F32.
+
+The GGUF dims are reversed from PyTorch, as usual. In the GGUF layout
+the expert index is the slowest dimension, so one expert's matrix is a
+contiguous block. Expert `e` of `ffn_gate_exps` occupies elements
+`[e * 2048 * 512, (e + 1) * 2048 * 512)` and is laid out as a
+row-major [512, 2048] matrix (n by k).
+
+Reference computation (Qwen3 MoE `SparseMoeBlock`):
+
+```
+router_logits = gate(x)                       # [num_experts]
+routing_weights = softmax(router_logits)
+topk_weights, topk_ids = topk(routing_weights, k = 8)
+if norm_topk_prob: topk_weights /= sum(topk_weights)
+for e in topk_ids:
+    y += topk_weights[e] * down_e(silu(gate_e(x)) * up_e(x))
+shared = down_shexp(silu(gate_shexp(x)) * up_shexp(x))
+shared = sigmoid(gate_inp_shexp(x)) * shared
+out = y + shared
+```
+
+The exact `norm_topk_prob` default is not in the config or the GGUF
+metadata. This must be matched to the served reference runtime and is
+tracked as an open question below.
+
+### MTP (nextn) head
+
+The nextn block is `blk.40` and uses the same tensor names as the dense
+Qwen3.5 module (`blk.40.nextn.eh_proj.weight`, `blk.40.nextn.enorm.weight`,
+`blk.40.nextn.hnorm.weight`, `blk.40.nextn.shared_head_norm.weight`).
+The block feed-forward is a MoE feed-forward, so the MTP draft path also
+needs the MoE FFN.
+
+## Reuse from the existing code base
+
+The `src/models/qwen3_5/` module already implements the whole Qwen3.5
+hybrid trunk: gated full attention, gated-delta linear attention, the
+mRoPE, the KV cache, the batched prefill and verify paths, and the nextn
+MTP head. All of that applies unchanged to Ornith.
+
+The narrow seam is the feed-forward. `RunFfn` (`trunk.cpp`) and
+`RunFfnBatch` (`trunk_batch.cpp`) are the only two places that assemble
+the FFN. Every block runner calls one of them. If these two functions
+select the FFN from the config, the entire trunk works for the MoE model
+with no duplication.
+
+## Decision: MoE as a generic capability, one family module
+
+`qwen35moe` is the Qwen3.5 hybrid architecture with a sparse FFN. The
+attention, linear-attention and MTP code is identical to the dense
+model. We therefore:
+
+1. Add the MoE hyper-parameters to `TransformerConfig` and parse them
+   from GGUF metadata in `src/core/model.cpp` (generic metadata).
+2. Add generic MoE kernels (router top-k and softmax, per-expert GEMV,
+   weighted combine) to both backends, with tests. These are shared by
+   any future MoE architecture, so they belong in the backend and in
+   `src/core/numerics/`.
+3. Make `RunFfn` and `RunFfnBatch` select the MoE FFN when
+   `config.num_experts > 0`. This is a data branch, not a model-name
+   branch. The FFN assembly for the MoE variant lives in a new
+   `src/models/qwen3_5/moe.cpp` so `trunk.cpp` stays small.
+4. Register `qwen35moe` (and the Hugging Face names `qwen3_5_moe`,
+   `Qwen3_5MoeForConditionalGeneration`) in `src/models/registry.cpp`
+   to the existing Qwen3.5 family module.
+
+This follows the AGENTS rules: no duplicated trunk code, the new
+capability is a generic kernel, and the new model arrives as data.
+
+## Implementation plan
+
+Status legend: done, in progress, todo.
+
+1. Recon and architecture analysis. **done**.
+2. Move the model files into `~/models/`. **done**.
+3. `TransformerConfig` MoE fields and GGUF/config.json parsing, with
+   tests. **todo**.
+4. Router kernels: projection reuse plus top-k and softmax. **todo**.
+5. Expert kernels: per-expert GEMV and weighted combine on Vulkan and
+   ROCm. **todo**.
+6. Shared-expert assembly (reuses the dense FFN path plus a sigmoid
+   gate). **todo**.
+7. `RunFfn` and `RunFfnBatch` dispatch and `moe.cpp`. **todo**.
+8. Registry entry, CLI check, tests. **todo**.
+9. End-to-end run on the Q4_K_M GGUF and comparison against the
+   reference. **todo**.
+
+## Open questions
+
+- `norm_topk_prob`: the served reference must be read to fix the exact
+  routing normalization. The config and the GGUF metadata do not carry
+  it.
+- Expert weight data type (Q4_K, Q5_K, Q6_K) coverage for the expert
+  GEMV kernel.
+- Batched (prefill and verify) MoE: the efficient design groups tokens
+  by expert. A correct first path can loop rows; a grouped path is the
+  performance target.
+
+## Verification log
+
+- Date 2026-10-10: GGUF header parsed. Architecture `qwen35moe`, 753
+  tensors, 49 metadata keys. Tensor naming and metadata recorded above.
