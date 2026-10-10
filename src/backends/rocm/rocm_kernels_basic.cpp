@@ -1460,37 +1460,21 @@ __global__ void SiluMulKernel(const float* g, const float* u, float* o,
   o[i] = (gate / (1.0f + expf(-gate))) * u[i];
 }
 
-// Built-in "moe_gate": one workgroup. Reduces the router logits to a max
-// and a sum of exponentials, then thread 0 writes the softmax weights of
-// the selected experts (optionally renormalized) and the shared-expert
-// sigmoid. See rocm_kernels.hpp for the contract.
-__global__ void MoeGateKernel(const float* logits, const float* vals,
-                              const float* gate, float* wts, float* sig,
-                              unsigned long long ne, unsigned long long top_k,
-                              unsigned long long renorm) {
-  constexpr float kNegInf = -3.402823466e+38f;
+// Built-in "moe_gate": one workgroup. Softmaxes the selected router logits
+// and computes the shared-expert gate from the normed hidden and the
+// shared-expert weight. See rocm_kernels.hpp for the contract.
+__global__ void MoeGateKernel(const float* vals, const float* x,
+                              const float* w, float* wts, float* sig,
+                              unsigned long long top_k,
+                              unsigned long long hidden) {
   __shared__ float red[256];
   const unsigned int tid = threadIdx.x;
   const unsigned int stride = blockDim.x;
-  float m = kNegInf;
-  for (unsigned long long c = tid; c < ne; c += stride) {
-    m = fmaxf(m, logits[c]);
+  float dot = 0.0f;
+  for (unsigned long long t = tid; t < hidden; t += stride) {
+    dot += x[t] * w[t];
   }
-  red[tid] = m;
-  __syncthreads();
-  for (unsigned int s = stride / 2u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      red[tid] = fmaxf(red[tid], red[tid + s]);
-    }
-    __syncthreads();
-  }
-  const float maxv = red[0];
-  __syncthreads();
-  float sum = 0.0f;
-  for (unsigned long long c = tid; c < ne; c += stride) {
-    sum += expf(logits[c] - maxv);
-  }
-  red[tid] = sum;
+  red[tid] = dot;
   __syncthreads();
   for (unsigned int s = stride / 2u; s > 0u; s >>= 1u) {
     if (tid < s) {
@@ -1498,20 +1482,19 @@ __global__ void MoeGateKernel(const float* logits, const float* vals,
     }
     __syncthreads();
   }
-  const float denom = red[0];
   if (tid == 0u) {
-    float total = 0.0f;
+    float m = -3.402823466e+38f;
     for (unsigned long long p = 0; p < top_k; ++p) {
-      const float w = expf(vals[p] - maxv) / denom;
-      wts[p] = w;
-      total += w;
+      m = fmaxf(m, vals[p]);
     }
-    if (renorm != 0ull && total > 0.0f) {
-      for (unsigned long long p = 0; p < top_k; ++p) {
-        wts[p] = wts[p] / total;
-      }
+    float sum = 0.0f;
+    for (unsigned long long p = 0; p < top_k; ++p) {
+      sum += expf(vals[p] - m);
     }
-    sig[0] = 1.0f / (1.0f + expf(-gate[0]));
+    for (unsigned long long p = 0; p < top_k; ++p) {
+      wts[p] = expf(vals[p] - m) / sum;
+    }
+    sig[0] = 1.0f / (1.0f + expf(-red[0]));
   }
 }
 

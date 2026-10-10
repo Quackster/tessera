@@ -1,56 +1,37 @@
 #version 450
 
 // Mixture-of-experts gating for one token. One workgroup of 256 threads.
-// The router logits are already reduced to the top-k (ids and vals); this
-// kernel turns the full logit vector into softmax weights over the selected
-// experts and applies the shared-expert gate.
+// It computes the softmax weights over the selected experts and the
+// shared-expert gate from the normed hidden and the shared-expert weight.
 layout(local_size_x = 256) in;
 
-// "moe_gate" contract: buffers Logits (ne fp32), Vals (top_k fp32, the
-// selected logits), Gate (1 fp32, the shared-expert logit), Wts (top_k fp32
-// output), Sig (1 fp32 output). Wts[p] = exp(Vals[p] - max) / sum(exp(l - max))
-// over all ne logits; when the renormalize flag is set Wts is divided by its
-// own sum. Sig = sigmoid(Gate[0]). Scalars: ne v[0], top_k v[2], renorm v[4].
+// "moe_gate" contract: buffers Vals (top_k fp32, the selected router
+// logits), X (hidden fp32, the normed input), ShexpW (hidden fp32),
+// Wts (top_k fp32 output), Sig (1 fp32 output). Wts = softmax(Vals);
+// Sig = sigmoid(dot(X, ShexpW)). Scalars: top_k v[0], hidden v[2].
+// (The top-k renormalized softmax equals the renormalized softmax over all
+// experts, so the full logit vector is not needed here.)
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
 
-layout(set = 0, binding = 0) readonly buffer Logits { float logits[]; };
-layout(set = 0, binding = 1) readonly buffer Vals { float vals[]; };
-layout(set = 0, binding = 2) readonly buffer Gate { float gate[]; };
-layout(set = 0, binding = 3) buffer Wts { float wts[]; };
+layout(set = 0, binding = 0) readonly buffer Vals { float vals[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) readonly buffer ShexpW { float w[]; };
+layout(set = 0, binding = 3) writeonly buffer Wts { float wts[]; };
 layout(set = 0, binding = 4) writeonly buffer Sig { float sig[]; };
 
 shared float red[256];
 
-const float kNegInf = -3.402823466e+38;
-
 void main() {
-  uint ne = pc.v[0];
-  uint top_k = pc.v[2];
-  uint renorm = pc.v[4];
+  uint top_k = pc.v[0];
+  uint hidden = pc.v[2];
   uint tid = gl_LocalInvocationID.x;
-
-  float m = kNegInf;
-  for (uint c = tid; c < ne; c += 256u) {
-    m = max(m, logits[c]);
+  float dot = 0.0;
+  for (uint t = tid; t < hidden; t += 256u) {
+    dot += x[t] * w[t];
   }
-  red[tid] = m;
-  barrier();
-  for (uint s = 128u; s > 0u; s >>= 1u) {
-    if (tid < s) {
-      red[tid] = max(red[tid], red[tid + s]);
-    }
-    barrier();
-  }
-  float maxv = red[0];
-  barrier();
-
-  float sum = 0.0;
-  for (uint c = tid; c < ne; c += 256u) {
-    sum += exp(logits[c] - maxv);
-  }
-  red[tid] = sum;
+  red[tid] = dot;
   barrier();
   for (uint s = 128u; s > 0u; s >>= 1u) {
     if (tid < s) {
@@ -58,20 +39,18 @@ void main() {
     }
     barrier();
   }
-  float denom = red[0];
-
   if (tid == 0u) {
-    float total = 0.0;
+    float m = -3.402823466e+38;
     for (uint p = 0u; p < top_k; ++p) {
-      float w = exp(vals[p] - maxv) / denom;
-      wts[p] = w;
-      total += w;
+      m = max(m, vals[p]);
     }
-    if (renorm != 0u && total > 0.0) {
-      for (uint p = 0u; p < top_k; ++p) {
-        wts[p] = wts[p] / total;
-      }
+    float sum = 0.0;
+    for (uint p = 0u; p < top_k; ++p) {
+      sum += exp(vals[p] - m);
     }
-    sig[0] = 1.0 / (1.0 + exp(-gate[0]));
+    for (uint p = 0u; p < top_k; ++p) {
+      wts[p] = exp(vals[p] - m) / sum;
+    }
+    sig[0] = 1.0 / (1.0 + exp(-red[0]));
   }
 }

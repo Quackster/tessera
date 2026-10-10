@@ -483,19 +483,42 @@ __global__ void DeltaStepHeadsKernel(
 __global__ void SiluMulKernel(const float* g, const float* u, float* o,
                               unsigned long long n);
 // Built-in "moe_gate": softmax weights over the selected experts plus the
-// shared-expert sigmoid. Buffer 0 router logits (ne fp32), 1 the selected
-// logits (top_k fp32), 2 the shared-expert logit (1 fp32), 3 the weights
-// output (top_k fp32), 4 the sigmoid output (1 fp32); scalars are ne,
-// top_k, renorm.
-__global__ void MoeGateKernel(const float* logits, const float* vals,
-                              const float* gate, float* wts, float* sig,
-                              unsigned long long ne, unsigned long long top_k,
-                              unsigned long long renorm);
+// shared-expert gate. Buffer 0 the selected logits (top_k fp32), 1 the
+// normed hidden (hidden fp32), 2 the shared-expert weight (hidden fp32),
+// 3 the weights output (top_k fp32), 4 the sigmoid output (1 fp32);
+// scalars are top_k, hidden.
+__global__ void MoeGateKernel(const float* vals, const float* x,
+                              const float* w, float* wts, float* sig,
+                              unsigned long long top_k,
+                              unsigned long long hidden);
 // Built-in "moe_scale_add": o = a + f[idx] * b, elementwise, n fp32.
 __global__ void MoeScaleAddKernel(const float* a, const float* b,
                                   const float* f, float* o,
                                   unsigned long long n,
                                   unsigned long long idx);
+// Built-in "moe_experts_gate_up_q4k": fused routed-expert gate and up for
+// one token. Buffer 0 x (hidden fp32), 1 gate (3D Q4_K), 2 up (3D Q4_K),
+// 3 ids (top_k u32), 4 phi (top_k x inter fp32); scalars hidden, inter,
+// top_k, gate_stride, up_stride. grid_x = ceil(inter * top_k / 8).
+__global__ void MoeExpertsGateUpQ4KKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+// Built-in "moe_experts_down_q4k"/"moe_experts_down_q6k": fused routed-expert
+// down accumulation. Buffer 0 phi (top_k x inter fp32), 1 down (3D Q4_K or
+// Q6_K), 2 ids (top_k u32), 3 wts (top_k fp32), 4 out (hidden fp32); scalars
+// hidden, inter, top_k, down_stride. grid_x = ceil(hidden / 8).
+__global__ void MoeExpertsDownQ4KKernel(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate);
+__global__ void MoeExpertsDownQ6KKernel(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate);
 // Built-in "embedding_f32"/"embedding_bf16"/"embedding_q4k": buffer 0
 // token ids (u32, rows), buffer 1 the embedding table (vocab x cols),
 // buffer 2 the fp32 output (rows x cols); scalars are rows, cols, vocab.

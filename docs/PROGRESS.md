@@ -225,15 +225,19 @@ through RADV GFX1100, rocm through the system ROCm).
   reorder, Gemma norm offset, and the MTP and verify paths.
 - Mixture-of-experts (Ornith-1.5, `qwen35moe`). The Qwen3.5 family
   module runs the sparse MoE FFN when the config carries an expert
-  count. The router uses `top_k_rows` plus the new `moe_gate` kernel;
-  each routed expert runs its gated MLP through the generic GEMM
-  helpers after a device-to-device gather of its rank-3 weight slice;
-  `moe_scale_add` accumulates the weighted outputs and folds in the
-  sigmoid-gated shared expert. Generic GGUF metadata
-  (`expert_count`, `expert_used_count`, ...) and config.json keys are
-  parsed in core. New kernels are tested on both backends. Decode is
-  correct end to end on the Q4_K_M GGUF (see docs/ORNITH-1.5.md). The
-  batch (prefill and verify) path is row-serial for now.
+  count. `top_k_rows` selects the experts and `moe_gate` softmaxes the
+  selected logits and computes the shared-expert gate in one launch.
+  The routed experts run through the fused kernels
+  `moe_experts_gate_up_q4k` and `moe_experts_down_q4k`/`_q6k`, which read
+  the expert ids from device memory and process all `top_k` experts in
+  one launch each (no device-to-device gather, no host round-trip). The
+  shared expert reuses those kernels with an accumulate flag. Generic
+  GGUF metadata (`expert_count`, `expert_used_count`, ...) and
+  config.json keys are parsed in core. The ROCm decoder shares its block
+  codec with the dense GEMV path. Decode is 83 tok/s on the Q4_K_M GGUF
+  (was 37), prefill 81 tok/s (see docs/ORNITH-1.5.md). New kernels are
+  tested on both backends. The batch (prefill and verify) path is
+  row-serial for now.
 - Single GoogleTest target. Device tests skip cleanly with no
   device. Numerical checks use per-backend tolerance.
 
@@ -464,12 +468,12 @@ through RADV GFX1100, rocm through the system ROCm).
 
 ## Next (in order)
 
-- MoE performance. The Ornith-1.5 batch path is row-serial: prefill is
-  about 27 prompt tok/s against 36 decode tok/s. Next: a grouped-expert
-  GEMM that gathers the routed rows per expert and runs one matmul per
-  expert, and a fused router that keeps the expert ids on the device so
-  the per-layer host round-trip disappears. Also confirm the routing
-  normalization (`norm_topk_prob`) against the reference runtime.
+- MoE batch performance. The Ornith-1.5 batch path is row-serial, so
+  prefill (81 prompt tok/s) trails decode (83 tok/s). Next: a
+  grouped-expert GEMM that gathers the routed rows per expert and runs
+  one matmul per expert over the gathered rows. The decode path already
+  keeps the expert ids on device and fuses the experts, so the routing
+  normalization is settled (see docs/ORNITH-1.5.md).
 - Vulkan batch verify. The Vulkan 2-row verify is still 1.3x the ROCm
   one (73 against 57 ms) while the single-row forward is only 1.05x
   (54 against 51), so a paragraph is 27 tok/s against 31 on ROCm. The

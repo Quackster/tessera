@@ -1,11 +1,14 @@
 #include "models/qwen3_5/internal.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "core/decode_internal.hpp"
+#include "core/profile.hpp"
 #include "models/qwen3_5/state.hpp"
 
 // Sparse mixture-of-experts feed-forward for the Qwen3.5-MoE family
@@ -28,10 +31,6 @@ using detail::SiluMulDevice;
 using detail::TopKRowsDevice;
 
 namespace {
-
-// The Qwen3-family MoE renormalizes the selected top-k routing weights
-// (norm_topk_prob). See docs/ORNITH-1.5.md for the reference note.
-constexpr std::uint64_t kMoeRenormalize = 1;
 
 // Elementwise threads per MoE launch (matches the built-in kernels).
 constexpr std::size_t kMoeThreads = 256;
@@ -92,6 +91,15 @@ std::expected<void, StatusCode> LoadMoeKernels(Backend& backend,
   if (auto r = load(h.moe_scale_kernel, "moe_scale_add"); !r) return r;
   if (auto r = load(h.moe_topk_kernel, "top_k_rows"); !r) return r;
   if (auto r = load(h.moe_fill_kernel, "fill"); !r) return r;
+  if (auto r = load(h.moe_gate_up_kernel, "moe_experts_gate_up_q4k"); !r) {
+    return r;
+  }
+  if (auto r = load(h.moe_down_q4k_kernel, "moe_experts_down_q4k"); !r) {
+    return r;
+  }
+  if (auto r = load(h.moe_down_q6k_kernel, "moe_experts_down_q6k"); !r) {
+    return r;
+  }
   return {};
 }
 
@@ -119,8 +127,14 @@ std::expected<void, StatusCode> EnsureMoeReady(
     return {};
   };
   if (auto r = alloc(h.moe_logits, ne * 4); !r) return r;
-  if (auto r = alloc(h.moe_shexp_gate, 4); !r) return r;
   if (auto r = alloc(h.moe_sig, 4); !r) return r;
+  if (auto r = alloc(h.moe_shared_ids, 4); !r) return r;
+  const std::uint32_t shared_id = 0;
+  if (!backend.CopyH2D(*h.moe_shared_ids,
+                       std::span<const std::byte>(
+                           reinterpret_cast<const std::byte*>(&shared_id), 4))) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
   if (auto r = alloc(h.moe_ids, top_k * 4); !r) return r;
   if (auto r = alloc(h.moe_vals, top_k * 4); !r) return r;
   if (auto r = alloc(h.moe_wts, top_k * 4); !r) return r;
@@ -130,6 +144,7 @@ std::expected<void, StatusCode> EnsureMoeReady(
   if (auto r = alloc(h.moe_inter, inter * 4); !r) return r;
   if (auto r = alloc(h.moe_down_out, hidden * 4); !r) return r;
   if (auto r = alloc(h.moe_shared, hidden * 4); !r) return r;
+  if (auto r = alloc(h.moe_phi, top_k * cfg.moe_intermediate * 4); !r) return r;
   if (auto r = alloc(h.moe_row_in, hidden * 4); !r) return r;
   if (auto r = alloc(h.moe_row_out, hidden * 4); !r) return r;
   h.moe_ready = true;
@@ -198,9 +213,7 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, x_row, *(*mlp_norm)->device,
                      *h.xn, 1, hidden, cfg.norm_eps) ||
       !ProjectBatch(backend, h, (*router)->manifest.dtype, *h.xn,
-                    *(*router)->device, *h.moe_logits, 1, ne, hidden) ||
-      !ProjectBatch(backend, h, (*shexp_gate)->manifest.dtype, *h.xn,
-                    *(*shexp_gate)->device, *h.moe_shexp_gate, 1, 1, hidden)) {
+                    *(*router)->device, *h.moe_logits, 1, ne, hidden)) {
     return std::unexpected(StatusCode::DeviceError);
   }
   if (auto top = TopKRowsDevice(backend, *h.moe_topk_kernel, *h.moe_logits,
@@ -212,20 +225,12 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
     KernelLaunch gate;
     gate.grid_x = 1;
     gate.block_x = kMoeThreads;
-    gate.buffers = {h.moe_logits.get(), h.moe_vals.get(),
-                    h.moe_shexp_gate.get(), h.moe_wts.get(), h.moe_sig.get()};
-    gate.scalars = {ne, top_k, kMoeRenormalize};
+    gate.buffers = {h.moe_vals.get(), h.xn.get(), (*shexp_gate)->device.get(),
+                    h.moe_wts.get(), h.moe_sig.get()};
+    gate.scalars = {top_k, hidden};
     if (!backend.LaunchKernel(*h.moe_gate_kernel, gate)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-  }
-  std::vector<std::uint32_t> ids(top_k, 0);
-  if (!backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
-                       top_k * 4)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  if (auto r = ZeroBuffer(backend, h, *h.moe_acc, hidden); !r) {
-    return r;
   }
   auto gate_bytes = ExpertSliceBytes(**gate_exps, ne);
   auto up_bytes = ExpertSliceBytes(**up_exps, ne);
@@ -233,53 +238,131 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
   if (!gate_bytes || !up_bytes || !down_bytes) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  if (auto r = GrowBuffer(backend, h.moe_gate_w, *gate_bytes); !r) return r;
-  if (auto r = GrowBuffer(backend, h.moe_up_w, *up_bytes); !r) return r;
-  if (auto r = GrowBuffer(backend, h.moe_down_w, *down_bytes); !r) return r;
-  for (std::size_t k = 0; k < top_k; ++k) {
-    const std::uint32_t expert = ids[k];
-    if (expert >= ne) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    if (!backend.CopyD2D(*(*gate_exps)->device, expert * *gate_bytes,
-                         *h.moe_gate_w, 0, *gate_bytes) ||
-        !backend.CopyD2D(*(*up_exps)->device, expert * *up_bytes, *h.moe_up_w,
-                         0, *up_bytes) ||
-        !ProjectBatch(backend, h, (*gate_exps)->manifest.dtype, *h.xn,
-                      *h.moe_gate_w, *h.moe_gate_out, 1, inter, hidden) ||
-        !ProjectBatch(backend, h, (*up_exps)->manifest.dtype, *h.xn,
-                      *h.moe_up_w, *h.moe_up_out, 1, inter, hidden) ||
-        !SiluMulDevice(backend, *h.silu_mul_kernel, *h.moe_gate_out,
-                       *h.moe_up_out, *h.moe_inter, inter) ||
-        !backend.CopyD2D(*(*down_exps)->device, expert * *down_bytes,
-                         *h.moe_down_w, 0, *down_bytes) ||
-        !ProjectBatch(backend, h, (*down_exps)->manifest.dtype, *h.moe_inter,
-                      *h.moe_down_w, *h.moe_down_out, 1, hidden, inter)) {
+  const DType gate_dt = (*gate_exps)->manifest.dtype;
+  const DType up_dt = (*up_exps)->manifest.dtype;
+  const DType down_dt = (*down_exps)->manifest.dtype;
+  // The fused path covers the packed expert formats this model family uses
+  // (Q4_K gate/up, Q4_K or Q6_K down) on a block-aligned intermediate width.
+  const bool fused =
+      gate_dt == DType::Q4K && up_dt == DType::Q4K &&
+      (down_dt == DType::Q4K || down_dt == DType::Q6K) &&
+      hidden % kQ4KBlockElements == 0 && inter % kQ4KBlockElements == 0;
+  if (fused) {
+    KernelLaunch gate_up;
+    gate_up.grid_x = static_cast<std::uint32_t>((inter * top_k + 7) / 8);
+    gate_up.block_x = kMoeThreads;
+    gate_up.buffers = {h.xn.get(), (*gate_exps)->device.get(),
+                       (*up_exps)->device.get(), h.moe_ids.get(),
+                       h.moe_phi.get()};
+    gate_up.scalars = {hidden, inter, top_k, *gate_bytes, *up_bytes};
+    if (!backend.LaunchKernel(*h.moe_gate_up_kernel, gate_up)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    if (auto r = ScaleAdd(backend, h, *h.moe_acc, *h.moe_down_out, *h.moe_wts,
-                          *h.moe_acc, hidden, k);
+    const Kernel& down_kernel = down_dt == DType::Q6K ? *h.moe_down_q6k_kernel
+                                                      : *h.moe_down_q4k_kernel;
+    KernelLaunch down;
+    down.grid_x = static_cast<std::uint32_t>((hidden + 7) / 8);
+    down.block_x = kMoeThreads;
+    down.buffers = {h.moe_phi.get(), (*down_exps)->device.get(),
+                    h.moe_ids.get(), h.moe_wts.get(), &out_row};
+    down.scalars = {hidden, inter, top_k, *down_bytes, 0};
+    if (!backend.LaunchKernel(down_kernel, down)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  } else {
+    std::vector<std::uint32_t> ids(top_k, 0);
+    if (!backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
+                         top_k * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (auto r = ZeroBuffer(backend, h, *h.moe_acc, hidden); !r) {
+      return r;
+    }
+    if (auto r = GrowBuffer(backend, h.moe_gate_w, *gate_bytes); !r) return r;
+    if (auto r = GrowBuffer(backend, h.moe_up_w, *up_bytes); !r) return r;
+    if (auto r = GrowBuffer(backend, h.moe_down_w, *down_bytes); !r) return r;
+    for (std::size_t k = 0; k < top_k; ++k) {
+      const std::uint32_t expert = ids[k];
+      if (expert >= ne) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      if (!backend.CopyD2D(*(*gate_exps)->device, expert * *gate_bytes,
+                           *h.moe_gate_w, 0, *gate_bytes) ||
+          !backend.CopyD2D(*(*up_exps)->device, expert * *up_bytes,
+                           *h.moe_up_w, 0, *up_bytes) ||
+          !ProjectBatch(backend, h, gate_dt, *h.xn, *h.moe_gate_w,
+                        *h.moe_gate_out, 1, inter, hidden) ||
+          !ProjectBatch(backend, h, up_dt, *h.xn, *h.moe_up_w, *h.moe_up_out, 1,
+                        inter, hidden) ||
+          !SiluMulDevice(backend, *h.silu_mul_kernel, *h.moe_gate_out,
+                         *h.moe_up_out, *h.moe_inter, inter) ||
+          !backend.CopyD2D(*(*down_exps)->device, expert * *down_bytes,
+                           *h.moe_down_w, 0, *down_bytes) ||
+          !ProjectBatch(backend, h, down_dt, *h.moe_inter, *h.moe_down_w,
+                        *h.moe_down_out, 1, hidden, inter)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      if (auto r = ScaleAdd(backend, h, *h.moe_acc, *h.moe_down_out,
+                            *h.moe_wts, *h.moe_acc, hidden, k);
+          !r) {
+        return r;
+      }
+    }
+    if (!backend.CopyD2D(*h.moe_acc, 0, out_row, 0, hidden * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  const DType gate_sh_dt = (*gate_sh)->manifest.dtype;
+  const DType up_sh_dt = (*up_sh)->manifest.dtype;
+  const DType down_sh_dt = (*down_sh)->manifest.dtype;
+  const bool shared_fused =
+      fused && gate_sh_dt == DType::Q4K && up_sh_dt == DType::Q4K &&
+      (down_sh_dt == DType::Q4K || down_sh_dt == DType::Q6K);
+  if (shared_fused) {
+    auto gs_bytes = ExpertSliceBytes(**gate_sh, 1);
+    auto us_bytes = ExpertSliceBytes(**up_sh, 1);
+    auto ds_bytes = ExpertSliceBytes(**down_sh, 1);
+    if (!gs_bytes || !us_bytes || !ds_bytes) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    KernelLaunch shared_up;
+    shared_up.grid_x = static_cast<std::uint32_t>((shared + 7) / 8);
+    shared_up.block_x = kMoeThreads;
+    shared_up.buffers = {h.xn.get(), (*gate_sh)->device.get(),
+                         (*up_sh)->device.get(), h.moe_shared_ids.get(),
+                         h.moe_phi.get()};
+    shared_up.scalars = {hidden, shared, 1, *gs_bytes, *us_bytes};
+    if (!backend.LaunchKernel(*h.moe_gate_up_kernel, shared_up)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    const Kernel& down_kernel = down_sh_dt == DType::Q6K
+                                    ? *h.moe_down_q6k_kernel
+                                    : *h.moe_down_q4k_kernel;
+    KernelLaunch shared_down;
+    shared_down.grid_x = static_cast<std::uint32_t>((hidden + 7) / 8);
+    shared_down.block_x = kMoeThreads;
+    shared_down.buffers = {h.moe_phi.get(), (*down_sh)->device.get(),
+                           h.moe_shared_ids.get(), h.moe_sig.get(), &out_row};
+    shared_down.scalars = {hidden, shared, 1, *ds_bytes, 1};
+    if (!backend.LaunchKernel(down_kernel, shared_down)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  } else {
+    if (!ProjectBatch(backend, h, gate_sh_dt, *h.xn, *(*gate_sh)->device,
+                      *h.moe_gate_out, 1, shared, hidden) ||
+        !ProjectBatch(backend, h, up_sh_dt, *h.xn, *(*up_sh)->device,
+                      *h.moe_up_out, 1, shared, hidden) ||
+        !SiluMulDevice(backend, *h.silu_mul_kernel, *h.moe_gate_out,
+                       *h.moe_up_out, *h.moe_inter, shared) ||
+        !ProjectBatch(backend, h, down_sh_dt, *h.moe_inter,
+                      *(*down_sh)->device, *h.moe_shared, 1, hidden, shared)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (auto r = ScaleAdd(backend, h, out_row, *h.moe_shared, *h.moe_sig,
+                          out_row, hidden, 0);
         !r) {
       return r;
     }
-  }
-  if (!ProjectBatch(backend, h, (*gate_sh)->manifest.dtype, *h.xn,
-                    *(*gate_sh)->device, *h.moe_gate_out, 1, shared, hidden) ||
-      !ProjectBatch(backend, h, (*up_sh)->manifest.dtype, *h.xn,
-                    *(*up_sh)->device, *h.moe_up_out, 1, shared, hidden) ||
-      !SiluMulDevice(backend, *h.silu_mul_kernel, *h.moe_gate_out,
-                     *h.moe_up_out, *h.moe_inter, shared) ||
-      !ProjectBatch(backend, h, (*down_sh)->manifest.dtype, *h.moe_inter,
-                    *(*down_sh)->device, *h.moe_shared, 1, hidden, shared)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  if (auto r = ScaleAdd(backend, h, *h.moe_acc, *h.moe_shared, *h.moe_sig,
-                        *h.moe_acc, hidden, 0);
-      !r) {
-    return r;
-  }
-  if (!backend.CopyD2D(*h.moe_acc, 0, out_row, 0, hidden * 4)) {
-    return std::unexpected(StatusCode::DeviceError);
   }
   return {};
 }
@@ -290,6 +373,9 @@ std::expected<void, StatusCode> RunMoeFfn(Backend& backend,
                                           const Model& model,
                                           const TransformerConfig& cfg,
                                           Qwen35State& h, std::size_t layer) {
+  core::Profile* const deep =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
+  core::PhaseScope ffn_scope(deep, core::Phase::kFfn);
   if (auto ready = EnsureMoeReady(backend, cfg, h); !ready) {
     return ready;
   }
@@ -299,6 +385,9 @@ std::expected<void, StatusCode> RunMoeFfn(Backend& backend,
   }
   if (!AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, cfg.hidden_dim)) {
     return std::unexpected(StatusCode::DeviceError);
+  }
+  if (deep != nullptr) {
+    backend.Synchronize();
   }
   return {};
 }

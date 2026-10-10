@@ -141,9 +141,13 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Kernel> moe_scale_kernel;
   std::unique_ptr<Kernel> moe_topk_kernel;
   std::unique_ptr<Kernel> moe_fill_kernel;
+  // Fused routed-expert kernels (gate/up Q4_K; down Q4_K or Q6_K).
+  std::unique_ptr<Kernel> moe_gate_up_kernel;
+  std::unique_ptr<Kernel> moe_down_q4k_kernel;
+  std::unique_ptr<Kernel> moe_down_q6k_kernel;
   std::unique_ptr<Buffer> moe_logits;      // num_experts fp32
-  std::unique_ptr<Buffer> moe_shexp_gate;  // 1 fp32 (shared-expert logit)
   std::unique_ptr<Buffer> moe_sig;         // 1 fp32 (shared-expert gate)
+  std::unique_ptr<Buffer> moe_shared_ids;  // 1 u32 (zero; the shared expert)
   std::unique_ptr<Buffer> moe_ids;         // experts_per_tok u32
   std::unique_ptr<Buffer> moe_vals;        // experts_per_tok fp32
   std::unique_ptr<Buffer> moe_wts;         // experts_per_tok fp32
@@ -156,6 +160,7 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> moe_inter;       // moe_intermediate fp32
   std::unique_ptr<Buffer> moe_down_out;    // hidden fp32
   std::unique_ptr<Buffer> moe_shared;      // hidden fp32
+  std::unique_ptr<Buffer> moe_phi;         // experts_per_tok * moe_intermediate fp32
   std::unique_ptr<Buffer> moe_row_in;      // hidden fp32 (batch row staging)
   std::unique_ptr<Buffer> moe_row_out;     // hidden fp32 (batch row staging)
   bool moe_ready = false;

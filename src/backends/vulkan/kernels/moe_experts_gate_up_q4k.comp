@@ -1,0 +1,145 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+
+// Fused routed-expert gate and up for one token. One warp per intermediate
+// output of one selected expert: phi[slot][j] = silu(G_e x)[j] * (U_e x)[j],
+// where e = ids[slot] is read from device memory (no host round-trip). Both
+// the gate and the up weight are Q4_K packed as [inter, hidden] per expert.
+layout(local_size_x = 256) in;
+
+// "moe_experts_gate_up_q4k" contract: buffers X (hidden fp32, the normed
+// input row), Gate (3D Q4_K), Up (3D Q4_K), Ids (top_k u32), Phi
+// (top_k x inter fp32). Scalars: hidden v[0], inter v[2], top_k v[4],
+// gate_stride v[6], up_stride v[8] (bytes per expert slice). Grid:
+// grid_x = ceil(inter / 8), grid_y = top_k.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Gate { uint8_t g[]; };
+layout(set = 0, binding = 2) readonly buffer Up { uint8_t u[]; };
+layout(set = 0, binding = 3) readonly buffer Ids { uint ids[]; };
+layout(set = 0, binding = 4) writeonly buffer Phi { float phi[]; };
+
+float reduce32(float v) {
+  return subgroupClusteredAdd(v, 32u);
+}
+
+uint gbyte(uint offset) {
+  return uint(g[offset]);
+}
+
+uint ubyte(uint offset) {
+  return uint(u[offset]);
+}
+
+float gfp16(uint offset) {
+  uint h = gbyte(offset) | (gbyte(offset + 1) << 8);
+  uint e = (h >> 10) & 31;
+  uint m = h & 1023;
+  float value;
+  if (e == 0) {
+    value = float(m) * exp2(-24.0);
+  } else if (e == 31) {
+    value = m > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(m) / 1024.0) * exp2(float(e) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+float ufp16(uint offset) {
+  uint h = ubyte(offset) | (ubyte(offset + 1) << 8);
+  uint e = (h >> 10) & 31;
+  uint m = h & 1023;
+  float value;
+  if (e == 0) {
+    value = float(m) * exp2(-24.0);
+  } else if (e == 31) {
+    value = m > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(m) / 1024.0) * exp2(float(e) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+void gscale_min4(uint j, uint base, out uint scale, out uint min) {
+  uint sj = gbyte(base + 4 + j);
+  uint sj4 = gbyte(base + 8 + j);
+  uint sjm4 = gbyte(base + j);
+  if (j < 4) {
+    scale = sj & 63;
+    min = sj4 & 63;
+  } else {
+    scale = (sj4 & 15) | ((sjm4 >> 6) << 4);
+    min = (sj4 >> 4) | ((sj >> 6) << 4);
+  }
+}
+
+void uscale_min4(uint j, uint base, out uint scale, out uint min) {
+  uint sj = ubyte(base + 4 + j);
+  uint sj4 = ubyte(base + 8 + j);
+  uint sjm4 = ubyte(base + j);
+  if (j < 4) {
+    scale = sj & 63;
+    min = sj4 & 63;
+  } else {
+    scale = (sj4 & 15) | ((sjm4 >> 6) << 4);
+    min = (sj4 >> 4) | ((sj >> 6) << 4);
+  }
+}
+
+void main() {
+  uint hidden = pc.v[0];
+  uint inter = pc.v[2];
+  uint top_k = pc.v[4];
+  uint gate_stride = pc.v[6];
+  uint up_stride = pc.v[8];
+  uint slot = gl_WorkGroupID.y;
+  uint warps = gl_WorkGroupSize.x / 32u;
+  uint idx = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
+  if (idx >= inter || slot >= top_k) {
+    return;
+  }
+  uint lane = gl_LocalInvocationID.x % 32u;
+  uint expert = ids[slot];
+  uint blocks = hidden / 256u;
+  uint g_base = expert * gate_stride + idx * (blocks * 144u);
+  uint u_base = expert * up_stride + idx * (blocks * 144u);
+  float gate_acc = 0.0;
+  float up_acc = 0.0;
+  for (uint b = 0u; b < blocks; ++b) {
+    uint gb = g_base + b * 144u;
+    uint ub = u_base + b * 144u;
+    float gd = gfp16(gb);
+    float gdm = gfp16(gb + 2u);
+    float ud = ufp16(ub);
+    float udm = ufp16(ub + 2u);
+    for (uint grp = 0u; grp < 4u; ++grp) {
+      uint gsc0, gmn0, gsc1, gmn1;
+      gscale_min4(grp * 2u, gb, gsc0, gmn0);
+      gscale_min4(grp * 2u + 1u, gb, gsc1, gmn1);
+      uint usc0, umn0, usc1, umn1;
+      uscale_min4(grp * 2u, ub, usc0, umn0);
+      uscale_min4(grp * 2u + 1u, ub, usc1, umn1);
+      uint gq = gbyte(gb + 16u + grp * 32u + lane);
+      uint uq = ubyte(ub + 16u + grp * 32u + lane);
+      uint t = b * 256u + grp * 64u + lane;
+      float xv = x[t];
+      float xv2 = x[t + 32u];
+      gate_acc += xv * (gd * float(gsc0) * float(gq & 15u) - gdm * float(gmn0));
+      gate_acc +=
+          xv2 * (gd * float(gsc1) * float(gq >> 4) - gdm * float(gmn1));
+      up_acc += xv * (ud * float(usc0) * float(uq & 15u) - udm * float(umn0));
+      up_acc += xv2 * (ud * float(usc1) * float(uq >> 4) - udm * float(umn1));
+    }
+  }
+  float gate = reduce32(gate_acc);
+  float up = reduce32(up_acc);
+  if ((gl_SubgroupInvocationID % 32u) == 0u) {
+    phi[slot * inter + idx] = (gate / (1.0 + exp(-gate))) * up;
+  }
+}

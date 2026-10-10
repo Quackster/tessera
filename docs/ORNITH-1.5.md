@@ -213,18 +213,38 @@ with the reference ordering.
 ### Current implementation and known debt
 
 - Routing is on the device: `top_k_rows` selects the experts and
-  `moe_gate` softmaxes the selected logits and applies the shared-expert
-  sigmoid. The selected expert ids are copied back to the host once per
-  layer so the generic GEMM helpers can run each expert slice.
-- The expert projection reuses the existing GEMM helpers: one expert
-  slice is gathered with a device-to-device copy and projected as a
-  dense matrix. This keeps the numerics identical to the dense path and
-  avoids new quantized-decode code, at the cost of a device copy and
-  several launches per expert.
+  `moe_gate` softmaxes the selected logits and computes the shared-expert
+  gate from the normed hidden and the shared-expert weight in one launch
+  (no separate projection).
+- The routed experts run through two fused kernels,
+  `moe_experts_gate_up_q4k` and `moe_experts_down_q4k` /
+  `moe_experts_down_q6k`. They read the selected expert ids from device
+  memory and process all `top_k` experts in one launch each: gate and up
+  for every expert, then the weighted down accumulation. There is no
+  device-to-device weight copy and no host round-trip per layer. The block
+  decode is shared with the dense GEMV path (ROCm
+  `rocm_kernels_codec.hpp`; Vulkan inlines the same block math).
+- The shared expert runs through the same two fused kernels as a
+  one-entry expert (id zero) with an accumulate flag on the down kernel,
+  so it adds its sigmoid-gated output in the second launch.
 - The batch (prefill and verify) path is row-serial: it loops over rows
-  and reuses the single-row kernel. This is correct but slow for large
-  prefill chunks (about 27 prompt tokens per second). A grouped-expert
-  GEMM is the performance follow-up.
+  and reuses the single-row kernels. It is correct but leaves prefill
+  below the decode rate; a grouped-expert GEMM is the remaining work.
+
+### Speed result
+
+Measured on ROCm, device 0, the Q4_K_M GGUF, greedy decode of a 64-token
+generation:
+
+| | before | after |
+| --- | --- | --- |
+| decode | 37 tok/s (27 ms/token) | 83 tok/s (12 ms/token) |
+| prefill | 27 prompt tok/s | 81 prompt tok/s |
+
+Vulkan reaches 79 tok/s decode on the same checkpoint and produces the
+same answers ("Paris.", "Tokyo", "four"). The remaining cost is the
+routing and attention launches, not the expert weight reads: the experts
+stream about 640 MB per token, far below the card's memory rate.
 
 ## Reference match
 
@@ -243,11 +263,11 @@ carries none).
 
 ## Open questions
 
-- Expert weight data type coverage for the expert GEMM: Q4_K, Q5_K,
-  Q6_K are exercised by the Q4_K_M checkpoint; Q8_0 experts are not
-  yet tested.
-- Batched (prefill and verify) MoE performance: the current row-serial
-  path is correct but slow. A grouped-expert GEMM is the target.
+- The fused expert kernels cover Q4_K gate/up and Q4_K or Q6_K down; any
+  other expert dtype falls back to the generic per-expert path. Q5_K and
+  Q8_0 experts are not exercised by the Q4_K_M checkpoint.
+- Batched (prefill and verify) MoE performance: the row-serial path is
+  correct but slower than decode. A grouped-expert GEMM is the target.
 
 ## Verification log
 
@@ -264,3 +284,9 @@ carries none).
   speculation path (`--speculate`) also returns "Paris." and exercises
   the MoE feed-forward in the nextn block. Full suite passes on Vulkan
   and ROCm (204 tests each).
+- Date 2026-10-10: MoE speed optimization. Fused expert kernels read the
+  expert ids on device and process all selected experts in two launches;
+  the shared expert shares those kernels; `moe_gate` folds the
+  shared-expert gate. Decode 37 to 83 tok/s (ROCm) and 79 tok/s (Vulkan);
+  prefill 27 to 81 tok/s. Both backends return the same answers. Suite is
+  206 tests on both backends.

@@ -2505,48 +2505,41 @@ TEST(BackendTest, MoeScaleAddDeviceMatchesRef) {
   }
 }
 
-// Device: moe_gate softmaxes the router logits over the selected experts
-// and applies the shared-expert sigmoid.
+// Device: moe_gate softmaxes the selected router logits and computes the
+// shared-expert gate from the normed hidden and the shared-expert weight.
 TEST(BackendTest, MoeGateDeviceMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
   std::mt19937 rng(92);
-  constexpr std::size_t kNe = 64;
-  constexpr std::size_t kTopK = 4;
-  std::vector<float> logits(kNe);
-  for (auto& v : logits) v = DrawValue(rng);
-  std::vector<std::size_t> order(kNe);
-  std::iota(order.begin(), order.end(), 0u);
-  std::sort(order.begin(), order.end(),
-            [&](std::size_t x, std::size_t y) {
-              return logits[x] > logits[y];
-            });
+  const std::size_t kTopK = 4;
+  const std::size_t kHidden = 64;
   std::vector<float> vals(kTopK);
-  for (std::size_t p = 0; p < kTopK; ++p) {
-    vals[p] = logits[order[p]];
-  }
-  const float gate_logit = 0.75f;
-  auto logits_buf = backend->AllocateBuffer(kNe * 4, MemoryKind::Device);
+  for (auto& v : vals) v = DrawValue(rng);
+  std::vector<float> x(kHidden);
+  std::vector<float> w(kHidden);
+  for (auto& v : x) v = DrawValue(rng);
+  for (auto& v : w) v = DrawValue(rng);
   auto vals_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
-  auto gate_buf = backend->AllocateBuffer(4, MemoryKind::Device);
+  auto x_buf = backend->AllocateBuffer(kHidden * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(kHidden * 4, MemoryKind::Device);
   auto wts_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
   auto sig_buf = backend->AllocateBuffer(4, MemoryKind::Device);
-  ASSERT_TRUE(logits_buf && vals_buf && gate_buf && wts_buf && sig_buf);
+  ASSERT_TRUE(vals_buf && x_buf && w_buf && wts_buf && sig_buf);
   const auto upload = [&backend](auto& buf, const auto& data) {
     return backend->CopyH2D(**buf, std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
   };
-  ASSERT_TRUE(upload(logits_buf, logits).has_value());
   ASSERT_TRUE(upload(vals_buf, vals).has_value());
-  ASSERT_TRUE(upload(gate_buf, std::vector<float>{gate_logit}).has_value());
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(upload(w_buf, w).has_value());
   auto kernel = backend->LoadKernel("moe_gate", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
   launch.grid_x = 1;
   launch.block_x = 256;
-  launch.buffers = {(*logits_buf).get(), (*vals_buf).get(), (*gate_buf).get(),
+  launch.buffers = {(*vals_buf).get(), (*x_buf).get(), (*w_buf).get(),
                     (*wts_buf).get(), (*sig_buf).get()};
-  launch.scalars = {kNe, kTopK, 1};
+  launch.scalars = {kTopK, kHidden};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -2556,23 +2549,22 @@ TEST(BackendTest, MoeGateDeviceMatchesRef) {
                   .has_value());
   ASSERT_TRUE(backend->CopyD2H(**sig_buf, sig_read.data(), sig_read.size())
                   .has_value());
-  const float maxv = *std::max_element(logits.begin(), logits.end());
+  const float maxv = *std::max_element(vals.begin(), vals.end());
   float denom = 0.0f;
-  for (float l : logits) {
-    denom += std::exp(l - maxv);
-  }
-  float total = 0.0f;
-  for (std::size_t p = 0; p < kTopK; ++p) {
-    total += std::exp(vals[p] - maxv) / denom;
+  for (float v : vals) {
+    denom += std::exp(v - maxv);
   }
   const auto* wts_got = reinterpret_cast<const float*>(wts_read.data());
   const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
   for (std::size_t p = 0; p < kTopK; ++p) {
-    const float expected = (std::exp(vals[p] - maxv) / denom) / total;
-    EXPECT_NEAR(wts_got[p], expected, tol.abs);
+    EXPECT_NEAR(wts_got[p], std::exp(vals[p] - maxv) / denom, tol.abs);
+  }
+  float dot = 0.0f;
+  for (std::size_t t = 0; t < kHidden; ++t) {
+    dot += x[t] * w[t];
   }
   const auto* sig_got = reinterpret_cast<const float*>(sig_read.data());
-  EXPECT_NEAR(sig_got[0], 1.0f / (1.0f + std::exp(-gate_logit)), tol.abs);
+  EXPECT_NEAR(sig_got[0], 1.0f / (1.0f + std::exp(-dot)), tol.abs);
 }
 
 // Device: chained device-to-device kernels (gemm_q4k -> rmsnorm -> add)

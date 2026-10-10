@@ -1,0 +1,110 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+
+// Fused routed-expert down projection for one token. One warp per hidden
+// output; it sums the weighted contribution of every selected expert:
+// out[j] = sum_slot wts[slot] * (D_{e} phi[slot])[j], e = ids[slot] read
+// from device memory. The down weight is Q6_K packed as [hidden, inter]
+// per expert.
+layout(local_size_x = 256) in;
+
+// "moe_experts_down_q6k" contract: buffers Phi (top_k x inter fp32), Down
+// (3D Q6_K), Ids (top_k u32), Wts (top_k fp32), Out (hidden fp32). Scalars:
+// hidden v[0], inter v[2], top_k v[4], down_stride v[6] (bytes per expert
+// slice). Grid: grid_x = ceil(hidden / 8).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Phi { float phi[]; };
+layout(set = 0, binding = 1) readonly buffer Down { uint8_t d[]; };
+layout(set = 0, binding = 2) readonly buffer Ids { uint ids[]; };
+layout(set = 0, binding = 3) readonly buffer Wts { float wts[]; };
+layout(set = 0, binding = 4) buffer Out { float outv[]; };
+
+float reduce32(float v) {
+  return subgroupClusteredAdd(v, 32u);
+}
+
+uint dbyte(uint offset) {
+  return uint(d[offset]);
+}
+
+float dfp16(uint offset) {
+  uint h = dbyte(offset) | (dbyte(offset + 1) << 8);
+  uint e = (h >> 10) & 31;
+  uint m = h & 1023;
+  float value;
+  if (e == 0) {
+    value = float(m) * exp2(-24.0);
+  } else if (e == 31) {
+    value = m > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(m) / 1024.0) * exp2(float(e) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+void main() {
+  uint hidden = pc.v[0];
+  uint inter = pc.v[2];
+  uint top_k = pc.v[4];
+  uint down_stride = pc.v[6];
+  uint warps = gl_WorkGroupSize.x / 32u;
+  uint idx = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
+  if (idx >= hidden) {
+    return;
+  }
+  uint lane = gl_LocalInvocationID.x % 32u;
+  uint is = lane / 16u;
+  uint blocks = inter / 256u;
+  float acc = 0.0;
+  for (uint slot = 0u; slot < top_k; ++slot) {
+    uint expert = ids[slot];
+    float w = wts[slot];
+    uint base = expert * down_stride + idx * (blocks * 210u);
+    uint phi_base = slot * inter;
+    float dot = 0.0;
+    for (uint b = 0u; b < blocks; ++b) {
+      uint bb = base + b * 210u;
+      float dscale = dfp16(bb + 208u);
+      for (uint n2 = 0u; n2 < 2u; ++n2) {
+        int s0 = int(dbyte(bb + 192u + n2 * 8u + is));
+        int s2 = int(dbyte(bb + 192u + n2 * 8u + is + 2u));
+        int s4 = int(dbyte(bb + 192u + n2 * 8u + is + 4u));
+        int s6 = int(dbyte(bb + 192u + n2 * 8u + is + 6u));
+        if (s0 >= 128) {
+          s0 -= 256;
+        }
+        if (s2 >= 128) {
+          s2 -= 256;
+        }
+        if (s4 >= 128) {
+          s4 -= 256;
+        }
+        if (s6 >= 128) {
+          s6 -= 256;
+        }
+        uint ql0 = dbyte(bb + n2 * 64u + lane);
+        uint ql1 = dbyte(bb + n2 * 64u + 32u + lane);
+        uint qh = dbyte(bb + 128u + n2 * 32u + lane);
+        int q1 = int((ql0 & 15u) | (((qh >> 0) & 3u) << 4)) - 32;
+        int q2 = int((ql1 & 15u) | (((qh >> 2) & 3u) << 4)) - 32;
+        int q3 = int((ql0 >> 4) | (((qh >> 4) & 3u) << 4)) - 32;
+        int q4 = int((ql1 >> 4) | (((qh >> 6) & 3u) << 4)) - 32;
+        uint t = b * 256u + n2 * 128u + lane;
+        dot += phi[phi_base + t] * (dscale * float(s0) * float(q1));
+        dot += phi[phi_base + t + 32u] * (dscale * float(s2) * float(q2));
+        dot += phi[phi_base + t + 64u] * (dscale * float(s4) * float(q3));
+        dot += phi[phi_base + t + 96u] * (dscale * float(s6) * float(q4));
+      }
+    }
+    acc += w * reduce32(dot);
+  }
+  uint accumulate = pc.v[8];
+  if ((gl_SubgroupInvocationID % 32u) == 0u) {
+    outv[idx] = accumulate != 0u ? outv[idx] + acc : acc;
+  }
+}
