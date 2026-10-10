@@ -103,10 +103,11 @@ std::expected<DraftWeightStore, StatusCode> DraftWeightStore::Load(
     if (!buffer) {
       return nullptr;
     }
-    backend.CopyH2D(**buffer, std::span<const std::byte>(
-                                 reinterpret_cast<const std::byte*>(
-                                     data.data()),
-                                 data.size() * 4));
+    const std::span<const std::byte> src(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4);
+    if (!backend.CopyH2D(**buffer, src)) {
+      return nullptr;
+    }
     store.owned_.push_back(std::move(*buffer));
     return store.owned_.back().get();
   };
@@ -139,7 +140,9 @@ std::expected<DraftWeightStore, StatusCode> DraftWeightStore::Load(
     if (!buffer) {
       return nullptr;
     }
-    backend.CopyH2D(**buffer, std::span<const std::byte>(bf16));
+    if (!backend.CopyH2D(**buffer, std::span<const std::byte>(bf16))) {
+      return nullptr;
+    }
     store.owned_.push_back(std::move(*buffer));
     return store.owned_.back().get();
   };

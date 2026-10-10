@@ -49,11 +49,13 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_mxfp4", reinterpret_cast<void*>(&GemmMxFp4Kernel)},
     {"gemm_mxfp4_batched", reinterpret_cast<void*>(&GemmMxFp4BatchedKernel)},
     {"gemm_mxfp4_rows", reinterpret_cast<void*>(&GemmMxFp4RowsKernel)},
+#if defined(TESSERA_ROCM_WMMA)
     {"gemm_mxfp4_wmma", reinterpret_cast<void*>(&GemmMxFp4WmmaKernel)},
     {"gemm_mxfp4_wmma_reduce",
      reinterpret_cast<void*>(&GemmMxFp4WmmaReduceKernel)},
     {"gemm_bf16_wmma", reinterpret_cast<void*>(&GemmBf16WmmaKernel)},
     {"mxfp4_row_ref", reinterpret_cast<void*>(&MxFp4RowRefKernel)},
+#endif
     {"gemm_q5k", reinterpret_cast<void*>(&GemmQ5KKernel)},
     {"gemm_q5k_batched", reinterpret_cast<void*>(&GemmQ5KBatchedKernel)},
     {"gemm_q6k", reinterpret_cast<void*>(&GemmQ6KKernel)},

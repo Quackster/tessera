@@ -907,6 +907,7 @@ __global__ void GemmMxFp4BatchedKernel(const float* a, const unsigned char* w,
 // served reference's small-m path (radiance_mxfp4_fp8_gemm_decode). Buffers:
 // 0 A (m x k fp8), 1 W (packed MXFP4), 2 As (m f32), 3 Wref (n bytes), 4 C
 // (m x n f32); scalars m, n, k. Grid ceil(n/64), block 128.
+#if defined(TESSERA_ROCM_WMMA)
 typedef int WmmaFp8A __attribute__((ext_vector_type(2)));
 typedef float WmmaFp8C __attribute__((ext_vector_type(8)));
 typedef unsigned int WmmaU4 __attribute__((ext_vector_type(4)));
@@ -1193,6 +1194,8 @@ __global__ void GemmBf16WmmaKernel(const float* a, const unsigned short* w,
     }
   }
 }
+#endif  // defined(TESSERA_ROCM_WMMA)
+
 // Built-in "rmsnorm": row-wise RMS norm over rows x cols fp32. One block
 // per row; the row sum reduces across the block so a single-row decode
 // step does not serialize the row on one thread.

@@ -228,6 +228,13 @@ elseif(TESSERA_BACKEND STREQUAL "rocm")
     target_include_directories(tessera PRIVATE src/backends)
     # The ROCm headers require an explicit platform selection.
     target_compile_definitions(tessera PRIVATE __HIP_PLATFORM_AMD__)
+    # The fp8/bf16 tensor-core WMMA kernels use RDNA 4 (gfx12) builtins, so
+    # build and register them only when the target ISA is gfx12. Other ISAs
+    # fall through to the scalar GEMMs at load time (LoadKernel reports
+    # UnsupportedFeature, the caller uses the baseline kernels).
+    if(HIP_ARCHITECTURES MATCHES "gfx12")
+        target_compile_definitions(tessera PRIVATE TESSERA_ROCM_WMMA=1)
+    endif()
     # System ROCm layout (headers in /usr/include, libs in /usr/lib64).
     find_library(TESSERA_HIP_LIB amdhip64 REQUIRED)
     target_link_libraries(tessera PRIVATE ${TESSERA_HIP_LIB})
