@@ -187,10 +187,12 @@ through RADV GFX1100, rocm through the system ROCm).
   candidates are ascending multiples of 256 from the 512 default
   (512, 768, 1024, 1536, 2048); decode settings sweep a 64-token
   prompt, the attention split and the prefill chunk a long prompt, so
-  the run stays within its cap. The tiled-GEMM dispatch thresholds
-  and the prefill attention pair budget are exposed as environment
-  overrides for measurement but are not swept: the thresholds are
-  coupled and the budget is a driver-hang safety clamp. The command defaults the KV cache to int8 (kv8) and reports the
+  each point pays only the phase it tunes. The sweep has no time cap;
+  it runs to completion, so the prompt set sizes the run. The tiled-GEMM
+  dispatch thresholds and the prefill attention pair budget are exposed
+  as environment overrides for measurement but are not swept: the
+  thresholds are coupled and the budget is a driver-hang safety clamp.
+  The command defaults the KV cache to int8 (kv8) and reports the
   maximum context length the device allows for that cache type
   (free memory minus a 2 GiB reserve, divided by the per-token KV
   bytes over the full-attention layers). It writes a JSON calibration

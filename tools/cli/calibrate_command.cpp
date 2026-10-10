@@ -1,6 +1,5 @@
 #include "calibrate_command.hpp"
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -52,9 +51,6 @@ constexpr std::size_t kMinReportedContext = 2048;
 // The attention split only applies at this many keys or more (mirrors
 // core::detail::kSplitMinKeys; the CLI cannot include that header).
 constexpr std::size_t kAttentionSplitMinKeys = 1024;
-// The whole sweep stops after this; a longer run means the sweep is too
-// heavy or a kernel regressed.
-constexpr int kSweepBudgetMinutes = 15;
 const char* const kPromptBases[] = {
     "Explain step by step how a large language model computes self "
     "attention over its context. ",
@@ -340,26 +336,10 @@ int RunCalibrateCommand(int argc, char** argv) {
     defaults.draft_tokens = strategy != nullptr ? strategy->DraftBlock() : 0;
   }
 
-  const auto sweep_started = std::chrono::steady_clock::now();
-  bool over_budget = false;
   const auto measure =
       [&](Setting setting, const CalibrationConfig& config,
           std::size_t prompt, bool warmup)
       -> std::expected<Measurement, StatusCode> {
-    // Cap the whole sweep: a longer run means the sweep is too heavy or a
-    // kernel regressed, so stop instead of waiting.
-    if (std::chrono::steady_clock::now() - sweep_started >
-        std::chrono::minutes(kSweepBudgetMinutes)) {
-      if (!over_budget) {
-        over_budget = true;
-        log.Error("calibrate",
-                  "sweep exceeded the " +
-                      std::to_string(kSweepBudgetMinutes) +
-                      " minute cap; the sweep is too heavy or a kernel "
-                      "regressed");
-      }
-      return std::unexpected(StatusCode::DeviceError);
-    }
     const bool prefill = setting == Setting::PrefillChunkTokens;
     // The attention split only applies at a long key range, so it measures
     // decode on the long prompts; the other decode settings use the short

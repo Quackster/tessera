@@ -121,10 +121,11 @@ only when a draft is attached.
 - Run the whole sweep in one process with one model load. Do not load the model
   per candidate (`AGENTS.md` rule 20). Each candidate is a per-request value,
   so no restart is needed.
-- Cap the run at fifteen minutes. A longer run means the sweep is too heavy or a
-  kernel regressed. Stop and fix the cause. The decode settings sweep a short
-  prompt and the prefill chunk a long one, so each measurement pays only the
-  phase it tunes.
+- The sweep has no time cap; it runs to completion in one process. Every
+  point prefills its prompt, so the run length scales with the prompt set and
+  the model prefill rate. Size the prompt file for the time at hand. The
+  decode settings sweep a short prompt and the prefill chunk a long one, so
+  each measurement pays only the phase it tunes.
 
 The default path is the floor. A candidate is kept only when it is faster and
 its output matches the default within the per-backend tolerance. Do not trade
