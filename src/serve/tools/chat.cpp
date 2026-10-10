@@ -1,5 +1,6 @@
 #include "serve/tools/chat.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -65,6 +66,7 @@ bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
                    const GenerateOptions& options, std::size_t prompt_size,
                    SessionMessage* out_turn) {
   std::string text;
+  const auto gen_started = std::chrono::steady_clock::now();
   auto streamed = engine.GenerateStreaming(
       model, options, [&](std::uint32_t token) {
         if (writer.IsPeerGone()) {
@@ -74,6 +76,8 @@ bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
         text += piece ? *piece : std::string();
         return true;
       });
+  const long long elapsed_ms = MillisBetween(gen_started,
+                                             std::chrono::steady_clock::now());
   if (!streamed) {
     SendGenerationError(writer, streamed.error());
     return false;
@@ -90,6 +94,9 @@ bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
     out_turn->tool_calls_json =
         has_calls ? ToolCallsJson(calls).Dump() : std::string();
     out_turn->stopped = writer.IsPeerGone();
+    out_turn->stats.prompt_tokens = prompt_size;
+    out_turn->stats.completion_tokens = *streamed;
+    out_turn->stats.elapsed_ms = elapsed_ms;
   }
   core::Json message = core::Json::Object();
   message.Set("role", core::Json::String("assistant"));
@@ -124,6 +131,7 @@ bool ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
                   ResponseWriter& writer, const std::string& model_name,
                   const GenerateOptions& options, SessionMessage* out_turn) {
   std::string text;
+  const auto gen_started = std::chrono::steady_clock::now();
   auto streamed = engine.GenerateStreaming(
       model, options, [&](std::uint32_t token) {
         if (writer.IsPeerGone()) {
@@ -133,6 +141,8 @@ bool ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
         text += piece ? *piece : std::string();
         return true;
       });
+  const long long elapsed_ms = MillisBetween(gen_started,
+                                             std::chrono::steady_clock::now());
   if (!streamed) {
     core::Json chunk = core::Json::Object();
     chunk.Set("error", core::Json::String(
@@ -157,6 +167,9 @@ bool ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
     out_turn->tool_calls_json =
         calls.empty() ? std::string() : ToolCallsJson(calls).Dump();
     out_turn->stopped = writer.IsPeerGone();
+    out_turn->stats.prompt_tokens = options.prompt_tokens.size();
+    out_turn->stats.completion_tokens = *streamed;
+    out_turn->stats.elapsed_ms = elapsed_ms;
   }
   if (!reasoning.empty()) {
     core::Json delta = core::Json::Object();

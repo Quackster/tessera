@@ -2,6 +2,7 @@
 
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -19,6 +20,18 @@ namespace tessera::serve {
 // names it unless the caller set a title.
 inline constexpr char kDefaultTitle[] = "New chat";
 
+// Wall-clock stats for one generated assistant turn, measured around
+// GenerateStreaming (queue wait excluded). All zero when the turn did
+// not record stats.
+struct TurnStats {
+  std::size_t prompt_tokens = 0;
+  std::size_t completion_tokens = 0;
+  long long elapsed_ms = 0;
+  // Completion tokens per second over the generation window; 0 when
+  // the turn recorded no time or no tokens.
+  [[nodiscard]] double TokensPerSecond() const;
+};
+
 // One stored chat turn message. Tool turns keep their OpenAI form:
 // an assistant message carries the `tool_calls` array dump, a tool
 // message its `tool_call_id`, so the history re-renders exactly.
@@ -29,11 +42,13 @@ struct SessionMessage {
   std::string tool_calls_json;  // assistant tool_calls array dump, else empty
   std::string tool_call_id;     // tool message id, else empty
   bool stopped = false;   // generation was stopped mid-turn
+  TurnStats stats;        // generation speed, assistant turns only
+  std::uint64_t created_ms = 0;  // unix millis, stamped on store
 };
 
 // True when two messages render the same prompt row: the response-side
-// metadata (reasoning, stopped) is ignored, so a resent OpenAI history
-// still matches the stored one.
+// metadata (reasoning, stopped, stats, created_ms) is ignored, so a
+// resent OpenAI history still matches the stored one.
 [[nodiscard]] bool SamePromptRow(const SessionMessage& a,
                                  const SessionMessage& b);
 

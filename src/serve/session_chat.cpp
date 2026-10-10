@@ -1,5 +1,6 @@
 #include "serve/session_chat.hpp"
 
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -30,6 +31,15 @@ Json MessageJson(const SessionMessage& message) {
     item.Set("tool_call_id", Json::String(message.tool_call_id));
   }
   item.Set("stopped", Json::Bool(message.stopped));
+  item.Set("created_ms",
+           Json::Number(static_cast<double>(message.created_ms)));
+  item.Set("prompt_tokens",
+           Json::Number(static_cast<double>(message.stats.prompt_tokens)));
+  item.Set("completion_tokens",
+           Json::Number(
+               static_cast<double>(message.stats.completion_tokens)));
+  item.Set("tokens_per_second",
+           Json::Number(message.stats.TokensPerSecond()));
   return item;
 }
 
@@ -274,6 +284,8 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
   std::string reasoning_text;
   std::string content_text;
   bool saw_stop = false;
+  TurnStats stats;
+  stats.prompt_tokens = ids->size();
   // One decode step: stop aborts, pause blocks, deltas stream live
   // (buffered mode only accumulates into the totals below).
   auto on_token = [&](std::uint32_t token, bool live) {
@@ -313,15 +325,19 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     Json role = Json::Object();
     role.Set("role", Json::String("assistant"));
     WriteSse(writer, "", SseDelta(std::move(role), ""), false);
+    const auto gen_started = std::chrono::steady_clock::now();
     auto streamed = engine_.GenerateStreaming(
         model_, options,
         [&](std::uint32_t token) { return on_token(token, true); });
+    stats.elapsed_ms = MillisBetween(gen_started,
+                                     std::chrono::steady_clock::now());
     if (!streamed) {
       Json chunk = Json::Object();
       chunk.Set("error", Json::String("generation failed"));
       WriteSse(writer, "", chunk, false);
       return;
     }
+    stats.completion_tokens = *streamed;
     const ThinkStreamer::Deltas tail = streamer.Finish();
     reasoning_text += tail.reasoning;
     content_text += tail.content;
@@ -340,23 +356,26 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
              SseDelta(std::move(end), saw_stop ? "stop" : "length"), false);
     (void)writer.Write("data: [DONE]\n\n");
   } else {
+    const auto gen_started = std::chrono::steady_clock::now();
     auto streamed = engine_.GenerateStreaming(
         model_, options,
         [&](std::uint32_t token) { return on_token(token, false); });
+    stats.elapsed_ms = MillisBetween(gen_started,
+                                     std::chrono::steady_clock::now());
     if (!streamed) {
       SendGenerationError(writer, streamed.error());
       return;
     }
     const std::size_t produced = *streamed;
+    stats.completion_tokens = produced;
     const ThinkStreamer::Deltas tail = streamer.Finish();
     reasoning_text += tail.reasoning;
     content_text += tail.content;
-    session->Append(SessionMessage{"assistant", content_text, reasoning_text,
-                                   /*tool_calls_json=*/{}, /*tool_call_id=*/{},
-                                   saw_stop});
-    Json message = MessageJson(SessionMessage{
-        "assistant", content_text, reasoning_text, /*tool_calls_json=*/{},
-        /*tool_call_id=*/{}, saw_stop});
+    const SessionMessage turn{"assistant", content_text, reasoning_text,
+                              /*tool_calls_json=*/{}, /*tool_call_id=*/{},
+                              saw_stop, stats, /*created_ms=*/0};
+    session->Append(turn);
+    Json message = MessageJson(turn);
     Json response = Json::Object();
     response.Set("message", std::move(message));
     response.Set("usage", UsageJson(ids->size(), produced));
@@ -365,7 +384,7 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
   }
   session->Append(SessionMessage{"assistant", content_text, reasoning_text,
                                    /*tool_calls_json=*/{}, /*tool_call_id=*/{},
-                                   saw_stop});
+                                   saw_stop, stats, /*created_ms=*/0});
 }
 
 // Acquire the session turn and queue for the device: 409 when the
@@ -405,7 +424,7 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   const bool first = session->View().messages.empty();
   session->Append(SessionMessage{"user", message->AsString(), /*reasoning=*/{},
                                  /*tool_calls_json=*/{}, /*tool_call_id=*/{},
-                                 false});
+                                 false, /*stats=*/{}, /*created_ms=*/0});
   if (first) {
     auto view = session->View();
     if (view.title == kDefaultTitle) {

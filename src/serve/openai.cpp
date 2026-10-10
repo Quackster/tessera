@@ -1,5 +1,6 @@
 #include "serve/openai.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -49,12 +50,14 @@ void MaybeNameSession(const std::shared_ptr<Session>& session,
 
 // Assistant turn stored from generated `text`: thinking and tool markup
 // stay out of the history, so a resent OpenAI history still matches.
-SessionMessage AssistantTurn(std::string_view text, bool stopped) {
+SessionMessage AssistantTurn(std::string_view text, bool stopped,
+                             TurnStats stats) {
   std::string before;
   std::string reasoning;
   (void)ParseToolCalls(text, &before, &reasoning);
   return SessionMessage{"assistant", before, reasoning,
-                        /*tool_calls_json=*/{}, /*tool_call_id=*/{}, stopped};
+                        /*tool_calls_json=*/{}, /*tool_call_id=*/{}, stopped,
+                        stats, /*created_ms=*/0};
 }
 
 // Reconcile an incoming OpenAI history with the session: 422 on a
@@ -139,7 +142,7 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
     const SessionView before = session->View();
     session->Append(SessionMessage{"user", prompt_text, /*reasoning=*/{},
                                    /*tool_calls_json=*/{}, /*tool_call_id=*/{},
-                                   false});
+                                   false, /*stats=*/{}, /*created_ms=*/0});
     MaybeNameSession(session, before);
     std::string error;
     prompt_text = RenderPrompt(model, SessionPromptBody(body, session->View()),
@@ -163,11 +166,14 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
                            model.MaxContextLength())) {
     return;
   }
+  TurnStats stats;
+  stats.prompt_tokens = ids->size();
   if (!stream) {
     // GenerateStreaming with a liveness hook instead of Generate:
     // identical tokens, but a closed window aborts the turn instead
     // of decoding into the void.
     std::vector<std::uint32_t> produced;
+    const auto gen_started = std::chrono::steady_clock::now();
     auto streamed = engine.GenerateStreaming(
         model, options, [&](std::uint32_t token) {
           if (writer.IsPeerGone()) {
@@ -176,6 +182,8 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
           produced.push_back(token);
           return true;
         });
+    stats.elapsed_ms = MillisBetween(gen_started,
+                                     std::chrono::steady_clock::now());
     if (!streamed) {
       // A gone peer fails here only on a real error (abort returns a
       // count); anything else is reported when someone listens.
@@ -184,13 +192,14 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
       }
       return;
     }
+    stats.completion_tokens = produced.size();
     auto text = tokenizer.Decode(produced);
     if (!text) {
       SendError(writer, 500, "detokenization failed");
       return;
     }
     if (session != nullptr) {
-      session->Append(AssistantTurn(*text, writer.IsPeerGone()));
+      session->Append(AssistantTurn(*text, writer.IsPeerGone(), stats));
     }
     Json choice = Json::Object();
     choice.Set("text", Json::String(*text));
@@ -210,6 +219,7 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
   (void)writer.SendHeaders(200, "text/event-stream", true);
   std::size_t count = 0;
   std::string text;
+  const auto gen_started = std::chrono::steady_clock::now();
   auto streamed = engine.GenerateStreaming(
       model, options, [&](std::uint32_t token) {
         if (writer.IsPeerGone()) {
@@ -234,8 +244,11 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
         ++count;
         return true;
       });
+  stats.elapsed_ms = MillisBetween(gen_started,
+                                   std::chrono::steady_clock::now());
+  stats.completion_tokens = count;
   if (session != nullptr) {
-    session->Append(AssistantTurn(text, writer.IsPeerGone()));
+    session->Append(AssistantTurn(text, writer.IsPeerGone(), stats));
   }
   if (!streamed) {
     Json chunk = Json::Object();
@@ -314,12 +327,15 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     return;
   }
   const std::string model_name(model.Name());
+  TurnStats stats;
+  stats.prompt_tokens = ids->size();
   if (anthropic) {
     if (!stream) {
       // GenerateStreaming with a liveness hook instead of Generate:
       // identical tokens, but a closed window aborts the turn instead
       // of decoding into the void.
       std::vector<std::uint32_t> produced;
+      const auto gen_started = std::chrono::steady_clock::now();
       auto streamed = engine.GenerateStreaming(
           model, options, [&](std::uint32_t token) {
             if (writer.IsPeerGone()) {
@@ -328,6 +344,8 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
             produced.push_back(token);
             return true;
           });
+      stats.elapsed_ms = MillisBetween(gen_started,
+                                       std::chrono::steady_clock::now());
       if (!streamed) {
         // A gone peer fails here only on a real error (abort returns a
         // count); anything else is reported when someone listens.
@@ -336,10 +354,11 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
         }
         return;
       }
+      stats.completion_tokens = produced.size();
       auto text = tokenizer.Decode(produced);
       if (session != nullptr) {
         session->Append(AssistantTurn(text ? *text : std::string(),
-                                      writer.IsPeerGone()));
+                                      writer.IsPeerGone(), stats));
       }
       Json content = Json::Array();
       Json block = Json::Object();
@@ -379,6 +398,8 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     block_start.Set("content_block", std::move(block));
     WriteSse(writer, "content_block_start", block_start, true);
     std::string text;
+    std::size_t count = 0;
+    const auto gen_started = std::chrono::steady_clock::now();
     (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
       if (writer.IsPeerGone()) {
         return false;
@@ -388,6 +409,7 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
       if (piece) {
         text += *piece;
       }
+      ++count;
       Json delta = Json::Object();
       delta.Set("type", Json::String("content_block_delta"));
       delta.Set("index", Json::Number(0));
@@ -398,8 +420,11 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
       WriteSse(writer, "content_block_delta", delta, true);
       return true;
     });
+    stats.elapsed_ms = MillisBetween(gen_started,
+                                     std::chrono::steady_clock::now());
+    stats.completion_tokens = count;
     if (session != nullptr) {
-      session->Append(AssistantTurn(text, writer.IsPeerGone()));
+      session->Append(AssistantTurn(text, writer.IsPeerGone(), stats));
     }
     Json stop = Json::Object();
     stop.Set("type", Json::String("content_block_stop"));
@@ -422,6 +447,7 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     // identical tokens, but a closed window aborts the turn instead
     // of decoding into the void.
     std::vector<std::uint32_t> produced;
+    const auto chat_started = std::chrono::steady_clock::now();
     auto streamed = engine.GenerateStreaming(
         model, options, [&](std::uint32_t token) {
           if (writer.IsPeerGone()) {
@@ -430,6 +456,8 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
           produced.push_back(token);
           return true;
         });
+    stats.elapsed_ms = MillisBetween(chat_started,
+                                     std::chrono::steady_clock::now());
     if (!streamed) {
       // A gone peer fails here only on a real error (abort returns a
       // count); anything else is reported when someone listens.
@@ -438,13 +466,14 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
       }
       return;
     }
+    stats.completion_tokens = produced.size();
     auto text = tokenizer.Decode(produced);
     if (!text) {
       SendError(writer, 500, "detokenization failed");
       return;
     }
     if (session != nullptr) {
-      session->Append(AssistantTurn(*text, writer.IsPeerGone()));
+      session->Append(AssistantTurn(*text, writer.IsPeerGone(), stats));
     }
     Json message = Json::Object();
     message.Set("role", Json::String("assistant"));
@@ -466,6 +495,8 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   }
   (void)writer.SendHeaders(200, "text/event-stream", true);
   std::string text;
+  std::size_t count = 0;
+  const auto chat_started = std::chrono::steady_clock::now();
   (void)engine.GenerateStreaming(model, options, [&](std::uint32_t token) {
     if (writer.IsPeerGone()) {
       return false;
@@ -474,6 +505,7 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     if (piece) {
       text += *piece;
     }
+    ++count;
     Json delta = Json::Object();
     delta.Set("content", Json::String(piece ? *piece : std::string()));
     Json choice = Json::Object();
@@ -490,8 +522,11 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     WriteSse(writer, "", chunk, false);
     return true;
   });
+  stats.elapsed_ms = MillisBetween(chat_started,
+                                   std::chrono::steady_clock::now());
+  stats.completion_tokens = count;
   if (session != nullptr) {
-    session->Append(AssistantTurn(text, writer.IsPeerGone()));
+    session->Append(AssistantTurn(text, writer.IsPeerGone(), stats));
   }
   (void)writer.Write("data: [DONE]\n\n");
 }

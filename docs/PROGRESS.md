@@ -2267,6 +2267,16 @@ through RADV GFX1201, rocm through the system ROCm).
   OpenAI endpoint code moves from `server.cpp` to `src/serve/openai.*`,
   keeping both files under the size cap.
 
+- 2026-10-10: **Chat UI message meta and thinking box (329/329 `ctest`
+  on vulkan).** Each stored message carries its store timestamp and,
+  for assistant turns, the generation stats (prompt/completion tokens
+  over the serve-layer generation window, `TurnStats::TokensPerSecond`).
+  The web UI shows the timestamp and tok/s at the left of every message
+  (token counts as a hover title), renders thinking in a separate
+  expandable box, and scrolls sticky: the stream follows only while the
+  view sits at the bottom, so reading back never yanks. Verified through
+  the unit suite and the embedded assets; no live GPU run yet.
+
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.

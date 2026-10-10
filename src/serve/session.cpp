@@ -1,5 +1,7 @@
 #include "serve/session.hpp"
 
+#include <chrono>
+#include <cstdint>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -21,10 +23,26 @@ std::string Trim(std::string_view text) {
       text.substr(begin, text.find_last_not_of(" \t\r\n") - begin + 1));
 }
 
+// Unix millis of the store clock, for message timestamps.
+std::uint64_t NowMillis() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
 }  // namespace
 
 Session::Session(std::string id, std::string title)
     : id_(std::move(id)), title_(std::move(title)) {}
+
+double TurnStats::TokensPerSecond() const {
+  if (elapsed_ms <= 0 || completion_tokens == 0) {
+    return 0.0;
+  }
+  return static_cast<double>(completion_tokens) * 1000.0 /
+         static_cast<double>(elapsed_ms);
+}
 
 bool SamePromptRow(const SessionMessage& a, const SessionMessage& b) {
   return a.role == b.role && a.content == b.content &&
@@ -54,6 +72,9 @@ SessionInfo Session::Info() const {
 
 void Session::Append(SessionMessage message) {
   std::lock_guard<std::mutex> lock(control_);
+  if (message.created_ms == 0) {
+    message.created_ms = NowMillis();
+  }
   messages_.push_back(std::move(message));
 }
 
@@ -67,12 +88,22 @@ void Session::SyncHistory(std::vector<SessionMessage> incoming) {
   if (keep == 0 && !messages_.empty()) {
     // No common prefix: the client sent only new turns, so they append
     // and the stored history survives.
+    for (SessionMessage& message : incoming) {
+      if (message.created_ms == 0) {
+        message.created_ms = NowMillis();
+      }
+    }
     messages_.insert(messages_.end(),
                      std::make_move_iterator(incoming.begin()),
                      std::make_move_iterator(incoming.end()));
     return;
   }
   messages_.erase(messages_.begin() + keep, messages_.end());
+  for (auto it = incoming.begin() + keep; it != incoming.end(); ++it) {
+    if (it->created_ms == 0) {
+      it->created_ms = NowMillis();
+    }
+  }
   messages_.insert(messages_.end(), std::make_move_iterator(incoming.begin() +
                                                             keep),
                    std::make_move_iterator(incoming.end()));

@@ -257,22 +257,47 @@ function renderBareMedia(line) {
 function messageHtml(message, thinkingOpen) {
   const thinking = message.reasoning_content
       ? '<details class="thinking"' + (thinkingOpen ? ' open' : '') +
-        '><summary>Thinking</summary>' +
-        renderMarkdown(message.reasoning_content) + '</details>'
+        '><summary>Thinking</summary><div class="thinking-body">' +
+        renderMarkdown(message.reasoning_content) + '</div></details>'
       : '';
   const stopped = message.stopped
       ? ' <span class="stopped-badge">(stopped)</span>' : '';
-  return '<div class="role">' + escapeHtml(message.role) + stopped + '</div>' +
-      '<div class="body">' + thinking +
-      renderMarkdown(message.content || '') + '</div>';
+  return messageMeta(message) +
+      '<div class="content"><div class="role">' + escapeHtml(message.role) +
+      stopped + '</div><div class="body">' + thinking +
+      renderMarkdown(message.content || '') + '</div></div>';
 }
 
-function renderMessages(messages, liveThinkingOpen) {
+// Left-hand per-message meta: the store timestamp plus, for assistant
+// turns that recorded stats, the generation speed (token counts ride
+// along as a hover title).
+function messageMeta(message) {
+  const time = message.created_ms
+      ? '<div>' + escapeHtml(new Date(message.created_ms)
+          .toLocaleTimeString()) + '</div>'
+      : '';
+  const speed = (message.role === 'assistant' &&
+      message.tokens_per_second > 0)
+      ? '<div>' + message.tokens_per_second.toFixed(1) + ' tok/s</div>'
+      : '';
+  const counts = (message.prompt_tokens > 0 || message.completion_tokens > 0)
+      ? ' title="' + (message.prompt_tokens || 0) + ' prompt / ' +
+        (message.completion_tokens || 0) + ' completion tokens"'
+      : '';
+  return '<div class="meta"' + counts + '>' + time + speed + '</div>';
+}
+
+function renderMessages(messages, liveThinkingOpen, scroll) {
   const box = $('messages');
+  // Sticky scroll: follow the stream only while the view sits at the
+  // bottom, so reading back never yanks. A fresh session opens at the
+  // bottom instead.
+  const sticky = scroll !== 'bottom' &&
+      (box.scrollHeight - box.scrollTop - box.clientHeight < 80);
   box.innerHTML = messages.map((message) =>
       '<div class="message' + (message.stopped ? ' stopped' : '') + '">' +
       messageHtml(message, liveThinkingOpen) + '</div>').join('');
-  box.scrollTop = box.scrollHeight;
+  if (scroll === 'bottom' || sticky) box.scrollTop = box.scrollHeight;
 }
 
 function renderSidebar() {
@@ -353,8 +378,12 @@ async function openSession(id) {
     content: m.content || '',
     reasoning_content: m.reasoning_content || '',
     stopped: !!m.stopped,
+    created_ms: m.created_ms || 0,
+    tokens_per_second: m.tokens_per_second || 0,
+    prompt_tokens: m.prompt_tokens || 0,
+    completion_tokens: m.completion_tokens || 0,
   }));
-  renderMessages(currentMessages, false);
+  renderMessages(currentMessages, false, 'bottom');
   renderSidebar();
   updateControls();
   setStatus(session.busy ? 'Generating\u2026' : 'Ready');
@@ -378,6 +407,7 @@ async function streamTurn(path, payload, base, sid) {
   showError('');
   let thinking = '';
   let content = '';
+  const turnStarted = Date.now();
   const draw = (thinkingOpen) => {
     if (myTurn !== activeTurn) return;
     renderMessages(base.concat([{
@@ -385,7 +415,11 @@ async function streamTurn(path, payload, base, sid) {
       content,
       reasoning_content: thinking,
       stopped: false,
-    }]), thinkingOpen);
+      created_ms: turnStarted,
+      tokens_per_second: 0,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+    }]), thinkingOpen, 'sticky');
   };
   draw(true);
   try {
@@ -472,6 +506,10 @@ async function sendMessage() {
     content: text,
     reasoning_content: '',
     stopped: false,
+    created_ms: Date.now(),
+    tokens_per_second: 0,
+    prompt_tokens: 0,
+    completion_tokens: 0,
   };
   const base = currentMessages.concat([userMessage]);
   currentMessages = base;

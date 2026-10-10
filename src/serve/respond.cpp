@@ -74,6 +74,12 @@ std::optional<std::unique_lock<std::mutex>> WaitForGpu(
   }
 }
 
+long long MillisBetween(std::chrono::steady_clock::time_point start,
+                        std::chrono::steady_clock::time_point end) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+      .count();
+}
+
 bool WantsStream(const core::Json& body) {
   const core::Json* value = body.Find("stream");
   return value != nullptr && value->type() == core::Json::Type::Bool &&

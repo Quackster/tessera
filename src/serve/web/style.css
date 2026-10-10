@@ -47,13 +47,35 @@ aside {
 #sessions .del { float: right; color: var(--dim); background: none; border: none; cursor: pointer; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 #messages { flex: 1; overflow-y: auto; padding: 16px; }
-.message { margin-bottom: 16px; max-width: 860px; }
+.message { display: flex; gap: 10px; margin-bottom: 16px; max-width: 940px; }
+.message .meta {
+  flex: 0 0 92px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--dim);
+  padding-top: 2px;
+  line-height: 1.6;
+}
+.message .content { flex: 1; min-width: 0; }
 .message .role { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
 .message .body { background: var(--panel); border-radius: 8px; padding: 10px 12px; }
 .message.stopped .body { border: 1px solid var(--danger); }
 .message .stopped-badge { color: var(--danger); font-size: 12px; }
-details.thinking { margin-bottom: 8px; }
-details.thinking summary { cursor: pointer; color: var(--dim); font-size: 13px; }
+details.thinking {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #101216;
+  margin-bottom: 8px;
+}
+details.thinking summary { cursor: pointer; color: var(--dim); font-size: 13px; padding: 6px 10px; }
+details.thinking .thinking-body {
+  border-top: 1px solid var(--line);
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--dim);
+}
+details.thinking .thinking-body p:first-child { margin-top: 0; }
+details.thinking .thinking-body p:last-child { margin-bottom: 0; }
 pre {
   background: #101216;
   padding: 10px;

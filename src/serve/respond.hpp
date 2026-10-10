@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <mutex>
 #include <optional>
@@ -35,6 +36,10 @@ void SendError(ResponseWriter& writer, int status, const std::string& message);
 // device queue for every endpoint.
 [[nodiscard]] std::optional<std::unique_lock<std::mutex>> WaitForGpu(
     std::mutex& generation, const ResponseWriter& writer);
+// Wall milliseconds between two steady-clock readings, for turn stats.
+[[nodiscard]] long long MillisBetween(
+    std::chrono::steady_clock::time_point start,
+    std::chrono::steady_clock::time_point end);
 // True when the body asks for server-sent events.
 [[nodiscard]] bool WantsStream(const core::Json& body);
 // Send the failure of a generation call: InvalidArgument (for example

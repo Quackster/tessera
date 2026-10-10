@@ -442,9 +442,9 @@ TEST(ServeTest, SessionStoreCrud) {
 TEST(ServeTest, SessionHistoryAndTurnGuard) {
   tessera::serve::SessionStore store;
   auto session = store.Create({});
-  session->Append({"user", "hi", {}, {}, {}, false});
-  session->Append({"assistant", "hello", "thinking", {}, {}, false});
-  session->Append({"assistant", "again", {}, {}, {}, false});
+  session->Append({"user", "hi", {}, {}, {}, false, {}, 0});
+  session->Append({"assistant", "hello", "thinking", {}, {}, false, {}, 0});
+  session->Append({"assistant", "again", {}, {}, {}, false, {}, 0});
   EXPECT_EQ(session->View().messages.size(), 3u);
   EXPECT_EQ(session->PopTrailingAssistant(), 2u);
   EXPECT_EQ(session->View().messages.size(), 1u);
@@ -742,30 +742,34 @@ TEST(ServeTest, SessionIdFromReadsSessionField) {
 // history (no reasoning) still matches the stored turns.
 TEST(ServeTest, SamePromptRowIgnoresResponseMetadata) {
   const tessera::serve::SessionMessage stored{"assistant", "hi", "thinking",
-                                              {}, {}, false};
+                                              {}, {}, false, {}, 0};
   const tessera::serve::SessionMessage resent{"assistant", "hi", {}, {}, {},
-                                              true};
+                                              true, {}, 0};
   EXPECT_TRUE(tessera::serve::SamePromptRow(stored, resent));
   const tessera::serve::SessionMessage other{"assistant", "bye", "thinking",
-                                             {}, {}, false};
+                                             {}, {}, false, {}, 0};
   EXPECT_FALSE(tessera::serve::SamePromptRow(stored, other));
-  const tessera::serve::SessionMessage role{"user", "hi", {}, {}, {}, false};
+  const tessera::serve::SessionMessage role{"user", "hi", {}, {}, {}, false, {}, 0};
   EXPECT_FALSE(tessera::serve::SamePromptRow(stored, role));
   const tessera::serve::SessionMessage tools{"assistant", "hi", "thinking",
-                                             "[{}]", {}, false};
+                                             "[{}]", {}, false, {}, 0};
   EXPECT_FALSE(tessera::serve::SamePromptRow(stored, tools));
+  const tessera::serve::SessionMessage timed{"assistant", "hi", "thinking",
+                                             {}, {}, false, {10, 50, 2000},
+                                             12345};
+  EXPECT_TRUE(tessera::serve::SamePromptRow(stored, timed));
 }
 
 // A full-history resend converges without duplicating the prefix.
 TEST(ServeTest, SyncHistoryMergesFullResend) {
   tessera::serve::SessionStore store;
   auto session = store.Create({});
-  session->Append({"user", "hi", {}, {}, {}, false});
-  session->Append({"assistant", "hello", "thinking", {}, {}, false});
+  session->Append({"user", "hi", {}, {}, {}, false, {}, 0});
+  session->Append({"assistant", "hello", "thinking", {}, {}, false, {}, 0});
   std::vector<tessera::serve::SessionMessage> incoming{
-      {"user", "hi", {}, {}, {}, false},
-      {"assistant", "hello", {}, {}, {}, false},
-      {"user", "again", {}, {}, {}, false},
+      {"user", "hi", {}, {}, {}, false, {}, 0},
+      {"assistant", "hello", {}, {}, {}, false, {}, 0},
+      {"user", "again", {}, {}, {}, false, {}, 0},
   };
   session->SyncHistory(std::move(incoming));
   const auto view = session->View();
@@ -780,9 +784,9 @@ TEST(ServeTest, SyncHistoryMergesFullResend) {
 TEST(ServeTest, SyncHistoryAppendsDeltaOnly) {
   tessera::serve::SessionStore store;
   auto session = store.Create({});
-  session->Append({"user", "hi", {}, {}, {}, false});
+  session->Append({"user", "hi", {}, {}, {}, false, {}, 0});
   std::vector<tessera::serve::SessionMessage> incoming{
-      {"user", "next", {}, {}, {}, false},
+      {"user", "next", {}, {}, {}, false, {}, 0},
   };
   session->SyncHistory(std::move(incoming));
   const auto view = session->View();
@@ -794,11 +798,11 @@ TEST(ServeTest, SyncHistoryTruncatesOnDiverge) {
 
   tessera::serve::SessionStore store;
   auto session = store.Create({});
-  session->Append({"user", "hi", {}, {}, {}, false});
-  session->Append({"assistant", "hello", {}, {}, {}, false});
+  session->Append({"user", "hi", {}, {}, {}, false, {}, 0});
+  session->Append({"assistant", "hello", {}, {}, {}, false, {}, 0});
   std::vector<tessera::serve::SessionMessage> incoming{
-      {"user", "hi", {}, {}, {}, false},
-      {"assistant", "changed", {}, {}, {}, false},
+      {"user", "hi", {}, {}, {}, false, {}, 0},
+      {"assistant", "changed", {}, {}, {}, false, {}, 0},
   };
   session->SyncHistory(std::move(incoming));
   const auto view = session->View();
@@ -810,7 +814,7 @@ TEST(ServeTest, SyncHistoryTruncatesOnDiverge) {
 TEST(ServeTest, SyncHistoryKeepsHistoryOnEmpty) {
   tessera::serve::SessionStore store;
   auto session = store.Create({});
-  session->Append({"user", "hi", {}, {}, {}, false});
+  session->Append({"user", "hi", {}, {}, {}, false, {}, 0});
   std::vector<tessera::serve::SessionMessage> incoming;
   session->SyncHistory(std::move(incoming));
   const auto view = session->View();
@@ -864,7 +868,7 @@ TEST(ServeTest, SessionMessagesFromJsonRejectsBlocks) {
 TEST(ServeTest, SessionHistoryJsonRoundTripsTools) {
   tessera::serve::SessionStore store;
   auto session = store.Create({});
-  session->Append({"user", "hi", {}, {}, {}, false});
+  session->Append({"user", "hi", {}, {}, {}, false, {}, 0});
   session->Append({"assistant", "", "thinking", R"([{"id":"call_0"}])", {},
                    false});
   session->Append({"tool", "data", {}, {}, "call_0", false});
@@ -889,7 +893,8 @@ TEST(ServeTest, SessionHistoryJsonRoundTripsTools) {
 // feeds the sidebar and GET /slots.
 TEST(ServeTest, SessionJsonExposesToolTurns) {
   tessera::serve::SessionMessage turn{"assistant", "", "thinking",
-                                      R"([{"id":"call_0"}])", {}, false};
+                                      R"([{"id":"call_0"}])", {}, false,
+                                      {}, 0};
   tessera::serve::SessionView view{"s1", "title", {turn}, true, false};
   const Json json = tessera::serve::SessionJson(view);
   const Json* messages = json.Find("messages");
@@ -969,4 +974,69 @@ TEST(ServeTest, WaitForGpuAbortsWhenPeerGone) {
   EXPECT_FALSE(slot.has_value());
   held.unlock();
   ::close(pair[0]);
+}
+
+// Turn speed is completions per generation second; unknown stays zero.
+TEST(ServeTest, TurnStatsTokensPerSecond) {
+  const tessera::serve::TurnStats known{128, 50, 2000};
+  EXPECT_DOUBLE_EQ(known.TokensPerSecond(), 25.0);
+  EXPECT_DOUBLE_EQ(tessera::serve::TurnStats{}.TokensPerSecond(), 0.0);
+  EXPECT_DOUBLE_EQ((tessera::serve::TurnStats{128, 50, 0}).TokensPerSecond(),
+                   0.0);
+  EXPECT_DOUBLE_EQ((tessera::serve::TurnStats{128, 0, 2000}).TokensPerSecond(),
+                   0.0);
+}
+
+// The clock helper reports whole millis between two readings.
+TEST(ServeTest, MillisBetweenMeasuresElapsed) {
+  const auto point = std::chrono::steady_clock::now();
+  EXPECT_EQ(tessera::serve::MillisBetween(point, point), 0);
+  EXPECT_GE(tessera::serve::MillisBetween(
+                point, point + std::chrono::milliseconds(7)),
+            7);
+}
+
+// Appends stamp the store time unless the message carries one.
+TEST(ServeTest, AppendStampsCreatedMillis) {
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hi", {}, {}, {}, false, {}, 0});
+  const auto stamped = session->View();
+  ASSERT_EQ(stamped.messages.size(), 1u);
+  EXPECT_NE(stamped.messages[0].created_ms, 0u);
+  session->Append({"user", "again", {}, {}, {}, false, {}, 999});
+  EXPECT_EQ(session->View().messages[1].created_ms, 999u);
+}
+
+// Sync keeps stored stamps and stamps new arrivals.
+TEST(ServeTest, SyncHistoryStampsArrivals) {
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hi", {}, {}, {}, false, {}, 4242});
+  std::vector<tessera::serve::SessionMessage> incoming{
+      {"user", "hi", {}, {}, {}, false, {}, 0},
+      {"assistant", "hello", {}, {}, {}, false, {}, 0},
+  };
+  session->SyncHistory(std::move(incoming));
+  const auto view = session->View();
+  ASSERT_EQ(view.messages.size(), 2u);
+  EXPECT_EQ(view.messages[0].created_ms, 4242u);
+  EXPECT_NE(view.messages[1].created_ms, 0u);
+}
+
+// Session JSON carries the per-message timestamp and turn speed.
+TEST(ServeTest, SessionJsonExposesMessageStats) {
+  tessera::serve::TurnStats stats{128, 50, 2000};
+  tessera::serve::SessionMessage turn{"assistant", "hello", {}, {}, {},
+                                      false, stats, 1700000000000u};
+  tessera::serve::SessionView view{"s1", "title", {turn}, false, false};
+  const Json json = tessera::serve::SessionJson(view);
+  const Json* messages = json.Find("messages");
+  ASSERT_NE(messages, nullptr);
+  ASSERT_EQ(messages->AsArray().size(), 1u);
+  const Json& first = messages->AsArray()[0];
+  EXPECT_DOUBLE_EQ(first.Find("created_ms")->AsNumber(), 1700000000000.0);
+  EXPECT_DOUBLE_EQ(first.Find("prompt_tokens")->AsNumber(), 128.0);
+  EXPECT_DOUBLE_EQ(first.Find("completion_tokens")->AsNumber(), 50.0);
+  EXPECT_DOUBLE_EQ(first.Find("tokens_per_second")->AsNumber(), 25.0);
 }
