@@ -66,6 +66,12 @@ class SpeculativeStrategy {
   // for the batch to amortize the anchor row.
   [[nodiscard]] virtual bool FoldsAnchor() const { return false; }
 
+  // True when the drafter needs the prefill's final anchor recorded before
+  // the first proposal (MTP pairs the first anchor token with the prompt's
+  // last hidden). A drafter that builds its own context during prefill
+  // leaves this false.
+  [[nodiscard]] virtual bool NeedsPrefillAnchor() const { return false; }
+
   // Block indices whose per-position residual hidden the target must capture
   // for the drafter (empty when the drafter does not read target hidden).
   [[nodiscard]] virtual std::span<const std::size_t> CaptureLayers() const = 0;
@@ -107,6 +113,12 @@ class SpeculativeStrategy {
   // hold the per-layer residual hidden for the same position. Record the
   // pre-draft state and append the anchor position to the draft context. A
   // stateless drafter only records the pre-draft state.
+  //
+  // A folding strategy (FoldsAnchor() true) is called after the verify
+  // instead: `token` is the next anchor at `position` (the row the verify's
+  // last committed row selects) and `hidden` is that row's residual hidden,
+  // which is the hidden at `position - 1`. The reference MTP cycle pairs the
+  // anchor token with exactly that hidden, so the engine passes it here.
   virtual std::expected<void, StatusCode> OnAnchor(
       Backend& backend, Model& target, core::DecodeCache& cache,
       std::uint32_t token, std::uint64_t position,

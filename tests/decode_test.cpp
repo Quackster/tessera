@@ -12,6 +12,7 @@
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "core/profile.hpp"
 #include "core/think_budget.hpp"
 #include "models/qwen3_5/state.hpp"
 #include "serve/auto_title.hpp"
@@ -1623,4 +1624,55 @@ TEST(HybridDecodeTest, MaybeAutoTitleKeepsCustomTitle) {
   std::unique_lock<std::mutex> slot(generation);
   tessera::serve::MaybeAutoTitle(*engine, **model, *tokenizer, session, true);
   EXPECT_EQ(session->View().title, "my chat");
+}
+
+// The opt-in decode profiler accumulates wall-clock per phase and reports
+// one line per observed phase; a null profile records nothing.
+TEST(ProfileTest, AccumulatesAndReportsOnlyObservedPhases) {
+  tessera::core::Profile profile;
+  profile.Add(tessera::core::Phase::kForward, 1'500'000);  // 1.5 ms
+  profile.Add(tessera::core::Phase::kForward, 2'500'000);  // 2.5 ms
+  profile.Add(tessera::core::Phase::kDraft, 4'000'000);    // 4 ms
+  EXPECT_EQ(profile.Count(tessera::core::Phase::kForward), 2u);
+  EXPECT_EQ(profile.TotalNs(tessera::core::Phase::kForward), 4'000'000);
+  EXPECT_EQ(profile.Count(tessera::core::Phase::kHead), 0u);
+
+  std::vector<std::string> lines;
+  tessera::log::Diagnostics log;
+  log.SetSink([&lines](tessera::log::Level, std::string_view prefix,
+                       std::string_view message) {
+    lines.push_back(std::string(prefix) + ": " + std::string(message));
+  });
+  profile.Report(log, "engine 1", 2);
+  ASSERT_EQ(lines.size(), 2u);  // only the observed phases
+  EXPECT_EQ(lines[0],
+            "engine 1: profile: target forward 4 ms over 2 call(s), "
+            "2 ms avg, 2 ms/step");
+  EXPECT_EQ(lines[1],
+            "engine 1: profile: draft 4 ms over 1 call(s), 4 ms avg, "
+            "2 ms/step");
+}
+
+TEST(ProfileTest, PhaseScopeMeasuresOnlyWithAProfile) {
+  tessera::core::Profile profile;
+  {
+    tessera::core::PhaseScope scope(nullptr, tessera::core::Phase::kVerify);
+  }
+  EXPECT_EQ(profile.Count(tessera::core::Phase::kVerify), 0u);
+  {
+    tessera::core::PhaseScope scope(&profile, tessera::core::Phase::kVerify);
+  }
+  EXPECT_EQ(profile.Count(tessera::core::Phase::kVerify), 1u);
+}
+
+TEST(ProfileTest, EnvSwitchTreatsZeroAndEmptyAsOff) {
+  unsetenv("TESSERA_PROFILE");
+  EXPECT_FALSE(tessera::core::DecodeProfilingEnabled());
+  setenv("TESSERA_PROFILE", "0", 1);
+  EXPECT_FALSE(tessera::core::DecodeProfilingEnabled());
+  setenv("TESSERA_PROFILE", "", 1);
+  EXPECT_FALSE(tessera::core::DecodeProfilingEnabled());
+  setenv("TESSERA_PROFILE", "1", 1);
+  EXPECT_TRUE(tessera::core::DecodeProfilingEnabled());
+  unsetenv("TESSERA_PROFILE");
 }

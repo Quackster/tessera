@@ -9,6 +9,7 @@
 
 #include "core/decode_internal.hpp"
 #include "core/numerics/conv.hpp"
+#include "core/profile.hpp"
 #include "models/qwen3_5/architecture.hpp"
 #include "models/qwen3_5/internal.hpp"
 #include "models/qwen3_5/state.hpp"
@@ -188,6 +189,9 @@ std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
                                        const TransformerConfig& cfg,
                                        Qwen35State& h,
                                        std::size_t layer) {
+  core::Profile* const deep =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
+  core::PhaseScope ffn_scope(deep, core::Phase::kFfn);
   const std::string base = "blk." + std::to_string(layer) + ".";
   auto mlp_norm =
       NeedWeight(model, base + "post_attention_norm.weight", DType::F32);
@@ -209,6 +213,9 @@ std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
                     *h.proj, 1, cfg.hidden_dim, cfg.ffn_dim) ||
       !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, cfg.hidden_dim)) {
     return std::unexpected(StatusCode::DeviceError);
+  }
+  if (deep != nullptr) {
+    backend.Synchronize();  // profile attribution only
   }
   return {};
 }
@@ -323,6 +330,7 @@ std::expected<void, StatusCode> EnsureHybridReady(
     Backend& backend, const TransformerConfig& cfg, DecodeCache& cache,
     const LinearGeometry& g) {
   Qwen35State& h = State(cache);
+  h.profile = cache.profile;
   if (!h.ready) {
     auto load = [&backend](std::unique_ptr<Kernel>& slot,
                            std::string_view name) -> bool {
@@ -520,17 +528,24 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
     }
     return StatusCode::Ok;
   };
+  core::Profile* const deep_profile =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
   for (std::size_t l = 0; l < cfg.layers; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
+      core::PhaseScope layer_scope(deep_profile, core::Phase::kFullLayer);
       if (auto block = RunFullBlock(backend, model, cfg, h, l, p, h.full[l]);
           !block) {
         return std::unexpected(block.error());
+      }
+      if (deep_profile != nullptr) {
+        backend.Synchronize();  // profile attribution only
       }
       if (capture_layer(l) != StatusCode::Ok) {
         return std::unexpected(StatusCode::DeviceError);
       }
       continue;
     }
+    core::PhaseScope layer_scope(deep_profile, core::Phase::kLinearLayer);
     const std::string base = "blk." + std::to_string(l) + ".";
     auto norm = NeedWeight(model, base + "attn_norm.weight", DType::F32);
     if (!norm) {
@@ -619,10 +634,18 @@ std::expected<std::vector<float>, StatusCode> Qwen35Architecture::Logits(
     std::uint32_t token, std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
     std::vector<Buffer*>* capture, const Buffer* embedding) const {
-  auto forward = Forward(backend, model, cache, token, hidden_out,
-                         capture_layers, capture, embedding);
-  if (!forward) {
-    return std::unexpected(forward.error());
+  core::Profile* profile = cache.profile;
+  {
+    core::PhaseScope scope(profile, core::Phase::kForward);
+    auto forward = Forward(backend, model, cache, token, hidden_out,
+                           capture_layers, capture, embedding);
+    if (!forward) {
+      return std::unexpected(forward.error());
+    }
+    // Profile attribution only: the download below would sync anyway.
+    if (profile != nullptr) {
+      backend.Synchronize();
+    }
   }
   auto config = model.Config();
   if (!config) {
@@ -630,10 +653,17 @@ std::expected<std::vector<float>, StatusCode> Qwen35Architecture::Logits(
   }
   const TransformerConfig& cfg = *config;
   Qwen35State& h = State(cache);
-  auto head = RunOutputHead(backend, model, cfg, h);
-  if (!head) {
-    return std::unexpected(head.error());
+  {
+    core::PhaseScope scope(profile, core::Phase::kHead);
+    auto head = RunOutputHead(backend, model, cfg, h);
+    if (!head) {
+      return std::unexpected(head.error());
+    }
+    if (profile != nullptr) {
+      backend.Synchronize();
+    }
   }
+  core::PhaseScope scope(profile, core::Phase::kDownload);
   backend.Synchronize();
   return detail::DownloadF32(backend, *h.logits);
 }
@@ -643,10 +673,17 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::GreedyToken(
     std::uint32_t token, std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
     std::vector<Buffer*>* capture, const Buffer* embedding) const {
-  auto forward = Forward(backend, model, cache, token, hidden_out,
-                         capture_layers, capture, embedding);
-  if (!forward) {
-    return std::unexpected(forward.error());
+  core::Profile* profile = cache.profile;
+  {
+    core::PhaseScope scope(profile, core::Phase::kForward);
+    auto forward = Forward(backend, model, cache, token, hidden_out,
+                           capture_layers, capture, embedding);
+    if (!forward) {
+      return std::unexpected(forward.error());
+    }
+    if (profile != nullptr) {
+      backend.Synchronize();
+    }
   }
   auto config = model.Config();
   if (!config) {
@@ -654,11 +691,18 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::GreedyToken(
   }
   const TransformerConfig& cfg = *config;
   Qwen35State& h = State(cache);
-  auto head = RunOutputHead(backend, model, cfg, h);
-  if (!head) {
-    return std::unexpected(head.error());
+  {
+    core::PhaseScope scope(profile, core::Phase::kHead);
+    auto head = RunOutputHead(backend, model, cfg, h);
+    if (!head) {
+      return std::unexpected(head.error());
+    }
+    if (profile != nullptr) {
+      backend.Synchronize();
+    }
   }
   // Top-1 on the device: read back one id instead of the whole vocabulary.
+  core::PhaseScope scope(profile, core::Phase::kDownload);
   auto best = DeviceRowArgMax(backend, h, *h.logits, 1, cfg.vocab_size);
   if (!best) {
     return std::unexpected(best.error());

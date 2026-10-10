@@ -45,6 +45,13 @@ class MtpStrategy final : public SpeculativeStrategy {
   }
 
   std::size_t DraftBlock() const override { return block_; }
+  // The anchor rides the verify batch (the reference MTP cycle): the draft
+  // runs before the target sees the anchor, pairing the anchor token with
+  // the hidden one position before, and the verify scores
+  // [anchor, drafts...] in one batched forward. OnAnchor is therefore
+  // called after the verify with the next anchor.
+  [[nodiscard]] bool FoldsAnchor() const override { return true; }
+  [[nodiscard]] bool NeedsPrefillAnchor() const override { return true; }
   std::span<const std::size_t> CaptureLayers() const override { return {}; }
   std::span<Buffer* const> CaptureBuffers() override { return {}; }
 
@@ -72,10 +79,14 @@ class MtpStrategy final : public SpeculativeStrategy {
       std::span<const float> hidden) override {
     (void)backend;
     (void)target;
+    // Folding contract: `token` is the next anchor at `position` and
+    // `hidden` is the target residual hidden at `position - 1`; the first
+    // MTP step consumes that pair at KV slot `position`.
     anchor_ = token;
     anchor_pos_ = position;
     chain_hidden_.assign(hidden.begin(), hidden.end());
     mtp_base_ = arch_->DraftRows(cache);
+    chain_rows_ = 0;
     return {};
   }
 
@@ -86,15 +97,19 @@ class MtpStrategy final : public SpeculativeStrategy {
     (void)current_logits;
     std::vector<float> chain = chain_hidden_;
     std::uint32_t tok = anchor;
-    std::uint64_t pos = anchor_pos_ + 1;
     std::size_t count = 0;
     for (std::size_t i = 0; i < block_ && i < drafts.size(); ++i) {
       // The last draft in the step is not chained, so skip its hidden-state
       // download: only the draft token is needed from it.
       const bool last = (i + 1 >= block_) || (i + 1 >= drafts.size());
       std::vector<float> next_chain;
-      auto draft = core::MtpDraftStep(backend, target, cache, chain, tok, pos,
-                                      last ? nullptr : &next_chain);
+      // Slot `anchor_pos_ + i`: the first step writes the anchor's own
+      // slot with (anchor token, hidden at anchor_pos_ - 1) and predicts
+      // the next token; later steps chain the previous MTP output hidden,
+      // exactly like the reference cycle.
+      auto draft =
+          core::MtpDraftStep(backend, target, cache, chain, tok,
+                             anchor_pos_ + i, last ? nullptr : &next_chain);
       if (!draft) {
         if (draft.error() == StatusCode::UnsupportedFeature) {
           break;
@@ -106,8 +121,8 @@ class MtpStrategy final : public SpeculativeStrategy {
         chain = std::move(next_chain);
       }
       tok = *draft;
-      ++pos;
       ++count;
+      ++chain_rows_;
     }
     return count;
   }
@@ -117,7 +132,12 @@ class MtpStrategy final : public SpeculativeStrategy {
                                          std::size_t accepted) override {
     (void)backend;
     (void)target;
-    arch_->DraftTruncate(cache, mtp_base_ + accepted);
+    // Keep the rows for the committed positions: the anchor's row (step 0)
+    // plus one per accepted draft, never more than the chain wrote. The
+    // next cycle rewrites the following slot in order, so rejected rows
+    // never enter the attention window.
+    const std::size_t keep = std::min(chain_rows_, accepted + 1);
+    arch_->DraftTruncate(cache, mtp_base_ + keep);
     return {};
   }
 
@@ -127,6 +147,9 @@ class MtpStrategy final : public SpeculativeStrategy {
   std::uint64_t mtp_base_ = 0;
   std::uint64_t anchor_pos_ = 0;
   std::uint32_t anchor_ = 0;
+  // Rows the current chain wrote (one per MtpDraftStep); Commit keeps at
+  // most that many plus the anchor.
+  std::size_t chain_rows_ = 0;
   std::vector<float> chain_hidden_;
 };
 

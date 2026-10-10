@@ -87,6 +87,76 @@ __global__ void GemmIq4XsKernel(const float* a, const unsigned char* w,
   c[idx] = acc;
 }
 
+// Built-in "gemm_iq4xs_vec": warp-per-output IQ4_XS GEMV. Lane l owns
+// sub-block ib = l/4 and its four nibble bytes at jj = (l%4)*4, so its
+// eight elements are ib*32+jj..+3 (low nibbles) and +16 (high nibbles).
+// The block scale is read once per lane and the partial sums reduce with
+// five warp shuffles; the grid is ceil(m n / 8) with 256-thread
+// workgroups (eight outputs each), grid_y the split-K chunk (see
+// gemm_q4k_vec).
+__global__ void GemmIq4XsVecKernel(const float* a, const unsigned char* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n, unsigned long long k,
+                                   unsigned long long split) {
+  const unsigned long long warps = blockDim.x >> 5;
+  const unsigned long long total = m * n;
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * warps + (threadIdx.x >> 5);
+  if (idx >= total) {
+    return;
+  }
+  const unsigned long long blocks = k / 256;
+  const unsigned long long per = blocks / split;
+  const unsigned long long b0 = static_cast<unsigned long long>(blockIdx.y) * per;
+  const unsigned int lane = threadIdx.x & 31u;
+  const unsigned int ib = lane >> 2;
+  const unsigned int jj = (lane & 3u) * 4u;
+  const float* av = a + (idx / n) * k + b0 * 256;
+  const unsigned char* wr = w + (idx % n) * blocks * 136 + b0 * 136;
+  float acc = 0.0f;
+  for (unsigned long long b = 0; b < per; ++b) {
+    const unsigned char* base = wr + b * 136;
+    std::uint16_t d_bits = 0;
+    std::uint16_t scales_h = 0;
+    std::memcpy(&d_bits, base, 2);
+    std::memcpy(&scales_h, base + 2, 2);
+    const float d = Fp16ToFloatDev(d_bits);
+    const unsigned char packed = base[4 + ib / 2];
+    const int ls = ((packed >> (4 * (ib % 2))) & 15) |
+                   (((scales_h >> (2 * ib)) & 3) << 4);
+    const float dl = d * (ls - 32);
+    unsigned int word = 0;
+    std::memcpy(&word, base + 8 + ib * 16 + jj, 4);
+    const float* e0 = av + b * 256 + ib * 32 + jj;
+    float4 v0;
+    float4 v1;
+    std::memcpy(&v0, e0, 16);
+    std::memcpy(&v1, e0 + 16, 16);
+    acc = fmaf(v0.x, dl * static_cast<float>(kIq4NlValuesDev[word & 15u]), acc);
+    acc = fmaf(v0.y, dl * static_cast<float>(kIq4NlValuesDev[(word >> 8) & 15u]),
+               acc);
+    acc = fmaf(v0.z, dl * static_cast<float>(kIq4NlValuesDev[(word >> 16) & 15u]),
+               acc);
+    acc = fmaf(v0.w, dl * static_cast<float>(kIq4NlValuesDev[(word >> 24) & 15u]),
+               acc);
+    acc = fmaf(v1.x, dl * static_cast<float>(kIq4NlValuesDev[(word >> 4) & 15u]),
+               acc);
+    acc = fmaf(v1.y, dl * static_cast<float>(kIq4NlValuesDev[(word >> 12) & 15u]),
+               acc);
+    acc = fmaf(v1.z, dl * static_cast<float>(kIq4NlValuesDev[(word >> 20) & 15u]),
+               acc);
+    acc = fmaf(v1.w, dl * static_cast<float>(kIq4NlValuesDev[(word >> 28) & 15u]),
+               acc);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(~0ull, acc, off, 32);
+  }
+  if (lane == 0u) {
+    c[static_cast<unsigned long long>(blockIdx.y) * total + idx] = acc;
+  }
+}
+
 // Built-in "gemm_iq4xs_batched": tiled C = A x dequant(W)^T for a batch.
 // One workgroup handles 8 activation rows x one weight column; the 256
 // IQ4_XS elements of a block are dequantized once into shared memory and

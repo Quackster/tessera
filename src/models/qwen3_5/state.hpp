@@ -9,6 +9,10 @@
 #include "core/decode.hpp"
 #include "tessera/backend.hpp"
 
+namespace tessera::core {
+class Profile;
+}
+
 namespace tessera::models::qwen3_5 {
 
 // Scratch for the multi-token (batched) hybrid forward used by
@@ -108,6 +112,11 @@ struct Qwen35State final : core::ArchState {
   std::unordered_map<int, std::unique_ptr<Kernel>> embed_kernels;
   // Token ids for the embedding-gather launch, grown on demand.
   std::unique_ptr<Buffer> embed_ids;
+  // Split-K scratch for the warp-per-output GEMV family (split x m x n
+  // floats) and the ordered reduce kernel that sums the partials, both
+  // grown/loaded on demand.
+  std::unique_ptr<Buffer> gemv_part;
+  std::unique_ptr<Kernel> gemv_reduce_kernel;
   // Tiled batched GEMM kernels, keyed by dtype (used when rows > 1).
   std::unordered_map<int, std::unique_ptr<Kernel>> gemm_tiled;
   // Shared scratch buffers (sized from the config).
@@ -147,6 +156,8 @@ struct Qwen35State final : core::ArchState {
   // Host-side cache of constant weights (conv kernels) and the sequence
   // position (full-layer KV rows equal the position).
   std::unordered_map<std::string, std::vector<float>> host_weights;
+  // Opt-in decode phase profiler, mirrored from the cache on first use.
+  core::Profile* profile = nullptr;
   std::size_t position = 0;  // full-layer KV rows equal the position
   bool ready = false;
 };

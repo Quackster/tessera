@@ -14,6 +14,7 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/generate_helpers.hpp"
+#include "core/profile.hpp"
 #include "core/sampling.hpp"
 #include "core/think_budget.hpp"
 
@@ -86,6 +87,11 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   cache.kv_type = options.kv_type;
   cache.tuning.mxfp4_split_target = options.mxfp4_split_target;
   cache.tuning.mxfp4_split_cap = options.mxfp4_split_cap;
+  // Opt-in decode phase profiler (TESSERA_PROFILE=1). The profile lives for
+  // the whole generation and is reported after the decode summary.
+  core::Profile profile(core::DecodeProfilingDeep());
+  const bool profiling = core::DecodeProfilingEnabled();
+  cache.profile = profiling ? &profile : nullptr;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
@@ -211,10 +217,24 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   std::vector<std::uint32_t> drafts(block);
   std::uint32_t next = pick(first_logits);
   std::uint64_t position = prompt.size();
+  // A folding drafter drafts before the target sees the anchor, pairing the
+  // anchor token with the prefill's final hidden (the hidden at one
+  // position before). Seed it here; the loop re-records it after each
+  // verify. DFlash2 records its own context during prefill and ignores the
+  // values.
+  if (strategy != nullptr && block > 0 && strategy->NeedsPrefillAnchor() &&
+      !hidden.empty()) {
+    auto seeded =
+        strategy->OnAnchor(*backend_, model, cache, next, position, hidden);
+    if (!seeded) {
+      return std::unexpected(seeded.error());
+    }
+  }
   std::size_t produced = 0;
   std::size_t spec_proposed = 0;
   std::size_t spec_accepted = 0;
   std::size_t spec_steps = 0;
+  std::size_t loop_steps = 0;
   bool stopped = false;
   bool aborted = false;
   // Thinking budget: resolve the tags once and scan the prompt, so a
@@ -245,8 +265,12 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     std::vector<float> close_logits;
     for (std::uint32_t id : think_close) {
       // Forced markup bypasses the stop check like any protocol token.
-      auto logits = core::DecodeLogits(*backend_, model, cache, id, &hidden,
-                                       capture_layers_ptr, capture_ptr);
+      std::expected<std::vector<float>, StatusCode> logits;
+      {
+        core::PhaseScope scope(cache.profile, core::Phase::kAnchor);
+        logits = core::DecodeLogits(*backend_, model, cache, id, &hidden,
+                                    capture_layers_ptr, capture_ptr);
+      }
       if (!logits) {
         diagnostics_.Warn("engine", std::string("think force-close failed: ") +
                                         std::string(ToString(logits.error())));
@@ -284,6 +308,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     return pick(close_logits);
   };
   while (produced < max_completion_tokens) {
+    ++loop_steps;
     if (think.closeOwed()) {
       diagnostics_.Info("engine", "thinking budget (" +
                                        std::to_string(
@@ -316,20 +341,29 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     // is read once per step. The drafter context already excludes this anchor:
     // OnAnchor runs after the verify and appends the anchor it produced.
     if (strategy != nullptr && block > 0 && strategy->FoldsAnchor()) {
-      auto count = strategy->Draft(*backend_, model, cache, {}, next, drafts);
+      std::expected<std::size_t, StatusCode> count;
+      {
+        core::PhaseScope scope(cache.profile, core::Phase::kDraft);
+        count = strategy->Draft(*backend_, model, cache, {}, next, drafts);
+      }
       if (!count) {
         return std::unexpected(count.error());
       }
-      if (*count <= 1) {
+      if (*count == 0) {
         // No usable proposal: decode the anchor alone and take its greedy
         // token. The drafter context still gains the anchor below.
-        auto logits = core::DecodeLogits(*backend_, model, cache, next, &hidden,
-                                         capture_layers_ptr, capture_ptr);
+        std::expected<std::vector<float>, StatusCode> logits;
+        {
+          core::PhaseScope scope(cache.profile, core::Phase::kAnchor);
+          logits = core::DecodeLogits(*backend_, model, cache, next, &hidden,
+                                      capture_layers_ptr, capture_ptr);
+        }
         if (!logits) {
           return std::unexpected(logits.error());
         }
-        auto anchored = strategy->OnAnchor(*backend_, model, cache, next,
-                                           position, hidden);
+        const std::uint32_t picked = pick(*logits);
+        auto anchored = strategy->OnAnchor(*backend_, model, cache, picked,
+                                           position + 1, hidden);
         if (!anchored) {
           return std::unexpected(anchored.error());
         }
@@ -339,20 +373,30 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
         if (!committed) {
           return std::unexpected(committed.error());
         }
-        next = pick(*logits);
+        next = picked;
         ++position;
         continue;
       }
       std::span<const std::uint32_t> proposal(drafts.data(), *count);
-      auto verify =
-          core::VerifyDraft(*backend_, model, cache, proposal, {}, next,
-                            /*hidden_out=*/nullptr, capture_layers_ptr,
-                            capture_ptr);
+      std::expected<DraftVerification, StatusCode> verify;
+      {
+        core::PhaseScope scope(cache.profile, core::Phase::kVerify);
+        // The anchor leads the batch and its row plus the committed drafts
+        // advance the cache; `hidden` receives the last committed row's
+        // residual hidden, which the drafter pairs with the next anchor
+        // (the reference MTP contract: token at p with the hidden at p-1).
+        verify = core::VerifyDraft(*backend_, model, cache, proposal, {}, next,
+                                   &hidden, capture_layers_ptr, capture_ptr);
+      }
       if (!verify) {
         return std::unexpected(verify.error());
       }
-      auto anchored = strategy->OnAnchor(*backend_, model, cache, next,
-                                         position, {});
+      // Record the next anchor for the drafter: the token the last
+      // committed row selects, at its absolute position, with that row's
+      // hidden (the hidden at one position before the anchor).
+      auto anchored = strategy->OnAnchor(
+          *backend_, model, cache, verify->next_token,
+          position + 1 + verify->accepted, hidden);
       if (!anchored) {
         return std::unexpected(anchored.error());
       }
@@ -364,6 +408,18 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
       spec_proposed += *count;
       spec_accepted += verify->accepted;
       ++spec_steps;
+      if (profiling) {
+        // Per-step draft trace: the accepted draft (or the target's
+        // replacement on a reject), so an acceptance problem is
+        // visible token by token.
+        diagnostics_.Info(
+            "engine", "draft step " + std::to_string(spec_steps) +
+                          ": proposed " + std::to_string(drafts[0]) +
+                          (verify->accepted > 0
+                               ? " accepted"
+                               : " rejected, target picked " +
+                                     std::to_string(verify->next_token)));
+      }
       for (std::size_t i = 0; i < verify->accepted; ++i) {
         if (produced >= max_completion_tokens) {
           break;
@@ -405,8 +461,12 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     // position, which the drafter chains from; without a drafter nothing
     // reads it, so it is not downloaded.
     std::vector<float>* hidden_out = strategy != nullptr ? &hidden : nullptr;
-    auto logits = core::DecodeLogits(*backend_, model, cache, next, hidden_out,
-                                     capture_layers_ptr, capture_ptr);
+    std::expected<std::vector<float>, StatusCode> logits;
+    {
+      core::PhaseScope scope(cache.profile, core::Phase::kAnchor);
+      logits = core::DecodeLogits(*backend_, model, cache, next, hidden_out,
+                                  capture_layers_ptr, capture_ptr);
+    }
     if (!logits) {
       diagnostics_.Warn(
           "engine", std::string("generation step failed: ") +
@@ -419,16 +479,24 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
       if (!anchored) {
         return std::unexpected(anchored.error());
       }
-      auto count =
-          strategy->Draft(*backend_, model, cache, *logits, next, drafts);
+      std::expected<std::size_t, StatusCode> count;
+      {
+        core::PhaseScope scope(cache.profile, core::Phase::kDraft);
+        count =
+            strategy->Draft(*backend_, model, cache, *logits, next, drafts);
+      }
       if (!count) {
         return std::unexpected(count.error());
       }
       if (*count > 0) {
         std::span<const std::uint32_t> proposal(drafts.data(), *count);
-        auto verify = core::VerifyDraft(*backend_, model, cache, proposal,
-                                        *logits, std::nullopt, &hidden,
-                                        capture_layers_ptr, capture_ptr);
+        std::expected<DraftVerification, StatusCode> verify;
+        {
+          core::PhaseScope scope(cache.profile, core::Phase::kVerify);
+          verify = core::VerifyDraft(*backend_, model, cache, proposal,
+                                     *logits, std::nullopt, &hidden,
+                                     capture_layers_ptr, capture_ptr);
+        }
         if (!verify) {
           return std::unexpected(verify.error());
         }
@@ -481,6 +549,9 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - decode_started)
           .count());
+  if (profiling) {
+    profile.Report(diagnostics_, "engine", loop_steps);
+  }
   if (produced > 0) {
     const long long decode_ms_ll = static_cast<long long>(decode_ms);
     const long long decode_tps =

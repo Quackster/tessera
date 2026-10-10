@@ -7,6 +7,7 @@
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "core/profile.hpp"
 #include "models/qwen3_5/internal.hpp"
 #include "models/qwen3_5/state.hpp"
 
@@ -60,61 +61,84 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
     if (!gemm_eh || !gemm_out) {
       return std::unexpected(StatusCode::UnsupportedFeature);
     }
-    // e_n = RMSNorm(embed(token), enorm).
-    auto gathered = GatherEmbeddingRows(
-        backend, model, h, std::span<const std::uint32_t>(&token, 1),
-        hidden_dim, *h.mtp_h);
-    if (!gathered) {
-      return std::unexpected(gathered.error());
-    }
-    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.mtp_h, *(*enorm)->device,
-                       *h.mtp_h, 1, hidden_dim, cfg.norm_eps)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-    // h_n = RMSNorm(hidden, hnorm).
-    if (!UploadF32(backend, *h.xn,
-                   std::vector<float>(hidden.begin(), hidden.end())) ||
-        !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.xn, *(*hnorm)->device,
-                       *h.xn, 1, hidden_dim, cfg.norm_eps)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-    // fused = concat([e_n, h_n]); x = eh_proj(fused).
-    if (!backend.CopyD2D(*h.mtp_h, 0, *h.mtp_fused, 0, hidden_dim * 4) ||
-        !backend.CopyD2D(*h.xn, 0, *h.mtp_fused, hidden_dim * 4,
-                         hidden_dim * 4) ||
-        !ProjectDevice(backend, *(*gemm_eh), *h.mtp_fused, *(*eh)->device, *h.x,
-                       1, hidden_dim, 2 * hidden_dim)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-    const std::uint64_t triples[3] = {pos, pos, pos};
-    if (!backend.CopyH2D(*h.pos,
-                         std::span<const std::byte>(
-                             reinterpret_cast<const std::byte*>(triples),
-                             sizeof(triples)))) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-    if (auto block = RunFullBlock(backend, model, cfg, h, layer, pos, h.mtp_kv);
-        !block) {
-      return std::unexpected(block.error());
-    }
-    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*shnorm)->device,
-                       *h.xn, 1, hidden_dim, cfg.norm_eps) ||
-        !ProjectDevice(backend, *(*gemm_out), *h.xn, *(*output)->device,
-                       *h.logits, 1, cfg.vocab_size, hidden_dim)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-    if (mtp_hidden_out != nullptr) {
-      // The shared-head norm output is the MTP hidden to chain the next
-      // draft.
-      auto down = DownloadF32(backend, *h.xn);
-      if (!down) {
-        return std::unexpected(down.error());
+    core::Profile* profile = cache.profile;
+    {
+      // e_n = RMSNorm(embed(token), enorm); h_n = RMSNorm(hidden, hnorm);
+      // x = eh_proj(concat([e_n, h_n])).
+      core::PhaseScope scope(profile, core::Phase::kDraftPrep);
+      auto gathered = GatherEmbeddingRows(
+          backend, model, h, std::span<const std::uint32_t>(&token, 1),
+          hidden_dim, *h.mtp_h);
+      if (!gathered) {
+        return std::unexpected(gathered.error());
       }
-      *mtp_hidden_out = std::move(*down);
+      if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.mtp_h,
+                         *(*enorm)->device, *h.mtp_h, 1, hidden_dim,
+                         cfg.norm_eps)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      // h_n = RMSNorm(hidden, hnorm).
+      if (!UploadF32(backend, *h.xn,
+                     std::vector<float>(hidden.begin(), hidden.end())) ||
+          !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.xn, *(*hnorm)->device,
+                         *h.xn, 1, hidden_dim, cfg.norm_eps)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      // fused = concat([e_n, h_n]); x = eh_proj(fused).
+      if (!backend.CopyD2D(*h.mtp_h, 0, *h.mtp_fused, 0, hidden_dim * 4) ||
+          !backend.CopyD2D(*h.xn, 0, *h.mtp_fused, hidden_dim * 4,
+                           hidden_dim * 4) ||
+          !ProjectDevice(backend, *(*gemm_eh), *h.mtp_fused, *(*eh)->device,
+                         *h.x, 1, hidden_dim, 2 * hidden_dim)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      if (profile != nullptr) {
+        backend.Synchronize();
+      }
+    }
+    {
+      core::PhaseScope scope(profile, core::Phase::kDraftBlock);
+      const std::uint64_t triples[3] = {pos, pos, pos};
+      if (!backend.CopyH2D(*h.pos,
+                           std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(triples),
+                               sizeof(triples)))) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      if (auto block = RunFullBlock(backend, model, cfg, h, layer, pos, h.mtp_kv);
+          !block) {
+        return std::unexpected(block.error());
+      }
+      if (profile != nullptr) {
+        backend.Synchronize();
+      }
+    }
+    {
+      core::PhaseScope scope(profile, core::Phase::kDraftHead);
+      if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*shnorm)->device,
+                         *h.xn, 1, hidden_dim, cfg.norm_eps) ||
+          !ProjectDevice(backend, *(*gemm_out), *h.xn, *(*output)->device,
+                         *h.logits, 1, cfg.vocab_size, hidden_dim)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      if (mtp_hidden_out != nullptr) {
+        // The post-FFN residual is the MTP hidden the next chained step
+        // consumes (the reference feeds t_mtp_out, before the shared-head
+        // norm, back as the next step's prev_hidden).
+        auto down = DownloadF32(backend, *h.x);
+        if (!down) {
+          return std::unexpected(down.error());
+        }
+        *mtp_hidden_out = std::move(*down);
+      }
+      if (profile != nullptr) {
+        backend.Synchronize();
+      }
     }
     // Argmax over the shared-head logits on the device. Prefer an on-device
     // top-1 so a draft never downloads the whole vocabulary; fall back to a
     // host scan where the backend has no top_k_rows kernel.
+    core::PhaseScope argmax_scope(profile, core::Phase::kDraftArgmax);
     auto best = DeviceRowArgMax(backend, h, *h.logits, 1, cfg.vocab_size);
     if (best) {
       return (*best)[0];

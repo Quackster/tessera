@@ -3,9 +3,10 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 402/402 `ctest` on vulkan. 402/402 `ctest` on ROCm.
-Both builds verified on AMD Radeon AI PRO R9700 (vulkan through
-RADV GFX1201, rocm through the system ROCm).
+Latest suite: 407/407 `ctest` on vulkan. 407/407 `ctest` on ROCm.
+Verified on AMD Radeon AI PRO R9700 (vulkan through RADV GFX1201,
+rocm through the system ROCm) and on AMD Radeon RX 7900 XTX (vulkan
+through RADV GFX1100, rocm through the system ROCm).
 
 ## Current status
 
@@ -343,6 +344,50 @@ RADV GFX1201, rocm through the system ROCm).
   `Model::FindDeviceTensor` is covered by
   `EngineTest.LoadGgufModelIndexesEveryWeightByName` and the extended
   `EngineTest.LoadGgufModelUploadsWeights`.
+- Decode phase profiler, opt-in and off by default. `TESSERA_PROFILE=1`
+  accumulates wall-clock per phase in the decode loop (anchor forward,
+  target forward/head/logits download, draft prep/block/head/argmax,
+  verify) and logs a per-phase summary after the decode line;
+  `TESSERA_PROFILE=2` adds the per-layer phases (full-attention layer,
+  linear-attention layer, FFN) with a synchronization per phase, which
+  perturbs the pipeline but attributes the trunk. `src/core/profile.hpp`
+  owns the accumulator and the RAII scope; `DecodeCache` carries the
+  pointer. It found the GGUF decode culprits on the 7900 XTX: the
+  one-workgroup-per-output GEMVs streamed at 40-250 GB/s (the Q6_K
+  vocab head alone was 26 ms per pass at 40 GB/s) and the Q4_K/Q5_K/
+  IQ4_XS small-n projections were under one wave of workgroups.
+- Warp-per-output GEMV kernels: `gemm_q4k_vec`, `gemm_q5k_vec`,
+  `gemm_q6k_vec` and `gemm_iq4xs_vec` replace the scalar GEMVs for the
+  four hot GGUF formats at decode batch sizes. One 32-lane group
+  computes one output element (eight per 256-thread workgroup), every
+  lane reads its eight elements of each quant block with aligned loads,
+  and the partials reduce with five warp shuffles (Vulkan: the same
+  mapping with a shared-memory tree of the same association order).
+  The Q6_K head went from 26.0 ms at 40 GB/s to about 1.3 ms at
+  780 GB/s; the FFN-shape Q4_K GEMV from 134 to about 390-480 GB/s
+  (measured cold, one pass per buffer). A follow-up split-K pass
+  (`GemmVecSplit`, `gemm_vec_reduce`) raises the workgroup count for
+  narrow projections; deterministic, no atomics. Measured on the 27B
+  Q4_K_M GGUF (866 tensors) on the 7900 XTX: greedy decode 7 to
+  18 tok/s on ROCm and 8 to 15 tok/s on Vulkan; the MTP strategy
+  equals its acceptance but stays at parity with greedy until the
+  verify batch has a multi-row GEMV (see Next).
+- MTP matches the reference cycle. The strategy now folds the anchor
+  into the verify batch (`FoldsAnchor`), pairs the anchor token with
+  the trunk hidden one position before it, and writes the MTP KV at
+  the anchor's own slot (`pos`, not `pos + 1`), which is the contract
+  hipfire/llama.cpp implement (CREDITS.md). Chained drafts feed the
+  post-FFN MTP residual back, not the normed hidden. The engine seeds
+  the first anchor from the prefill's final hidden
+  (`NeedsPrefillAnchor`), re-records the anchor after every verify
+  (the architecture verify now fills the hidden for the anchor-only
+  case), and the generic single-draft verify returns the anchor's
+  hidden so the pairing survives a rejection. Acceptance on the 27B
+  Q4_K_M GGUF went from 8 of 17 to 23 of 24 on a repetitive prompt
+  (19 of 28 before on the same prompt) and from 8 of 17 to 10 of 15
+  on a short factual prompt; both backends agree token for token.
+  MTP still runs one target forward per emitted token (the verify is
+  not batched), so it matches greedy rather than beating it.
 - Row-parallel quantized KV append: `quantize_q8`, `quantize_q4` and
   `quantize_fp8_pack` are one workgroup per row (shared-memory absmax),
   and `QuantizeRowDevice` launches a workgroup. The old one-thread
@@ -355,6 +400,19 @@ RADV GFX1201, rocm through the system ROCm).
 
 ## Next (in order)
 
+- Multi-row GGUF GEMV (`gemm_q4k_rows` and siblings). A decode verify
+  batch (m = 2..8) currently runs the per-row GEMV m times, so the
+  folding MTP cycle costs the same as two greedy steps. A warp-per-
+  column kernel (like the MXFP4 `gemm_mxfp4_rows`) that decodes each
+  weight block once and applies it to every row makes the 2-row MTP
+  verify about 1.3x one row on Q4_K (measured 0.19 ms for two rows vs
+  0.24 ms for the per-row pair at n=5120, k=17408; 0.17 vs 0.24 at
+  n=17408). Landing it for Q4_K/Q5_K/Q6_K/IQ4_XS on both backends is
+  the remaining lever to push GGUF MTP past greedy.
+- Vulkan `_vec` GEMV speed. The new Vulkan shaders use a shared-memory
+  tree reduction (five barriers per output) while ROCm uses shuffles;
+  the same GGUF decode is 15 vs 18 tok/s. Subgroup reductions
+  (`subgroupAdd`) should close the gap.
 - Speculative cost. The verifier still runs the full target trunk
   at the draft size. The draft forward still costs more than
   greedy (fp32 weights, many small kernels, per-layer context K/V

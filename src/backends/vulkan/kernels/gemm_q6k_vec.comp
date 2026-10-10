@@ -1,0 +1,112 @@
+#version 450
+
+// Warp-per-output Q6_K GEMV; see gemm_q4k_vec for the launch contract.
+// Lane l owns byte l of the two 32-byte qh groups and of each ql group
+// (210-byte superblock). Per 128-element half it produces four elements
+// (t, t+32, t+64, t+96) sharing the byte's low/high nibbles and two qh
+// bit pairs, with four int8 sub-block scales.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) buffer C {
+  float c[];
+};
+
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+shared float sh[256];
+
+void main() {
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  uint split = pc.v[6];
+  uint warps = gl_WorkGroupSize.x / 32u;
+  uint idx = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
+  if (idx >= m * n) {
+    return;
+  }
+  uint lane = gl_LocalInvocationID.x % 32u;
+  uint is = lane / 16u;
+  uint blocks = k / 256u;
+  uint per = blocks / split;
+  uint b0 = gl_WorkGroupID.y * per;
+  uint row_a = idx / n;
+  uint row_w = idx % n;
+  uint w_base = row_w * (blocks * 210u);
+  float acc = 0.0;
+  for (uint b = b0; b < b0 + per; ++b) {
+    uint base = w_base + b * 210u;
+    float d = fp16_at(base + 208u);
+    for (uint n2 = 0u; n2 < 2u; ++n2) {
+      int s0 = int(wbyte(base + 192u + n2 * 8u + is));
+      int s2 = int(wbyte(base + 192u + n2 * 8u + is + 2u));
+      int s4 = int(wbyte(base + 192u + n2 * 8u + is + 4u));
+      int s6 = int(wbyte(base + 192u + n2 * 8u + is + 6u));
+      if (s0 >= 128) {
+        s0 -= 256;
+      }
+      if (s2 >= 128) {
+        s2 -= 256;
+      }
+      if (s4 >= 128) {
+        s4 -= 256;
+      }
+      if (s6 >= 128) {
+        s6 -= 256;
+      }
+      uint ql0 = wbyte(base + n2 * 64u + lane);
+      uint ql1 = wbyte(base + n2 * 64u + 32u + lane);
+      uint qh = wbyte(base + 128u + n2 * 32u + lane);
+      int q1 = int((ql0 & 15u) | (((qh >> 0) & 3u) << 4)) - 32;
+      int q2 = int((ql1 & 15u) | (((qh >> 2) & 3u) << 4)) - 32;
+      int q3 = int((ql0 >> 4) | (((qh >> 4) & 3u) << 4)) - 32;
+      int q4 = int((ql1 >> 4) | (((qh >> 6) & 3u) << 4)) - 32;
+      uint t = b * 256u + n2 * 128u + lane;
+      acc += a[row_a * k + t] * (d * float(s0) * float(q1));
+      acc += a[row_a * k + t + 32u] * (d * float(s2) * float(q2));
+      acc += a[row_a * k + t + 64u] * (d * float(s4) * float(q3));
+      acc += a[row_a * k + t + 96u] * (d * float(s6) * float(q4));
+    }
+  }
+  uint t = gl_LocalInvocationID.x;
+  sh[t] = acc;
+  barrier();
+  for (uint off = 16u; off > 0u; off >>= 1u) {
+    if ((t & 31u) < off) {
+      sh[t] += sh[t + off];
+    }
+    barrier();
+  }
+  if (lane == 0u) {
+    c[gl_WorkGroupID.y * (m * n) + idx] = sh[t];
+  }
+}

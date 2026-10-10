@@ -7629,3 +7629,181 @@ TEST(BackendTest, VisionMergerMatchesRef) {
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
+
+// The warp-per-output GEMV family ("_vec"): one 32-lane group per output,
+// eight per workgroup, vectorized weight reads and a shuffle reduction.
+// ProjectDevice derives the launch from the kernel id, so one helper
+// exercises the grid rule the engine uses for all four formats.
+using GemmRefFn = std::expected<void, StatusCode> (*)(
+    std::span<const float>, std::span<const std::byte>, std::span<float>,
+    std::size_t, std::size_t, std::size_t);
+
+static void ExpectGemvVecMatchesRef(std::unique_ptr<Backend>& backend,
+                                    const char* kernel_name,
+                                    const std::vector<std::byte>& w,
+                                    std::size_t kM, std::size_t kN,
+                                    std::size_t kK, GemmRefFn reference) {
+  auto kernel = backend->LoadKernel(kernel_name, {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no " << kernel_name << " kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(97531 + static_cast<unsigned>(w.size()));
+  // Small activations: the warp tree changes the summation order, so keep
+  // the absolute rounding error far below the per-backend tolerance while
+  // the relative error the tolerance is for stays the same.
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng) * 0.01f;
+  }
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(a.data()),
+                                           a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(w))
+                  .has_value());
+  // ProjectGemvDevice adds the split-K path (its reduce pass and partial
+  // scratch) the engine uses for narrow projections.
+  tessera::models::qwen3_5::Qwen35State state;
+  auto launch = tessera::models::qwen3_5::ProjectGemvDevice(
+      *backend, state, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  ASSERT_TRUE(reference(std::span<const float>(a),
+                        std::span<const std::byte>(w), std::span<float>(ref),
+                        kM, kN, kK)
+                  .has_value());
+  const GemmTolerance tol = ToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float rel = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+    rel = std::max(rel,
+                   std::abs(got[i] - ref[i]) / std::max(1.0f, std::abs(ref[i])));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << kernel_name << " on " << backend->Name() << " max_abs " << max_abs;
+  EXPECT_LE(rel, tol.rel)
+      << kernel_name << " on " << backend->Name() << " max_rel " << rel;
+}
+
+// Random blocks with a finite block scale d (and, where the format has
+// one, a small dmin so the min term stays in range).
+static std::vector<std::byte> RandomVecBlocks(std::mt19937& rng,
+                                              std::size_t rows,
+                                              std::size_t k,
+                                              std::size_t block_bytes,
+                                              std::size_t d_off) {
+  const std::size_t row_bytes = (k / 256) * block_bytes;
+  std::vector<std::byte> w = RandomBlocks(rng, rows, row_bytes, d_off);
+  for (std::size_t r = 0; r < rows; ++r) {
+    for (std::size_t b = 0; b < k / 256; ++b) {
+      std::byte* base = w.data() + r * row_bytes + b * block_bytes;
+      base[d_off] = std::byte{0};
+      base[d_off + 1] = std::byte{0x20};
+    }
+  }
+  return w;
+}
+
+TEST(BackendTest, GemmQ4KVecMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kM = 5;  // not a multiple of the 8-output group
+  constexpr std::size_t kN = 60;
+  constexpr std::size_t kK = 512;
+  std::mt19937 rng(70001);
+  std::vector<float> w_raw(kN * kK);
+  for (auto& v : w_raw) {
+    v = DrawValue(rng);
+  }
+  ExpectGemvVecMatchesRef(backend, "gemm_q4k_vec", QuantizeRows(w_raw, kN, kK),
+                          kM, kN, kK, core::GemmQ4KRef);
+}
+
+TEST(BackendTest, GemmQ5KVecMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kM = 5;
+  constexpr std::size_t kN = 60;
+  constexpr std::size_t kK = 512;
+  std::mt19937 rng(70003);
+  std::vector<std::byte> w = RandomVecBlocks(rng, kN, kK, 176, 0);
+  for (std::size_t r = 0; r < kN; ++r) {  // small dmin, keeps the min term
+    for (std::size_t b = 0; b < kK / 256; ++b) {
+      std::byte* base = w.data() + (r * (kK / 256) + b) * 176;
+      base[2] = std::byte{0};
+      base[3] = std::byte{0x20};
+    }
+  }
+  ExpectGemvVecMatchesRef(backend, "gemm_q5k_vec", w, kM, kN, kK,
+                          core::GemmQ5KRef);
+}
+
+TEST(BackendTest, GemmQ6KVecMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kM = 5;
+  constexpr std::size_t kN = 60;
+  constexpr std::size_t kK = 512;
+  std::mt19937 rng(70004);
+  std::vector<std::byte> w = RandomVecBlocks(rng, kN, kK, 210, 208);
+  ExpectGemvVecMatchesRef(backend, "gemm_q6k_vec", w, kM, kN, kK,
+                          core::GemmQ6KRef);
+}
+
+TEST(BackendTest, GemmIq4XsVecMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kM = 5;
+  constexpr std::size_t kN = 60;
+  constexpr std::size_t kK = 512;
+  std::mt19937 rng(70005);
+  std::vector<std::byte> w = RandomVecBlocks(rng, kN, kK, 136, 0);
+  ExpectGemvVecMatchesRef(backend, "gemm_iq4xs_vec", w, kM, kN, kK,
+                          core::GemmIq4XsRef);
+}
+
+// A wide-enough output count keeps split-K off (one workgroup per output):
+// the same kernel and the plain grid must match the reference.
+TEST(BackendTest, GemmQ4KVecSplitOneMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kM = 1;
+  constexpr std::size_t kN = 33000;  // 4125 output blocks >= split target
+  constexpr std::size_t kK = 256;
+  std::mt19937 rng(70006);
+  std::vector<float> w_raw(kN * kK);
+  for (auto& v : w_raw) {
+    v = DrawValue(rng);
+  }
+  ExpectGemvVecMatchesRef(backend, "gemm_q4k_vec", QuantizeRows(w_raw, kN, kK),
+                          kM, kN, kK, core::GemmQ4KRef);
+}
+
+// Split-K: a narrow projection (few output blocks) splits the k range
+// across grid_y chunks and sums the partials in a second pass.
+TEST(BackendTest, GemmQ4KVecSplitMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kM = 1;
+  constexpr std::size_t kN = 16;
+  constexpr std::size_t kK = 2048;  // 8 superblocks, so the split is whole
+  std::mt19937 rng(70007);
+  std::vector<float> w_raw(kN * kK);
+  for (auto& v : w_raw) {
+    v = DrawValue(rng);
+  }
+  ASSERT_GT(core::detail::GemmVecSplit(kM * kN, kK), 1u);
+  ExpectGemvVecMatchesRef(backend, "gemm_q4k_vec", QuantizeRows(w_raw, kN, kK),
+                          kM, kN, kK, core::GemmQ4KRef);
+}

@@ -273,7 +273,12 @@ std::expected<void, StatusCode> ProjectBatch(
     if (!gemm) {
       return std::unexpected(gemm.error());
     }
-    projected = detail::ProjectDevice(backend, **gemm, a, w, out, m, n, k);
+    // The warp-per-output family gets the split-K treatment for narrow
+    // projections; every other GEMV uses the plain grid.
+    projected = (*gemm)->Id().ends_with("_vec")
+                    ? ProjectGemvDevice(backend, h, **gemm, a, w, out, m, n, k)
+                    : detail::ProjectDevice(backend, **gemm, a, w, out, m, n,
+                                            k);
   }
   if (!projected) {
     return projected;

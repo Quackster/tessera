@@ -99,6 +99,11 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_q6k_batched", kGemmQ6kBatchedSpirV, sizeof(kGemmQ6kBatchedSpirV)},
     {"gemm_iq4xs_batched", kGemmIq4XsBatchedSpirV,
      sizeof(kGemmIq4XsBatchedSpirV)},
+    {"gemm_q4k_vec", kGemmQ4kVecSpirV, sizeof(kGemmQ4kVecSpirV)},
+    {"gemm_q5k_vec", kGemmQ5kVecSpirV, sizeof(kGemmQ5kVecSpirV)},
+    {"gemm_q6k_vec", kGemmQ6kVecSpirV, sizeof(kGemmQ6kVecSpirV)},
+    {"gemm_iq4xs_vec", kGemmIq4XsVecSpirV, sizeof(kGemmIq4XsVecSpirV)},
+    {"gemm_vec_reduce", kGemmVecReduceSpirV, sizeof(kGemmVecReduceSpirV)},
 };
 
 int LookupBuiltIn(std::string_view name) {

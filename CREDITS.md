@@ -75,3 +75,12 @@ project, the version, the license, and where it is used.
   per machine and model keyed by a hardware key. Reimplemented in
   src/core/calibrate/calibrate.cpp and tools/cli/calibrate_command.cpp;
   no code copied.
+- hipfire Qwen3.5 native MTP head (Apache-2.0, local checkout at
+  a89ed0a8e, crates/hipfire-arch-qwen35/src/mtp_head.rs and
+  mtp_spec.rs): the decode-cycle contract the tessera MTP strategy now
+  matches. One MTP step consumes the token at position p paired with
+  the trunk hidden at p-1, writes KV slot p before attending 0..p, and
+  predicts p+1; the verify batch leads with the anchor and the trunk's
+  last committed hidden seeds the next draft. Also the prefill KV fill
+  that writes an MTP slot per prompt position. Design reference; no
+  code copied.

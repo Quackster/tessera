@@ -241,7 +241,10 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
     return std::unexpected(config.error());
   }
   // An architecture that batches the scoring owns the cache rollback;
-  // everything else feeds one token at a time and never over-advances.
+  // everything else feeds one token at a time and never over-advances. A
+  // single draft with an anchor stays on the feed-one-token path: its two
+  // sequential forwards cost less than a two-row batch while the GGUF
+  // projections have no multi-row GEMV.
   const Architecture* arch = model.Arch();
   if (draft.size() > 1 && arch != nullptr) {
     return arch->Verify(backend, model, cache, draft, prefix_logits, anchor,
@@ -250,9 +253,10 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   DraftVerification result;
   if (anchor.has_value()) {
     // The anchor rides as the batch's first row: it advances the cache and
-    // its logits score draft[0].
+    // its logits score draft[0]. Its hidden goes to the caller, so a folding
+    // drafter keeps the last committed row's hidden even with no acceptance.
     auto anchor_logits =
-        DecodeLogits(backend, model, cache, *anchor, nullptr, capture_layers,
+        DecodeLogits(backend, model, cache, *anchor, hidden_out, capture_layers,
                      capture);
     if (!anchor_logits) {
       return std::unexpected(anchor_logits.error());

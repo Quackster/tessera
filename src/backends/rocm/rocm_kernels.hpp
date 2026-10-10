@@ -201,6 +201,25 @@ __global__ void GemmQ4KBatchedKernel(const float* a, const unsigned char* w,
                                      float* c, unsigned long long m,
                                      unsigned long long n,
                                      unsigned long long k);
+__global__ void GemmQ4KVecKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k,
+                                 unsigned long long split);
+__global__ void GemmQ5KVecKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k,
+                                 unsigned long long split);
+__global__ void GemmQ6KVecKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k,
+                                 unsigned long long split);
+__global__ void GemmIq4XsVecKernel(const float* a, const unsigned char* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n, unsigned long long k,
+                                   unsigned long long split);
+__global__ void GemmVecReduceKernel(const float* part, float* c,
+                                    unsigned long long total,
+                                    unsigned long long split);
 __global__ void GemmQ5KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);

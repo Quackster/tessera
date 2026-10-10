@@ -518,15 +518,59 @@ inline std::expected<void, StatusCode> GatherEmbedding(
 // the device and chain kernels. The device-resident block forward uses
 // these instead of Project (which round-trips through the host).
 
+// Outputs per workgroup for the warp-per-output GEMV family ("_vec"):
+// eight 32-lane groups in one 256-thread workgroup.
+constexpr std::size_t kGemmVecOutputsPerBlock = 8;
+
+// Split-K tuning for the "_vec" GEMV family. A decode projection with a
+// small output count (n = 5120 is 640 workgroups, under one wave on a
+// 96-CU card) leaves the device under-filled and streams at a fraction of
+// the memory rate; splitting the k range across grid_y workgroups raises
+// the resident workgroup count. The split targets this many output
+// blocks, is capped, and must divide k/256 so every chunk covers whole
+// quant superblocks.
+constexpr std::size_t kGemmVecSplitTargetBlocks = 4096;
+constexpr std::size_t kGemmVecMaxSplit = 8;
+
+// Split factor for one "_vec" GEMV launch: 1 keeps the plain
+// one-workgroup-per-output grid. Uses the largest divisor of the
+// superblock count that reaches the target block count.
+[[nodiscard]] inline std::size_t GemmVecSplit(std::size_t outputs,
+                                              std::size_t k) {
+  const std::size_t blocks_x =
+      (outputs + kGemmVecOutputsPerBlock - 1) / kGemmVecOutputsPerBlock;
+  if (blocks_x == 0 || blocks_x >= kGemmVecSplitTargetBlocks) {
+    return 1;
+  }
+  const std::size_t superblocks = k / 256;
+  std::size_t split =
+      (kGemmVecSplitTargetBlocks + blocks_x - 1) / blocks_x;
+  if (split > kGemmVecMaxSplit) {
+    split = kGemmVecMaxSplit;
+  }
+  for (; split > 1; --split) {
+    if (superblocks % split == 0) {
+      return split;
+    }
+  }
+  return 1;
+}
+
 // Grid rule shared by the GEMM launch helpers: a kernel id ending in
-// "_row" runs one workgroup per output element (coalesced reads across
-// the workgroup); "gemm_mxfp4" runs one 32-lane warp per output (eight
-// per 256-thread workgroup, coalesced reads across the warp); every other
-// quant/plain GEMM runs one thread per output element with 256-thread
-// workgroups. Both backends implement the same ids, so the rule stays
-// backend-agnostic.
+// "_vec" runs one 32-lane warp per output element, eight per 256-thread
+// workgroup, with vectorized weight reads and a shuffle reduction (the
+// decode GEMV family); "_row" runs one workgroup per output element
+// (coalesced reads across the workgroup, the older kernel); "gemm_mxfp4"
+// runs one 32-lane warp per output (eight per 256-thread workgroup,
+// coalesced reads across the warp); every other quant/plain GEMM runs one
+// thread per output element with 256-thread workgroups. Both backends
+// implement the same ids, so the rule stays backend-agnostic.
 inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
                                  std::size_t n) {
+  if (gemm.Id().ends_with("_vec")) {
+    return static_cast<std::uint32_t>(
+        (m * n + kGemmVecOutputsPerBlock - 1) / kGemmVecOutputsPerBlock);
+  }
   if (gemm.Id().ends_with("_row")) {
     return static_cast<std::uint32_t>(m * n);
   }
@@ -550,7 +594,9 @@ inline std::uint32_t GemmGridFor(const Kernel& gemm, std::size_t m,
 }
 
 // C = A (m x k) times dequant(W) with A and C on the device; scalars
-// follow the shared (m, n, k) order.
+// follow the shared (m, n, k) order, plus the split-K factor for the
+// "_vec" family (1 here: the split path lives in ProjectGemvDevice,
+// which owns the partial scratch).
 inline std::expected<void, StatusCode> ProjectDevice(
     Backend& backend, const Kernel& gemm, const Buffer& a, const Buffer& w,
     Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
@@ -558,7 +604,11 @@ inline std::expected<void, StatusCode> ProjectDevice(
   launch.grid_x = GemmGridFor(gemm, m, n);
   launch.block_x = gemm.Id() == "gemm_bf16_wmma" ? 128 : 256;
   launch.buffers = {&a, &w, &c};
-  launch.scalars = {m, n, k};
+  if (gemm.Id().ends_with("_vec")) {
+    launch.scalars = {m, n, k, 1};
+  } else {
+    launch.scalars = {m, n, k};
+  }
   return backend.LaunchKernel(gemm, launch);
 }
 
@@ -842,13 +892,13 @@ inline std::expected<void, StatusCode> RepeatHeadsDevice(
 // Empty when the dtype has no GEMM kernel.
 inline std::string_view GemmKernelName(DType dtype) {
   switch (dtype) {
-    case DType::Q4K: return "gemm_q4k_row";
-    case DType::Q5K: return "gemm_q5k";
-    case DType::Q6K: return "gemm_q6k";
+    case DType::Q4K: return "gemm_q4k_vec";
+    case DType::Q5K: return "gemm_q5k_vec";
+    case DType::Q6K: return "gemm_q6k_vec";
     case DType::Q3K: return "gemm_q3k";
     case DType::Q80: return "gemm_q80";
     case DType::IQ4_NL: return "gemm_iq4nl";
-    case DType::IQ4_XS: return "gemm_iq4xs";
+    case DType::IQ4_XS: return "gemm_iq4xs_vec";
     case DType::IQ3_S: return "gemm_iq3s";
     case DType::F32: return "gemm_f32";
     case DType::BF16: return "gemm_bf16";

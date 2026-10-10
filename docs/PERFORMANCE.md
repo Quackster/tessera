@@ -240,6 +240,24 @@ This is the full catalogue. Each phase below turns part of it into cards.
 
 ### P1: GEMM
 
+**P1.5 Multi-row GGUF GEMV for the small-batch verify**
+
+- Objective: a decode verify batch (m = 2..8) reads each weight block once
+  instead of once per row. The folding MTP cycle batches [anchor, drafts]
+  and currently pays the per-row GEMV for every projection, so MTP matches
+  greedy instead of beating it.
+- Reference: the tessera `gemm_mxfp4_rows` kernel (warp per column, one
+  block decode for all rows). A Q4_K prototype measured 0.19 ms for two
+  rows at n=5120, k=17408 against 0.24 ms for the per-row pair (1.3x), and
+  0.17 vs 0.24 at n=17408, k=5120 (1.4x); four rows gave 2.2x.
+- Change: add `gemm_q4k_rows`, `gemm_q5k_rows`, `gemm_q6k_rows` and
+  `gemm_iq4xs_rows` on both backends, and route 2 <= m <= 8 for those
+  dtypes through them in `ProjectBatch` (the MXFP4 route is the pattern).
+- Verify: host-reference tests with m = 2, 3 and 8, including a
+  non-multiple-of-8 output count. Compare to `GemmQ4KRef` and siblings.
+- Accept: a two-row verify costs about 1.3x a one-row pass; GGUF MTP
+  exceeds greedy decode on the loop-prompt measurement.
+
 **P1.1 int8-WMMA W4A8 for GGUF Q4_K and Q5_K**
 
 - Objective: tensor-core decode and prefill for the GGUF 4-bit linears.
@@ -475,6 +493,7 @@ This is the full catalogue. Each phase below turns part of it into cards.
 | P1.2 | MXFP4 decode split-K | both | todo |
 | P1.3 | MXFP4 tiled prefill | both | todo |
 | P1.4 | Double-buffered tiled LDS | both | todo |
+| P1.5 | Multi-row GGUF GEMV | both | todo |
 | P2.1 | WMMA transposed attention | both | todo |
 | P2.2 | Paged KV and varlen | both | todo |
 | P3.1 | Fused GDN conv prep | both | todo |
@@ -492,6 +511,13 @@ This is the full catalogue. Each phase below turns part of it into cards.
 
 Move a card here with its commit hash and the measured result.
 
+- Warp-per-output decode GEMVs (tessera-native, not a radiance card):
+  `gemm_q4k_vec`/`gemm_q5k_vec`/`gemm_q6k_vec`/`gemm_iq4xs_vec` plus the
+  deterministic split-K pass (`gemm_vec_reduce`) replaced the coalesced
+  row GEMVs at decode batch sizes. The Q6_K vocab head went from 26.0 ms
+  at 40 GB/s to about 1.3 ms at 780 GB/s; the FFN-shape Q4_K GEMV from
+  134 to about 390-480 GB/s cold. GGUF greedy decode on the 7900 XTX:
+  7 to 18 tok/s (ROCm), 8 to 15 (Vulkan). Anti-card next lever: P1.5.
 - Not a radiance card, but a tessera-native decode fix: the quantized
   KV append launched one thread per row (`QuantizeRowDevice` grid and
   block both 1), so a single lane walked each row and fp8 KV decode

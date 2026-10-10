@@ -1,0 +1,32 @@
+#version 450
+
+// Sums the `split` partial regions written by the "*_vec" GEMVs into the
+// output. Ordered accumulation (s = 0..split-1), so the result is
+// deterministic. Scalars: total outputs, split.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) buffer Part {
+  float part[];
+};
+
+layout(set = 0, binding = 1) buffer C {
+  float c[];
+};
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint total = pc.v[0];
+  uint split = pc.v[2];
+  if (idx >= total) {
+    return;
+  }
+  float acc = 0.0;
+  for (uint s = 0u; s < split; ++s) {
+    acc += part[s * total + idx];
+  }
+  c[idx] = acc;
+}

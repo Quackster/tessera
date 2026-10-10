@@ -17,6 +17,8 @@
 
 namespace tessera::core {
 
+class Profile;
+
 // Base for the architecture-specific decode state. Each architecture
 // module defines its own subclass (in src/models/<arch>/) and stores it in
 // DecodeCache::arch; src/core never names the fields.
@@ -58,6 +60,8 @@ struct DecodeCache {
   std::unique_ptr<ArchState> arch;
   // Device-resident vanilla state, created on the first vanilla step.
   std::unique_ptr<struct DeviceDecodeState> device;
+  // Opt-in decode phase profiler (TESSERA_PROFILE). Null disables timing.
+  Profile* profile = nullptr;
 };
 
 // Per-step device-resident state for the vanilla decode: kernels,

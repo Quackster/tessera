@@ -708,7 +708,9 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
       }
     }
   }
-  if (hidden_out != nullptr && accepted > 0) {
+  if (hidden_out != nullptr && (accepted > 0 || lead == 1)) {
+    // The last committed row: the accepted draft, the anchor with no
+    // accepted draft, or the accepted prefix's last draft without one.
     auto xh = detail::DownloadF32(backend, *h.batch->x);
     if (xh) {
       hidden_out->resize(config->hidden_dim);
