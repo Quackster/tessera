@@ -270,6 +270,13 @@ These are hard rules, set by the project owner:
     reference. A numerical or acceptance difference from the reference is a
     defect to root-cause, not a property of the model.
 
+22. **Test discipline** — do not add tests willy-nilly. Add a new test only
+    when a change adds or alters real behavior that no existing test covers;
+    otherwise extend the test that already covers that code path. Edit an
+    existing test only when the change is about what that test checks, and
+    leave unrelated tests alone (no renaming, reformatting, or moving). Every
+    change leaves the suite compiling and passing on the configured backend.
+
 ## Working Principles
 
 Repository-specific constraints on top of the hard rules:
