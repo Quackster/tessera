@@ -27,11 +27,11 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | GGUF loader | Done | Parses v2 and v3 headers. Checks bounds. Rejects bad input. The file is memory-mapped, not read into an anonymous host buffer, so a multi-gigabyte GGUF is neither copied nor zero-filled before parsing and upload. |
 | MXFP4 loader | Done | Parses tensor map. Uploads weights. FP8 and MXFP4 GEMM verified. |
 | Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. A batched host-to-device upload (`CopyH2DBatch`) drains many weight tensors with one synchronization per internal chunk: ROCm queues async copies on the null stream, Vulkan records a whole chunk into one command buffer and submits it once. |
-| Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. ROCm launches are asynchronous; Vulkan pipelines launches through a four-slot command-buffer and fence ring, so the host does not wait on a fence after every kernel. |
+| Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. Vulkan defers the submission: every dispatch and device copy of a decode step records into one command buffer (with an inter-operation barrier), so a step of about two thousand small launches pays one queue submit, not thousands. ROCm launches on one stream configured with the blocking synchronization policy, so host waits sleep instead of busy-waiting in the runtime; host readbacks and uploads stage through pinned memory. |
 | DFlash2 | Partial | Draft forward built: grouped dynamic convolution, sliding attention, candidate selector and target-hidden fusion. The real draft loads and runs the block. The 27B MXFP4 target accepts 4.4 tokens per step. Output equals greedy. The draft step costs more than greedy, so speed work remains. |
 | CLI | Partial | Loads a model, prints a tensor summary, streams generated text to stdout (`--max-completion-tokens`), caps thinking per turn (`--max-thinking-tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). It serves HTTP (`serve`), samples (`--sample` and parameter flags), selects the KV cache (`--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`), speculates (`--speculate`, `--draft`) and encodes images (`--mmproj`, `--image`). Text prompts work for GGUF and MXFP4. |
 | Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in chunk-sized batched forwards (512 by default, `--prefill-chunk`), so a 220k-token prompt on the 8-bit KV cache (`--context 220000 --kv-q8`) prefills in bounded memory. Each forward is also clamped to the attention work budget, so a long prompt cannot wedge the device with one oversized launch. A prompt past the context is rejected before any device work. A zero `max_completion_tokens` fills the remaining context, which is also the default for requests that omit it. A `max_thinking_tokens` budget force-closes the think block past budget and decoding continues with the answer. Generation stops at the model's declared stop tokens (GGUF `tokenizer.ggml.eos_token_id`, HuggingFace `eos_token_id`) and does not emit them; callers add stops through `GenerateOptions::stop_tokens`. Runtime options: `--context`, `--max-completion-tokens`, `--max-thinking-tokens`, `--prefill-chunk`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) or FP8 (`--kv-fp8`) KV cache. |
-| KV cache | Done | fp32 (default), fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) and FP8 E4M3 (`--kv-fp8`, the served target's cache quant) full-attention storage on both backends. |
+| KV cache | Done | fp32 (default), fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) and FP8 E4M3 (`--kv-fp8`, the served target's cache quant) full-attention storage on both backends. An appended quantized row is written by a row-parallel kernel: one workgroup per row reduces the absmax in shared memory and packs the codes together. This replaced a single-thread launch per row, which dominated fp8 KV decode (a 27B DFlash2 verify step pays 16 full-attention layers times 2 tensors times the block width in rows). |
 | Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Tiled batched kernels for the hot formats (four partial sums per thread) and warp-per-output decode GEMVs. An fp8 tensor-core MXFP4 GEMM and a bf16 tensor-core GEMM cover the m=1 to 16 decode and verify batch. The vocab-width bf16 head uses the bf16 tensor-core kernel, so it streams coalesced. Host reference check. Per backend tolerance. |
 | Activation quant | Done | Per-token FP8 E4M3 quantize-dequantize (`quantize_fp8`) on Vulkan and ROCm, the W4A8 activation contract. The DFlash2 drafter input uses it. The served target's W4A8 linear activation is opt-in (`TESSERA_MXFP4_W4A8=1`). |
@@ -101,14 +101,31 @@ Model weights live outside the repo. Each variant uses one flat directory. Model
 | `~/models/Ornith-1.5-35B-A3B/` | MoE weights | To do: MoE support. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
 | `/home/alex/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S` split, `IQ3_XXS` split, `mmproj-Qwen3.8-Flash-Next-BF16.gguf`, RCO allocation files | (Planned, not working) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
 
-CLI example:
+CLI examples:
 
 ```sh
+# GGUF target, greedy decode.
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf
-./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --draft ~/models/Qwen3.8-27B-DFlash2-FP8
+
+# GGUF target with MTP speculation. The MTP head drafts from the target, so it needs no draft path.
+./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --speculate
+
+# MXFP4 target, greedy decode.
+./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8
+
+# MXFP4 target with MTP speculation.
+./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 --speculate
+
+# MXFP4 target with the DFlash2 draft checkpoint.
+./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --draft ~/models/Qwen3.8-27B-DFlash2-FP8
+
+# MXFP4 target and DFlash2 draft over the HTTP server.
+./cmake-build-vulkan/tessera-cli serve --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --draft ~/models/Qwen3.8-27B-DFlash2-FP8 --port 8080
 ```
 
-The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count, total elements and device bytes. With `--max-completion-tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head on both `run` and `serve`. `--draft` drafts with the DFlash2 checkpoint. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
+The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` or `--speculate` is set. It prints tensor count, total elements and device bytes. With `--max-completion-tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head on both `run` and `serve`. `--draft` drafts with the DFlash2 checkpoint. The DFlash2 draft is tested against the MXFP4 target, not the GGUF. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
 
 ## Usage
 
@@ -152,16 +169,24 @@ auto text = tokenizer->Decode(*generated);
 HTTP API with the server:
 
 ```sh
+# GGUF target.
 ./cmake-build-vulkan/tessera-cli serve \
   --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
   --port 8080
+
+# MXFP4 target with the DFlash2 draft. MTP speculation uses --speculate instead.
+./cmake-build-vulkan/tessera-cli serve \
+  --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --draft ~/models/Qwen3.8-27B-DFlash2-FP8 \
+  --port 8080
+
 curl -X POST http://127.0.0.1:8080/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Explain gravity in one sentence.", "max_completion_tokens": 64}'
 curl http://127.0.0.1:8080/health
 ```
 
-`max_completion_tokens` is optional. Without it the server fills the remaining context.
+`max_completion_tokens` is optional. Without it the server fills the remaining context. Speculation is set when the server starts and applies to every served turn.
 
 With `--api-key` set, requests need `Authorization: Bearer <key>`. `GET /health` and `GET /metrics` stay public.
 
