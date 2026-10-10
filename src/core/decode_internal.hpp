@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <expected>
 #include <span>
@@ -31,9 +32,26 @@ namespace tessera::core::detail {
 // 0.3 s, while 512x16384 pairs wedge the gfx ring and the driver
 // resets the device, which the backend reports as a sticky device
 // loss. Scale the pair budget by heads and head dim for other shapes.
-inline constexpr std::uint64_t kMaxPrefillAttnPairs = 4ull * 1024 * 1024;
+inline constexpr std::uint64_t kMaxPrefillAttnPairs = kDefaultPrefillAttnPairs;
 inline constexpr std::uint64_t kMaxPrefillAttnHeads = 24;
 inline constexpr std::uint64_t kMaxPrefillAttnHeadDim = 256;
+
+// The attention pair budget, read once. TESSERA_PREFILL_ATTN_PAIRS
+// overrides it for a diagnostic measurement: the built-in value is set to
+// stay under the driver's hang timeout, so a larger value risks a device
+// reset.
+[[nodiscard]] inline std::uint64_t PrefillAttnPairBudget() {
+  static const std::uint64_t kBudget = []() -> std::uint64_t {
+    if (const char* env = std::getenv("TESSERA_PREFILL_ATTN_PAIRS")) {
+      const unsigned long long value = std::strtoull(env, nullptr, 10);
+      if (value > 0) {
+        return value;
+      }
+    }
+    return kMaxPrefillAttnPairs;
+  }();
+  return kBudget;
+}
 
 // Clamp one prefill chunk to the attention work budget: at most `want`
 // rows, and rows * (base + rows) * heads * head_dim within the scaled
@@ -48,7 +66,7 @@ inline constexpr std::uint64_t kMaxPrefillAttnHeadDim = 256;
     return want;
   }
   const double budget =
-      static_cast<double>(kMaxPrefillAttnPairs) *
+      static_cast<double>(PrefillAttnPairBudget()) *
       static_cast<double>(kMaxPrefillAttnHeads) *
       static_cast<double>(kMaxPrefillAttnHeadDim) /
       (static_cast<double>(heads) * static_cast<double>(head_dim));
@@ -224,14 +242,33 @@ inline std::expected<void, StatusCode> AttentionQuantDevice(
 // Split-N flash decoding: 16 chunks for one query row over a long key
 // range, the base kernel otherwise. Measured 2.6-4.5x faster than the
 // base kernel for rows == 1 and n >= 1024, and slower for rows == 7, so
-// only the latency-bound single-token path splits.
+// only the latency-bound single-token path splits. The chunk count is a
+// per-request tuning value (GenerateOptions::attention_split); zero
+// selects kDefaultAttentionSplitChunks.
 constexpr std::size_t kSplitChunks = 16;
 constexpr std::size_t kSplitMinKeys = 1024;
+// Upper bound on a requested split, so one request cannot allocate an
+// unbounded partial scratch.
+constexpr std::size_t kMaxAttentionSplitChunks = 64;
 
-// Split chunk count for an attention call, or 0 for the base kernel.
-[[nodiscard]] inline std::size_t SplitFor(std::size_t rows, std::size_t n) {
-  if (rows == 1 && n >= kSplitMinKeys) {
+// The split count a request uses when the split path applies: the
+// requested value clamped, or the built-in default for 0.
+[[nodiscard]] inline std::size_t ResolveAttentionSplit(
+    std::size_t requested_split) {
+  if (requested_split == 0) {
     return kSplitChunks;
+  }
+  return requested_split < kMaxAttentionSplitChunks ? requested_split
+                                                    : kMaxAttentionSplitChunks;
+}
+
+// Split chunk count for an attention call, or 0 for the base kernel. Only
+// the latency-bound single-token path (rows == 1) splits, and only once the
+// key range is long enough to amortize the partial reduction.
+[[nodiscard]] inline std::size_t SplitFor(std::size_t rows, std::size_t n,
+                                          std::size_t requested_split) {
+  if (rows == 1 && n >= kSplitMinKeys) {
+    return ResolveAttentionSplit(requested_split);
   }
   return 0;
 }
@@ -976,12 +1013,12 @@ constexpr std::size_t kGemmTileRows = 8;
 // A batch smaller than this uses the m = 1 GEMV instead of the tiled kernel:
 // the tiled MXFP4 tile is 32 rows, so a draft-sized batch (about 7) leaves
 // most of the tile idle and is slower than the GEMV's shallower chains.
-constexpr std::size_t kGemmTiledMinRows = 16;
+constexpr std::size_t kGemmTiledMinRows = kDefaultTiledMinRows;
 
 // A very wide projection (the vocab-sized output head) uses the tiled kernel
 // even for a draft-sized batch: reading the weight matrix once beats the
 // GEMV's once-per-row re-read, which dominates when n is this large.
-constexpr std::size_t kGemmTiledMinCols = 65536;
+constexpr std::size_t kGemmTiledMinCols = kDefaultTiledMinCols;
 
 // Multi-row GEMV kernel id ("gemm_<fmt>_rows<rows>") for a dtype and a
 // row count, or empty when there is no specialization (the caller uses the

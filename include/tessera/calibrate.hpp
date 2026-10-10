@@ -29,19 +29,25 @@ struct GenerateOptions;
 // a change must not change the produced tokens.
 enum class Setting : int {
   MxFp4SplitTarget,    // split-K workgroups for the fp8 MXFP4 GEMM, decode
+  MxFp4SplitCap,       // split-K factor cap for the fp8 MXFP4 GEMM, decode
   PrefillChunkTokens,  // tokens per prefill forward, prefill
+  AttentionSplit,      // single-token flash-decoding chunks, decode
   DraftTokens,         // draft block for speculative decode, decode
+  DraftContext,        // DFlash2 draft context window, decode
 };
 
 // Human-readable name of a setting ("mxfp4_split_target",
-// "prefill_chunk_tokens", "draft_tokens").
+// "prefill_chunk_tokens", "draft_tokens", ...).
 [[nodiscard]] std::string_view ToString(Setting setting);
 
 // One calibration configuration. A zero field means the built-in default.
 struct CalibrationConfig {
   std::size_t mxfp4_split_target = 0;
+  std::size_t mxfp4_split_cap = 0;
   std::size_t prefill_chunk_tokens = 0;
+  std::size_t attention_split = 0;
   std::size_t draft_tokens = 0;
+  std::size_t draft_context = 0;
 };
 
 // Speed of one configuration, in tokens per second.
@@ -83,10 +89,14 @@ struct SweepOptions {
   // both a candidate and the floor the sweep must beat.
   CalibrationConfig defaults;
   // Settings to sweep. A setting left false is reported as not applicable
-  // (the split target on Vulkan, the draft block when no draft is attached).
+  // (the split target and cap on Vulkan, the draft settings when no draft
+  // is attached, the attention split when the prompts are too short).
   bool sweep_split_target = true;
+  bool sweep_split_cap = true;
   bool sweep_prefill_chunk = true;
+  bool sweep_attention_split = true;
   bool sweep_draft_tokens = false;
+  bool sweep_draft_context = false;
 };
 
 struct SweepOutcome {
@@ -224,6 +234,7 @@ struct CalibrationReport {
   double prefill_tps = 0.0;
   std::string file;
   bool split_applicable = false;
+  bool attention_applicable = false;
   bool draft_attached = false;
 };
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <string_view>
 
 #include "tessera/types.hpp"
@@ -40,6 +41,44 @@ inline bool MatchKvType(std::string_view arg, KvCacheType& type) {
   }
   if (arg == "--kv-fp8") {
     type = KvCacheType::FP8;
+    return true;
+  }
+  return false;
+}
+
+// Match a diagnostic flag that maps to an environment override and set the
+// environment, returning true when handled. `i` advances past the flag's
+// value for the flags that take one. The library reads these environment
+// variables, so the flag is the command-line form of the same diagnostic.
+inline bool ApplyDiagnosticFlag(std::string_view arg, int& i, char** argv,
+                                int argc) {
+  const auto set = [](const char* name, const char* value) {
+    setenv(name, value, 1);
+  };
+  if (arg == "--wmma") {
+    set("TESSERA_MXFP4_WMMA", "1");
+    return true;
+  }
+  if (arg == "--no-wmma") {
+    set("TESSERA_MXFP4_WMMA", "0");
+    return true;
+  }
+  if (arg == "--w4a8") {
+    set("TESSERA_MXFP4_W4A8", "1");
+    return true;
+  }
+  if (arg == "--target-bf16") {
+    set("TESSERA_TARGET_BF16", "1");
+    return true;
+  }
+  if ((arg == "--tiled-min-rows" || arg == "--tiled-min-cols" ||
+       arg == "--prefill-attn-pairs") &&
+      i + 1 < argc) {
+    const char* value = argv[++i];
+    const char* name = arg == "--tiled-min-rows"   ? "TESSERA_TILED_MIN_ROWS"
+                       : arg == "--tiled-min-cols" ? "TESSERA_TILED_MIN_COLS"
+                                                   : "TESSERA_PREFILL_ATTN_PAIRS";
+    set(name, value);
     return true;
   }
   return false;

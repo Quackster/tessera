@@ -64,31 +64,44 @@ Hardware-dependent knobs in the tree today:
   (`kDefaultPrefillChunkTokens`).
 - `GenerateOptions::draft_tokens`, default from the draft checkpoint.
 - `GenerateOptions::kv_type`, the KV cache type.
-- The MXFP4 fp8 tensor-core GEMM split-K target and cap. Today these are
-  environment-only: `TESSERA_MXFP4_SPLIT` (target `320`) and
-  `TESSERA_MXFP4_SPLITCAP` (cap `4`), read in
-  `src/models/qwen3_5/project.cpp`.
-- Split-N attention chunks (`kSplitChunks = 16`, `kSplitMinKeys = 1024`),
-  fixed.
+- The MXFP4 fp8 tensor-core GEMM split-K target and cap. They are request
+  tunings (`GenerateOptions::mxfp4_split_target` / `mxfp4_split_cap`), with
+  the environment values `TESSERA_MXFP4_SPLIT` (target `320`) and
+  `TESSERA_MXFP4_SPLITCAP` (cap `4`) as a diagnostic override that wins over
+  the request value.
+- Split-N attention chunks: the count is a request tuning
+  (`GenerateOptions::attention_split`, default `16`), and the path applies
+  once the key range reaches `kSplitMinKeys` (1024).
+- The DFlash2 draft context window (`GenerateOptions::draft_context`, default
+  from the checkpoint; `TESSERA_DFLASH2_CTX` as a diagnostic override).
 - Diagnostic toggles: `TESSERA_MXFP4_WMMA`, `TESSERA_MXFP4_W4A8`,
-  `TESSERA_TARGET_BF16`, `TESSERA_DFLASH2_CTX`.
+  `TESSERA_TARGET_BF16`, `TESSERA_DFLASH2_CTX`, `TESSERA_TILED_MIN_ROWS`,
+  `TESSERA_TILED_MIN_COLS`, `TESSERA_PREFILL_ATTN_PAIRS`. The tiled-GEMM
+  dispatch thresholds and the prefill attention pair budget are exposed for
+  measurement but are not swept automatically: the thresholds are coupled
+  and the prefill budget is a driver-hang safety clamp.
 
 ## Settings to tune
 
 | Setting | What it controls | Default | Candidates | Metric |
 | --- | --- | --- | --- | --- |
 | `mxfp4_split_target` | Split-K workgroups for the fp8 tensor-core MXFP4 GEMM. A small GPU is latency-bound with one split, a large GPU wants more. | `320` | `120`, `320`, `640` | decode tok/s |
+| `mxfp4_split_cap` | Upper bound on the split-K factor, so one projection does not over-split. | `4` | `2`, `4`, `8` | decode tok/s |
 | `prefill_chunk_tokens` | Tokens per prefill forward. A larger chunk cuts launch overhead and raises scratch. A smaller chunk bounds memory. | auto `512` | `512`, `768`, `1024`, `1536`, `2048` | prefill tok/s |
+| `attention_split` | Flash-decoding chunks for the single-token (m=1) path once the key range is long (`kSplitMinKeys` 1024). Splitting trades parallel work against the reduction. | `16` | `4`, `8`, `16`, `32` | decode tok/s, long context |
 | `draft_tokens` | Draft block for speculative decode. A larger block trades acceptance against verify cost. | checkpoint value (DFlash2 block `8`) | `4`, `8`, and the checkpoint value | decode tok/s |
+| `draft_context` | DFlash2 draft context window in rows. A smaller window cuts draft cost, a larger one can raise acceptance. | checkpoint window | `512`, `1024`, `2048` | decode tok/s |
 
-The first and third settings target decode speed, as in Strata. The second
-targets prefill speed.
+The split-K, cap, attention-split, draft-block and draft-context settings
+target decode speed, as in Strata. The prefill chunk targets prefill speed.
 
-Backend scope: the split target acts only on ROCm, because the fp8 WMMA MXFP4
-path is ROCm-only. On Vulkan the kernel does not exist, so the setting is
-inert. Calibration must detect this and report the setting as not applicable,
-not as a failure. Vulkan still calibrates the prefill chunk and the draft
-block.
+Backend scope: the split target and cap act only on ROCm, because the fp8
+WMMA MXFP4 path is ROCm-only. On Vulkan the kernel does not exist, so both
+are inert. Calibration detects this and reports the settings as not
+applicable, not as a failure. The attention split and the prefill chunk are
+swept on both backends; the attention split is reported not applicable when
+the prompts are shorter than `kSplitMinKeys`. The draft settings are swept
+only when a draft is attached.
 
 ## Measurement protocol
 

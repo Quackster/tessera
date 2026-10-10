@@ -56,6 +56,12 @@ class SpeculativeStrategy {
   // Maximum draft tokens proposed per window (0 = strategy default).
   [[nodiscard]] virtual std::size_t DraftBlock() const = 0;
 
+  // Override the draft context window in rows for the next generation
+  // (0 keeps the checkpoint's configured window). Called once before a
+  // generation; a strategy without a bounded draft context ignores it. Safe
+  // to call repeatedly.
+  virtual void SetDraftContext(std::size_t rows) { (void)rows; }
+
   // True when the engine folds the per-step anchor (the just-emitted token)
   // into the draft verification batch instead of running a separate
   // single-token target forward for it. The verify then processes

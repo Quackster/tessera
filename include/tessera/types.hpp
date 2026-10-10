@@ -301,4 +301,17 @@ struct TensorManifest {
 constexpr std::size_t kDefaultMxFp4SplitTarget = 320;
 constexpr std::size_t kDefaultMxFp4SplitCap = 4;
 
+// Built-in split count for the single-token (m=1) flash-decoding
+// attention path at long context (>= 1024 keys). A request that leaves
+// GenerateOptions::attention_split at 0 selects it.
+constexpr std::size_t kDefaultAttentionSplitChunks = 16;
+
+// Built-in tiled-GEMM dispatch thresholds and the prefill attention pair
+// budget (core::detail). Exposed so a diagnostic override can be named and
+// reported; the environment variables TESSERA_TILED_MIN_ROWS,
+// TESSERA_TILED_MIN_COLS and TESSERA_PREFILL_ATTN_PAIRS win over them.
+constexpr std::size_t kDefaultTiledMinRows = 16;
+constexpr std::size_t kDefaultTiledMinCols = 65536;
+constexpr std::uint64_t kDefaultPrefillAttnPairs = 4ull * 1024 * 1024;
+
 }  // namespace tessera

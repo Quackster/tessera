@@ -127,8 +127,10 @@ class DFlash2Strategy final : public SpeculativeStrategy {
       const int v = std::atoi(env);
       if (v > 0) {
         ctx_window_ = static_cast<std::size_t>(v);
+        env_ctx_window_ = ctx_window_;
       }
     }
+    default_ctx_window_ = ctx_window_;
     drafter_.SetContextLimit(ctx_window_ == 0 ? 0 : ctx_window_ + 1);
     capture_layers_ = std::vector<std::size_t>(
         config_.target_layer_ids.begin(), config_.target_layer_ids.end());
@@ -208,6 +210,17 @@ class DFlash2Strategy final : public SpeculativeStrategy {
   }
 
   std::size_t DraftBlock() const override { return block_; }
+
+  // Override the draft context window for this generation. Zero keeps the
+  // checkpoint's window. The TESSERA_DFLASH2_CTX diagnostic still wins.
+  void SetDraftContext(std::size_t rows) override {
+    std::size_t window = rows > 0 ? rows : default_ctx_window_;
+    if (env_ctx_window_ > 0) {
+      window = env_ctx_window_;
+    }
+    ctx_window_ = window;
+    drafter_.SetContextLimit(window == 0 ? 0 : window + 1);
+  }
 
   // The engine folds the anchor into the verify batch (one trunk read per
   // step); OnAnchor then sources the anchor from the verify's capture row 0.
@@ -482,6 +495,11 @@ class DFlash2Strategy final : public SpeculativeStrategy {
   std::size_t rank_ = 0;
   std::size_t topk_ = 0;
   std::size_t ctx_window_ = 0;
+  // The window Prepare resolved (config sliding window, with the env
+  // override applied) and the env override itself, so SetDraftContext can
+  // restore the default and keep the diagnostic value winning.
+  std::size_t default_ctx_window_ = 0;
+  std::size_t env_ctx_window_ = 0;
   std::uint32_t anchor_ = 0;
   std::vector<std::size_t> capture_layers_;
   std::vector<std::unique_ptr<Buffer>> capture_storage_;

@@ -68,6 +68,16 @@ MeasureFn AsMeasure(const StandInEngine& engine) {
   };
 }
 
+// Disable every sweep except `setting`, so a test isolates one setting.
+void OnlySweep(SweepOptions& options, Setting setting) {
+  options.sweep_split_target = setting == Setting::MxFp4SplitTarget;
+  options.sweep_split_cap = setting == Setting::MxFp4SplitCap;
+  options.sweep_prefill_chunk = setting == Setting::PrefillChunkTokens;
+  options.sweep_attention_split = setting == Setting::AttentionSplit;
+  options.sweep_draft_tokens = setting == Setting::DraftTokens;
+  options.sweep_draft_context = setting == Setting::DraftContext;
+}
+
 CalibrationEntry MakeEntry(const HardwareKey& key, CalibrationConfig config,
                            double decode_tps, double prefill_tps) {
   CalibrationEntry entry;
@@ -84,6 +94,12 @@ CalibrationEntry MakeEntry(const HardwareKey& key, CalibrationConfig config,
 TEST(CalibrateTest, CandidateValuesListsDedupeAndBounds) {
   const auto split = CandidateValues(Setting::MxFp4SplitTarget, 320);
   EXPECT_EQ(split, (std::vector<std::size_t>{120, 320, 640}));
+  const auto split_cap = CandidateValues(Setting::MxFp4SplitCap, 4);
+  EXPECT_EQ(split_cap, (std::vector<std::size_t>{2, 4, 8}));
+  const auto attention = CandidateValues(Setting::AttentionSplit, 16);
+  EXPECT_EQ(attention, (std::vector<std::size_t>{4, 8, 16, 32}));
+  const auto draft_context = CandidateValues(Setting::DraftContext, 1024);
+  EXPECT_EQ(draft_context, (std::vector<std::size_t>{512, 1024, 2048}));
   const auto prefill = CandidateValues(Setting::PrefillChunkTokens, 512);
   EXPECT_EQ(prefill, (std::vector<std::size_t>{512, 768, 1024, 1536, 2048}));
   const auto prefill_default = CandidateValues(Setting::PrefillChunkTokens, 768);
@@ -268,7 +284,7 @@ TEST(CalibrateTest, SweepKeepsDefaultWhenFlat) {
   SweepOptions options;
   options.prompt_count = 3;
   options.defaults.mxfp4_split_target = 320;
-  options.sweep_prefill_chunk = false;
+  OnlySweep(options, Setting::MxFp4SplitTarget);
   auto outcome = tessera::RunCalibrationSweep(options, AsMeasure(engine));
   ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
   EXPECT_EQ(outcome->config.mxfp4_split_target, 320u);
@@ -279,7 +295,7 @@ TEST(CalibrateTest, SweepKeepsDefaultBelowMinGain) {
   SweepOptions options;
   options.prompt_count = 3;
   options.defaults.mxfp4_split_target = 320;
-  options.sweep_prefill_chunk = false;
+  OnlySweep(options, Setting::MxFp4SplitTarget);
   // Only the 640 candidate is a hair faster, inside the noise floor.
   auto measure = [](Setting, const CalibrationConfig& config, std::size_t, bool)
       -> std::expected<Measurement, StatusCode> {
@@ -299,7 +315,7 @@ TEST(CalibrateTest, SweepFindsSplitTargetGain) {
   SweepOptions options;
   options.prompt_count = 3;
   options.defaults.mxfp4_split_target = 320;
-  options.sweep_prefill_chunk = false;
+  OnlySweep(options, Setting::MxFp4SplitTarget);
   auto measure = [](Setting, const CalibrationConfig& config, std::size_t, bool)
       -> std::expected<Measurement, StatusCode> {
     Measurement m;
@@ -325,7 +341,7 @@ TEST(CalibrateTest, SweepFindsDraftGain) {
   options.prompt_count = 3;
   options.defaults.draft_tokens = 8;
   options.sweep_split_target = false;
-  options.sweep_prefill_chunk = false;
+  OnlySweep(options, Setting::MxFp4SplitTarget);
   options.sweep_draft_tokens = true;
   auto measure = [](Setting, const CalibrationConfig& config, std::size_t, bool)
       -> std::expected<Measurement, StatusCode> {
@@ -359,7 +375,7 @@ TEST(CalibrateTest, SweepConfirmationRejectsNoisyWin) {
   SweepOptions options;
   options.prompt_count = 3;
   options.defaults.mxfp4_split_target = 320;
-  options.sweep_prefill_chunk = false;
+  OnlySweep(options, Setting::MxFp4SplitTarget);
   auto outcome = tessera::RunCalibrationSweep(options, measure);
   ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
   EXPECT_EQ(outcome->config.mxfp4_split_target, 320u);
@@ -378,7 +394,7 @@ TEST(CalibrateTest, SweepFailureReturnsError) {
   SweepOptions options;
   options.prompt_count = 3;
   options.defaults.mxfp4_split_target = 320;
-  options.sweep_prefill_chunk = false;
+  OnlySweep(options, Setting::MxFp4SplitTarget);
   auto outcome = tessera::RunCalibrationSweep(options, measure);
   ASSERT_FALSE(outcome.has_value());
   EXPECT_EQ(outcome.error(), StatusCode::DeviceError);
@@ -393,12 +409,15 @@ TEST(CalibrateTest, SweepReportsNotApplicable) {
   SweepOptions options;
   options.prompt_count = 1;
   options.sweep_split_target = false;
+  options.sweep_split_cap = false;
   options.sweep_prefill_chunk = false;
+  options.sweep_attention_split = false;
   options.sweep_draft_tokens = false;
+  options.sweep_draft_context = false;
   auto outcome = tessera::RunCalibrationSweep(options, measure);
   ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
   EXPECT_EQ(outcome->points.size(), 0u);
-  EXPECT_EQ(outcome->not_applicable.size(), 3u);
+  EXPECT_EQ(outcome->not_applicable.size(), 6u);
 }
 
 // The report lists the sweep, the chosen settings, the memory-bound
@@ -415,25 +434,34 @@ TEST(CalibrateTest, ReportShowsSweepChosenAndExample) {
   report.key_context = 4096;
   report.max_context = 359872;
   report.defaults.mxfp4_split_target = 320;
+  report.defaults.mxfp4_split_cap = 4;
   report.defaults.prefill_chunk_tokens = 512;
+  report.defaults.attention_split = 16;
   report.points = {
       {Setting::MxFp4SplitTarget, 120, 24.30, false},
       {Setting::MxFp4SplitTarget, 320, 23.90, true},
+      {Setting::MxFp4SplitCap, 4, 23.90, true},
       {Setting::PrefillChunkTokens, 512, 73.60, true},
       {Setting::PrefillChunkTokens, 768, 73.50, false},
+      {Setting::AttentionSplit, 16, 23.50, true},
   };
-  report.not_applicable = {Setting::DraftTokens};
+  report.not_applicable = {Setting::DraftTokens, Setting::DraftContext};
   report.chosen.mxfp4_split_target = 320;
+  report.chosen.mxfp4_split_cap = 4;
   report.chosen.prefill_chunk_tokens = 512;
+  report.chosen.attention_split = 16;
   report.decode_tps = 23.85;
   report.prefill_tps = 73.42;
   report.file = "/tmp/calibration.json";
   report.split_applicable = true;
+  report.attention_applicable = true;
   const std::string text = FormatCalibrationReport(report);
   EXPECT_NE(text.find("Tessera calibration report"), std::string::npos);
   EXPECT_NE(text.find("max context"), std::string::npos);
   EXPECT_NE(text.find("359872"), std::string::npos);
   EXPECT_NE(text.find("mxfp4_split_target"), std::string::npos);
+  EXPECT_NE(text.find("mxfp4_split_cap"), std::string::npos);
+  EXPECT_NE(text.find("attention_split"), std::string::npos);
   EXPECT_NE(text.find("(default)"), std::string::npos);
   EXPECT_NE(text.find("(kept)"), std::string::npos);
   EXPECT_NE(text.find("draft_tokens"), std::string::npos);
@@ -441,8 +469,46 @@ TEST(CalibrateTest, ReportShowsSweepChosenAndExample) {
   EXPECT_NE(text.find("--kv-q8"), std::string::npos);
   EXPECT_NE(text.find("--prefill-chunk 512"), std::string::npos);
   EXPECT_NE(text.find("--split-target 320"), std::string::npos);
+  EXPECT_NE(text.find("--split-cap 4"), std::string::npos);
+  EXPECT_NE(text.find("--attention-split 16"), std::string::npos);
   EXPECT_NE(text.find("--calibration /tmp/calibration.json"),
             std::string::npos);
+}
+
+// A real gain in the split-K cap is found and kept.
+TEST(CalibrateTest, SweepFindsSplitCapGain) {
+  SweepOptions options;
+  options.prompt_count = 3;
+  options.defaults.mxfp4_split_cap = 4;
+  OnlySweep(options, Setting::MxFp4SplitCap);
+  auto measure = [](Setting, const CalibrationConfig& config, std::size_t,
+                    bool) -> std::expected<Measurement, StatusCode> {
+    Measurement m;
+    m.decode_tps = config.mxfp4_split_cap == 8 ? 2.0 : 1.0;
+    m.prefill_tps = m.decode_tps;
+    return m;
+  };
+  auto outcome = tessera::RunCalibrationSweep(options, measure);
+  ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  EXPECT_EQ(outcome->config.mxfp4_split_cap, 8u);
+}
+
+// A real gain in the attention split is found and kept.
+TEST(CalibrateTest, SweepFindsAttentionSplitGain) {
+  SweepOptions options;
+  options.prompt_count = 3;
+  options.defaults.attention_split = 16;
+  OnlySweep(options, Setting::AttentionSplit);
+  auto measure = [](Setting, const CalibrationConfig& config, std::size_t,
+                    bool) -> std::expected<Measurement, StatusCode> {
+    Measurement m;
+    m.decode_tps = config.attention_split == 32 ? 2.0 : 1.0;
+    m.prefill_tps = m.decode_tps;
+    return m;
+  };
+  auto outcome = tessera::RunCalibrationSweep(options, measure);
+  ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  EXPECT_EQ(outcome->config.attention_split, 32u);
 }
 
 // A calibrated value must equal the default: the greedy token sequence is

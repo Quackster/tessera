@@ -48,7 +48,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
 | MoE, MLP, norms | Todo | Norms and MLP kernels done. No MoE kernels yet (planned Ornith-1.5-35B-A3B). |
-| Calibration | Done | `calibrate` sweeps the split-K target (ROCm), the prefill chunk (multiples of 256 from 512) and the draft block, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8 and reports the memory-bound max context. Prints a report with an example `run` command; writes JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
+| Calibration | Done | `calibrate` sweeps the split-K target and cap (ROCm), the prefill chunk (multiples of 256 from 512), the single-token attention split and (with a draft) the draft block and draft context, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8 and reports the memory-bound max context. Prints a report with an example `run` command; writes JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 
@@ -205,6 +205,8 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects the automatic default (512). |
 | `--split-target <n>` | both | 0 | fp8 MXFP4 split-K workgroup target (ROCm only). 0 uses the built-in default (320). |
 | `--split-cap <n>` | both | 0 | fp8 MXFP4 split-K factor cap (ROCm only). 0 uses the built-in default (4). |
+| `--attention-split <n>` | both | 0 | Single-token flash-decoding chunks at long context (>= 1024 keys). 0 uses the built-in default (16). |
+| `--draft-context <n>` | both | 0 | DFlash2 draft context window in rows. 0 keeps the checkpoint's window. |
 | `--quiet` | both | off | Suppress progress and info logs. |
 | `--prompt-text <str>` | run | none | Text prompt. It is tokenized, so the model needs a tokenizer. |
 | `--mmproj <path>` | run | none | Vision projector (mmproj) GGUF. |
@@ -241,6 +243,7 @@ Environment variables:
 * `TESSERA_MXFP4_W4A8=1` enables the served MXFP4 target's W4A8 linear activation.
 * `TESSERA_CALIBRATION` supplies `--calibration` when the flag is absent.
 * `TESSERA_MXFP4_SPLIT` and `TESSERA_MXFP4_SPLITCAP` override the split-K target and cap as a diagnostic (they win over the request value).
+* `TESSERA_TILED_MIN_ROWS`, `TESSERA_TILED_MIN_COLS` and `TESSERA_PREFILL_ATTN_PAIRS` override the tiled-GEMM dispatch thresholds and the prefill attention work budget for measurement.
 
 ## Build and test
 

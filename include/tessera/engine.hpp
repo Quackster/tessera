@@ -64,6 +64,15 @@ struct GenerateOptions {
   // Upper bound on the split-K factor, the cap that keeps one projection
   // from over-splitting (0 uses kDefaultMxFp4SplitCap).
   std::size_t mxfp4_split_cap = 0;
+  // Split count for the single-token (m=1) flash-decoding attention path
+  // at long context (>= 1024 keys); 0 uses the built-in default
+  // (kDefaultAttentionSplitChunks). A per-request speed knob; it changes
+  // only the accumulation order, not the produced tokens.
+  std::size_t attention_split = 0;
+  // Draft context window in rows for the DFlash2 drafter; 0 keeps the
+  // checkpoint's configured window. A smaller window cuts draft cost, a
+  // larger one can raise acceptance.
+  std::size_t draft_context = 0;
   // Prompt tokens fed before generation; when non-empty they take the
   // place of first_token and the last one seeds generation.
   std::vector<std::uint32_t> prompt_tokens;

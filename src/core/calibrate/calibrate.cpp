@@ -25,11 +25,20 @@ void ApplySetting(CalibrationConfig& config, Setting setting,
     case Setting::MxFp4SplitTarget:
       config.mxfp4_split_target = value;
       break;
+    case Setting::MxFp4SplitCap:
+      config.mxfp4_split_cap = value;
+      break;
     case Setting::PrefillChunkTokens:
       config.prefill_chunk_tokens = value;
       break;
+    case Setting::AttentionSplit:
+      config.attention_split = value;
+      break;
     case Setting::DraftTokens:
       config.draft_tokens = value;
+      break;
+    case Setting::DraftContext:
+      config.draft_context = value;
       break;
   }
 }
@@ -155,6 +164,22 @@ bool ReadNumber(const core::Json& object, std::string_view key, double& out) {
   return true;
 }
 
+// Optional numeric field: absent leaves `out` unchanged. Used for fields
+// added after the first calibration file version, so a file without them
+// still loads.
+bool ReadOptionalNumber(const core::Json& object, std::string_view key,
+                        double& out) {
+  const core::Json* field = object.Find(key);
+  if (field == nullptr) {
+    return true;
+  }
+  if (field->type() != core::Json::Type::Number) {
+    return false;
+  }
+  out = field->AsNumber();
+  return true;
+}
+
 // Parse one entry object. Any missing or wrong-typed field is
 // MalformedFile, so a truncated file is rejected instead of half-applied.
 std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
@@ -164,8 +189,11 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
   CalibrationEntry entry;
   double context = 0.0;
   double split = 0.0;
+  double cap = 0.0;
   double prefill = 0.0;
+  double attention = 0.0;
   double draft = 0.0;
+  double draft_context = 0.0;
   if (!ReadString(item, "backend", entry.key.backend) ||
       !ReadString(item, "device", entry.key.device) ||
       !ReadString(item, "model", entry.key.model) ||
@@ -173,20 +201,27 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
       !ReadString(item, "kv_type", entry.key.kv_type) ||
       !ReadString(item, "strategy", entry.key.strategy) ||
       !ReadNumber(item, "mxfp4_split_target", split) ||
+      !ReadOptionalNumber(item, "mxfp4_split_cap", cap) ||
       !ReadNumber(item, "prefill_chunk_tokens", prefill) ||
+      !ReadOptionalNumber(item, "attention_split", attention) ||
       !ReadNumber(item, "draft_tokens", draft) ||
+      !ReadOptionalNumber(item, "draft_context", draft_context) ||
       !ReadNumber(item, "decode_tps", entry.decode_tps) ||
       !ReadNumber(item, "prefill_tps", entry.prefill_tps) ||
       !ReadString(item, "date", entry.date)) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  if (context < 0.0 || split < 0.0 || prefill < 0.0 || draft < 0.0) {
+  if (context < 0.0 || split < 0.0 || cap < 0.0 || prefill < 0.0 ||
+      attention < 0.0 || draft < 0.0 || draft_context < 0.0) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   entry.key.context = static_cast<std::size_t>(context);
   entry.config.mxfp4_split_target = static_cast<std::size_t>(split);
+  entry.config.mxfp4_split_cap = static_cast<std::size_t>(cap);
   entry.config.prefill_chunk_tokens = static_cast<std::size_t>(prefill);
+  entry.config.attention_split = static_cast<std::size_t>(attention);
   entry.config.draft_tokens = static_cast<std::size_t>(draft);
+  entry.config.draft_context = static_cast<std::size_t>(draft_context);
   return entry;
 }
 
@@ -196,10 +231,16 @@ std::string_view ToString(Setting setting) {
   switch (setting) {
     case Setting::MxFp4SplitTarget:
       return "mxfp4_split_target";
+    case Setting::MxFp4SplitCap:
+      return "mxfp4_split_cap";
     case Setting::PrefillChunkTokens:
       return "prefill_chunk_tokens";
+    case Setting::AttentionSplit:
+      return "attention_split";
     case Setting::DraftTokens:
       return "draft_tokens";
+    case Setting::DraftContext:
+      return "draft_context";
   }
   return "unknown";
 }
@@ -212,14 +253,25 @@ std::vector<std::size_t> CandidateValues(Setting setting,
     case Setting::MxFp4SplitTarget:
       values = {120, 320, 640};
       break;
+    case Setting::MxFp4SplitCap:
+      values = {2, 4, 8};
+      break;
     case Setting::PrefillChunkTokens:
       // Ascending multiples of 256 from the 512 default: a larger chunk
       // issues fewer launches, a smaller one bounds memory. The sweep keeps
       // the default unless a larger chunk measurably wins.
       values = {512, 768, 1024, 1536, 2048};
       break;
+    case Setting::AttentionSplit:
+      // Flash-decoding chunks for the single-token long-context path.
+      values = {4, 8, 16, 32};
+      break;
     case Setting::DraftTokens:
       values = {4, 8};
+      break;
+    case Setting::DraftContext:
+      // Draft context window in rows; the checkpoint value is the default.
+      values = {512, 1024, 2048};
       break;
   }
   if (default_value > 0) {
@@ -336,6 +388,13 @@ std::expected<SweepOutcome, StatusCode> RunCalibrationSweep(
       !status) {
     return std::unexpected(status.error());
   }
+  if (auto status = SweepSetting(options, measure, Setting::MxFp4SplitCap,
+                                 options.sweep_split_cap,
+                                 options.defaults.mxfp4_split_cap,
+                                 /*decode=*/true, outcome);
+      !status) {
+    return std::unexpected(status.error());
+  }
   if (auto status = SweepSetting(options, measure, Setting::PrefillChunkTokens,
                                  options.sweep_prefill_chunk,
                                  options.defaults.prefill_chunk_tokens,
@@ -343,9 +402,23 @@ std::expected<SweepOutcome, StatusCode> RunCalibrationSweep(
       !status) {
     return std::unexpected(status.error());
   }
+  if (auto status = SweepSetting(options, measure, Setting::AttentionSplit,
+                                 options.sweep_attention_split,
+                                 options.defaults.attention_split,
+                                 /*decode=*/true, outcome);
+      !status) {
+    return std::unexpected(status.error());
+  }
   if (auto status = SweepSetting(options, measure, Setting::DraftTokens,
                                  options.sweep_draft_tokens,
                                  options.defaults.draft_tokens,
+                                 /*decode=*/true, outcome);
+      !status) {
+    return std::unexpected(status.error());
+  }
+  if (auto status = SweepSetting(options, measure, Setting::DraftContext,
+                                 options.sweep_draft_context,
+                                 options.defaults.draft_context,
                                  /*decode=*/true, outcome);
       !status) {
     return std::unexpected(status.error());
@@ -402,11 +475,20 @@ std::expected<void, StatusCode> CalibrationFile::Save(
     item.Set("mxfp4_split_target",
              core::Json::Number(
                  static_cast<double>(entry.config.mxfp4_split_target)));
+    item.Set("mxfp4_split_cap",
+             core::Json::Number(
+                 static_cast<double>(entry.config.mxfp4_split_cap)));
     item.Set("prefill_chunk_tokens",
              core::Json::Number(
                  static_cast<double>(entry.config.prefill_chunk_tokens)));
+    item.Set("attention_split",
+             core::Json::Number(
+                 static_cast<double>(entry.config.attention_split)));
     item.Set("draft_tokens", core::Json::Number(
                                  static_cast<double>(entry.config.draft_tokens)));
+    item.Set("draft_context",
+             core::Json::Number(
+                 static_cast<double>(entry.config.draft_context)));
     item.Set("decode_tps", core::Json::Number(entry.decode_tps));
     item.Set("prefill_tps", core::Json::Number(entry.prefill_tps));
     item.Set("date", core::Json::String(entry.date));
@@ -462,25 +544,43 @@ CalibrationConfig ApplySavedCalibration(
   if (merged.mxfp4_split_target == 0) {
     merged.mxfp4_split_target = saved.config.mxfp4_split_target;
   }
+  if (merged.mxfp4_split_cap == 0) {
+    merged.mxfp4_split_cap = saved.config.mxfp4_split_cap;
+  }
   if (merged.prefill_chunk_tokens == 0) {
     merged.prefill_chunk_tokens = saved.config.prefill_chunk_tokens;
   }
+  if (merged.attention_split == 0) {
+    merged.attention_split = saved.config.attention_split;
+  }
   if (merged.draft_tokens == 0) {
     merged.draft_tokens = saved.config.draft_tokens;
+  }
+  if (merged.draft_context == 0) {
+    merged.draft_context = saved.config.draft_context;
   }
   return merged;
 }
 
 void ApplyToGenerateOptions(const CalibrationConfig& config,
                             GenerateOptions& options) {
+  if (config.mxfp4_split_target != 0) {
+    options.mxfp4_split_target = config.mxfp4_split_target;
+  }
+  if (config.mxfp4_split_cap != 0) {
+    options.mxfp4_split_cap = config.mxfp4_split_cap;
+  }
   if (config.prefill_chunk_tokens != 0) {
     options.prefill_chunk_tokens = config.prefill_chunk_tokens;
+  }
+  if (config.attention_split != 0) {
+    options.attention_split = config.attention_split;
   }
   if (config.draft_tokens != 0) {
     options.draft_tokens = config.draft_tokens;
   }
-  if (config.mxfp4_split_target != 0) {
-    options.mxfp4_split_target = config.mxfp4_split_target;
+  if (config.draft_context != 0) {
+    options.draft_context = config.draft_context;
   }
 }
 
@@ -497,10 +597,16 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
     switch (setting) {
       case Setting::MxFp4SplitTarget:
         return report.defaults.mxfp4_split_target;
+      case Setting::MxFp4SplitCap:
+        return report.defaults.mxfp4_split_cap;
       case Setting::PrefillChunkTokens:
         return report.defaults.prefill_chunk_tokens;
+      case Setting::AttentionSplit:
+        return report.defaults.attention_split;
       case Setting::DraftTokens:
         return report.defaults.draft_tokens;
+      case Setting::DraftContext:
+        return report.defaults.draft_context;
     }
     return 0;
   };
@@ -523,8 +629,10 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
                                 report.kv_type + " memory bound",
              14);
   out += "\nSweep\n-----\n";
-  for (Setting setting : {Setting::MxFp4SplitTarget, Setting::PrefillChunkTokens,
-                          Setting::DraftTokens}) {
+  for (Setting setting :
+       {Setting::MxFp4SplitTarget, Setting::MxFp4SplitCap,
+        Setting::PrefillChunkTokens, Setting::AttentionSplit,
+        Setting::DraftTokens, Setting::DraftContext}) {
     out += std::string(ToString(setting)) + "\n";
     bool any = false;
     for (const SweepPoint& point : report.points) {
@@ -549,12 +657,21 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += "\nChosen\n------\n";
   out += row("mxfp4_split_target",
              std::to_string(report.chosen.mxfp4_split_target), 21);
+  out += row("mxfp4_split_cap",
+             std::to_string(report.chosen.mxfp4_split_cap), 21);
   out += row("prefill_chunk_tokens",
              std::to_string(report.chosen.prefill_chunk_tokens), 21);
+  out += row("attention_split",
+             std::to_string(report.chosen.attention_split), 21);
   out += row("draft_tokens",
              report.chosen.draft_tokens == 0
                  ? std::string("(none)")
                  : std::to_string(report.chosen.draft_tokens),
+             21);
+  out += row("draft_context",
+             report.chosen.draft_context == 0
+                 ? std::string("(checkpoint)")
+                 : std::to_string(report.chosen.draft_context),
              21);
   out += row("decode", format_rate(report.decode_tps) + " tok/s", 21);
   out += row("prefill", format_rate(report.prefill_tps) + " tok/s", 21);
@@ -566,9 +683,19 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   if (report.split_applicable) {
     example +=
         " --split-target " + std::to_string(report.chosen.mxfp4_split_target);
+    example +=
+        " --split-cap " + std::to_string(report.chosen.mxfp4_split_cap);
+  }
+  if (report.attention_applicable && report.chosen.attention_split > 0) {
+    example +=
+        " --attention-split " + std::to_string(report.chosen.attention_split);
   }
   if (report.draft_attached && report.chosen.draft_tokens > 0) {
     example += " --draft-block " + std::to_string(report.chosen.draft_tokens);
+  }
+  if (report.draft_attached && report.chosen.draft_context > 0) {
+    example +=
+        " --draft-context " + std::to_string(report.chosen.draft_context);
   }
   example += " --prompt-text \"Hello\"";
   out += "\nExample\n-------\n";

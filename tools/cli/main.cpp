@@ -25,6 +25,7 @@ namespace {
 using tessera::cli::kDefaultContext;
 using tessera::cli::kDefaultDraftBlock;
 using tessera::cli::kDefaultPrefillChunk;
+using tessera::cli::ApplyDiagnosticFlag;
 using tessera::cli::LogModelSummary;
 using tessera::cli::MatchKvType;
 using tessera::cli::PrintUsage;
@@ -87,6 +88,8 @@ int main(int argc, char** argv) {
   std::size_t prefill_chunk = kDefaultPrefillChunk;
   std::size_t split_target = 0;
   std::size_t split_cap = 0;
+  std::size_t attention_split = 0;
+  std::size_t draft_context = 0;
   int gpu = 0;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
@@ -128,6 +131,10 @@ int main(int argc, char** argv) {
       split_target = std::stoul(argv[++i]);
     } else if (arg == "--split-cap" && i + 1 < argc) {
       split_cap = std::stoul(argv[++i]);
+    } else if (arg == "--attention-split" && i + 1 < argc) {
+      attention_split = std::stoul(argv[++i]);
+    } else if (arg == "--draft-context" && i + 1 < argc) {
+      draft_context = std::stoul(argv[++i]);
     } else if (arg == "--speculate") {
       speculate = true;
     } else if (arg == "--sample") {
@@ -152,6 +159,8 @@ int main(int argc, char** argv) {
       max_completion_tokens = std::stoul(argv[++i]);
     } else if (arg == "--max-thinking-tokens" && i + 1 < argc) {
       max_thinking_tokens = std::stoul(argv[++i]);
+    } else if (ApplyDiagnosticFlag(arg, i, argv, argc)) {
+      // handled by ApplyDiagnosticFlag (sets the diagnostic env var)
     } else {
       std::fprintf(stderr, "cli: unknown or unterminated argument '%s'\n",
                    arg.data());
@@ -313,6 +322,8 @@ int main(int argc, char** argv) {
   applied.prefill_chunk_tokens = prefill_chunk;
   applied.draft_tokens = draft_block;
   applied.mxfp4_split_target = split_target;
+  applied.attention_split = attention_split;
+  applied.draft_context = draft_context;
   if (!calibration_path.empty()) {
     const std::string strategy =
         draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
@@ -333,6 +344,8 @@ int main(int argc, char** argv) {
     gen.prefill_chunk_tokens = applied.prefill_chunk_tokens;
     gen.mxfp4_split_target = applied.mxfp4_split_target;
     gen.mxfp4_split_cap = split_cap;
+    gen.attention_split = applied.attention_split;
+    gen.draft_context = applied.draft_context;
     gen.kv_type = kv_type;
     gen.progress_every = quiet ? 0 : 64;
     if (!quiet) {

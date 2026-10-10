@@ -40,14 +40,18 @@ constexpr std::size_t kDecodeTokens = 32;
 // would dominate the run.
 constexpr std::size_t kDecodePromptTokens = 64;
 // The fixed prompt set is a file-local constant. Each base line repeats to
-// this many sentences so the prompt is longer than the prefill chunk half
-// of the candidate list and the sweep can tell the chunks apart.
-constexpr std::size_t kPromptRepeats = 64;
+// this many sentences so the prompt exceeds the attention-split threshold
+// (1024 keys) and the prefill chunk half of the candidate list, and the
+// sweep can tell the chunks apart.
+constexpr std::size_t kPromptRepeats = 72;
 // Headroom kept free for scratch and fragmentation when reporting the
 // maximum context length.
 constexpr std::uint64_t kMemoryReserveBytes = 2ull * 1024 * 1024 * 1024;
 // Below this the reported maximum context is not useful.
 constexpr std::size_t kMinReportedContext = 2048;
+// The attention split only applies at this many keys or more (mirrors
+// core::detail::kSplitMinKeys; the CLI cannot include that header).
+constexpr std::size_t kAttentionSplitMinKeys = 1024;
 // The whole sweep stops after this; a longer run means the sweep is too
 // heavy or a kernel regressed.
 constexpr int kSweepBudgetMinutes = 15;
@@ -146,6 +150,12 @@ void PrintCalibrateUsage() {
       "TESSERA_CALIBRATION)\n"
       "  --gpu <n>         GPU index to use (default 0, the first)\n"
       "  --prompts <file>  fixed prompts, one per non-empty line\n"
+      "  --wmma|--no-wmma  fp8 tensor-core MXFP4 GEMM (diagnostic)\n"
+      "  --w4a8            MXFP4 W4A8 activation quant (diagnostic)\n"
+      "  --target-bf16     round projection outputs to bf16 (diagnostic)\n"
+      "  --tiled-min-rows <n> | --tiled-min-cols <n>  tiled-GEMM thresholds "
+      "(diagnostic)\n"
+      "  --prefill-attn-pairs <n>  prefill attention work budget (diagnostic)\n"
       "  --quiet           suppress progress and info logs\n",
       kDefaultContext);
 }
@@ -193,6 +203,8 @@ int RunCalibrateCommand(int argc, char** argv) {
       quiet = true;
     } else if (MatchKvType(arg, kv_type)) {
       // handled by MatchKvType
+    } else if (ApplyDiagnosticFlag(arg, i, argv, argc)) {
+      // handled by ApplyDiagnosticFlag (sets the diagnostic env var)
     } else {
       std::fprintf(stderr, "cli: unknown or unterminated argument '%s'\n",
                    arg.data());
@@ -320,7 +332,9 @@ int RunCalibrateCommand(int argc, char** argv) {
 
   CalibrationConfig defaults;
   defaults.mxfp4_split_target = kDefaultMxFp4SplitTarget;
+  defaults.mxfp4_split_cap = kDefaultMxFp4SplitCap;
   defaults.prefill_chunk_tokens = kDefaultPrefillChunkTokens;
+  defaults.attention_split = kDefaultAttentionSplitChunks;
   if (draft_attached) {
     const SpeculativeStrategy* strategy = engine.Speculative();
     defaults.draft_tokens = strategy != nullptr ? strategy->DraftBlock() : 0;
@@ -346,16 +360,23 @@ int RunCalibrateCommand(int argc, char** argv) {
       }
       return std::unexpected(StatusCode::DeviceError);
     }
-    const bool decode = setting != Setting::PrefillChunkTokens;
+    const bool prefill = setting == Setting::PrefillChunkTokens;
+    // The attention split only applies at a long key range, so it measures
+    // decode on the long prompts; the other decode settings use the short
+    // ones.
+    const bool long_context = prefill || setting == Setting::AttentionSplit;
     GenerateOptions gen;
-    gen.max_completion_tokens = warmup ? 1 : (decode ? kDecodeTokens : 1);
+    gen.max_completion_tokens = warmup ? 1 : (prefill ? 1 : kDecodeTokens);
     gen.sample = false;
     gen.progress_every = 0;
     gen.kv_type = kv_type;
     gen.prefill_chunk_tokens = config.prefill_chunk_tokens;
     gen.draft_tokens = config.draft_tokens;
     gen.mxfp4_split_target = config.mxfp4_split_target;
-    gen.prompt_tokens = decode ? decode_ids[prompt] : prefill_ids[prompt];
+    gen.mxfp4_split_cap = config.mxfp4_split_cap;
+    gen.attention_split = config.attention_split;
+    gen.draft_context = config.draft_context;
+    gen.prompt_tokens = long_context ? prefill_ids[prompt] : decode_ids[prompt];
     auto outcome =
         engine.GenerateStreaming(loaded, gen, [](std::uint32_t) { return true; });
     if (!outcome) {
@@ -386,8 +407,15 @@ int RunCalibrateCommand(int argc, char** argv) {
   sweep.prompt_count = prefill_ids.size();
   sweep.defaults = defaults;
   sweep.sweep_split_target = backend == "rocm";
+  sweep.sweep_split_cap = backend == "rocm";
   sweep.sweep_prefill_chunk = true;
+  std::size_t longest_prompt = 0;
+  for (const auto& ids : prefill_ids) {
+    longest_prompt = std::max(longest_prompt, ids.size());
+  }
+  sweep.sweep_attention_split = longest_prompt >= kAttentionSplitMinKeys;
   sweep.sweep_draft_tokens = draft_attached && defaults.draft_tokens > 0;
+  sweep.sweep_draft_context = draft_attached;
 
   if (!quiet) {
     log.Info("calibrate", std::string("sweeping on ") + backend + " (" +
@@ -487,6 +515,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   report.prefill_tps = MedianOf(prefill_rates);
   report.file = calibration_file;
   report.split_applicable = backend == "rocm";
+  report.attention_applicable = sweep.sweep_attention_split;
   report.draft_attached = draft_attached;
   std::fputs("\n", stdout);
   std::fputs(FormatCalibrationReport(report).c_str(), stdout);

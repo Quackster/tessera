@@ -74,6 +74,19 @@ void PrintUsage() {
                "built-in, ROCm only)\n"
                "  --split-cap <n>    fp8 MXFP4 split-K factor cap (0 = built-in, "
                "ROCm only)\n"
+               "  --attention-split <n> single-token flash-decoding chunks (0 = "
+               "built-in, %zu)\n"
+               "  --draft-context <n> DFlash2 draft context window in rows (0 = "
+               "checkpoint)\n"
+               "  --wmma | --no-wmma   fp8 tensor-core MXFP4 GEMM (default on; "
+               "diagnostic)\n"
+               "  --w4a8             MXFP4 W4A8 activation quant (diagnostic)\n"
+               "  --target-bf16      round projection outputs to bf16 "
+               "(diagnostic)\n"
+               "  --tiled-min-rows <n> | --tiled-min-cols <n>  tiled-GEMM "
+               "dispatch thresholds (diagnostic)\n"
+               "  --prefill-attn-pairs <n>  prefill attention work budget "
+               "(diagnostic)\n"
                "  --prompt-text <s> text prompt (tokenized; needs a "
                "tokenizer)\n"
                "  --max-completion-tokens <n> completion tokens (0 fills the "
@@ -105,7 +118,7 @@ void PrintUsage() {
                "TESSERA_API_KEY)\n"
                "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
                kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk,
-               kDefaultMaxCompletionTokens);
+               kDefaultAttentionSplitChunks, kDefaultMaxCompletionTokens);
 }
 
 CalibrationConfig ResolveCalibration(Engine& engine, Model& model,

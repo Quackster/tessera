@@ -33,6 +33,8 @@ struct RequestTuning {
   // Split-K workgroup target and cap for the fp8 tensor-core MXFP4 GEMM.
   std::size_t mxfp4_split_target = 0;
   std::size_t mxfp4_split_cap = 0;
+  // Split count for the single-token flash-decoding attention path.
+  std::size_t attention_split = 0;
 };
 
 // Per-step state for single-token vanilla decoding: the host key/value

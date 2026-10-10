@@ -87,6 +87,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   cache.kv_type = options.kv_type;
   cache.tuning.mxfp4_split_target = options.mxfp4_split_target;
   cache.tuning.mxfp4_split_cap = options.mxfp4_split_cap;
+  cache.tuning.attention_split = options.attention_split;
   // Opt-in decode phase profiler (TESSERA_PROFILE=1). The profile lives for
   // the whole generation and is reported after the decode summary.
   core::Profile profile(core::DecodeProfilingDeep());
@@ -123,6 +124,9 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
                                       std::string(ToString(prepared.error())));
       return std::unexpected(prepared.error());
     }
+    // A request may override the draft context window; set it before the
+    // prefill so the capture tail matches.
+    strategy->SetDraftContext(options.draft_context);
     const std::span<const std::size_t> layers = strategy->CaptureLayers();
     capture_layers.assign(layers.begin(), layers.end());
     const std::span<Buffer* const> buffers = strategy->CaptureBuffers();

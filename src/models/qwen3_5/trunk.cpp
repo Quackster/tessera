@@ -124,7 +124,7 @@ std::expected<void, StatusCode> EnsureSplitReady(Backend& backend,
                                                  KvCacheType type) {
   const std::size_t heads = cfg.attention.heads;
   const std::size_t head_dim = cfg.attention.head_dim;
-  const std::size_t chunks = detail::kSplitChunks;
+  const std::size_t chunks = detail::ResolveAttentionSplit(h.attention_split);
   if (h.split_acc == nullptr || h.split_heads != heads ||
       h.split_dim != head_dim || h.split_chunks != chunks) {
     const std::size_t part = heads * chunks;
@@ -279,7 +279,7 @@ std::expected<void, StatusCode> RunFullBlock(
   // range is one serial 128-tile dependency chain per workgroup, so a long
   // context is latency-bound. Batches (prefill, verify) keep the tiled
   // kernel, which is faster at their row counts.
-  const std::size_t split = detail::SplitFor(1, kv.rows);
+  const std::size_t split = detail::SplitFor(1, kv.rows, h.attention_split);
   bool attention_ok = false;
   if (split > 0) {
     auto ready = EnsureSplitReady(backend, cfg, h, kv.type);

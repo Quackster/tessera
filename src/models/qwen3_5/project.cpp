@@ -17,6 +17,36 @@ namespace tessera::models::qwen3_5 {
 
 namespace detail = ::tessera::core::detail;
 
+namespace {
+
+// A positive size_t from an environment override, else the fallback. The
+// tiled-GEMM dispatch thresholds are diagnostic tunables: the built-in
+// values were measured, and an override lets a sweep measure another point
+// without a rebuild.
+std::size_t EnvSize(const char* name, std::size_t fallback) {
+  if (const char* env = std::getenv(name)) {
+    const unsigned long long value = std::strtoull(env, nullptr, 10);
+    if (value > 0) {
+      return static_cast<std::size_t>(value);
+    }
+  }
+  return fallback;
+}
+
+std::size_t TiledMinRows() {
+  static const std::size_t kValue =
+      EnvSize("TESSERA_TILED_MIN_ROWS", detail::kGemmTiledMinRows);
+  return kValue;
+}
+
+std::size_t TiledMinCols() {
+  static const std::size_t kValue =
+      EnvSize("TESSERA_TILED_MIN_COLS", detail::kGemmTiledMinCols);
+  return kValue;
+}
+
+}  // namespace
+
 void InvalidateActivationPack(Qwen35State& h) {
   h.wmma_pack_valid = false;
 }
@@ -220,7 +250,7 @@ std::expected<void, StatusCode> ProjectBatch(
   // and the m=1+draft verify head through the same kernel so they share
   // numerics. Falls through where the backend lacks it (Vulkan).
   if (dtype == DType::BF16 && wmma_on && m >= 1 && m <= 16 &&
-      n >= detail::kGemmTiledMinCols) {
+      n >= TiledMinCols()) {
     auto wmma = detail::CachedKernel(backend, h.gemms,
                                      static_cast<int>(DType::BF16) + 0x4000,
                                      "gemm_bf16_wmma");
@@ -270,8 +300,7 @@ std::expected<void, StatusCode> ProjectBatch(
     }
   }
   if (!projected_done &&
-      (m >= detail::kGemmTiledMinRows ||
-       (m >= 2 && n >= detail::kGemmTiledMinCols)) &&
+      (m >= TiledMinRows() || (m >= 2 && n >= TiledMinCols())) &&
       !detail::GemmTiledKernelName(dtype).empty()) {
     auto tiled = detail::GemmTiledFor(backend, h.gemm_tiled, dtype);
     if (tiled) {

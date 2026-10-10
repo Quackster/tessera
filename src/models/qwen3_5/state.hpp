@@ -104,6 +104,9 @@ struct Qwen35State final : core::ArchState {
   // still win as a diagnostic override.
   std::size_t mxfp4_split_target = 0;
   std::size_t mxfp4_split_cap = 0;
+  // Request split count for the single-token flash-decoding attention path;
+  // 0 means the built-in default.
+  std::size_t attention_split = 0;
   std::unordered_map<const void*, std::unique_ptr<Buffer>> mxfp4_wref;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
@@ -171,6 +174,7 @@ inline Qwen35State& State(core::DecodeCache& cache) {
     auto state = std::make_unique<Qwen35State>();
     state->mxfp4_split_target = cache.tuning.mxfp4_split_target;
     state->mxfp4_split_cap = cache.tuning.mxfp4_split_cap;
+    state->attention_split = cache.tuning.attention_split;
     cache.arch = std::move(state);
   }
   return *static_cast<Qwen35State*>(cache.arch.get());

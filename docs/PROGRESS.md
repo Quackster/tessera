@@ -174,15 +174,19 @@ through RADV GFX1100, rocm through the system ROCm).
   (off, no acceptance gain), `TESSERA_TARGET_BF16=1` (off).
 - Calibration (docs/CALIBRATE.md). A `calibrate` subcommand loads
   the model once, warms it, sweeps the hardware dependent settings
-  (the MXFP4 fp8 split-K target on ROCm, the prefill chunk on both
-  backends, the draft block when a draft is attached), applies the
-  pick rule (keep a candidate only when it beats the default by more
-  than MIN_GAIN 0.03) and confirms a winner with an interleaved
-  re-measurement (three rounds each, median). The prefill candidates
-  are ascending multiples of 256 from the 512 default (512, 768,
-  1024, 1536, 2048); decode settings sweep a 64-token prompt, the
-  prefill chunk a long prompt, so the run stays within its cap. The
-  command defaults the KV cache to int8 (kv8) and reports the
+  (the MXFP4 fp8 split-K target and cap on ROCm, the prefill chunk on
+  both backends, the single-token attention split at long context,
+  and the draft block and draft context when a draft is attached),
+  applies the pick rule (keep a candidate only when it beats the
+  default by more than MIN_GAIN 0.03) and confirms a winner with an
+  interleaved re-measurement (three rounds each, median). The prefill
+  candidates are ascending multiples of 256 from the 512 default
+  (512, 768, 1024, 1536, 2048); decode settings sweep a 64-token
+  prompt, the attention split and the prefill chunk a long prompt, so
+  the run stays within its cap. The tiled-GEMM dispatch thresholds
+  and the prefill attention pair budget are exposed as environment
+  overrides for measurement but are not swept: the thresholds are
+  coupled and the budget is a driver-hang safety clamp. The command defaults the KV cache to int8 (kv8) and reports the
   maximum context length the device allows for that cache type
   (free memory minus a 2 GiB reserve, divided by the per-token KV
   bytes over the full-attention layers). It writes a JSON calibration
@@ -199,11 +203,12 @@ through RADV GFX1100, rocm through the system ROCm).
   `GenerateOptions`, carried through the request tuning into the
   architecture state (`TESSERA_MXFP4_SPLIT`/`SPLITCAP` still win as a
   diagnostic override). Measured on the 27B MXFP4 target (ROCm,
-  GPU0, int8 KV, the default three-prompt set, 6m36s): the default
-  split target 320 and prefill chunk 512 were kept (every candidate
-  inside the noise floor; prefill held at about 73 tok/s for all
-  chunk sizes), 23.8 decode tok/s, 73.4 prefill tok/s. The reported
-  memory bound for the int8 cache is 359872 tokens. A calibrated run
+  GPU0, int8 KV, the default three-prompt set, 12m19s): the default
+  split target 320, split cap 4, prefill chunk 512 and attention
+  split 16 were all kept (every candidate inside the noise floor;
+  prefill held at about 73 tok/s for every chunk size), 23.9 decode
+  tok/s, 73.7 prefill tok/s. The reported memory bound for the int8
+  cache is 359872 tokens. A calibrated run
   produces the same tokens as the default. Covered by `CalibrateTest`
   (stand-in engine sweep, candidate/pick/key/file/context units, and
   a device test that confirms a calibrated split matches the default
