@@ -46,6 +46,11 @@ aside {
 #sessions .busy-dot { color: var(--accent); }
 #sessions .del { float: right; color: var(--dim); background: none; border: none; cursor: pointer; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#empty-state { flex: 1; display: flex; align-items: center; justify-content: center; }
+#empty-state[hidden] { display: none; }
+#empty-state button { font-size: 17px; padding: 12px 28px; }
+#messages[hidden] { display: none; }
+#composer[hidden] { display: none; }
 #messages { flex: 1; overflow-y: auto; padding: 16px; }
 .message { display: flex; gap: 10px; margin-bottom: 16px; max-width: 940px; }
 .message .meta {

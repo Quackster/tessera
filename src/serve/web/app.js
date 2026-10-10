@@ -372,6 +372,7 @@ function renderSidebar() {
         else {
           currentMessages = [];
           $('messages').innerHTML = '';
+          updateControls();
         }
       } catch (error) { showError(String(error)); }
     });
@@ -379,6 +380,19 @@ function renderSidebar() {
     item.addEventListener('click', () => openSession(session.id));
     list.appendChild(item);
   }
+}
+
+// Apply a title the server generated before the answer streamed, so
+// the sidebar names the chat while its reply is still generating. The
+// list entry and the cached chat both update, whether or not this chat
+// is the one on screen.
+function applyTitle(id, title) {
+  if (!title) return;
+  if (cachedFull[id]) cachedFull[id].title = title;
+  const session = sessions.find((entry) => entry.id === id);
+  if (session) session.title = title;
+  writeCache();
+  renderSidebar();
 }
 
 // The live turn of the open chat, or null when that chat is idle.
@@ -431,6 +445,12 @@ function updateControls() {
   $('stop').hidden = !turn;
   $('pause').hidden = !turn || turn.paused;
   $('resume').hidden = !turn || !turn.paused;
+  // No open chat shows the centered start button in place of the view.
+  const empty = !currentId;
+  $('empty-state').hidden = !empty;
+  $('messages').hidden = empty;
+  $('composer').hidden = empty;
+  $('start-chat').disabled = !serverReady;
 }
 
 // One stored or cached message to the rendered shape; unknown fields
@@ -490,8 +510,10 @@ async function refreshSessions() {
   for (const session of sessions) {
     if (cachedFull[session.id]) cachedFull[session.id].title = session.title;
   }
-  if (!sessions.some((s) => s.id === currentId)) {
-    currentId = sessions.length ? sessions[0].id : null;
+  // No auto-select: an id the server dropped clears the view, and the
+  // initial load opens no chat (the center button starts one).
+  if (currentId && !sessions.some((s) => s.id === currentId)) {
+    currentId = null;
   }
   writeCache();
   renderSidebar();
@@ -523,22 +545,6 @@ async function openSession(id) {
   renderSidebar();
   updateControls();
   setStatus(session.busy ? 'Generating\u2026' : 'Ready');
-}
-
-// Paint a cached chat without fetching (instant reload path); false
-// on a miss, which falls back to the server fetch above.
-function paintCached(id) {
-  const cached = cachedFull[id];
-  if (!cached || !Array.isArray(cached.messages)) {
-    return false;
-  }
-  currentId = id;
-  currentMessages = cached.messages.map(normalizeMessage);
-  renderMessages(currentMessages, false, 'bottom', true);
-  renderSidebar();
-  updateControls();
-  setStatus('Connecting\u2026');
-  return true;
 }
 
 // Stream one turn (chat or retry) over `base` history into session `sid`:
@@ -598,6 +604,10 @@ async function streamTurn(path, payload, base, sid) {
           if (data === '[DONE]') break;
           const chunk = JSON.parse(data);
           const delta = ((chunk.choices || [])[0] || {}).delta || {};
+          if (delta.session_title) {
+            applyTitle(sid, delta.session_title);
+            continue;
+          }
           if (delta.prefill) {
             const done = Number(delta.prefill.done) || 0;
             const total = Number(delta.prefill.total) || 0;
@@ -820,6 +830,12 @@ async function newSession() {
   await openSession(created.id);
 }
 
+// The center button on an empty view: open a fresh chat and focus it.
+async function startChat() {
+  await newSession();
+  $('input').focus();
+}
+
 // Ask /health: 200 means the model is loaded and warm. While loading,
 // show the loader's step and keep polling; a failed load is final.
 async function checkHealth() {
@@ -883,6 +899,9 @@ function init() {
   $('new-chat').addEventListener('click', () => {
     newSession().catch((error) => showError(String(error)));
   });
+  $('start-chat').addEventListener('click', () => {
+    startChat().catch((error) => showError(String(error)));
+  });
   $('send').addEventListener('click', () => {
     sendMessage().catch((error) => showError(String(error)));
   });
@@ -898,9 +917,10 @@ function init() {
   $('retry').addEventListener('click', () => {
     retryTurn().catch((error) => showError(String(error)));
   });
-  // Cache-aside boot: paint the browser cache instantly, then poll
-  // /health. The composer stays disabled until the model is ready, then
-  // the session list refreshes from the server (a miss fetches).
+  // Cache-aside boot: paint the left-hand chat list from the browser
+  // cache instantly, then poll /health. No chat opens on load; the
+  // center button starts one. The list refreshes from the server once
+  // the model is ready.
   const cached = readCache();
   if (cached) {
     cachedFull = cached.full;
@@ -913,14 +933,7 @@ function init() {
               Array.isArray(s.messages) ? s.messages.length : 0,
           busy: false,
         }));
-    if (cached.currentId && cachedFull[cached.currentId]) {
-      currentId = cached.currentId;
-    } else if (sessions.length) {
-      currentId = sessions[0].id;
-    }
     renderSidebar();
-    updateControls();
-    if (currentId) paintCached(currentId);
   }
   setStatus('Connecting\u2026');
   updateControls();

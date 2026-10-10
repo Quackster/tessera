@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/json.hpp"
@@ -69,7 +70,7 @@ class SessionHandler {
                ResponseWriter& writer, const core::Json& request,
                std::size_t max_completion_tokens,
                std::size_t max_thinking_tokens, bool enable_thinking,
-               bool stream) const;
+               bool stream, std::string_view title) const;
   // 409 when the session is busy; otherwise take the turn and queue
   // for the device behind running generations. The guard releases it.
   bool BeginTurn(const std::shared_ptr<Session>& session,

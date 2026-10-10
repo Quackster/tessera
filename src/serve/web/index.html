@@ -20,6 +20,9 @@
 <ul id="sessions"></ul>
 </aside>
 <main>
+<div id="empty-state" hidden>
+<button id="start-chat" type="button">Start chatting</button>
+</div>
 <div id="messages"></div>
 <div id="composer">
 <textarea id="input" rows="3" placeholder="Message the model (Enter sends, Shift+Enter adds a line)"></textarea>
@@ -35,8 +38,8 @@
 <label id="effort-row" hidden>Difficulty
 <select id="reasoning-effort"></select></label>
 </div>
-<div id="error" hidden></div>
 </div>
+<div id="error" hidden></div>
 </main>
 </div>
 <script src="/app.js" defer></script>

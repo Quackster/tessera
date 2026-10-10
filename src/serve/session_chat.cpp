@@ -262,7 +262,8 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
                              ResponseWriter& writer, const Json& request,
                              std::size_t max_completion_tokens,
                              std::size_t max_thinking_tokens,
-                             bool enable_thinking, bool stream) const {
+                             bool enable_thinking, bool stream,
+                             std::string_view title) const {
   auto view = sessions_.View(session->Id());
   Json prompt_body = Json::Object();
   prompt_body.Set("messages", SessionHistoryJson(*view));
@@ -338,6 +339,13 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     Json role = Json::Object();
     role.Set("role", Json::String("assistant"));
     WriteSse(writer, "", SseDelta(std::move(role), ""), false);
+    // The chat's name arrives ahead of the answer: the title turn runs
+    // first, so the sidebar can label the chat as generation starts.
+    if (!title.empty()) {
+      Json name = Json::Object();
+      name.Set("session_title", Json::String(std::string(title)));
+      WriteSse(writer, "", SseDelta(std::move(name), ""), false);
+    }
     // Prefill progress rides the stream ahead of thinking: the UI
     // shows it as a loading line until the first deltas arrive.
     options.prefill_progress = [&](std::size_t done, std::size_t total) {
@@ -445,26 +453,22 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
     SendError(writer, 422, "message must be a non-empty string");
     return;
   }
-  const bool first = session->View().messages.empty();
   session->Append(SessionMessage{"user", message->AsString(), /*reasoning=*/{},
                                  /*tool_calls_json=*/{}, /*tool_call_id=*/{},
                                  false, /*stats=*/{}, /*created_ms=*/0});
-  if (first && !auto_title_) {
-    auto view = session->View();
-    if (view.title == kDefaultTitle) {
-      session->SetTitle(TitleFromText(message->AsString()));
-    }
-  }
   SessionTurn guard;
   std::unique_lock<std::mutex> gpu;
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
   }
+  // Name a fresh chat before its first answer: the title turn runs on
+  // the device slot first, so the reply streams under the final title.
+  MaybeAutoTitle(engine_, model_, tokenizer_, session, auto_title_);
+  const std::string title = session->View().title;
   RunTurn(session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
-          WantsSessionStream(body));
-  MaybeAutoTitle(engine_, model_, tokenizer_, session, auto_title_);
+          WantsSessionStream(body), title);
 }
 
 void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
@@ -484,10 +488,11 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
   }
+  const std::string title = session->View().title;
   RunTurn(session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
-          WantsSessionStream(body));
+          WantsSessionStream(body), title);
 }
 
 void SessionHandler::HandleStop(ResponseWriter& writer,
