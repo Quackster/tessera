@@ -2567,6 +2567,133 @@ TEST(BackendTest, MoeGateDeviceMatchesRef) {
   EXPECT_NEAR(sig_got[0], 1.0f / (1.0f + std::exp(-dot)), tol.abs);
 }
 
+// Device: the fused MoE expert kernels reproduce a host reference. gate and
+// up are Q4_K [inter, hidden] per expert, down is Q4_K [hidden, inter].
+TEST(BackendTest, MoeFusedExpertsMatchRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(93);
+  const std::size_t kHidden = 256;
+  const std::size_t kInter = 256;
+  const std::size_t kExperts = 4;
+  const std::size_t kTopK = 2;
+  const std::vector<std::uint32_t> ids = {1, 3};
+  const std::vector<float> wts = {0.6f, 0.4f};
+  const std::size_t kGatePerExpert =
+      (kInter * kHidden / tessera::kQ4KBlockElements) *
+      core::kQ4KBlockBytes;
+  const std::size_t kDownPerExpert =
+      (kHidden * kInter / tessera::kQ4KBlockElements) *
+      core::kQ4KBlockBytes;
+
+  std::vector<float> x(kHidden);
+  for (auto& v : x) v = DrawValue(rng);
+  std::vector<float> gate_vals(kExperts * kInter * kHidden);
+  std::vector<float> up_vals(kExperts * kInter * kHidden);
+  std::vector<float> down_vals(kExperts * kHidden * kInter);
+  for (auto& v : gate_vals) v = DrawValue(rng);
+  for (auto& v : up_vals) v = DrawValue(rng);
+  for (auto& v : down_vals) v = DrawValue(rng);
+  std::vector<std::byte> gate = QuantizeRows(gate_vals, kExperts * kInter,
+                                             kHidden);
+  std::vector<std::byte> up = QuantizeRows(up_vals, kExperts * kInter, kHidden);
+  std::vector<std::byte> down = QuantizeRows(down_vals, kExperts * kHidden,
+                                             kInter);
+
+  auto x_buf = backend->AllocateBuffer(kHidden * 4, MemoryKind::Device);
+  auto gate_buf = backend->AllocateBuffer(gate.size(), MemoryKind::Device);
+  auto up_buf = backend->AllocateBuffer(up.size(), MemoryKind::Device);
+  auto down_buf = backend->AllocateBuffer(down.size(), MemoryKind::Device);
+  auto ids_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+  auto wts_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+  auto phi_buf = backend->AllocateBuffer(kTopK * kInter * 4, MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(kHidden * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf && gate_buf && up_buf && down_buf && ids_buf && wts_buf &&
+              phi_buf && out_buf);
+  const auto upload = [&backend](auto& buf, const auto& data) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(data.data()), data.size() * 4));
+  };
+  ASSERT_TRUE(upload(x_buf, x).has_value());
+  ASSERT_TRUE(backend->CopyH2D(**gate_buf, std::span<const std::byte>(gate))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**up_buf, std::span<const std::byte>(up))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**down_buf, std::span<const std::byte>(down))
+                  .has_value());
+  ASSERT_TRUE(upload(ids_buf, ids).has_value());
+  ASSERT_TRUE(upload(wts_buf, wts).has_value());
+
+  auto gate_up = backend->LoadKernel("moe_experts_gate_up_q4k", {});
+  auto down_k = backend->LoadKernel("moe_experts_down_q4k", {});
+  ASSERT_TRUE(gate_up.has_value()) << tessera::ToString(gate_up.error());
+  ASSERT_TRUE(down_k.has_value()) << tessera::ToString(down_k.error());
+  tessera::KernelLaunch gu;
+  gu.grid_x = static_cast<std::uint32_t>((kInter * kTopK + 7) / 8);
+  gu.block_x = 256;
+  gu.buffers = {(*x_buf).get(), (*gate_buf).get(), (*up_buf).get(),
+                (*ids_buf).get(), (*phi_buf).get()};
+  gu.scalars = {kHidden, kInter, kTopK, kGatePerExpert, kGatePerExpert};
+  ASSERT_TRUE(backend->LaunchKernel(**gate_up, gu).has_value());
+  tessera::KernelLaunch dn;
+  dn.grid_x = static_cast<std::uint32_t>((kHidden + 7) / 8);
+  dn.block_x = 256;
+  dn.buffers = {(*phi_buf).get(), (*down_buf).get(), (*ids_buf).get(),
+                (*wts_buf).get(), (*out_buf).get()};
+  dn.scalars = {kHidden, kInter, kTopK, kDownPerExpert, 0};
+  ASSERT_TRUE(backend->LaunchKernel(**down_k, dn).has_value());
+  backend->Synchronize();
+
+  std::vector<std::byte> phi_read(kTopK * kInter * 4);
+  std::vector<std::byte> out_read(kHidden * 4);
+  ASSERT_TRUE(backend->CopyD2H(**phi_buf, phi_read.data(), phi_read.size())
+                  .has_value());
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, out_read.data(), out_read.size())
+                  .has_value());
+  const auto* phi_got = reinterpret_cast<const float*>(phi_read.data());
+  const auto* out_got = reinterpret_cast<const float*>(out_read.data());
+
+  const auto tol = tessera::testing::ToleranceFor(backend->Name());
+  std::vector<float> out_ref(kHidden, 0.0f);
+  for (std::size_t p = 0; p < kTopK; ++p) {
+    const std::size_t e = ids[p];
+    std::span<const std::byte> g_slice(gate.data() + e * kGatePerExpert,
+                                       kGatePerExpert);
+    std::span<const std::byte> u_slice(up.data() + e * kGatePerExpert,
+                                       kGatePerExpert);
+    std::span<const std::byte> d_slice(down.data() + e * kDownPerExpert,
+                                       kDownPerExpert);
+    std::vector<float> gate_ref(kInter);
+    std::vector<float> up_ref(kInter);
+    ASSERT_TRUE(core::GemmQ4KRef(std::span<const float>(x), g_slice,
+                                 std::span<float>(gate_ref), 1, kInter,
+                                 kHidden)
+                    .has_value());
+    ASSERT_TRUE(core::GemmQ4KRef(std::span<const float>(x), u_slice,
+                                 std::span<float>(up_ref), 1, kInter, kHidden)
+                    .has_value());
+    std::vector<float> phi_ref(kInter);
+    for (std::size_t i = 0; i < kInter; ++i) {
+      const float silu = gate_ref[i] / (1.0f + std::exp(-gate_ref[i]));
+      phi_ref[i] = silu * up_ref[i];
+      EXPECT_NEAR(phi_got[p * kInter + i], phi_ref[i],
+                  tol.abs + tol.rel * std::abs(phi_ref[i]));
+    }
+    std::vector<float> down_ref(kHidden);
+    ASSERT_TRUE(core::GemmQ4KRef(std::span<const float>(phi_ref), d_slice,
+                                 std::span<float>(down_ref), 1, kHidden, kInter)
+                    .has_value());
+    for (std::size_t j = 0; j < kHidden; ++j) {
+      out_ref[j] += wts[p] * down_ref[j];
+    }
+  }
+  for (std::size_t j = 0; j < kHidden; ++j) {
+    // The device reduce sums in a different order than the host reference.
+    EXPECT_NEAR(out_got[j], out_ref[j],
+                1e-4f + 1e-4f * std::abs(out_ref[j]));
+  }
+}
+
 // Device: chained device-to-device kernels (gemm_q4k -> rmsnorm -> add)
 // with no host round-trips match the host references.
 TEST(BackendTest, DeviceChainMatchesRef) {

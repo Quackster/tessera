@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 206/206 `ctest` on vulkan. 206/206 `ctest` on ROCm.
+Latest suite: 207/207 `ctest` on vulkan. 207/207 `ctest` on ROCm.
 The suite is trimmed to the coverage that catches a decode break: the
 kernel correctness tests (vs host references), the decode/speculation
 tests, the model loaders, and the calibration device test. The serving,
@@ -234,8 +234,8 @@ through RADV GFX1100, rocm through the system ROCm).
   shared expert reuses those kernels with an accumulate flag. Generic
   GGUF metadata (`expert_count`, `expert_used_count`, ...) and
   config.json keys are parsed in core. The ROCm decoder shares its block
-  codec with the dense GEMV path. Decode is 83 tok/s on the Q4_K_M GGUF
-  (was 37), prefill 81 tok/s (see docs/ORNITH-1.5.md). New kernels are
+  codec with the dense GEMV path. Decode is 84 tok/s on the Q4_K_M GGUF
+  (was 37; Vulkan 88), prefill 81 tok/s (see docs/ORNITH-1.5.md). New kernels are
   tested on both backends. The batch (prefill and verify) path is
   row-serial for now.
 - Single GoogleTest target. Device tests skip cleanly with no
@@ -469,7 +469,7 @@ through RADV GFX1100, rocm through the system ROCm).
 ## Next (in order)
 
 - MoE batch performance. The Ornith-1.5 batch path is row-serial, so
-  prefill (81 prompt tok/s) trails decode (83 tok/s). Next: a
+  prefill (81 prompt tok/s) trails decode (84 tok/s). Next: a
   grouped-expert GEMM that gathers the routed rows per expert and runs
   one matmul per expert over the gathered rows. The decode path already
   keeps the expert ids on device and fuses the experts, so the routing

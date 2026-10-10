@@ -47,7 +47,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. |
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
-| MoE, MLP, norms | Partial | Norms and MLP kernels done. Sparse mixture-of-experts (Ornith-1.5) decodes on Vulkan and ROCm with fused routed-expert kernels (83 tok/s ROCm). Grouped-expert batch GEMM is the follow-up. |
+| MoE, MLP, norms | Partial | Norms and MLP kernels done. Sparse mixture-of-experts (Ornith-1.5) decodes on Vulkan and ROCm with fused routed-expert kernels (84 tok/s ROCm, 88 Vulkan). Grouped-expert batch GEMM is the follow-up. |
 | Calibration | Done | `calibrate` sweeps the split-K target and cap (ROCm), the prefill chunk (multiples of 256 from 512), the single-token attention split and (with a draft) the draft block and draft context, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8 and reports the memory-bound max context. Prints a report with an example `run` command; writes JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.

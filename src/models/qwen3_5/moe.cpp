@@ -186,8 +186,8 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
                                           const Model& model,
                                           const TransformerConfig& cfg,
                                           Qwen35State& h, std::size_t layer,
-                                          const Buffer& x_row,
-                                          Buffer& out_row) {
+                                          const Buffer& x_row, Buffer& out_row,
+                                          bool accumulate_residual) {
   const std::size_t hidden = cfg.hidden_dim;
   const std::size_t ne = cfg.num_experts;
   const std::size_t top_k = cfg.experts_per_tok;
@@ -265,7 +265,8 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
     down.block_x = kMoeThreads;
     down.buffers = {h.moe_phi.get(), (*down_exps)->device.get(),
                     h.moe_ids.get(), h.moe_wts.get(), &out_row};
-    down.scalars = {hidden, inter, top_k, *down_bytes, 0};
+    down.scalars = {hidden, inter, top_k, *down_bytes,
+                    accumulate_residual ? 1ull : 0ull};
     if (!backend.LaunchKernel(down_kernel, down)) {
       return std::unexpected(StatusCode::DeviceError);
     }
@@ -308,7 +309,12 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
         return r;
       }
     }
-    if (!backend.CopyD2D(*h.moe_acc, 0, out_row, 0, hidden * 4)) {
+    if (accumulate_residual) {
+      if (!AddDevice(backend, *h.add_kernel, x_row, *h.moe_acc, out_row,
+                     hidden)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    } else if (!backend.CopyD2D(*h.moe_acc, 0, out_row, 0, hidden * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }
   }
@@ -379,12 +385,9 @@ std::expected<void, StatusCode> RunMoeFfn(Backend& backend,
   if (auto ready = EnsureMoeReady(backend, cfg, h); !ready) {
     return ready;
   }
-  auto row = MoeFfnRow(backend, model, cfg, h, layer, *h.x, *h.proj);
+  auto row = MoeFfnRow(backend, model, cfg, h, layer, *h.x, *h.x, true);
   if (!row) {
     return row;
-  }
-  if (!AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, cfg.hidden_dim)) {
-    return std::unexpected(StatusCode::DeviceError);
   }
   if (deep != nullptr) {
     backend.Synchronize();
@@ -405,7 +408,7 @@ std::expected<void, StatusCode> RunMoeFfnBatch(
       return std::unexpected(StatusCode::DeviceError);
     }
     if (auto row = MoeFfnRow(backend, model, cfg, h, layer, *h.moe_row_in,
-                             *h.moe_row_out);
+                             *h.moe_row_out, false);
         !row) {
       return row;
     }

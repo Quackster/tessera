@@ -238,13 +238,14 @@ generation:
 
 | | before | after |
 | --- | --- | --- |
-| decode | 37 tok/s (27 ms/token) | 83 tok/s (12 ms/token) |
+| decode | 37 tok/s (27 ms/token) | 84 tok/s (12 ms/token) |
 | prefill | 27 prompt tok/s | 81 prompt tok/s |
 
-Vulkan reaches 79 tok/s decode on the same checkpoint and produces the
-same answers ("Paris.", "Tokyo", "four"). The remaining cost is the
-routing and attention launches, not the expert weight reads: the experts
-stream about 640 MB per token, far below the card's memory rate.
+Vulkan reaches 88 tok/s decode on the same checkpoint and produces the
+same answers ("Paris.", "Tokyo", "four", and the same paragraphs as
+ROCm). The remaining cost is the routing and attention launches, not the
+expert weight reads: the experts stream about 640 MB per token, far below
+the card's memory rate.
 
 ## Reference match
 
@@ -287,6 +288,9 @@ carries none).
 - Date 2026-10-10: MoE speed optimization. Fused expert kernels read the
   expert ids on device and process all selected experts in two launches;
   the shared expert shares those kernels; `moe_gate` folds the
-  shared-expert gate. Decode 37 to 83 tok/s (ROCm) and 79 tok/s (Vulkan);
-  prefill 27 to 81 tok/s. Both backends return the same answers. Suite is
-  206 tests on both backends.
+  shared-expert gate; the residual add folds into the down kernel. Decode
+  37 to 84 tok/s (ROCm) and 88 tok/s (Vulkan); prefill 27 to 81 tok/s.
+  Both backends return the same answers. A host-reference test for the
+  fused expert kernels caught a Vulkan launch-convention bug (the gate/up
+  grid processed a single expert), now fixed. Suite is 207 tests on both
+  backends.

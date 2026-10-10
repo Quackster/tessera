@@ -13,7 +13,7 @@ layout(local_size_x = 256) in;
 // input row), Gate (3D Q4_K), Up (3D Q4_K), Ids (top_k u32), Phi
 // (top_k x inter fp32). Scalars: hidden v[0], inter v[2], top_k v[4],
 // gate_stride v[6], up_stride v[8] (bytes per expert slice). Grid:
-// grid_x = ceil(inter / 8), grid_y = top_k.
+// grid_x = ceil(inter * top_k / 8).
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
@@ -98,17 +98,19 @@ void main() {
   uint top_k = pc.v[4];
   uint gate_stride = pc.v[6];
   uint up_stride = pc.v[8];
-  uint slot = gl_WorkGroupID.y;
   uint warps = gl_WorkGroupSize.x / 32u;
+  uint total = inter * top_k;
   uint idx = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
-  if (idx >= inter || slot >= top_k) {
+  if (idx >= total) {
     return;
   }
   uint lane = gl_LocalInvocationID.x % 32u;
+  uint j = idx % inter;
+  uint slot = idx / inter;
   uint expert = ids[slot];
   uint blocks = hidden / 256u;
-  uint g_base = expert * gate_stride + idx * (blocks * 144u);
-  uint u_base = expert * up_stride + idx * (blocks * 144u);
+  uint g_base = expert * gate_stride + j * (blocks * 144u);
+  uint u_base = expert * up_stride + j * (blocks * 144u);
   float gate_acc = 0.0;
   float up_acc = 0.0;
   for (uint b = 0u; b < blocks; ++b) {
@@ -140,6 +142,6 @@ void main() {
   float gate = reduce32(gate_acc);
   float up = reduce32(up_acc);
   if ((gl_SubgroupInvocationID % 32u) == 0u) {
-    phi[slot * inter + idx] = (gate / (1.0 + exp(-gate))) * up;
+    phi[slot * inter + j] = (gate / (1.0 + exp(-gate))) * up;
   }
 }
