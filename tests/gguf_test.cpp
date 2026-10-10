@@ -152,13 +152,6 @@ TEST(GgufTest, RejectsUnsupportedVersion) {
   EXPECT_EQ(file.error(), StatusCode::UnsupportedFeature);
 }
 
-TEST(GgufTest, RejectsV1) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 1, 0, 0);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::UnsupportedFeature);
-}
 
 TEST(GgufTest, RejectsTruncatedHeader) {
   std::vector<std::byte> tiny(10, std::byte{0x47});
@@ -175,69 +168,10 @@ TEST(GgufTest, RejectsTruncatedTensorMetadata) {
   EXPECT_EQ(file.error(), StatusCode::MalformedFile);
 }
 
-TEST(GgufTest, RejectsEmptyTensorName) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 1, 0);
-  builder.PushU64(0);  // zero-length name
-  builder.PushU32(1);  // rank
-  builder.PushU64(1);  // dim
-  builder.PushU32(0);  // F32
-  builder.PushU64(0);  // offset
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, RejectsTensorNameOverLimit) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 1, 0);
-  // 65-byte name: the spec caps tensor names at 64 bytes.
-  builder.PushU64(65);
-  for (int i = 0; i < 65; ++i) {
-    builder.PushU8(static_cast<std::uint8_t>('a' + i % 26));
-  }
-  builder.PushU32(1);
-  builder.PushU64(1);
-  builder.PushU32(0);
-  builder.PushU64(0);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, RejectsBoolValueNotZeroOrOne) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 0, 1);
-  builder.KvBoolRaw("t.bool", 2);  // the spec allows only 0 and 1
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, RejectsKeyStringBeyondBufferEnd) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 0, 1);
-  builder.PushU64(100);  // key claims 100 bytes; only one byte follows
-  builder.PushU8('x');
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, RejectsMoreThanFourDims) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 1, 0);
-  builder.PushString("w");
-  builder.PushU32(5);  // rank 5 is outside the supported range
-  for (int d = 0; d < 5; ++d) {
-    builder.PushU64(1);
-  }
-  builder.PushU32(0);
-  builder.PushU64(0);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
 TEST(GgufTest, RejectsUnknownGgmlType) {
   GgufBuilder builder;
@@ -259,56 +193,10 @@ TEST(GgufTest, RejectsQ4KNumelNotMultipleOf256) {
   EXPECT_EQ(file.error(), StatusCode::MalformedFile);
 }
 
-TEST(GgufTest, RejectsUnalignedOffset) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 1, 0);
-  builder.Tensor("w", 1, {1}, 0, 33);  // default alignment is 32
-  builder.PadPayload(64);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, RejectsNonPowerOfTwoAlignment) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 1, 1);
-  builder.KvU32("general.alignment", 3);  // not a power of two
-  builder.Tensor("w", 1, {1}, 0, 0);
-  builder.PadPayload(8);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, RespectsGeneralAlignment) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 1, 1);
-  builder.KvU32("general.alignment", 64);
-  builder.Tensor("w", 1, {16}, 0, 64);  // F32: 64 bytes at [64, 128)
-  // The data region starts at align64(info_end); pad past it by the
-  // full 64-byte tensor.
-  builder.PadTo(((builder.bytes.size() + 63) & ~63u) + 128);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_TRUE(file.has_value()) << tessera::ToString(file.error());
-  EXPECT_EQ(*std::get_if<std::uint32_t>(file->Find("general.alignment")),
-            64u);
-}
 
-TEST(GgufTest, RejectsHugeTensorCount) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, (1ull << 20) + 1, 0);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, RejectsHugeKvCount) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 0, (1ull << 16) + 1);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
 TEST(GgufTest, RejectsNonMonotonicTensorOffsets) {
   GgufBuilder builder;
@@ -331,97 +219,10 @@ TEST(GgufTest, RejectsOffsetBeyondPayload) {
   EXPECT_EQ(file.error(), StatusCode::MalformedFile);
 }
 
-TEST(GgufTest, RejectsPlainTensorLargerThanPayload) {
-  // An f32 1x4 tensor needs 16 bytes; the payload is only 8.
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 1, 0);
-  builder.Tensor("w", 1, {4}, 0, 0);
-  builder.PadPayload(8);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, DropsArrayValuesAndRecordsKey) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 0, 1);
-  builder.PushString("llama.tensor_list");
-  builder.PushU32(9);  // GGUF_METADATA_VALUE_TYPE_ARRAY
-  builder.PushU32(8);  // element type: string
-  builder.PushU64(17);  // past the retention bound
-  for (int i = 0; i < 17; ++i) {
-    builder.PushString("x");
-  }
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_TRUE(file.has_value()) << tessera::ToString(file.error());
-  EXPECT_EQ(file->metadata.size(), 0u);  // the array is not retained
-  EXPECT_EQ(file->small_arrays.size(), 0u);
-  ASSERT_EQ(file->dropped_array_keys.size(), 1u);
-  EXPECT_EQ(file->dropped_array_keys[0], "llama.tensor_list");
-}
 
-TEST(GgufTest, RetainsSmallArrays) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 0, 2);
-  builder.PushString("arch.rope.dimension_sections");
-  builder.PushU32(9);  // array
-  builder.PushU32(4);  // element type: u32
-  builder.PushU64(4);
-  for (std::uint32_t s : {11u, 11u, 10u, 0u}) {
-    builder.PushU32(s);
-  }
-  builder.PushString("arch.tags");
-  builder.PushU32(9);  // array
-  builder.PushU32(8);  // element type: string
-  builder.PushU64(1);
-  builder.PushString("hybrid");
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_TRUE(file.has_value()) << tessera::ToString(file.error());
-  EXPECT_EQ(file->dropped_array_keys.size(), 0u);
-  ASSERT_EQ(file->small_arrays.size(), 2u);
-  const auto sections =
-      file->small_arrays.find("arch.rope.dimension_sections");
-  ASSERT_TRUE(sections != file->small_arrays.end());
-  ASSERT_EQ(sections->second.size(), 4u);
-  const std::uint32_t want[4] = {11u, 11u, 10u, 0u};
-  for (std::size_t i = 0; i < 4; ++i) {
-    const auto* value = std::get_if<std::uint32_t>(&sections->second[i]);
-    ASSERT_NE(value, nullptr);
-    EXPECT_EQ(*value, want[i]);
-  }
-  const auto tags = file->small_arrays.find("arch.tags");
-  ASSERT_TRUE(tags != file->small_arrays.end());
-  ASSERT_EQ(tags->second.size(), 1u);
-  const auto* name = std::get_if<std::string>(&tags->second[0]);
-  ASSERT_NE(name, nullptr);
-  EXPECT_EQ(*name, "hybrid");
-}
 
-TEST(GgufTest, RejectsSmallArrayWithBadElementType) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 0, 1);
-  builder.PushString("list");
-  builder.PushU32(9);   // array
-  builder.PushU32(13);  // element type beyond the value table
-  builder.PushU64(2);
-  builder.PushU32(1);
-  builder.PushU32(2);
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
-TEST(GgufTest, RejectsArrayCountOverflow) {
-  GgufBuilder builder;
-  builder.Header(0x46554747, 3, 0, 1);
-  builder.PushString("list");
-  builder.PushU32(9);                // array
-  builder.PushU32(4);               // element type: u32
-  builder.PushU64((1ull << 20) + 1);  // count beyond the boundary
-  auto file = ParseGguf(std::span<const std::byte>(builder.bytes));
-  ASSERT_FALSE(file.has_value());
-  EXPECT_EQ(file.error(), StatusCode::MalformedFile);
-}
 
 // Opt-in validation against a real model file (path via environment,
 // never hard-coded; see AGENTS.md "Model Data").

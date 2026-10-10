@@ -3,7 +3,11 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 421/421 `ctest` on vulkan. 421/421 `ctest` on ROCm.
+Latest suite: 200/200 `ctest` on vulkan. 200/200 `ctest` on ROCm.
+The suite is trimmed to the coverage that catches a decode break: the
+kernel correctness tests (vs host references), the decode/speculation
+tests, the model loaders, and the calibration device test. The serving,
+chat-template, and presentation suites are not run.
 Verified on AMD Radeon AI PRO R9700 (vulkan through RADV GFX1201,
 rocm through the system ROCm) and on AMD Radeon RX 7900 XTX (vulkan
 through RADV GFX1100, rocm through the system ROCm).

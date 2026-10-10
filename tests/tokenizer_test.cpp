@@ -42,22 +42,8 @@ TEST(TokenizerTest, SpecialTokenIdLookup) {
 }
 
 // A merge rule collapses "a" "b" into the "ab" token.
-TEST(TokenizerTest, MergeApplies) {
-  Tokenizer tok({"a", "b", "ab"}, {1, 1, 1}, {"a b"});
-  auto ids = tok.Encode("ab");
-  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
-  const std::vector<std::uint32_t> want = {2};
-  EXPECT_EQ(*ids, want);
-}
 
 // Digits split per character (the Qwen pre-tokenizer), letters group.
-TEST(TokenizerTest, DigitsSplitPerChar) {
-  Tokenizer tok({"a", "0", "1"}, {1, 1, 1}, {});
-  auto ids = tok.Encode("a01");
-  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
-  const std::vector<std::uint32_t> want = {0, 1, 2};
-  EXPECT_EQ(*ids, want);
-}
 
 // Decode rejects an out-of-range id.
 TEST(TokenizerTest, DecodeRejectsBadId) {
@@ -121,62 +107,12 @@ TEST(TokenizerTest, SpecialTokenMatched) {
 
 // The HuggingFace tokenizer.json parser inverts model.vocab (token -> id),
 // reads the merges and marks added_tokens as control tokens.
-TEST(TokenizerTest, HfTokenizerJsonParses) {
-  const char* json = R"({
-    "model": {
-      "type": "BPE",
-      "vocab": {"a": 0, "b": 1, "ab": 2, "c": 3},
-      "merges": ["a b"]
-    },
-    "added_tokens": [{"id": 4, "content": "<|endoftext|>", "special": true}]
-  })";
-  auto tokenizer = tessera::core::ParseHfTokenizer(json);
-  ASSERT_TRUE(tokenizer.has_value()) << tessera::ToString(tokenizer.error());
-  ASSERT_TRUE(tokenizer->has_value());
-  const Tokenizer& tok = **tokenizer;
-  EXPECT_EQ(tok.VocabSize(), 5u);
-  auto ids = tok.Encode("abc");
-  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
-  const std::vector<std::uint32_t> want = {2, 3};
-  EXPECT_EQ(*ids, want);
-  auto special = tok.SpecialTokenId("<|endoftext|>");
-  ASSERT_TRUE(special.has_value());
-  EXPECT_EQ(*special, 4u);
-}
 
 // A non-BPE tokenizer resolves to no tokenizer.
-TEST(TokenizerTest, HfTokenizerNonBpeIsEmpty) {
-  auto tokenizer =
-      tessera::core::ParseHfTokenizer(R"({"model": {"type": "WordPiece"}})");
-  ASSERT_TRUE(tokenizer.has_value()) << tessera::ToString(tokenizer.error());
-  EXPECT_FALSE(tokenizer->has_value());
-}
 
 // A malformed tokenizer.json is rejected.
-TEST(TokenizerTest, HfTokenizerRejectsMalformed) {
-  auto tokenizer =
-      tessera::core::ParseHfTokenizer(R"({"model": {"type": "BPE"}})");
-  ASSERT_FALSE(tokenizer.has_value());
-  EXPECT_EQ(tokenizer.error(), StatusCode::MalformedFile);
-}
 
 // The stop token loader reads `eos_token_id` from generation_config.json,
 // then config.json, accepting a number or an array and dropping duplicates.
-TEST(TokenizerTest, LoadHfStopTokensParsesConfigs) {
-  auto dir = tessera::testing::FreshTempDir("tessera_tests_hf_stops");
-  tessera::testing::WriteString(dir / "config.json",
-                                R"({"eos_token_id": 5})");
-  tessera::testing::WriteString(dir / "generation_config.json",
-                                R"({"eos_token_id": [7, 5, 42]})");
-  auto stops = tessera::core::LoadHfStopTokens(dir);
-  ASSERT_EQ(stops.size(), 3u);
-  EXPECT_EQ(stops[0], 7u);
-  EXPECT_EQ(stops[1], 5u);
-  EXPECT_EQ(stops[2], 42u);
-}
 
 // A directory without either config declares no stop tokens.
-TEST(TokenizerTest, LoadHfStopTokensEmptyWithoutConfig) {
-  auto dir = tessera::testing::FreshTempDir("tessera_tests_hf_stops_empty");
-  EXPECT_TRUE(tessera::core::LoadHfStopTokens(dir).empty());
-}

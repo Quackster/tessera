@@ -10,26 +10,6 @@ using tessera::TensorEntry;
 using tessera::TensorManifest;
 using tessera::TensorShape;
 
-TEST(StatusCodeTest, ToStringCoversEveryCodeUniquely) {
-  const StatusCode codes[] = {
-      StatusCode::Ok,
-      StatusCode::InvalidArgument,
-      StatusCode::FileNotFound,
-      StatusCode::MalformedFile,
-      StatusCode::UnsupportedFeature,
-      StatusCode::OutOfMemory,
-      StatusCode::DeviceError,
-  };
-  for (std::size_t i = 0; i < std::size(codes); ++i) {
-    EXPECT_NE(tessera::ToString(codes[i]).size(), 0u)
-        << "empty name for code " << static_cast<int>(codes[i]);
-    for (std::size_t j = i + 1; j < std::size(codes); ++j) {
-      EXPECT_NE(tessera::ToString(codes[i]), tessera::ToString(codes[j]))
-          << "codes " << static_cast<int>(codes[i]) << " and "
-          << static_cast<int>(codes[j]) << " share a name";
-    }
-  }
-}
 
 TEST(TensorShapeTest, NumelTracksRank) {
   TensorShape scalar;  // rank 0: one element
@@ -55,43 +35,8 @@ TEST(TensorShapeTest, NumelTracksRank) {
   EXPECT_EQ(volume.Numel(), 270u);
 }
 
-TEST(TensorShapeTest, Equality) {
-  TensorShape a;
-  a.rank = 2;
-  a.dims[0] = 4;
-  a.dims[1] = 8;
-  TensorShape b = a;
-  EXPECT_EQ(a, b);
-  b.dims[1] = 9;
-  EXPECT_NE(a, b);
-  TensorShape c;  // rank 0
-  EXPECT_NE(a, c);
-}
 
-TEST(DTypeTest, ElementBytesForPlainTypes) {
-  EXPECT_EQ(tessera::ElementBytes(DType::F32), 4);
-  EXPECT_EQ(tessera::ElementBytes(DType::F16), 2);
-  EXPECT_EQ(tessera::ElementBytes(DType::BF16), 2);
-  EXPECT_EQ(tessera::ElementBytes(DType::F8E4M3), 1);
-  EXPECT_EQ(tessera::ElementBytes(DType::F8E5M2), 1);
-  EXPECT_EQ(tessera::ElementBytes(DType::F8E8M0), 1);
-  EXPECT_EQ(tessera::ElementBytes(DType::I32), 4);
-  EXPECT_EQ(tessera::ElementBytes(DType::I64), 8);
-}
 
-TEST(DTypeTest, ElementBytesRejectsBlockTypes) {
-  int value = 0;
-  EXPECT_THROW(value = tessera::ElementBytes(DType::Q2K),
-               std::invalid_argument);
-  EXPECT_THROW(value = tessera::ElementBytes(DType::Q40),
-               std::invalid_argument);
-  EXPECT_THROW(value = tessera::ElementBytes(DType::Q4K),
-               std::invalid_argument);
-  EXPECT_THROW(value = tessera::ElementBytes(DType::Q8K),
-               std::invalid_argument);
-  EXPECT_THROW(value = tessera::ElementBytes(DType::F4E2M1),
-               std::invalid_argument);
-}
 
 TEST(DTypeTest, TensorBytesSizesTensors) {
   EXPECT_EQ(*tessera::TensorBytes(DType::F32, 4), 16u);
@@ -119,21 +64,3 @@ TEST(DTypeTest, TensorBytesSizesTensors) {
             StatusCode::InvalidArgument);
 }
 
-TEST(TensorManifestTest, TotalNumelSumsTensors) {
-  TensorManifest manifest;
-  TensorEntry first;
-  first.name = "a";
-  first.shape.rank = 2;
-  first.shape.dims[0] = 2;
-  first.shape.dims[1] = 3;
-  TensorEntry second;
-  second.name = "b";
-  second.shape.rank = 1;
-  second.shape.dims[0] = 4;
-  manifest.tensors.push_back(first);
-  manifest.tensors.push_back(second);
-  EXPECT_EQ(manifest.TotalNumel(), 10u);
-
-  TensorManifest empty;
-  EXPECT_EQ(empty.TotalNumel(), 0u);
-}

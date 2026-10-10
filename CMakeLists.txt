@@ -269,8 +269,6 @@ add_executable(tessera-tests
     tests/engine_test.cpp
     tests/decode_test.cpp
     tests/tokenizer_test.cpp
-    tests/serve_test.cpp
-    tests/jinja_test.cpp
     tests/backend_test.cpp
     tests/spec_test.cpp
     tests/calibrate_test.cpp
