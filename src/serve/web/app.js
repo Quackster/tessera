@@ -65,12 +65,6 @@ function escapeHtml(text) {
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// Inline SVG from a fenced block, scripts and handlers removed.
-function sanitizeSvg(svg) {
-  return svg.replace(/<script[\s\S]*?<\/script\s*>/gi, '')
-      .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '');
-}
-
 // Tiny dependency-free syntax highlighter: one single-pass split on
 // a capture group, odd parts classified. Keywords, strings, comments
 // and numbers for a few language families; markup gets tag mode.
@@ -209,7 +203,8 @@ function renderFence(info, code) {
   const head = filename
       ? '<div class="file-name">' + escapeHtml(filename) + '</div>' : '';
   if (lang === 'svg') {
-    return head + '<div class="rendered">' + sanitizeSvg(code) + '</div>';
+    const src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(code);
+    return head + '<img class="svg-embed" src="' + src + '" alt="SVG">';
   }
   if (lang === 'html') {
     const src = code.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
