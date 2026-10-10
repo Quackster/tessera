@@ -47,7 +47,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. |
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
-| MoE, MLP, norms | Todo | Norms and MLP kernels done. No MoE kernels yet (planned Ornith-1.5-35B-A3B). |
+| MoE, MLP, norms | Partial | Norms and MLP kernels done. Sparse mixture-of-experts (Ornith-1.5) decodes on Vulkan and ROCm. Grouped-expert GEMM is the speed follow-up. |
 | Calibration | Done | `calibrate` sweeps the split-K target and cap (ROCm), the prefill chunk (multiples of 256 from 512), the single-token attention split and (with a draft) the draft block and draft context, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8 and reports the memory-bound max context. Prints a report with an example `run` command; writes JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
@@ -87,7 +87,7 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS and IQ3_S. Checks bounds. |
 | MXFP4 safetensors | Done | Parses the map, maps names, converts the value layout and packs the MXFP4 weights; config.json drives the decode config. |
-| NVFP4 MoE | Todo | Planned: MoE model support (Ornith-1.5-35B-A3B). Needs MoE routing and NVFP4 kernels. |
+| NVFP4 MoE | Partial | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. MXFP4 MoE and the grouped-expert GEMM remain. |
 | DFlash2 FP8 draft | Partial | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. Step cost work remains. |
 
 Model weights live outside the repo. Each variant uses one flat directory. Model paths are runtime configuration. Code and tests never hard code model paths.
@@ -97,9 +97,9 @@ Model weights live outside the repo. Each variant uses one flat directory. Model
 | `~/models/Qwen3.8-27B-GGUF/` | `Qwen3.8-27B-UD-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, `config.json` | Main GGUF target. | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
 | `~/models/Qwen3.8-27B-MXFP4-MTPFP8/` | MXFP4 weights with FP8 MTP | Main MXFP4 target. | [amd/Qwen3.8-27B-Quark-AWQ-MXFP4](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4) |
 | `~/models/Qwen3.8-27B-DFlash2-FP8/` | DFlash2 draft checkpoint | Draft layout tests. | [tcclaviger/Qwen3.8-27B-DFlash2-FP8](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8) |
-| `~/models/Ornith-1.5-35B-A3B-GGUF/` | MoE GGUF weights | To do: MoE support. | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) |
-| `~/models/Ornith-1.5-35B-A3B-MXFP4-GGUF/` | MoE MXFP4 GGUF weights | To do: MoE support. | [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) |
-| `~/models/Ornith-1.5-35B-A3B/` | MoE weights | To do: MoE support. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
+| `~/models/Ornith-1.5-35B-A3B-GGUF/` | `Ornith-1.5-35B-Q4_K_M.gguf`, `mmproj-Ornith-1.5-35B-BF16.gguf` | MoE GGUF target. | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) |
+| `~/models/Ornith-1.5-35B-A3B-MXFP4-GGUF/` | MoE MXFP4 GGUF weights | Not yet supported. | [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) |
+| `~/models/Ornith-1.5-35B-A3B-BF16/` | bf16 safetensors | Reference checkpoint. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
 | `/home/alex/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S` split, `IQ3_XXS` split, `mmproj-Qwen3.8-Flash-Next-BF16.gguf`, RCO allocation files | (Planned, not working) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
 
 CLI examples:

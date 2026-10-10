@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 200/200 `ctest` on vulkan. 200/200 `ctest` on ROCm.
+Latest suite: 204/204 `ctest` on vulkan. 204/204 `ctest` on ROCm.
 The suite is trimmed to the coverage that catches a decode break: the
 kernel correctness tests (vs host references), the decode/speculation
 tests, the model loaders, and the calibration device test. The serving,
@@ -221,6 +221,17 @@ through RADV GFX1100, rocm through the system ROCm).
   family (`src/models/qwen3_5/`). Core names no model. The Qwen3.5
   module handles HF config parse, weight rename, value-head
   reorder, Gemma norm offset, and the MTP and verify paths.
+- Mixture-of-experts (Ornith-1.5, `qwen35moe`). The Qwen3.5 family
+  module runs the sparse MoE FFN when the config carries an expert
+  count. The router uses `top_k_rows` plus the new `moe_gate` kernel;
+  each routed expert runs its gated MLP through the generic GEMM
+  helpers after a device-to-device gather of its rank-3 weight slice;
+  `moe_scale_add` accumulates the weighted outputs and folds in the
+  sigmoid-gated shared expert. Generic GGUF metadata
+  (`expert_count`, `expert_used_count`, ...) and config.json keys are
+  parsed in core. New kernels are tested on both backends. Decode is
+  correct end to end on the Q4_K_M GGUF (see docs/ORNITH-1.5.md). The
+  batch (prefill and verify) path is row-serial for now.
 - Single GoogleTest target. Device tests skip cleanly with no
   device. Numerical checks use per-backend tolerance.
 
@@ -451,6 +462,12 @@ through RADV GFX1100, rocm through the system ROCm).
 
 ## Next (in order)
 
+- MoE performance. The Ornith-1.5 batch path is row-serial: prefill is
+  about 27 prompt tok/s against 36 decode tok/s. Next: a grouped-expert
+  GEMM that gathers the routed rows per expert and runs one matmul per
+  expert, and a fused router that keeps the expert ids on the device so
+  the per-layer host round-trip disappears. Also confirm the routing
+  normalization (`norm_topk_prob`) against the reference runtime.
 - Vulkan batch verify. The Vulkan 2-row verify is still 1.3x the ROCm
   one (73 against 57 ms) while the single-row forward is only 1.05x
   (54 against 51), so a paragraph is 27 tok/s against 31 on ROCm. The

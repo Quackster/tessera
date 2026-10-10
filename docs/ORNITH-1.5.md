@@ -247,3 +247,8 @@ with the reference ordering.
   failures).
 - Date 2026-10-10: end-to-end greedy decode on the Q4_K_M GGUF returns
   "Paris." for "The capital of France is" on ROCm device 0.
+- Date 2026-10-10: chat-template prompts return correct answers
+  ("Tokyo" for the capital of Japan, "Four" for 2 + 2). The MTP
+  speculation path (`--speculate`) also returns "Paris." and exercises
+  the MoE feed-forward in the nextn block. Full suite passes on Vulkan
+  and ROCm (204 tests each).
