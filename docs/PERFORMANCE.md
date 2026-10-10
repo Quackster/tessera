@@ -516,9 +516,12 @@ Move a card here with its commit hash and the measured result.
   `gemm_q6k_rows{r}`/`gemm_iq4xs_rows{r}` decode each weight block once
   per column for all `r` rows of a verify batch (r = 2, 3, 4, templated),
   with a split-K pass for narrow output counts. A 2-row pass at n=10240,
-  k=5120 fell from 0.146 to 0.098 ms. This made GGUF MTP beat greedy:
-  30-37 tok/s against 18 greedy on the 27B Q4_K_M target (ROCm, 7900
-  XTX). Remaining: the Vulkan shaders are ~1.5x slower per kernel.
+  k=5120 fell from 0.146 to 0.098 ms on ROCm and 0.129 to 0.082 on
+  Vulkan (its fixed-row shaders; the runtime-row version was 1.6x
+  slower). The Vulkan shaders also moved to 8-bit storage buffers. This
+  made GGUF MTP beat greedy: 31-37 tok/s against 18 greedy on the 27B
+  Q4_K_M target (ROCm, 7900 XTX), 26-31 on Vulkan. Remaining: the
+  Vulkan batch verify is still 1.3x the ROCm one.
 - Warp-per-output decode GEMVs (tessera-native, not a radiance card):
   `gemm_q4k_vec`/`gemm_q5k_vec`/`gemm_q6k_vec`/`gemm_iq4xs_vec` plus the
   deterministic split-K pass (`gemm_vec_reduce`) replaced the coalesced

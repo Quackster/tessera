@@ -1,9 +1,10 @@
 #version 450
 
 #extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
 
 
-// Multi-row IQ4_XS GEMV ("gemm_iq4xs_rows<rows>"): one warp per\n// weight column decodes each 136-byte block once for all m rows\n// (m = 2..4). See gemm_q4k_rows.comp for the launch contract.
+// Multi-row Q6_K GEMV ("gemm_q6k_rows4"): one warp per\n// weight column decodes each 210-byte superblock once for all m rows\n// (m = 2..4). See gemm_q4k_rows.comp for the launch contract.
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PushConstants {
@@ -15,7 +16,7 @@ layout(set = 0, binding = 0) buffer A {
 };
 
 layout(set = 0, binding = 1) buffer W {
-  uint w[];
+  uint8_t w[];
 };
 
 layout(set = 0, binding = 2) buffer C {
@@ -31,7 +32,7 @@ float reduce32(float v) {
 
 
 uint wbyte(uint offset) {
-  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+  return uint(w[offset]);
 }
 
 float fp16_at(uint offset) {
@@ -62,11 +63,6 @@ void scale_min4(uint j, uint base, out uint scale, out uint min) {
   }
 }
 
-// IQ4 codebook (ports kvalues_iq4nl).
-const int kValues[16] =
-    int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53,
-             69, 89, 113);
-
 
 void main() {
   uint m = pc.v[0];
@@ -79,41 +75,41 @@ void main() {
   if (warp >= n) {
     return;
   }
-  uint rows = m < 4u ? m : 4u;
+  uint rows = 4u;
   uint blocks = k / 256u;
   uint per = blocks / split;
   uint b0 = gl_WorkGroupID.y * per;
-  uint wbase = warp * (blocks * 136u) + b0 * 136u;
+  uint wbase = warp * (blocks * 210u) + b0 * 210u;
   float acc[4] = float[4](0.0, 0.0, 0.0, 0.0);
-  uint ib = lane >> 2u;
-  uint jj = (lane & 3u) * 4u;
+  uint is = lane >> 4u;
   for (uint b = 0u; b < per; ++b) {
-    uint base = wbase + b * 136u;
-    float d = fp16_at(base);
-    uint scales_h = wbyte(base + 2u) | (wbyte(base + 3u) << 8);
-    uint packed = wbyte(base + 4u + ib / 2u);
-    int ls = int((packed >> (4u * (ib & 1u))) & 15u) |
-             (int((scales_h >> (2u * ib)) & 3u) << 4);
-    float dl = d * float(ls - 32);
-    uint q0 = wbyte(base + 8u + ib * 16u + jj + 0u);
-    uint q1 = wbyte(base + 8u + ib * 16u + jj + 1u);
-    uint q2 = wbyte(base + 8u + ib * 16u + jj + 2u);
-    uint q3 = wbyte(base + 8u + ib * 16u + jj + 3u);
-    float w0 = dl * float(kValues[q0 & 15u]);
-    float w1 = dl * float(kValues[q1 & 15u]);
-    float w2 = dl * float(kValues[q2 & 15u]);
-    float w3 = dl * float(kValues[q3 & 15u]);
-    float w4 = dl * float(kValues[q0 >> 4]);
-    float w5 = dl * float(kValues[q1 >> 4]);
-    float w6 = dl * float(kValues[q2 >> 4]);
-    float w7 = dl * float(kValues[q3 >> 4]);
-    uint t0 = (b0 + b) * 256u + ib * 32u + jj;
-    for (uint r = 0u; r < 4u; ++r) {
-      if (r < rows) {
-        uint t = r * k + t0;
-        acc[r] += a[t] * w0 + a[t + 1u] * w1 + a[t + 2u] * w2 + a[t + 3u] * w3;
-        acc[r] += a[t + 16u] * w4 + a[t + 17u] * w5 + a[t + 18u] * w6 +
-                  a[t + 19u] * w7;
+    uint base = wbase + b * 210u;
+    float d = fp16_at(base + 208u);
+    for (uint n2 = 0u; n2 < 2u; ++n2) {
+      int s0 = int(wbyte(base + 192u + n2 * 8u + is));
+      int s1 = int(wbyte(base + 192u + n2 * 8u + is + 2u));
+      int s2 = int(wbyte(base + 192u + n2 * 8u + is + 4u));
+      int s3 = int(wbyte(base + 192u + n2 * 8u + is + 6u));
+      if (s0 >= 128) { s0 -= 256; }
+      if (s1 >= 128) { s1 -= 256; }
+      if (s2 >= 128) { s2 -= 256; }
+      if (s3 >= 128) { s3 -= 256; }
+      uint ql0 = wbyte(base + n2 * 64u + lane);
+      uint ql1 = wbyte(base + n2 * 64u + 32u + lane);
+      uint qh = wbyte(base + 128u + n2 * 32u + lane);
+      float q1 = float(int((ql0 & 15u) | (((qh >> 0) & 3u) << 4)) - 32);
+      float q2 = float(int((ql1 & 15u) | (((qh >> 2) & 3u) << 4)) - 32);
+      float q3 = float(int((ql0 >> 4) | (((qh >> 4) & 3u) << 4)) - 32);
+      float q4 = float(int((ql1 >> 4) | (((qh >> 6) & 3u) << 4)) - 32);
+      uint t0 = (b0 + b) * 256u + n2 * 128u + lane;
+      for (uint r = 0u; r < 4u; ++r) {
+        if (r < rows) {
+          uint t = r * k + t0;
+          acc[r] += a[t] * (d * float(s0) * q1);
+          acc[r] += a[t + 32u] * (d * float(s1) * q2);
+          acc[r] += a[t + 64u] * (d * float(s2) * q3);
+          acc[r] += a[t + 96u] * (d * float(s3) * q4);
+        }
       }
     }
   }

@@ -1,6 +1,7 @@
 #version 450
 
 #extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
 
 
 // Warp-per-output IQ4_XS GEMV; see gemm_q4k_vec for the launch contract.
@@ -18,7 +19,7 @@ layout(set = 0, binding = 0) buffer A {
 };
 
 layout(set = 0, binding = 1) buffer W {
-  uint w[];
+  uint8_t w[];
 };
 
 layout(set = 0, binding = 2) buffer C {
@@ -39,7 +40,7 @@ const int kValues[16] =
              69, 89, 113);
 
 uint wbyte(uint offset) {
-  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+  return uint(w[offset]);
 }
 
 float fp16_at(uint offset) {

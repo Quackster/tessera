@@ -81,10 +81,12 @@ std::expected<VkInstance, StatusCode> CreateInstance() {
   VkApplicationInfo app_info{};
   app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app_info.pApplicationName = "tessera";
-  // Vulkan 1.1 / SPIR-V 1.3: the decode GEMV shaders reduce within a
-  // 32-lane subgroup (GL_KHR_shader_subgroup_clustered), which needs
-  // SPIR-V 1.3.
-  app_info.apiVersion = VK_API_VERSION_1_1;
+  // Vulkan 1.2 / SPIR-V 1.4: the decode GEMV shaders reduce within a
+  // 32-lane subgroup (GL_KHR_shader_subgroup_clustered) and read the
+  // quantized weight bytes through an 8-bit storage buffer
+  // (GL_EXT_shader_8bit_storage), which avoids a word load plus a shift
+  // per byte.
+  app_info.apiVersion = VK_API_VERSION_1_2;
   VkInstanceCreateInfo instance_info{};
   instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   instance_info.pApplicationInfo = &app_info;
@@ -267,10 +269,28 @@ class VulkanBackend final : public Backend {
     queue_info.queueFamilyIndex = queue_family;
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
+    // The decode GEMV shaders index the weight buffer as bytes; require
+    // 8-bit storage buffer access (Vulkan 1.2 feature, present on every
+    // GPU this project targets).
+    VkPhysicalDevice8BitStorageFeatures storage8{};
+    storage8.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &storage8;
+    vkGetPhysicalDeviceFeatures2(state_.physical, &features2);
+    if (storage8.storageBuffer8BitAccess != VK_TRUE) {
+      LogError(device_name_ +
+               " lacks 8-bit storage buffer access (Vulkan 1.2); the decode "
+               "GEMV shaders need it, so this device cannot run the engine");
+      DestroyState(state_);
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
     VkDeviceCreateInfo device_info{};
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
+    device_info.pNext = &storage8;
     result =
         vkCreateDevice(state_.physical, &device_info, nullptr, &state_.device);
     if (result != VK_SUCCESS) {
