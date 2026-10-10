@@ -691,10 +691,24 @@ TEST(ServeTest, DefaultMaxCompletionTokensIsZero) {
   ASSERT_NE(explicit_count, nullptr);
   EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*explicit_count, 7u),
             64u);
-  // The retired name is ignored: an old client falls back to the default.
-  auto retired = Json::Parse(R"({"max_tokens":64})");
-  ASSERT_NE(retired, nullptr);
-  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*retired, 7u), 7u);
+}
+
+// The older OpenAI `max_tokens` name is honored as an alias; the current
+// `max_completion_tokens` name wins when both are present, and a
+// non-positive alias falls back like a missing field.
+TEST(ServeTest, MaxCompletionTokensReadsMaxTokensAlias) {
+  auto alias = Json::Parse(R"({"max_tokens":64})");
+  ASSERT_NE(alias, nullptr);
+  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*alias, 7u), 64u);
+  auto both = Json::Parse(R"({"max_completion_tokens":32,"max_tokens":64})");
+  ASSERT_NE(both, nullptr);
+  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*both, 7u), 32u);
+  auto zero_alias = Json::Parse(R"({"max_tokens":0})");
+  ASSERT_NE(zero_alias, nullptr);
+  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*zero_alias, 7u), 7u);
+  auto negative_alias = Json::Parse(R"({"max_tokens":-4})");
+  ASSERT_NE(negative_alias, nullptr);
+  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*negative_alias, 7u), 7u);
 }
 
 // The thinking budget defaults to unlimited and needs a positive value.
@@ -708,29 +722,6 @@ TEST(ServeTest, MaxThinkingTokensFromReadsBudget) {
   auto zero = Json::Parse(R"({"max_thinking_tokens":0})");
   ASSERT_NE(zero, nullptr);
   EXPECT_EQ(tessera::serve::MaxThinkingTokensFrom(*zero), 0u);
-}
-
-// The retired field warns with its replacement, and only then.
-TEST(ServeTest, WarnRetiredMaxTokensNamesReplacement) {
-  tessera::log::Diagnostics log;
-  std::string lines;
-  log.SetSink([&lines](tessera::log::Level, std::string_view prefix,
-                       std::string_view message) {
-    lines += std::string(prefix) + ": " + std::string(message) + "\n";
-  });
-  auto retired = Json::Parse(R"({"max_tokens":64})");
-  ASSERT_NE(retired, nullptr);
-  tessera::serve::WarnRetiredMaxTokens(log, *retired);
-  EXPECT_NE(lines.find("max_completion_tokens"), std::string::npos);
-  lines.clear();
-  auto current = Json::Parse(R"({"max_completion_tokens":64})");
-  ASSERT_NE(current, nullptr);
-  tessera::serve::WarnRetiredMaxTokens(log, *current);
-  EXPECT_TRUE(lines.empty());
-  auto empty = Json::Parse(R"({})");
-  ASSERT_NE(empty, nullptr);
-  tessera::serve::WarnRetiredMaxTokens(log, *empty);
-  EXPECT_TRUE(lines.empty());
 }
 
 // The served page carries the same default: one constant, every

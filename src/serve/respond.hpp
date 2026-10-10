@@ -25,15 +25,12 @@ void SendError(ResponseWriter& writer, int status, const std::string& message);
 // OpenAI usage block for `prompt` prompt tokens and `completion` produced.
 [[nodiscard]] core::Json UsageJson(std::size_t prompt,
                                    std::size_t completion);
-// Positive `max_completion_tokens` from the body, else `fallback`.
+// Positive `max_completion_tokens` from the body, else the positive
+// `max_tokens` alias, else `fallback`. The current name wins.
 [[nodiscard]] std::size_t MaxCompletionTokensFrom(const core::Json& body,
                                                  std::size_t fallback);
 // Positive `max_thinking_tokens` from the body, else 0 (unlimited).
 [[nodiscard]] std::size_t MaxThinkingTokensFrom(const core::Json& body);
-// Warn when a body still carries the retired `max_tokens` field: the
-// clean break ignores it, and the warning names the replacement.
-void WarnRetiredMaxTokens(log::Diagnostics& diagnostics,
-                          const core::Json& body);
 // Session id from the body (`session_id` string); empty when the
 // request is stateless. OpenAI clients ignore the unknown field, so
 // passing it is compatible with other servers.

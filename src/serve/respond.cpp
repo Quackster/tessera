@@ -16,6 +16,17 @@ namespace {
 // promptly, long enough to stay out of the way.
 constexpr int kQueuePollMs = 10;
 
+// The positive number under `name`, else 0. A missing field, a
+// non-number, or a value at or below zero all read as absent.
+std::size_t PositiveTokenBudget(const core::Json& body, std::string_view name) {
+  const core::Json* value = body.Find(name);
+  if (value != nullptr && value->type() == core::Json::Type::Number &&
+      value->AsNumber() > 0) {
+    return static_cast<std::size_t>(value->AsNumber());
+  }
+  return 0;
+}
+
 }  // namespace
 
 void SendJson(ResponseWriter& writer, int status, const core::Json& body) {
@@ -43,31 +54,23 @@ core::Json UsageJson(std::size_t prompt, std::size_t completion) {
 
 std::size_t MaxCompletionTokensFrom(const core::Json& body,
                                      std::size_t fallback) {
-  const core::Json* value = body.Find("max_completion_tokens");
-  if (value != nullptr && value->type() == core::Json::Type::Number &&
-      value->AsNumber() > 0) {
-    return static_cast<std::size_t>(value->AsNumber());
+  // max_completion_tokens is the current OpenAI name; max_tokens is the
+  // older OpenAI alias that many clients still send. The current name
+  // wins when both are present; otherwise the alias is honored.
+  if (const std::size_t current =
+          PositiveTokenBudget(body, "max_completion_tokens");
+      current > 0) {
+    return current;
+  }
+  if (const std::size_t legacy = PositiveTokenBudget(body, "max_tokens");
+      legacy > 0) {
+    return legacy;
   }
   return fallback;
 }
 
 std::size_t MaxThinkingTokensFrom(const core::Json& body) {
-  const core::Json* value = body.Find("max_thinking_tokens");
-  if (value != nullptr && value->type() == core::Json::Type::Number &&
-      value->AsNumber() > 0) {
-    return static_cast<std::size_t>(value->AsNumber());
-  }
-  return 0;
-}
-
-void WarnRetiredMaxTokens(log::Diagnostics& diagnostics,
-                          const core::Json& body) {
-  if (body.Find("max_tokens") != nullptr &&
-      body.Find("max_completion_tokens") == nullptr) {
-    diagnostics.Warn("serve", "request uses retired max_tokens, which is "
-                              "ignored; use max_completion_tokens (0 fills "
-                              "the remaining context)");
-  }
+  return PositiveTokenBudget(body, "max_thinking_tokens");
 }
 
 std::string SessionIdFrom(const core::Json& body) {

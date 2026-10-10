@@ -453,7 +453,6 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
   }
-  WarnRetiredMaxTokens(engine_.Diagnostics(), body);
   RunTurn(session, writer,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
@@ -478,7 +477,6 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
   }
-  WarnRetiredMaxTokens(engine_.Diagnostics(), body);
   RunTurn(session, writer,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),

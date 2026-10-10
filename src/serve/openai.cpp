@@ -123,7 +123,6 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
                     SessionStore& sessions, std::mutex& generation,
                     ResponseWriter& writer, const Json& body,
                     std::size_t default_max) {
-  WarnRetiredMaxTokens(engine.Diagnostics(), body);
   const std::string session_id = SessionIdFrom(body);
   const Json* prompt = body.Find("prompt");
   if (prompt == nullptr || !prompt->isString()) {
@@ -282,7 +281,6 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
                 SessionStore& sessions, std::mutex& generation,
                 ResponseWriter& writer, const Json& body,
                 std::size_t default_max, bool anthropic) {
-  WarnRetiredMaxTokens(engine.Diagnostics(), body);
   const std::string session_id = SessionIdFrom(body);
   std::shared_ptr<Session> session;
   SessionTurn turn;
