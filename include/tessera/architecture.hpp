@@ -85,6 +85,17 @@ class Architecture {
       const std::vector<std::size_t>* capture_layers,
       std::vector<Buffer*>* capture, const Buffer* embedding) const = 0;
 
+  // One decode step returning the greedy (argmax) token id (same cache
+  // effect as Forward). The default implementation calls Logits and scans
+  // the host copy; an architecture overrides it to argmax on the device,
+  // so the hot greedy decode path avoids downloading the whole vocabulary
+  // and the synchronization that readback costs.
+  [[nodiscard]] virtual std::expected<std::uint32_t, StatusCode> GreedyToken(
+      Backend& backend, const Model& model, core::DecodeCache& cache,
+      std::uint32_t token, std::vector<float>* hidden_out,
+      const std::vector<std::size_t>* capture_layers,
+      std::vector<Buffer*>* capture, const Buffer* embedding) const;
+
   // Several tokens in one batched forward, advancing the cache by all of
   // them. `logits_out` receives one vocab row per token when all_logits is
   // true, otherwise only the last row; `embedding` supplies one embedding

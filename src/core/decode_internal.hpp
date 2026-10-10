@@ -83,27 +83,25 @@ inline constexpr std::uint64_t kMaxPrefillAttnHeadDim = 256;
 // UnsupportedFeature.
 [[nodiscard]] inline std::expected<const DeviceTensor*, StatusCode>
 NeedWeight(const Model& model, std::string_view name, DType dtype) {
-  for (const auto& weight : model.Weights()) {
-    if (weight.manifest.name == name) {
-      if (weight.manifest.dtype != dtype) {
-        return std::unexpected(StatusCode::UnsupportedFeature);
-      }
-      return &weight;
-    }
+  const DeviceTensor* weight = model.FindDeviceTensor(name);
+  if (weight == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
   }
-  return std::unexpected(StatusCode::MalformedFile);
+  if (weight->manifest.dtype != dtype) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  return weight;
 }
 
 // Like NeedWeight but accepts any dtype (the caller selects the kernel
 // from the weight's format). Missing is MalformedFile.
 [[nodiscard]] inline std::expected<const DeviceTensor*, StatusCode>
 NeedWeightAny(const Model& model, std::string_view name) {
-  for (const auto& weight : model.Weights()) {
-    if (weight.manifest.name == name) {
-      return &weight;
-    }
+  const DeviceTensor* weight = model.FindDeviceTensor(name);
+  if (weight == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
   }
-  return std::unexpected(StatusCode::MalformedFile);
+  return weight;
 }
 
 // Row-wise RMS norm on the host (norms are cheap vectors); the decode
@@ -182,8 +180,11 @@ inline std::expected<void, StatusCode> CastF16Device(
   return backend.LaunchKernel(kernel, launch);
 }
 
-// Quantize one fp32 row (n elements, n a multiple of 4) to packed int8
-// with an absmax scale.
+// Quantize one fp32 row (n elements, n a multiple of 4) to packed int8, 4-bit
+// or FP8 with an absmax scale. The kernel is the row-parallel variant (one
+// workgroup per row), so the whole workgroup reduces the absmax and writes
+// the codes; a one-thread launch made a single lane walk the row and
+// dominated fp8 KV decode.
 inline std::expected<void, StatusCode> QuantizeRowDevice(
     Backend& backend, const Kernel& kernel, const Buffer& in, Buffer& out,
     Buffer& scale, std::size_t n) {
@@ -192,7 +193,7 @@ inline std::expected<void, StatusCode> QuantizeRowDevice(
   }
   KernelLaunch launch;
   launch.grid_x = 1;
-  launch.block_x = 1;
+  launch.block_x = 256;
   launch.buffers = {&in, &out, &scale};
   launch.scalars = {1, n};
   return backend.LaunchKernel(kernel, launch);

@@ -67,6 +67,26 @@ std::expected<std::vector<float>, StatusCode> DecodeLogits(
   return DecodeStepDeviceLogits(backend, model, cache, token, hidden);
 }
 
+std::expected<std::uint32_t, StatusCode> DecodeToken(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture, const Buffer* embedding) {
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const Architecture* arch = model.Arch();
+  if (arch != nullptr) {
+    return arch->GreedyToken(backend, model, cache, token, hidden,
+                             capture_layers, capture, embedding);
+  }
+  if (embedding != nullptr) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  return DecodeStepDevice(backend, model, cache, token, hidden);
+}
+
 std::expected<std::vector<std::vector<float>>, StatusCode> ScoreTokens(
     Backend& backend, const Model& model,
     std::span<const std::uint32_t> tokens) {
@@ -257,3 +277,23 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
 }
 
 }  // namespace tessera::core
+
+namespace tessera {
+
+// The generic greedy step: download the logits and scan them on the host.
+// An architecture overrides GreedyToken to argmax on the device instead.
+std::expected<std::uint32_t, StatusCode> Architecture::GreedyToken(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture, const Buffer* embedding) const {
+  auto logits =
+      Logits(backend, model, cache, token, hidden, capture_layers, capture,
+             embedding);
+  if (!logits) {
+    return std::unexpected(logits.error());
+  }
+  return core::detail::ArgMax(*logits);
+}
+
+}  // namespace tessera

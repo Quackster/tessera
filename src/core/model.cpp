@@ -362,6 +362,13 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
       weights_(std::move(weights)), tokenizer_(std::move(tokenizer)),
       chat_template_(std::move(chat_template)),
       stop_tokens_(std::move(stop_tokens)) {
+  // Index the weights by name once, so the decode loop's per-op lookups do
+  // not scan every tensor (a 27B model has about 866). The keys are views
+  // into weights_, which is immutable after load.
+  weight_index_.reserve(weights_.size());
+  for (std::size_t i = 0; i < weights_.size(); ++i) {
+    weight_index_.emplace(weights_[i].manifest.name, i);
+  }
   module_ = CreateArchitecture(architecture_);
 }
 
@@ -564,13 +571,14 @@ std::span<const DeviceTensor> Model::Weights() const {
   return std::span<const DeviceTensor>(weights_);
 }
 
+const DeviceTensor* Model::FindDeviceTensor(std::string_view name) const {
+  const auto it = weight_index_.find(name);
+  return it == weight_index_.end() ? nullptr : &weights_[it->second];
+}
+
 const Buffer* Model::FindWeight(std::string_view name) const {
-  for (const auto& weight : weights_) {
-    if (weight.manifest.name == name) {
-      return weight.device.get();
-    }
-  }
-  return nullptr;
+  const DeviceTensor* found = FindDeviceTensor(name);
+  return found == nullptr ? nullptr : found->device.get();
 }
 
 const std::string& Model::Path() const {

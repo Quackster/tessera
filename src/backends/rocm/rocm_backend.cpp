@@ -84,7 +84,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"round_bf16", reinterpret_cast<void*>(&RoundBf16Kernel)},
     {"quantize_q8", reinterpret_cast<void*>(&QuantizeQ8Kernel)},
     {"quantize_fp8", reinterpret_cast<void*>(&QuantizeFp8Kernel)},
-    {"quantize_fp8_pack", reinterpret_cast<void*>(&QuantizeFp8PackKernel)},
+    {"quantize_fp8_pack", reinterpret_cast<void*>(&QuantizeFp8PackRowsKernel)},
     {"quantize_fp8_pack_rows",
      reinterpret_cast<void*>(&QuantizeFp8PackRowsKernel)},
     {"attention_fp8", reinterpret_cast<void*>(&AttentionFp8Kernel)},
@@ -127,6 +127,25 @@ int LookupBuiltIn(std::string_view name) {
 
 class RocmBackend final : public Backend {
  public:
+  ~RocmBackend() override {
+    if (staging_ != nullptr) {
+      auto freed = hipHostFree(staging_);
+      if (freed != hipSuccess) {
+        LogError(std::string("hipHostFree of the staging buffer failed (") +
+                 HipErrorName(freed) + "); the memory may leak");
+      }
+      staging_ = nullptr;
+    }
+    if (stream_ != nullptr) {
+      auto error = hipStreamDestroy(stream_);
+      if (error != hipSuccess) {
+        LogError(std::string("hipStreamDestroy failed (") +
+                 HipErrorName(error) + "); the stream may leak");
+      }
+      stream_ = nullptr;
+    }
+  }
+
   std::string_view Name() const override {
     return "rocm";
   }
@@ -155,7 +174,8 @@ class RocmBackend final : public Backend {
     if (device_index_ < 0 || device_index_ >= device_count) {
       LogError("requested GPU " + std::to_string(device_index_) + " but only " +
                std::to_string(device_count) + " device(s) are present; pass "
-               "--gpu in the range [0, " + std::to_string(device_count - 1) +
+               "--gpu in the range [0, " +
+               std::to_string(device_count - 1) +
                "] (defaults to the first GPU)");
       return std::unexpected(StatusCode::InvalidArgument);
     }
@@ -175,6 +195,28 @@ class RocmBackend final : public Backend {
     device_name_ = props.name;
     LogInfo("selected GPU " + std::to_string(device_index_) + " of " +
             std::to_string(device_count) + ": " + device_name_);
+    // A dedicated stream with the blocking synchronization policy. The
+    // default policy (hipSyncPolicyAuto) actively waits in the runtime on
+    // every host synchronization, so a decode step that waits for the GPU
+    // burns CPU. hipSyncPolicyBlockingSync sleeps instead. All work is
+    // enqueued on this one stream, which also keeps the copies ordered with
+    // the kernels.
+    auto created = hipStreamCreate(&stream_);
+    if (created != hipSuccess) {
+      LogError(std::string("hipStreamCreate failed (") + HipErrorName(created) +
+               "); decode will synchronize on the default stream");
+      stream_ = nullptr;
+    } else {
+      hipStreamAttrValue attr{};
+      attr.syncPolicy = hipSyncPolicyBlockingSync;
+      auto set = hipStreamSetAttribute(
+          stream_, hipStreamAttributeSynchronizationPolicy, &attr);
+      if (set != hipSuccess) {
+        LogError(std::string("hipStreamSetAttribute(blocking sync) failed (") +
+                 HipErrorName(set) +
+                 "); host waits may busy-wait and use more CPU");
+      }
+    }
     initialized_ = true;
     return {};
   }
@@ -218,8 +260,16 @@ class RocmBackend final : public Backend {
     if (src.size() > dst.Size()) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
-    auto error = hipMemcpy(dst.Handle(), src.data(), src.size(),
-                          hipMemcpyHostToDevice);
+    auto staging = EnsureStaging(src.size());
+    if (!staging) {
+      return std::unexpected(staging.error());
+    }
+    std::memcpy(*staging, src.data(), src.size());
+    auto error = hipMemcpyAsync(dst.Handle(), *staging, src.size(),
+                                hipMemcpyHostToDevice, stream_);
+    if (error == hipSuccess) {
+      error = hipStreamSynchronize(stream_);
+    }
     if (error != hipSuccess) {
       LogError(std::string("hipMemcpy H2D of ") +
                std::to_string(src.size()) + " bytes failed (" +
@@ -231,7 +281,7 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyH2DBatch(
       std::span<const Backend::HostCopy> copies) override {
-    // Queue every copy on the null stream, then drain once. A synchronous
+    // Queue every copy on the stream, then drain once. A synchronous
     // hipMemcpy per tensor paid the full round-trip latency on each of the
     // hundreds of weight tensors; the async form pays it once.
     for (const Backend::HostCopy& copy : copies) {
@@ -240,7 +290,7 @@ class RocmBackend final : public Backend {
       }
       auto error = hipMemcpyAsync(copy.dst->Handle(), copy.src.data(),
                                   copy.src.size(), hipMemcpyHostToDevice,
-                                  nullptr);
+                                  stream_);
       if (error != hipSuccess) {
         LogError(std::string("hipMemcpyAsync H2D of ") +
                  std::to_string(copy.src.size()) + " bytes failed (" +
@@ -248,9 +298,9 @@ class RocmBackend final : public Backend {
         return std::unexpected(FromHip(error));
       }
     }
-    auto error = hipDeviceSynchronize();
+    auto error = hipStreamSynchronize(stream_);
     if (error != hipSuccess) {
-      LogError(std::string("hipDeviceSynchronize after batch upload failed (") +
+      LogError(std::string("hipStreamSynchronize after batch upload failed (") +
                HipErrorName(error) + ")");
       return std::unexpected(FromHip(error));
     }
@@ -268,14 +318,25 @@ class RocmBackend final : public Backend {
     if (offset > src.Size() || bytes > src.Size() - offset) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
+    // Stage through pinned host memory: a device-to-host copy straight into
+    // pageable memory makes hipMemcpyAsync synchronous and busy-waits in the
+    // runtime, so every readback goes through the reusable pinned buffer.
+    auto staging = EnsureStaging(bytes);
+    if (!staging) {
+      return std::unexpected(staging.error());
+    }
     const auto* base = static_cast<const std::byte*>(src.Handle()) + offset;
-    auto error =
-        hipMemcpy(dst, base, bytes, hipMemcpyDeviceToHost);
+    auto error = hipMemcpyAsync(*staging, base, bytes, hipMemcpyDeviceToHost,
+                                stream_);
+    if (error == hipSuccess) {
+      error = hipStreamSynchronize(stream_);
+    }
     if (error != hipSuccess) {
       LogError(std::string("hipMemcpy D2H of ") + std::to_string(bytes) +
                " bytes failed (" + HipErrorName(error) + ")");
       return std::unexpected(FromHip(error));
     }
+    std::memcpy(dst, *staging, bytes);
     return {};
   }
 
@@ -289,14 +350,14 @@ class RocmBackend final : public Backend {
     const auto* src_base =
         static_cast<const std::byte*>(src.Handle()) + src_offset;
     auto* dst_base = static_cast<std::byte*>(dst.Handle()) + dst_offset;
-    // Asynchronous on the null stream: the copies and the kernels are both
-    // ordered on the null stream, so the copy still happens before the
+    // Asynchronous on the stream: the copies and the kernels are both
+    // ordered on the same stream, so the copy still happens before the
     // kernels that read it, but the host does not drain the queue on every
     // call. A synchronous hipMemcpy here serialized the per-row linear
     // prefill (about four copies per row per layer) and the state
     // snapshots.
     auto error = hipMemcpyAsync(dst_base, src_base, bytes,
-                                hipMemcpyDeviceToDevice, nullptr);
+                                hipMemcpyDeviceToDevice, stream_);
     if (error != hipSuccess) {
       LogError(std::string("hipMemcpy D2D of ") + std::to_string(bytes) +
                " bytes failed (" + HipErrorName(error) + ")");
@@ -374,7 +435,7 @@ class RocmBackend final : public Backend {
     config.gridDim = dim3(launch.grid_x, launch.grid_y, launch.grid_z);
     config.blockDim = dim3(launch.block_x, launch.block_y, launch.block_z);
     config.dynamicSmemBytes = 0;
-    config.stream = nullptr;
+    config.stream = stream_;
     auto error = hipLaunchKernelExC(
         &config, kBuiltInKernels[index].function, arg_pointers);
     if (error != hipSuccess) {
@@ -386,16 +447,53 @@ class RocmBackend final : public Backend {
   }
 
   void Synchronize() override {
-    auto error = hipDeviceSynchronize();
+    auto error = hipStreamSynchronize(stream_);
     if (error != hipSuccess) {
-      LogError(std::string("hipDeviceSynchronize failed (") +
+      LogError(std::string("hipStreamSynchronize failed (") +
                HipErrorName(error) +
                "); the device did not reach a quiescent state");
     }
   }
 
  private:
+  // A reusable pinned host staging buffer. A device<->host copy to pageable
+  // memory makes hipMemcpyAsync synchronous and busy-waits in the runtime,
+  // so every host readback and upload goes through pinned memory instead.
+  // The buffer grows to the largest copy seen and is reused.
+  std::expected<std::byte*, StatusCode> EnsureStaging(std::size_t bytes) {
+    if (bytes == 0) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    if (staging_ == nullptr || staging_bytes_ < bytes) {
+      if (staging_ != nullptr) {
+        auto freed = hipHostFree(staging_);
+        if (freed != hipSuccess) {
+          LogError(std::string("hipHostFree of the staging buffer failed (") +
+                   HipErrorName(freed) + "); the memory may leak");
+        }
+        staging_ = nullptr;
+        staging_bytes_ = 0;
+      }
+      void* pinned = nullptr;
+      auto error = hipHostMalloc(&pinned, bytes, hipHostMallocDefault);
+      if (error != hipSuccess) {
+        LogError(std::string("hipHostMalloc failed for the ") +
+                 std::to_string(bytes) + " byte staging buffer (" +
+                 HipErrorName(error) + ")");
+        return std::unexpected(FromHip(error));
+      }
+      staging_ = static_cast<std::byte*>(pinned);
+      staging_bytes_ = bytes;
+    }
+    return staging_;
+  }
+
   std::string device_name_;
+  // The stream every kernel and copy uses; carries the blocking sync policy.
+  hipStream_t stream_ = nullptr;
+  // Pinned host staging for device<->host copies (see EnsureStaging).
+  std::byte* staging_ = nullptr;
+  std::size_t staging_bytes_ = 0;
   bool initialized_ = false;
 };
 

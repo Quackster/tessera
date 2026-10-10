@@ -41,7 +41,11 @@ class Qwen35Architecture final : public Architecture {
       std::uint32_t token, std::vector<float>* hidden_out,
       const std::vector<std::size_t>* capture_layers,
       std::vector<Buffer*>* capture, const Buffer* embedding) const override;
-
+  [[nodiscard]] std::expected<std::uint32_t, StatusCode> GreedyToken(
+      Backend& backend, const Model& model, core::DecodeCache& cache,
+      std::uint32_t token, std::vector<float>* hidden_out,
+      const std::vector<std::size_t>* capture_layers,
+      std::vector<Buffer*>* capture, const Buffer* embedding) const override;
   [[nodiscard]] std::expected<void, StatusCode> ForwardBatch(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,

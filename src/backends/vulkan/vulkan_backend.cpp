@@ -352,6 +352,9 @@ class VulkanBackend final : public Backend {
       LogError("FreeBuffer: unknown handle; the buffer was already freed");
       return;
     }
+    // A pending command buffer may still reference the buffer; flush and
+    // wait so the driver never reads freed memory.
+    (void)compute_.Synchronize();
     ReleaseRecord(it->second);
     memories_.erase(it);
   }
@@ -360,6 +363,12 @@ class VulkanBackend final : public Backend {
                                          std::span<const std::byte> src) override {
     if (src.size() > dst.Size()) {
       return std::unexpected(StatusCode::InvalidArgument);
+    }
+    // Drain any pending compute work first: the copy is submitted on its
+    // own command buffer and must not overtake the dispatches before it.
+    auto flushed = compute_.Synchronize();
+    if (!flushed) {
+      return flushed;
     }
     auto staging = AllocateStaging(src.size());
     if (!staging) {
@@ -385,6 +394,11 @@ class VulkanBackend final : public Backend {
       std::size_t bytes) override {
     if (offset > src.Size() || bytes > src.Size() - offset) {
       return std::unexpected(StatusCode::InvalidArgument);
+    }
+    // Flush the pending dispatches so the readback sees their result.
+    auto flushed = compute_.Synchronize();
+    if (!flushed) {
+      return flushed;
     }
     auto staging = AllocateStaging(bytes);
     if (!staging) {
@@ -414,8 +428,10 @@ class VulkanBackend final : public Backend {
     if (!src_record || !dst_record) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    return SubmitCopy(src_record->buffer, dst_record->buffer, src_offset,
-                      dst_offset, bytes);
+    // Record into the pending compute command buffer, so the copy stays
+    // ordered with the dispatches around it without a queue wait.
+    return compute_.RecordCopy(src_record->buffer, dst_record->buffer,
+                               src_offset, dst_offset, bytes);
   }
 
   std::expected<void, StatusCode> CopyH2DBatch(
@@ -424,6 +440,10 @@ class VulkanBackend final : public Backend {
       if (copy.dst == nullptr || copy.src.size() > copy.dst->Size()) {
         return std::unexpected(StatusCode::InvalidArgument);
       }
+    }
+    auto flushed = compute_.Synchronize();
+    if (!flushed) {
+      return flushed;
     }
     // Drain the batch through one bounded staging buffer at a time. Every
     // copy in a chunk is recorded into a single command buffer: the whole
@@ -514,11 +534,10 @@ class VulkanBackend final : public Backend {
   }
 
   void Synchronize() override {
-    auto result = vkQueueWaitIdle(state_.queue);
-    if (result != VK_SUCCESS) {
-      LogError(std::string("vkQueueWaitIdle failed (") +
-               std::to_string(static_cast<int>(result)) + "); the device did "
-               "not reach a quiescent state");
+    auto flushed = compute_.Synchronize();
+    if (!flushed) {
+      LogError("compute flush failed; the device did not reach a quiescent "
+               "state");
     }
   }
 

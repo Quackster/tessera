@@ -191,6 +191,13 @@ TEST(EngineTest, LoadGgufModelUploadsWeights) {
   ASSERT_NE(buffer, nullptr);
   EXPECT_EQ(buffer->Size(), 16u);
   EXPECT_EQ(loaded->FindWeight("missing"), nullptr);
+  // The name index backs both lookups; a hit returns the tensor and a miss
+  // returns nullptr.
+  const tessera::DeviceTensor* tensor = loaded->FindDeviceTensor("w_a");
+  ASSERT_NE(tensor, nullptr);
+  EXPECT_EQ(tensor->manifest.name, "w_a");
+  EXPECT_EQ(tensor->device.get(), buffer);
+  EXPECT_EQ(loaded->FindDeviceTensor("missing"), nullptr);
   std::vector<std::byte> readback(16);
   auto download = engine->Owner().CopyD2H(*buffer, readback.data(), 16);
   ASSERT_TRUE(download.has_value())
@@ -200,6 +207,38 @@ TEST(EngineTest, LoadGgufModelUploadsWeights) {
   EXPECT_FLOAT_EQ(values[1], 2.0f);
   EXPECT_FLOAT_EQ(values[2], 3.0f);
   EXPECT_FLOAT_EQ(values[3], 4.0f);
+}
+
+TEST(EngineTest, LoadGgufModelIndexesEveryWeightByName) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 2, 1);
+  builder.KvString("general.name", "test-model");
+  builder.Tensor("w_a", 1, {8}, 0, 0);   // F32: 32 bytes at [0, 32)
+  builder.Tensor("w_b", 1, {8}, 0, 32);  // F32: 32 bytes at [32, 64)
+  builder.PadTo(((builder.bytes.size() + 63) & ~63u));
+  for (int i = 0; i < 16; ++i) {
+    builder.PushF32(static_cast<float>(i));
+  }
+  auto dir = FreshTempDir("tessera_tests_index");
+  auto path = dir / "index.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const tessera::Model& loaded = **model;
+  ASSERT_EQ(loaded.Weights().size(), 2u);
+  // Every weight is reachable through the name index, and the two names
+  // resolve to distinct tensors.
+  const tessera::DeviceTensor* a = loaded.FindDeviceTensor("w_a");
+  const tessera::DeviceTensor* b = loaded.FindDeviceTensor("w_b");
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+  EXPECT_NE(a, b);
+  EXPECT_EQ(a->manifest.name, "w_a");
+  EXPECT_EQ(b->manifest.name, "w_b");
+  EXPECT_EQ(a->device->Size(), 32u);
+  EXPECT_EQ(loaded.FindDeviceTensor("w_c"), nullptr);
 }
 
 TEST(EngineTest, LoadGgufModelUploadsQuantizedSize) {

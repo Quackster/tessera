@@ -492,4 +492,10 @@ This is the full catalogue. Each phase below turns part of it into cards.
 
 Move a card here with its commit hash and the measured result.
 
-None yet.
+- Not a radiance card, but a tessera-native decode fix: the quantized
+  KV append launched one thread per row (`QuantizeRowDevice` grid and
+  block both 1), so a single lane walked each row and fp8 KV decode
+  stalled on it. `quantize_q8`, `quantize_q4` and `quantize_fp8_pack`
+  are now one workgroup per row (shared-memory absmax). Measured on the
+  27B MXFP4 + DFlash2 target: 132.6 to 76.3 ms/step (29 to 50 tok/s);
+  greedy fp8 50 to 43 ms/token.

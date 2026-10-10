@@ -384,9 +384,26 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
       position += 1 + verify->accepted;
       continue;
     }
+    // Greedy without a drafter: argmax on the device, so the whole
+    // vocabulary is not downloaded and the hidden state is not read back
+    // (nothing consumes it).
+    if (strategy == nullptr && !options.sample) {
+      auto token = core::DecodeToken(*backend_, model, cache, next);
+      if (!token) {
+        diagnostics_.Warn(
+            "engine", std::string("generation step failed: ") +
+                          std::string(ToString(token.error())));
+        return std::unexpected(token.error());
+      }
+      next = *token;
+      ++position;
+      continue;
+    }
     // Advance the target by the just-emitted token. `hidden` describes its
-    // position, which the drafter chains from.
-    auto logits = core::DecodeLogits(*backend_, model, cache, next, &hidden,
+    // position, which the drafter chains from; without a drafter nothing
+    // reads it, so it is not downloaded.
+    std::vector<float>* hidden_out = strategy != nullptr ? &hidden : nullptr;
+    auto logits = core::DecodeLogits(*backend_, model, cache, next, hidden_out,
                                      capture_layers_ptr, capture_ptr);
     if (!logits) {
       diagnostics_.Warn(

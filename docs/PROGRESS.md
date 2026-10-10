@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 381/381 `ctest` on vulkan. 381/381 `ctest` on ROCm.
+Latest suite: 383/383 `ctest` on vulkan. 383/383 `ctest` on ROCm.
 Both builds verified on AMD Radeon AI PRO R9700 (vulkan through
 RADV GFX1201, rocm through the system ROCm).
 
@@ -24,9 +24,29 @@ RADV GFX1201, rocm through the system ROCm).
   H2D/D2H copy, D2D copy, synchronize. `CopyD2HAt` reads byte
   slices for embedding rows.
 - Kernel launch plumbing on both backends. `LaunchKernel` binds
-  buffers and 64-bit scalars in parameter order. Vulkan pipelines
-  through a four-slot launch ring. ROCm copies use async
-  device-to-device transfer.
+  buffers and 64-bit scalars in parameter order. Vulkan defers the
+  submission: every dispatch and device copy of a decode step records
+  into one command buffer (with an inter-operation barrier), so a step
+  that issues about two thousand small launches pays one queue submit
+  instead of thousands; host readbacks flush and wait. ROCm submits
+  on one stream whose synchronization policy is
+  `hipSyncPolicyBlockingSync`, so host waits sleep instead of busy
+   waiting in the runtime. Covered by the launch and copy device
+   tests on both backends.
+- Quantized KV append is row-parallel. `quantize_q8`, `quantize_q4`
+   and `quantize_fp8_pack` are one workgroup per row: the workgroup
+   reduces the row absmax in shared memory and packs the codes
+   together. `QuantizeRowDevice` launches a 256-thread workgroup, not
+   one thread. Before, a single lane walked each row serially, so an
+   fp8 KV verify step paid 16 full-attention layers times 2 tensors
+   times the block width in single-thread launches; the profiler put
+   `QuantizeFp8PackKernel` at 443 of 1115 ms of kernel time at 231 us
+   per row. On the 27B MXFP4 + DFlash2 target, fp8 KV decode went
+   from 132.6 to 76.3 ms/step (29 to 50 tok/s) and greedy fp8 from 50
+   to 43 ms/token, matching the fp32 KV path. The code, scale and
+   acceptance are unchanged. Covered by the quantize device tests on
+   both backends, including `QuantizeKvRowsWideMatchesRef` (a row
+   wider than the workgroup).
 - Generic GEMM kernels with dequantization and fp32 accumulation:
   Q4_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS, IQ3_S, F32, BF16, per-row
   scaled FP8 E4M3, block-scaled FP8, and MXFP4 (32-element E8M0
@@ -233,9 +253,44 @@ RADV GFX1201, rocm through the system ROCm).
   n >= 1024; batches (prefill, DFlash2 verify at m = 7, the
   draft) keep the tiled kernel, which is faster there. Measured
   4.5x faster at m = 1, n = 32768 (3.0 to 0.8 ms per layer Q8),
-  and bit-exact: 24 greedy tokens at n = 1170 are byte-identical
-  with the split on and off, and DFlash2 still equals greedy.
-  Covered by split device tests on both backends.
+   and bit-exact: 24 greedy tokens at n = 1170 are byte-identical
+   with the split on and off, and DFlash2 still equals greedy.
+   Covered by split device tests on both backends.
+- GPU-bound decode: generation CPU dropped toward idle. Vulkan
+  defers the submission of a whole decode step (one queue submit,
+  inter-operation barriers), and the greedy step argmaxes on the
+  device (top_k_rows) instead of downloading the vocabulary. ROCm
+  runs a blocking-sync stream and stages every host readback/upload
+  through reusable pinned memory. The greedy non-speculative loop
+  also stops downloading the hidden state, which no drafter reads.
+  Measured on the pelican SVG prompt, 27B MXFP4, greedy: Vulkan
+  decode CPU 26.5 to 6.8 ms/token (wall 51 to 40 ms/token); ROCm
+  main-thread decode CPU 76 to 8.4 ms/token and process CPU 82 to
+  48 ms/token. The ROCm residual is a HIP runtime background thread,
+  not tessera's thread: a ptrace sample of the spinning thread's RIP
+  lands in libc `ioctl` with `request=0xc0184b0c`, which is
+  `AMDKFD_IOC_WAIT_EVENTS` (KFD type 'K', nr 12, 24-byte args). The
+  runtime busy-polls the KFD event wait while the GPU runs (the
+  sync-policy change only stops the main thread from polling too).
+  `ROC_ACTIVE_WAIT_TIMEOUT`, `ROC_CPU_WAIT_FOR_SIGNAL`,
+  `HSA_ENABLE_INTERRUPT`, `HSA_ENABLE_MWAITX`, and `HSA_ENABLE_SDMA`
+  do not change it, and microbenchmarks do not reproduce it.
+  Weight lookups are
+  indexed by name, so a per-op lookup no longer scans every tensor.
+  Output is unchanged: the MXFP4 greedy tokens are identical on
+  Vulkan and ROCm, and greedy text on the 27B target still matches.
+  `Model::FindDeviceTensor` is covered by
+  `EngineTest.LoadGgufModelIndexesEveryWeightByName` and the extended
+  `EngineTest.LoadGgufModelUploadsWeights`.
+- Row-parallel quantized KV append: `quantize_q8`, `quantize_q4` and
+  `quantize_fp8_pack` are one workgroup per row (shared-memory absmax),
+  and `QuantizeRowDevice` launches a workgroup. The old one-thread
+  launch made a single lane walk each row and dominated fp8 KV decode.
+  Measured on the 27B MXFP4 + DFlash2 target (ROCm, GPU0, fp8 KV):
+  132.6 to 76.3 ms/step and 29 to 50 tok/s, against the served g1a
+  reference at 71.9 ms/step and about 47 tok/s. Greedy fp8 went from
+  50 to 43 ms/token, matching fp32. Codes and acceptance are
+  unchanged. Covered by the quantize device tests on both backends.
 
 ## Next (in order)
 

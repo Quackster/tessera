@@ -147,6 +147,17 @@ DecodeStepDeviceLogits(Backend& backend, const Model& model,
     std::vector<Buffer*>* capture = nullptr,
     const Buffer* embedding = nullptr);
 
+// One decoder step returning the greedy token id. The architecture may do
+// the argmax on the device, so this path avoids downloading the whole
+// vocabulary; the hot greedy decode loop uses it. Same cache effect as
+// DecodeLogits.
+[[nodiscard]] std::expected<std::uint32_t, StatusCode> DecodeToken(
+    Backend& backend, const Model& model, DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out = nullptr,
+    const std::vector<std::size_t>* capture_layers = nullptr,
+    std::vector<Buffer*>* capture = nullptr,
+    const Buffer* embedding = nullptr);
+
 // Score a token sequence with a fresh cache: run each token in order and
 // return the logits at every position (row i is the distribution after
 // tokens[0..i]). The cache is local, so the caller's decode state is not

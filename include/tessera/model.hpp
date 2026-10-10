@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "tessera/architecture.hpp"
@@ -57,6 +58,11 @@ class Model {
   // Uploaded weights, parallel to Tensors() (empty for MXFP4, whose
   // manifest is parsed in a later milestone).
   [[nodiscard]] std::span<const DeviceTensor> Weights() const;
+  // The uploaded weight with this name, or nullptr when absent. Backed by
+  // a name index, so the decode loop's per-op lookups are O(1) instead of
+  // a scan over every tensor.
+  [[nodiscard]] const DeviceTensor* FindDeviceTensor(
+      std::string_view name) const;
   // Device buffer for the tensor with this name; nullptr when absent.
   [[nodiscard]] const Buffer* FindWeight(std::string_view name) const;
   [[nodiscard]] const std::string& Path() const;
@@ -145,6 +151,9 @@ class Model {
   std::optional<AttentionParams> attention_;
   std::optional<TransformerConfig> config_;
   std::vector<DeviceTensor> weights_;
+  // Weight-name index: name -> position in weights_. Keys are string_views
+  // into the (immutable) DeviceTensor names, so no string is copied.
+  std::unordered_map<std::string_view, std::size_t> weight_index_;
   std::optional<Tokenizer> tokenizer_;
   std::string chat_template_;
   std::vector<std::uint32_t> stop_tokens_;

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -62,27 +61,42 @@ class VulkanCompute {
       std::string_view name, std::span<const std::byte> code);
   // Release a VkKernel; destroys its pipeline.
   void FreeKernel(VkKernel* kernel);
-  // Record, submit, and wait a launch (synchronous, like the copy path).
+  // Record a compute dispatch into the pending command buffer. The
+  // submission is deferred: the dispatch is flushed by Synchronize() (or
+  // when the descriptor pool fills), so a decode step that issues
+  // thousands of small launches pays one queue submit, not thousands.
   std::expected<void, StatusCode> LaunchKernel(
       const VkKernel& kernel, const KernelLaunch& launch,
       std::span<const VkBinding> bindings);
+  // Record a device-to-device copy into the pending command buffer, so it
+  // stays ordered with the dispatches around it without a queue wait.
+  std::expected<void, StatusCode> RecordCopy(VkBuffer src, VkBuffer dst,
+                                             std::size_t src_offset,
+                                             std::size_t dst_offset,
+                                             std::size_t bytes);
+  // Flush the pending command buffer (submit) and wait for it. Idempotent.
+  [[nodiscard]] std::expected<void, StatusCode> Synchronize();
 
  private:
   void DestroyResources();
   void LogError(std::string_view message) const;
+  // End and submit the pending command buffer, wait on its fence, and
+  // reset the descriptor pool. A no-op when nothing is recording.
+  [[nodiscard]] std::expected<void, StatusCode> FlushAndWait();
+  // Start the pending command buffer if it is not recording.
+  [[nodiscard]] std::expected<void, StatusCode> EnsureRecording();
 
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
   VkCommandPool pool_ = VK_NULL_HANDLE;
-  // Launches pipeline: each slot owns a command buffer, a fence and the
-  // descriptor set it last submitted. A slot is reused only after its fence
-  // signals, and the set is freed then, so the host does not wait on every
-  // launch (the GPU stays busy across the launches of one decode step).
-  static constexpr std::size_t kRing = 4;
-  std::array<VkCommandBuffer, kRing> commands_{};
-  std::array<VkFence, kRing> fences_{};
-  std::array<VkDescriptorSet, kRing> slot_sets_{};
-  std::size_t slot_ = 0;
+  // The pending command buffer and the fence for its submission. Dispatches
+  // and device copies record into it; it is submitted once per flush.
+  VkCommandBuffer cmd_ = VK_NULL_HANDLE;
+  VkFence fence_ = VK_NULL_HANDLE;
+  bool recording_ = false;
+  // Descriptor sets are allocated on demand from one pool and released in
+  // bulk by vkResetDescriptorPool after each flush.
+  static constexpr std::uint32_t kDescriptorSetBudget = 8192;
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;

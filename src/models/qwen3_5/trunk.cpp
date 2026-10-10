@@ -161,6 +161,27 @@ std::expected<void, StatusCode> EnsureSplitReady(Backend& backend,
   return {};
 }
 
+// Runs the output head (final norm plus the vocab projection) for the
+// current hidden h.x, leaving the logits in h.logits on the device.
+std::expected<void, StatusCode> RunOutputHead(Backend& backend,
+                                              const Model& model,
+                                              const TransformerConfig& cfg,
+                                              Qwen35State& h) {
+  const std::size_t hidden = cfg.hidden_dim;
+  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
+  auto output = NeedWeightAny(model, "output.weight");
+  if (!out_norm || !output) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
+                     *h.xn, 1, hidden, cfg.norm_eps) ||
+      !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
+                    *(*output)->device, *h.logits, 1, cfg.vocab_size, hidden)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return {};
+}
+
 }  // namespace
 
 std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
@@ -609,20 +630,40 @@ std::expected<std::vector<float>, StatusCode> Qwen35Architecture::Logits(
   }
   const TransformerConfig& cfg = *config;
   Qwen35State& h = State(cache);
-  const std::size_t hidden = cfg.hidden_dim;
-  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
-  auto output = NeedWeightAny(model, "output.weight");
-  if (!out_norm || !output) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
-                     *h.xn, 1, hidden, cfg.norm_eps) ||
-      !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
-                    *(*output)->device, *h.logits, 1, cfg.vocab_size, hidden)) {
-    return std::unexpected(StatusCode::DeviceError);
+  auto head = RunOutputHead(backend, model, cfg, h);
+  if (!head) {
+    return std::unexpected(head.error());
   }
   backend.Synchronize();
   return detail::DownloadF32(backend, *h.logits);
+}
+
+std::expected<std::uint32_t, StatusCode> Qwen35Architecture::GreedyToken(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
+    std::uint32_t token, std::vector<float>* hidden_out,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture, const Buffer* embedding) const {
+  auto forward = Forward(backend, model, cache, token, hidden_out,
+                         capture_layers, capture, embedding);
+  if (!forward) {
+    return std::unexpected(forward.error());
+  }
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const TransformerConfig& cfg = *config;
+  Qwen35State& h = State(cache);
+  auto head = RunOutputHead(backend, model, cfg, h);
+  if (!head) {
+    return std::unexpected(head.error());
+  }
+  // Top-1 on the device: read back one id instead of the whole vocabulary.
+  auto best = DeviceRowArgMax(backend, h, *h.logits, 1, cfg.vocab_size);
+  if (!best) {
+    return std::unexpected(best.error());
+  }
+  return (*best)[0];
 }
 
 std::string_view Qwen35Architecture::Name() const { return "qwen35"; }

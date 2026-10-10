@@ -6448,7 +6448,50 @@ TEST(BackendTest, QuantizeQ8MatchesRef) {
   auto kernel = backend->LoadKernel("quantize_q8", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kRows + 255) / 256;
+  launch.grid_x = kRows;
+  launch.block_x = 256;
+  launch.buffers = {(*in_buf).get(), (*out_buf).get(), (*scale_buf).get()};
+  launch.scalars = {kRows, kCols};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> got(in.size()), ref(in.size());
+  std::vector<float> got_scale(kRows), ref_scale(kRows);
+  backend->CopyD2H(**out_buf, got.data(), got.size());
+  backend->CopyD2H(**scale_buf, reinterpret_cast<std::byte*>(got_scale.data()),
+                   got_scale.size() * 4);
+  ASSERT_TRUE(core::QuantizeQ8Ref(std::span<const float>(in),
+                                  std::span<std::byte>(ref),
+                                  std::span<float>(ref_scale), kRows, kCols)
+                  .has_value());
+  EXPECT_EQ(got, ref);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    EXPECT_FLOAT_EQ(got_scale[r], ref_scale[r]);
+  }
+}
+
+// Device: the row-parallel KV quantizer with a row wider than the workgroup
+// (cols 1024 over 256 lanes) and multiple rows equals the host reference.
+// This covers the strided within-row loop the small-shape tests never reach.
+TEST(BackendTest, QuantizeKvRowsWideMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(211);
+  constexpr std::size_t kRows = 3, kCols = 1024;
+  std::vector<float> in(kRows * kCols);
+  for (auto& v : in) v = DrawValue(rng);
+  auto in_buf = backend->AllocateBuffer(in.size() * 4, MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(in.size(), MemoryKind::Device);
+  auto scale_buf = backend->AllocateBuffer(kRows * 4, MemoryKind::Device);
+  ASSERT_TRUE(in_buf && out_buf && scale_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **in_buf, std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(in.data()),
+                                in.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("quantize_q8", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = kRows;
   launch.block_x = 256;
   launch.buffers = {(*in_buf).get(), (*out_buf).get(), (*scale_buf).get()};
   launch.scalars = {kRows, kCols};
@@ -6759,7 +6802,7 @@ TEST(BackendTest, QuantizeFp8PackMatchesRef) {
   auto kernel = backend->LoadKernel("quantize_fp8_pack", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kRows + 255) / 256;
+  launch.grid_x = kRows;
   launch.block_x = 256;
   launch.buffers = {(*in_buf).get(), (*out_buf).get(), (*scale_buf).get()};
   launch.scalars = {kRows, kCols};
@@ -7055,7 +7098,7 @@ TEST(BackendTest, QuantizeQ4MatchesRef) {
   auto kernel = backend->LoadKernel("quantize_q4", {});
   ASSERT_TRUE(kernel.has_value());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kRows + 255) / 256;
+  launch.grid_x = kRows;
   launch.block_x = 256;
   launch.buffers = {(*in_buf).get(), (*out_buf).get(), (*scale_buf).get()};
   launch.scalars = {kRows, kCols};

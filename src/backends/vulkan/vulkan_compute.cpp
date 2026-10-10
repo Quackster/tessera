@@ -16,9 +16,6 @@ namespace {
 constexpr std::size_t kPushConstantBytes = 128;
 // SPIR-V module magic.
 constexpr std::uint32_t kSpirvMagic = 0x07230203;
-// Descriptor pool capacity: launches are serialized on a fence, so a few
-// concurrent sets suffice.
-constexpr std::uint32_t kMaxDescriptorSets = 8;
 
 // The built-in kernels: name + compiled SPIR-V (compiled at configure
 // time; the standard "main" entry, this radv build crashes compiling a
@@ -179,13 +176,12 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
   }
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  pool_size.descriptorCount = kMaxBoundBuffers * kMaxDescriptorSets;
+  pool_size.descriptorCount = kMaxBoundBuffers * kDescriptorSetBudget;
   VkDescriptorPoolCreateInfo pool_create{};
   pool_create.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  // Launches are synchronous, so each launch frees its set back to
-  // the pool; individual free needs this flag.
-  pool_create.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-  pool_create.maxSets = kMaxDescriptorSets;
+  // Sets are released in bulk by vkResetDescriptorPool after each flush,
+  // so individual free is not needed.
+  pool_create.maxSets = kDescriptorSetBudget;
   pool_create.poolSizeCount = 1;
   pool_create.pPoolSizes = &pool_size;
   result = vkCreateDescriptorPool(device, &pool_create, nullptr,
@@ -200,8 +196,8 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
   command_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   command_info.commandPool = pool_;
   command_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  command_info.commandBufferCount = static_cast<std::uint32_t>(kRing);
-  result = vkAllocateCommandBuffers(device, &command_info, commands_.data());
+  command_info.commandBufferCount = 1;
+  result = vkAllocateCommandBuffers(device, &command_info, &cmd_);
   if (result != VK_SUCCESS) {
     LogError(std::string("vkAllocateCommandBuffers failed (") +
              std::to_string(static_cast<int>(result)) + ")");
@@ -210,31 +206,26 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
   }
   VkFenceCreateInfo fence_info{};
   fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-  // Signaled so the first use of a slot does not wait.
+  // Signaled so the first flush's wait does not block on a fresh fence.
   fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-  for (std::size_t i = 0; i < kRing; ++i) {
-    result = vkCreateFence(device, &fence_info, nullptr, &fences_[i]);
-    if (result != VK_SUCCESS) {
-      LogError(std::string("vkCreateFence failed (") +
-               std::to_string(static_cast<int>(result)) + ")");
-      DestroyResources();
-      return std::unexpected(FromVkResult(result));
-    }
+  result = vkCreateFence(device, &fence_info, nullptr, &fence_);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkCreateFence failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    DestroyResources();
+    return std::unexpected(FromVkResult(result));
   }
   ready_ = true;
   return {};
 }
 
 void VulkanCompute::DestroyResources() {
-  for (VkFence& f : fences_) {
-    if (f != VK_NULL_HANDLE) {
-      vkDestroyFence(device_, f, nullptr);
-      f = VK_NULL_HANDLE;
-    }
+  if (fence_ != VK_NULL_HANDLE) {
+    vkDestroyFence(device_, fence_, nullptr);
+    fence_ = VK_NULL_HANDLE;
   }
-  for (VkCommandBuffer& c : commands_) {
-    c = VK_NULL_HANDLE;  // freed with the command pool
-  }
+  cmd_ = VK_NULL_HANDLE;  // freed with the command pool
+  recording_ = false;
   if (descriptor_pool_ != VK_NULL_HANDLE) {
     vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
     descriptor_pool_ = VK_NULL_HANDLE;
@@ -257,6 +248,8 @@ void VulkanCompute::Shutdown() {
   if (!ready_) {
     return;
   }
+  auto flushed = Synchronize();
+  (void)flushed;
   vkQueueWaitIdle(queue_);
   DestroyResources();
   ready_ = false;
@@ -334,69 +327,159 @@ void VulkanCompute::FreeKernel(VkKernel* kernel) {
   delete kernel;
 }
 
+std::expected<void, StatusCode> VulkanCompute::EnsureRecording() {
+  if (recording_) {
+    return {};
+  }
+  auto result = vkResetCommandBuffer(cmd_, 0);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkResetCommandBuffer failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    return std::unexpected(FromVkResult(result));
+  }
+  VkCommandBufferBeginInfo begin_info{};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  result = vkBeginCommandBuffer(cmd_, &begin_info);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkBeginCommandBuffer failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    return std::unexpected(FromVkResult(result));
+  }
+  recording_ = true;
+  return {};
+}
+
+std::expected<void, StatusCode> VulkanCompute::FlushAndWait() {
+  if (!recording_) {
+    return {};
+  }
+  auto result = vkEndCommandBuffer(cmd_);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkEndCommandBuffer failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    recording_ = false;
+    return std::unexpected(FromVkResult(result));
+  }
+  result = vkResetFences(device_, 1, &fence_);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkResetFences failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    recording_ = false;
+    return std::unexpected(FromVkResult(result));
+  }
+  VkSubmitInfo submit_info{};
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &cmd_;
+  result = vkQueueSubmit(queue_, 1, &submit_info, fence_);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkQueueSubmit failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    recording_ = false;
+    return std::unexpected(FromVkResult(result));
+  }
+  result = vkWaitForFences(device_, 1, &fence_, VK_TRUE, kFenceTimeoutNs);
+  recording_ = false;
+  if (result == VK_TIMEOUT) {
+    LogError("fence wait timed out after 30 s; the device is hung or the "
+             "ICD is unresponsive");
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkWaitForFences failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    return std::unexpected(FromVkResult(result));
+  }
+  // The submission is done, so every descriptor set it used can be released.
+  result = vkResetDescriptorPool(device_, descriptor_pool_, 0);
+  if (result != VK_SUCCESS) {
+    LogError(std::string("vkResetDescriptorPool failed (") +
+             std::to_string(static_cast<int>(result)) + ")");
+    return std::unexpected(FromVkResult(result));
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> VulkanCompute::Synchronize() {
+  return FlushAndWait();
+}
+
+std::expected<void, StatusCode> VulkanCompute::RecordCopy(
+    VkBuffer src, VkBuffer dst, std::size_t src_offset, std::size_t dst_offset,
+    std::size_t bytes) {
+  if (!ready_) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  auto recording = EnsureRecording();
+  if (!recording) {
+    return recording;
+  }
+  // Order this copy after every earlier recorded operation.
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
+                       nullptr, 0, nullptr);
+  VkBufferCopy copy{};
+  copy.srcOffset = src_offset;
+  copy.dstOffset = dst_offset;
+  copy.size = bytes;
+  vkCmdCopyBuffer(cmd_, src, dst, 1, &copy);
+  return {};
+}
+
 std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
     const VkKernel& kernel, const KernelLaunch& launch,
     std::span<const VkBinding> bindings) {
   if (!ready_) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  const std::size_t slot = slot_;
-  slot_ = (slot_ + 1) % kRing;
-  VkFence fence = fences_[slot];
-  // Reuse the slot only after its previous submission completed; its
-  // descriptor set is freed here, once the GPU no longer reads it.
-  auto result = vkWaitForFences(device_, 1, &fence, VK_TRUE, kFenceTimeoutNs);
-  if (result == VK_TIMEOUT) {
-    LogError(std::string("kernel ") + kernel.name +
-             ": fence wait timed out after 30 s; the device is hung or the "
-             "ICD is unresponsive");
-    return std::unexpected(StatusCode::DeviceError);
+  auto recording = EnsureRecording();
+  if (!recording) {
+    return recording;
   }
-  if (result != VK_SUCCESS) {
-    LogError(std::string("kernel ") + kernel.name +
-             ": vkWaitForFences failed (" +
-             std::to_string(static_cast<int>(result)) + ")");
-    return std::unexpected(FromVkResult(result));
-  }
-  if (slot_sets_[slot] != VK_NULL_HANDLE) {
-    vkFreeDescriptorSets(device_, descriptor_pool_, 1, &slot_sets_[slot]);
-    slot_sets_[slot] = VK_NULL_HANDLE;
-  }
-  const VkCommandBuffer command = commands_[slot];
-  result = vkResetCommandBuffer(command, 0);
-  if (result != VK_SUCCESS) {
-    LogError(std::string("kernel ") + kernel.name +
-             ": vkResetCommandBuffer failed (" +
-             std::to_string(static_cast<int>(result)) + ")");
-    return std::unexpected(FromVkResult(result));
-  }
-  VkCommandBufferBeginInfo begin_info{};
-  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  result = vkBeginCommandBuffer(command, &begin_info);
-  if (result != VK_SUCCESS) {
-    LogError(std::string("kernel ") + kernel.name +
-             ": vkBeginCommandBuffer failed (" +
-             std::to_string(static_cast<int>(result)) + ")");
-    return std::unexpected(FromVkResult(result));
-  }
-  vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+  // Order this dispatch after every earlier recorded operation. The
+  // deferred command buffer has no implicit inter-dispatch synchronization,
+  // so a conservative full barrier keeps every producer/consumer pair
+  // ordered.
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
+                       nullptr, 0, nullptr);
+  vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
   VkDescriptorSetAllocateInfo set_alloc{};
   set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   set_alloc.descriptorPool = descriptor_pool_;
   set_alloc.descriptorSetCount = 1;
   set_alloc.pSetLayouts = &set_layout_;
   VkDescriptorSet set = VK_NULL_HANDLE;
-  result = vkAllocateDescriptorSets(device_, &set_alloc, &set);
+  auto result = vkAllocateDescriptorSets(device_, &set_alloc, &set);
+  if (result == VK_ERROR_OUT_OF_POOL_MEMORY) {
+    // The window is larger than the pool: flush what is recorded, then
+    // start a new window and retry.
+    auto flushed = FlushAndWait();
+    if (!flushed) {
+      return flushed;
+    }
+    recording = EnsureRecording();
+    if (!recording) {
+      return recording;
+    }
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+    result = vkAllocateDescriptorSets(device_, &set_alloc, &set);
+  }
   if (result != VK_SUCCESS) {
     LogError(std::string("kernel ") + kernel.name +
              ": vkAllocateDescriptorSets failed (" +
-             std::to_string(static_cast<int>(result)) +
-             "); the descriptor pool is exhausted");
+             std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
-  // One write per bound buffer: buffer i goes to binding i. The write's
-  // pBufferInfo must outlive the update call, so it is set after the
-  // buffer_infos vector has finished growing (no reallocation in between).
+  // One write per bound buffer: buffer i goes to binding i.
   std::vector<VkDescriptorBufferInfo> buffer_infos;
   buffer_infos.reserve(kMaxBoundBuffers);
   for (std::size_t i = 0; i < bindings.size(); ++i) {
@@ -417,7 +500,6 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
     writes.push_back(write);
   }
   if (!writes.empty()) {
-    // The 2026 API reports update errors through the validation layer.
     vkUpdateDescriptorSets(device_,
                            static_cast<std::uint32_t>(writes.size()),
                            writes.data(), 0, nullptr);
@@ -426,42 +508,11 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   std::memset(push_constants, 0, kPushConstantBytes);
   std::memcpy(push_constants, launch.scalars.data(),
               launch.scalars.size() * sizeof(std::uint64_t));
-  vkCmdPushConstants(command, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+  vkCmdPushConstants(cmd_, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      kPushConstantBytes, push_constants);
-  vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0,
-                          1, &set, 0, nullptr);
-  vkCmdDispatch(command, launch.grid_x, launch.grid_y, launch.grid_z);
-  result = vkEndCommandBuffer(command);
-  if (result != VK_SUCCESS) {
-    vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
-    LogError(std::string("kernel ") + kernel.name +
-             ": vkEndCommandBuffer failed (" +
-             std::to_string(static_cast<int>(result)) + ")");
-    return std::unexpected(FromVkResult(result));
-  }
-  result = vkResetFences(device_, 1, &fence);
-  if (result != VK_SUCCESS) {
-    vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
-    LogError(std::string("kernel ") + kernel.name +
-             ": vkResetFences failed (" +
-             std::to_string(static_cast<int>(result)) + ")");
-    return std::unexpected(FromVkResult(result));
-  }
-  VkSubmitInfo submit_info{};
-  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit_info.commandBufferCount = 1;
-  submit_info.pCommandBuffers = &command;
-  result = vkQueueSubmit(queue_, 1, &submit_info, fence);
-  if (result != VK_SUCCESS) {
-    vkFreeDescriptorSets(device_, descriptor_pool_, 1, &set);
-    LogError(std::string("kernel ") + kernel.name +
-             " submit failed (" + std::to_string(static_cast<int>(result)) +
-             ")");
-    return std::unexpected(FromVkResult(result));
-  }
-  // The host does not wait: the next reuse of this slot waits on the fence,
-  // and Synchronize() drains the queue at the end of a decode step.
-  slot_sets_[slot] = set;
+  vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, layout_, 0, 1,
+                          &set, 0, nullptr);
+  vkCmdDispatch(cmd_, launch.grid_x, launch.grid_y, launch.grid_z);
   return {};
 }
 

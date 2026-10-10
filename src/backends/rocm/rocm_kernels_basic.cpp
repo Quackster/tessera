@@ -1692,34 +1692,84 @@ __global__ void DflashConvKernel(const float* x, const float* delta,
   y[i] = acc;
 }
 
-// Built-in "quantize_q8": one thread per row; symmetric int8 with a
+// Row-parallel KV quantizer: one workgroup per row. The workgroup reduces
+// the row absmax in shared memory and writes the codes in parallel, so a
+// single appended row costs a workgroup, not one thread. A one-thread-per-
+// row launch left a single lane to walk `cols` serially; at cols 1024 that
+// measured 231 us per row and dominated fp8 KV decode (a verify step pays
+// 16 full-attention layers times 2 tensors times the block width in rows).
+enum KvRowQuantKind { kKvRowQ8 = 0, kKvRowQ4 = 1, kKvRowFp8 = 2 };
+
+template <int Kind>
+__device__ void QuantizeKvRowBody(const float* in, unsigned int* packed,
+                                  float* scale, unsigned long long rows,
+                                  unsigned long long cols) {
+  __shared__ float red[1024];
+  const unsigned long long r = blockIdx.x;
+  if (r >= rows) {
+    return;
+  }
+  const unsigned long long tid = threadIdx.x;
+  const unsigned long long base = r * cols;
+  float amax = 0.0f;
+  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
+    amax = fmaxf(amax, fabsf(in[base + c]));
+  }
+  red[tid] = amax;
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    __syncthreads();
+    if (tid < s) {
+      red[tid] = fmaxf(red[tid], red[tid + s]);
+    }
+  }
+  __syncthreads();
+  float sc = 1.0f;
+  if (Kind == kKvRowFp8) {
+    sc = red[0] / 448.0f;
+    const float min_s = 1.0f / (448.0f * 512.0f);
+    if (sc < min_s) {
+      sc = min_s;
+    }
+  } else if (red[0] > 0.0f) {
+    sc = Kind == kKvRowQ4 ? red[0] / 7.0f : red[0] / 127.0f;
+  }
+  if (tid == 0) {
+    scale[r] = sc;
+  }
+  const unsigned long long words = Kind == kKvRowQ4 ? cols / 8 : cols / 4;
+  for (unsigned long long w = tid; w < words; w += blockDim.x) {
+    unsigned int word = 0u;
+    if (Kind == kKvRowQ4) {
+      for (unsigned int b = 0u; b < 8u; ++b) {
+        const float x = in[base + w * 8 + b] / sc;
+        int q = static_cast<int>(x >= 0.0f ? floorf(x + 0.5f) : ceilf(x - 0.5f));
+        q = q < -7 ? -7 : (q > 7 ? 7 : q);
+        word |= (static_cast<unsigned int>(q) & 0xFu) << (b * 4u);
+      }
+    } else if (Kind == kKvRowQ8) {
+      for (unsigned int b = 0u; b < 4u; ++b) {
+        const float x = in[base + w * 4 + b] / sc;
+        int q = static_cast<int>(x >= 0.0f ? floorf(x + 0.5f) : ceilf(x - 0.5f));
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        word |= (static_cast<unsigned int>(q) & 0xFFu) << (b * 8u);
+      }
+    } else {
+      for (unsigned int b = 0u; b < 4u; ++b) {
+        const float q = fminf(fmaxf(in[base + w * 4 + b] / sc, -448.0f), 448.0f);
+        const std::uint8_t bits = Fp8E4M3FromFloatDev(q);
+        word |= static_cast<unsigned int>(bits) << (b * 8u);
+      }
+    }
+    packed[r * words + w] = word;
+  }
+}
+
+// Built-in "quantize_q8": one workgroup per row; symmetric int8 with a
 // per-row absmax scale, packed four bytes per word.
 __global__ void QuantizeQ8Kernel(const float* in, unsigned int* packed,
                                  float* scale, unsigned long long rows,
                                  unsigned long long cols) {
-  const unsigned long long r =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (r >= rows) {
-    return;
-  }
-  const unsigned long long base = r * cols;
-  float amax = 0.0f;
-  for (unsigned long long c = 0; c < cols; ++c) {
-    amax = fmaxf(amax, fabsf(in[base + c]));
-  }
-  const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
-  scale[r] = s;
-  const unsigned long long words = cols / 4;
-  for (unsigned long long w = 0; w < words; ++w) {
-    unsigned int word = 0u;
-    for (unsigned int b = 0u; b < 4u; ++b) {
-      const float x = in[base + w * 4 + b] / s;
-      int q = static_cast<int>(x >= 0.0f ? floorf(x + 0.5f) : ceilf(x - 0.5f));
-      q = q < -127 ? -127 : (q > 127 ? 127 : q);
-      word |= (static_cast<unsigned int>(q) & 0xFFu) << (b * 8u);
-    }
-    packed[r * words + w] = word;
-  }
+  QuantizeKvRowBody<kKvRowQ8>(in, packed, scale, rows, cols);
 }
 
 // Built-in "attention_q8": GQA with symmetric int8 keys/values.
@@ -2067,85 +2117,14 @@ __global__ void AttentionQ8SplitKernel(
                                   split);
 }
 
-// Built-in "quantize_fp8_pack": one thread per row; OCP FP8 E4M3 bytes
-// packed four per word with the dynamic per-token W4A8 scale.
-__global__ void QuantizeFp8PackKernel(const float* in, unsigned int* packed,
-                                      float* scale, unsigned long long rows,
-                                      unsigned long long cols) {
-  const unsigned long long r =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (r >= rows) {
-    return;
-  }
-  const unsigned long long base = r * cols;
-  float amax = 0.0f;
-  for (unsigned long long c = 0; c < cols; ++c) {
-    amax = fmaxf(amax, fabsf(in[base + c]));
-  }
-  float s = amax / 448.0f;
-  const float min_s = 1.0f / (448.0f * 512.0f);
-  if (s < min_s) {
-    s = min_s;
-  }
-  scale[r] = s;
-  const unsigned long long words = cols / 4;
-  for (unsigned long long w = 0; w < words; ++w) {
-    unsigned int word = 0u;
-    for (unsigned int b = 0u; b < 4u; ++b) {
-      const float q =
-          fminf(fmaxf(in[base + w * 4 + b] / s, -448.0f), 448.0f);
-      const std::uint8_t bits = Fp8E4M3FromFloatDev(q);
-      word |= static_cast<unsigned int>(bits) << (b * 8u);
-    }
-    packed[r * words + w] = word;
-  }
-}
-
-// Built-in "quantize_fp8_pack_rows": as quantize_fp8_pack but one workgroup
-// per row (shared-memory amax reduction), so a few huge rows (the fp8-WMMA
-// activation) do not serialize on one thread. Buffers: 0 in (f32 rows x
-// cols), 1 packed (rows x cols/4 uint), 2 scale (rows). Scalars rows, cols
-// (a multiple of 4). Grid `rows`, block 256.
+// Built-in "quantize_fp8_pack" and "quantize_fp8_pack_rows": one workgroup
+// per row; OCP FP8 E4M3 bytes packed four per word with the dynamic
+// per-token scale. The W4A8 activation and the fp8 KV cache share this row
+// body (the KV merge calls it with one row and a 256-thread workgroup).
 __global__ void QuantizeFp8PackRowsKernel(const float* in, unsigned int* packed,
                                           float* scale, unsigned long long rows,
                                           unsigned long long cols) {
-  __shared__ float red[1024];
-  const unsigned long long r = blockIdx.x;
-  if (r >= rows) {
-    return;
-  }
-  const unsigned long long tid = threadIdx.x;
-  const unsigned long long base = r * cols;
-  float amax = 0.0f;
-  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
-    amax = fmaxf(amax, fabsf(in[base + c]));
-  }
-  red[tid] = amax;
-  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    __syncthreads();
-    if (tid < s) {
-      red[tid] = fmaxf(red[tid], red[tid + s]);
-    }
-  }
-  __syncthreads();
-  float sc = red[0] / 448.0f;
-  const float min_s = 1.0f / (448.0f * 512.0f);
-  if (sc < min_s) {
-    sc = min_s;
-  }
-  if (tid == 0) {
-    scale[r] = sc;
-  }
-  const unsigned long long words = cols / 4;
-  for (unsigned long long w = tid; w < words; w += blockDim.x) {
-    unsigned int word = 0u;
-    for (unsigned int b = 0u; b < 4u; ++b) {
-      const float q = fminf(fmaxf(in[base + w * 4 + b] / sc, -448.0f), 448.0f);
-      const std::uint8_t bits = Fp8E4M3FromFloatDev(q);
-      word |= static_cast<unsigned int>(bits) << (b * 8u);
-    }
-    packed[r * words + w] = word;
-  }
+  QuantizeKvRowBody<kKvRowFp8>(in, packed, scale, rows, cols);
 }
 
 // Built-in "attention_fp8": GQA with OCP FP8 E4M3 keys/values.
@@ -2284,34 +2263,12 @@ __global__ void GeluKernel(const float* x, float* y, unsigned long long n) {
          (1.0f + tanhf(0.7978845608f * (t + 0.044715f * t * t * t)));
 }
 
-// Built-in "quantize_q4": one thread per row; symmetric 4-bit with a
+// Built-in "quantize_q4": one workgroup per row; symmetric 4-bit with a
 // per-row absmax scale, packed eight nibbles per word.
 __global__ void QuantizeQ4Kernel(const float* in, unsigned int* packed,
                                  float* scale, unsigned long long rows,
                                  unsigned long long cols) {
-  const unsigned long long r =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (r >= rows) {
-    return;
-  }
-  const unsigned long long base = r * cols;
-  float amax = 0.0f;
-  for (unsigned long long c = 0; c < cols; ++c) {
-    amax = fmaxf(amax, fabsf(in[base + c]));
-  }
-  const float s = amax > 0.0f ? amax / 7.0f : 1.0f;
-  scale[r] = s;
-  const unsigned long long words = cols / 8;
-  for (unsigned long long w = 0; w < words; ++w) {
-    unsigned int word = 0u;
-    for (unsigned int b = 0u; b < 8u; ++b) {
-      const float x = in[base + w * 8 + b] / s;
-      int q = static_cast<int>(x >= 0.0f ? floorf(x + 0.5f) : ceilf(x - 0.5f));
-      q = q < -7 ? -7 : (q > 7 ? 7 : q);
-      word |= (static_cast<unsigned int>(q) & 0xFu) << (b * 4u);
-    }
-    packed[r * words + w] = word;
-  }
+  QuantizeKvRowBody<kKvRowQ4>(in, packed, scale, rows, cols);
 }
 
 // Built-in "attention_q4": GQA with symmetric 4-bit keys/values.
