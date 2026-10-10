@@ -112,59 +112,30 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
       }
       *mtp_hidden_out = std::move(*down);
     }
-    // No explicit synchronize: the CopyD2H below waits on the queued head
-    // kernels on both backends.
-    // Argmax over the shared-head logits. Prefer an on-device top-1 so a
-    // draft never downloads the whole vocabulary.
-    std::uint32_t best = 0;
-    bool have_best = false;
-    if (h.mtp_top_k_kernel == nullptr) {
-      auto kernel = backend.LoadKernel("top_k_rows", {});
-      if (kernel) {
-        h.mtp_top_k_kernel = std::move(*kernel);
+    // Argmax over the shared-head logits on the device. Prefer an on-device
+    // top-1 so a draft never downloads the whole vocabulary; fall back to a
+    // host scan where the backend has no top_k_rows kernel.
+    auto best = DeviceRowArgMax(backend, h, *h.logits, 1, cfg.vocab_size);
+    if (best) {
+      return (*best)[0];
+    }
+    if (best.error() != StatusCode::UnsupportedFeature) {
+      return std::unexpected(best.error());
+    }
+    std::vector<float> logits(cfg.vocab_size);
+    auto down = backend.CopyD2H(*h.logits,
+                                reinterpret_cast<std::byte*>(logits.data()),
+                                logits.size() * 4);
+    if (!down) {
+      return std::unexpected(down.error());
+    }
+    std::uint32_t arg = 0;
+    for (std::uint32_t i = 1; i < logits.size(); ++i) {
+      if (logits[i] > logits[arg]) {
+        arg = i;
       }
     }
-    if (h.mtp_top_k_kernel != nullptr) {
-      if (h.mtp_argmax_ids == nullptr) {
-        auto ids =
-            backend.AllocateBuffer(sizeof(std::uint32_t), MemoryKind::Device);
-        auto vals = backend.AllocateBuffer(sizeof(float), MemoryKind::Device);
-        if (ids && vals) {
-          h.mtp_argmax_ids = std::move(*ids);
-          h.mtp_argmax_vals = std::move(*vals);
-        }
-      }
-      if (h.mtp_argmax_ids != nullptr) {
-        auto top = core::detail::TopKRowsDevice(
-            backend, *h.mtp_top_k_kernel, *h.logits, *h.mtp_argmax_ids,
-            *h.mtp_argmax_vals, 1, cfg.vocab_size, 1);
-        if (!top) {
-          return std::unexpected(top.error());
-        }
-        std::uint32_t id = 0;
-        if (!backend.CopyD2H(*h.mtp_argmax_ids,
-                             reinterpret_cast<std::byte*>(&id), sizeof(id))) {
-          return std::unexpected(StatusCode::DeviceError);
-        }
-        best = id;
-        have_best = true;
-      }
-    }
-    if (!have_best) {
-      std::vector<float> logits(cfg.vocab_size);
-      auto down = backend.CopyD2H(*h.logits,
-                                  reinterpret_cast<std::byte*>(logits.data()),
-                                  logits.size() * 4);
-      if (!down) {
-        return std::unexpected(down.error());
-      }
-      for (std::uint32_t i = 1; i < logits.size(); ++i) {
-        if (logits[i] > logits[best]) {
-          best = i;
-        }
-      }
-    }
-  return best;
+    return arg;
 }
 
 std::size_t Qwen35Architecture::DraftRows(

@@ -6,7 +6,9 @@
 #include <span>
 
 #include "core/decode.hpp"
+#include "core/decode_internal.hpp"
 #include "models/qwen3_5/state.hpp"
+#include "tessera/backend.hpp"
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
 
@@ -95,5 +97,46 @@ void InvalidateActivationPack(Qwen35State& h);
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     Qwen35State& h, std::size_t layer, std::uint64_t pos,
     Qwen35State::FullKv& kv);
+
+// Per-row top-1 of `logits` (rows x vocab) computed on the device, so a
+// caller reads back `rows` ids instead of the whole vocabulary. Loads the
+// top_k_rows kernel and grows the shared argmax scratch on demand.
+[[nodiscard]] inline std::expected<std::vector<std::uint32_t>, StatusCode>
+DeviceRowArgMax(Backend& backend, Qwen35State& h, const Buffer& logits,
+                std::size_t rows, std::size_t vocab) {
+  if (h.top_k_kernel == nullptr) {
+    auto kernel = backend.LoadKernel("top_k_rows", {});
+    if (!kernel) {
+      return std::unexpected(kernel.error());
+    }
+    h.top_k_kernel = std::move(*kernel);
+  }
+  if (h.argmax_ids == nullptr || h.argmax_ids->Size() < rows * 4) {
+    auto ids = backend.AllocateBuffer(rows * 4, MemoryKind::Device);
+    if (!ids) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    h.argmax_ids = std::move(*ids);
+  }
+  if (h.argmax_vals == nullptr || h.argmax_vals->Size() < rows * 4) {
+    auto vals = backend.AllocateBuffer(rows * 4, MemoryKind::Device);
+    if (!vals) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    h.argmax_vals = std::move(*vals);
+  }
+  auto top = core::detail::TopKRowsDevice(
+      backend, *h.top_k_kernel, logits, *h.argmax_ids, *h.argmax_vals, rows,
+      vocab, 1);
+  if (!top) {
+    return std::unexpected(top.error());
+  }
+  std::vector<std::uint32_t> out(rows, 0);
+  if (!backend.CopyD2H(*h.argmax_ids,
+                       reinterpret_cast<std::byte*>(out.data()), rows * 4)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return out;
+}
 
 }  // namespace tessera::models::qwen3_5

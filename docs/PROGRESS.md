@@ -148,8 +148,8 @@ through RADV GFX1201, rocm through the system ROCm).
   through a four-slot ring instead of waiting on a fence per launch.
   ROCm copies use async device-to-device transfer. On the 27B MXFP4
   target (ROCm) greedy runs at about 23 tok/s (43 ms/token, the fp8
-  WMMA path) and DFlash2 at about 55 tok/s, faster than greedy with the
-  output equal to greedy. The speculative step is about 84 ms. See the
+  WMMA path) and DFlash2 at about 60 tok/s, faster than greedy with the
+  output equal to greedy. The speculative step is about 75 ms. See the
   newest Done entries for the numbers.
 - Single GoogleTest target. Device dependent tests skip cleanly when
   no device is present. Numerical checks use per backend tolerance.
@@ -2234,23 +2234,23 @@ through RADV GFX1201, rocm through the system ROCm).
   context K/V and the q/k/v projections, as the reference does) and
   the small-n GEMM occupancy.
 
-## Next (in order)
+- 2026-10-10: **The batched verifier argmaxes on the device.** With the
+  anchor folded into the verify batch, `Qwen35Architecture::Verify`
+  downloaded the whole `rows x vocab` logits (about 9 MB at the draft
+  size) and argmaxed each row on the host, on the critical path between
+  steps. The engine reads only `accepted` and `next_token` from the
+  result, so the anchor path now runs the trunk and the head without the
+  logits download, argmaxes every scored row on the device
+  (`top_k_rows`, top-1) and reads back `rows` ids (32 bytes). The head
+  and the device logits are shared with `ForwardBatch` (`RunBatchHead`);
+  the top-1 scratch is shared with the MTP draft (`DeviceRowArgMax` in
+  `internal.hpp`, replacing the MTP's inline argmax). The no-anchor path
+  keeps the host download because the caller reads `result.logits`
+  (`HybridDecodeTest.BatchedVerifyPreservesGreedy`). DFlash2 on the 27B
+  MXFP4 target drops from 82 to 75 ms per speculative step; 256 tokens:
+  60 tok/s, accepted 199 of 392, output equals greedy. 330/330 `ctest`
+  on ROCm.
 
-- **Speculation (seam done; acceptance fixed; speed remains).**
-  Greedy and both drafters share one loop and one `SpeculativeStrategy`
-  seam. DFlash2 acceptance is fixed (4.4 per step, reference 2.7 to
-  2.85) and MTP accepts about half its drafts with a default chain of
-  one. Output equals greedy in both. Greedy runs at about 25 tok/s on
-  the 27B MXFP4 target. DFlash2 runs slower than greedy. Remaining, in
-  order: (a) the engine runs one extra single-token target forward per
-  speculative step to advance the cache for the bonus token; the
-  verify batched forward already computes that position, so reuse it;
-  (b) the DFlash2 verifier still runs the full target trunk at the
-  draft size (m about 7); closing this gap needs the reference
-  structure (a batched or fused verify kernel), not a tile tweak;
-  (c) the draft forward cost (fp32 weights, many small kernels).
-  The MTP per-draft cost is measured: each draft reads the shared
-  2.5 GB output head, so the default chain stays at one.
 - 2026-10-10: **OpenAI session management and device queueing (324/324
   `ctest` on vulkan).** Generations queue in arrival order on the single
   device instead of answering 503, so parallel windows and parallel API
@@ -2295,6 +2295,23 @@ through RADV GFX1201, rocm through the system ROCm).
   ahead of thinking: the web UI shows it as a loading line and the
   CLI image path logs its rows.
 
+## Next (in order)
+
+- **Speculation (seam done; acceptance fixed; speed remains).**
+  Greedy and both drafters share one loop and one `SpeculativeStrategy`
+  seam. DFlash2 acceptance is fixed (4.4 per step, reference 2.7 to
+  2.85) and MTP accepts about half its drafts with a default chain of
+  one. Output equals greedy in both. Greedy runs at about 25 tok/s on
+  the 27B MXFP4 target. DFlash2 runs slower than greedy. Remaining, in
+  order: (a) the engine runs one extra single-token target forward per
+  speculative step to advance the cache for the bonus token; the
+  verify batched forward already computes that position, so reuse it;
+  (b) the DFlash2 verifier still runs the full target trunk at the
+  draft size (m about 7); closing this gap needs the reference
+  structure (a batched or fused verify kernel), not a tile tweak;
+  (c) the draft forward cost (fp32 weights, many small kernels).
+  The MTP per-draft cost is measured: each draft reads the shared
+  2.5 GB output head, so the default chain stays at one.
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.

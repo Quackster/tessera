@@ -101,10 +101,11 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> q_exp, k_exp, v_l, core, out;
   // MTP head scratch (fused embedding+hidden, hidden norms).
   std::unique_ptr<Buffer> mtp_fused, mtp_h;
-  // MTP draft argmax over the shared-head logits, computed on the device so a
-  // draft does not download the whole vocabulary.
-  std::unique_ptr<Kernel> mtp_top_k_kernel;
-  std::unique_ptr<Buffer> mtp_argmax_ids, mtp_argmax_vals;
+  // On-device per-row argmax (top-1) over a logits buffer, so the MTP draft
+  // and the batched verifier do not download the whole vocabulary. The ids
+  // and values scratch grows to the requested row count.
+  std::unique_ptr<Kernel> top_k_kernel;
+  std::unique_ptr<Buffer> argmax_ids, argmax_vals;
   struct FullKv {
     std::unique_ptr<Buffer> k;
     std::unique_ptr<Buffer> v;

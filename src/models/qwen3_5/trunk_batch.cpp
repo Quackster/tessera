@@ -412,6 +412,60 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
   return RunFfnBatch(backend, model, cfg, h, layer, rows);
 }
 
+// Runs the vocab head over the batch. `all_rows` projects every row (the
+// batched verify with all_logits); otherwise only the last row (prefill).
+// The device logits land in h.batch->logits / h.logits; when `download` is
+// non-null they are copied to the host, otherwise they stay on the device
+// for a device-side argmax.
+std::expected<void, StatusCode> RunBatchHead(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen35State& h, std::size_t rows, bool all_rows,
+    std::vector<float>* download) {
+  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
+  auto output = NeedWeightAny(model, "output.weight");
+  if (!out_norm || !output) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const std::size_t hidden = cfg.hidden_dim;
+  if (all_rows && rows > 1) {
+    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.batch->x,
+                       *(*out_norm)->device, *h.batch->xn, rows, hidden,
+                       cfg.norm_eps) ||
+        !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.batch->xn,
+                      *(*output)->device, *h.batch->logits, rows,
+                      cfg.vocab_size, hidden)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (download != nullptr) {
+      download->resize(rows * cfg.vocab_size);
+      if (!backend.CopyD2H(*h.batch->logits,
+                           reinterpret_cast<std::byte*>(download->data()),
+                           rows * cfg.vocab_size * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+  } else {
+    if (!backend.CopyD2D(*h.batch->x, (rows - 1) * hidden * 4, *h.x, 0,
+                         hidden * 4) ||
+        !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
+                       *h.xn, 1, hidden, cfg.norm_eps) ||
+        !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
+                      *(*output)->device, *h.logits, 1, cfg.vocab_size,
+                      hidden)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (download != nullptr) {
+      download->resize(cfg.vocab_size);
+      if (!backend.CopyD2H(*h.logits,
+                           reinterpret_cast<std::byte*>(download->data()),
+                           cfg.vocab_size * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+  }
+  return {};
+}
+
 }  // namespace
 
 std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
@@ -530,44 +584,10 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     std::copy(last->begin(), last->end(), hidden_out->begin());
   }
   if (logits_out != nullptr) {
-    auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
-    auto output = NeedWeightAny(model, "output.weight");
-    if (!out_norm || !output) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    if (all_logits && rows > 1) {
-      if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.batch->x,
-                         *(*out_norm)->device, *h.batch->xn, rows, hidden,
-                         cfg.norm_eps) ||
-          !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.batch->xn,
-                        *(*output)->device, *h.batch->logits, rows,
-                        cfg.vocab_size, hidden)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-      logits_out->resize(rows * cfg.vocab_size);
-      if (!backend.CopyD2H(*h.batch->logits,
-                           reinterpret_cast<std::byte*>(logits_out->data()),
-                           rows * cfg.vocab_size * 4)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-    } else {
-      // Only the last row needs logits (prefill): head on that row alone.
-      // ProjectBatch with one row uses the GEMV kernel.
-      if (!backend.CopyD2D(*h.batch->x, (rows - 1) * hidden * 4, *h.x, 0,
-                           hidden * 4) ||
-          !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
-                         *h.xn, 1, hidden, cfg.norm_eps) ||
-          !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
-                        *(*output)->device, *h.logits, 1, cfg.vocab_size,
-                        hidden)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-      logits_out->resize(cfg.vocab_size);
-      if (!backend.CopyD2H(*h.logits,
-                           reinterpret_cast<std::byte*>(logits_out->data()),
-                           cfg.vocab_size * 4)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
+    auto head =
+        RunBatchHead(backend, model, cfg, h, rows, all_logits, logits_out);
+    if (!head) {
+      return std::unexpected(head.error());
     }
   }
   return {};
@@ -607,31 +627,61 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     anchored.insert(anchored.end(), draft.begin(), draft.end());
     tokens = anchored;
   }
-  std::vector<float> flat;
-  std::vector<float> last_hidden;
-  auto status = ForwardBatch(backend, model, cache, tokens, &flat, &last_hidden,
-                             /*all_logits=*/true, nullptr, capture_layers,
-                             capture);
-  if (!status) {
-    return std::unexpected(status.error());
-  }
   const std::size_t vocab = config->vocab_size;
   DraftVerification result;
-  std::span<const float> last =
-      lead == 1 ? std::span<const float>(flat.data(), vocab)
-                : std::span<const float>(prefix_logits.begin(),
-                                         prefix_logits.end());
   std::size_t accepted = 0;
-  for (std::size_t i = 0; i < draft.size(); ++i) {
-    if (detail::ArgMax(last) != draft[i]) {
-      break;
+  if (lead == 1) {
+    // The anchor rides the batch. The engine reads only `accepted` and
+    // `next_token`, so argmax every scored row on the device and read back
+    // `rows` ids instead of downloading rows x vocab floats and scanning them
+    // on the host (about 9 MB per step at the draft size).
+    auto status = ForwardBatch(backend, model, cache, tokens, nullptr, nullptr,
+                               /*all_logits=*/true, nullptr, capture_layers,
+                               capture);
+    if (!status) {
+      return std::unexpected(status.error());
     }
-    ++accepted;
-    last = std::span<const float>(flat.data() + (i + lead) * vocab, vocab);
+    auto head =
+        RunBatchHead(backend, model, *config, h, tokens.size(), true, nullptr);
+    if (!head) {
+      return std::unexpected(head.error());
+    }
+    auto best =
+        DeviceRowArgMax(backend, h, *h.batch->logits, tokens.size(), vocab);
+    if (!best) {
+      return std::unexpected(best.error());
+    }
+    for (std::size_t i = 0; i < draft.size(); ++i) {
+      if ((*best)[i] != draft[i]) {
+        break;
+      }
+      ++accepted;
+    }
+    result.accepted = accepted;
+    result.next_token = (*best)[accepted];
+  } else {
+    // No anchor: the caller's prefix logits score draft[0], and the caller
+    // reads `result.logits` as the continuation row, so keep the host path.
+    std::vector<float> flat;
+    auto status = ForwardBatch(backend, model, cache, tokens, &flat, nullptr,
+                               /*all_logits=*/true, nullptr, capture_layers,
+                               capture);
+    if (!status) {
+      return std::unexpected(status.error());
+    }
+    std::span<const float> last =
+        std::span<const float>(prefix_logits.begin(), prefix_logits.end());
+    for (std::size_t i = 0; i < draft.size(); ++i) {
+      if (detail::ArgMax(last) != draft[i]) {
+        break;
+      }
+      ++accepted;
+      last = std::span<const float>(flat.data() + (i + lead) * vocab, vocab);
+    }
+    result.accepted = accepted;
+    result.logits.assign(last.begin(), last.end());
+    result.next_token = detail::ArgMax(result.logits);
   }
-  result.accepted = accepted;
-  result.logits.assign(last.begin(), last.end());
-  result.next_token = detail::ArgMax(result.logits);
   // Keep the anchor (when present) plus the accepted drafts; drop the rest.
   // The restore always runs: the batched verify advances the recurrent state
   // through the history slots (each DeltaStep writes its own slot), so the
