@@ -506,13 +506,86 @@ TEST(ServeTest, ThinkStreamerPassesPlainText) {
   EXPECT_EQ(content, "hello");
 }
 
-// An unclosed think block never strands text: Finish flushes it.
-TEST(ServeTest, ThinkStreamerFlushesUnclosedThink) {
+// Expected thinking streams live as reasoning: nothing waits for the
+// closer, and Finish adds nothing once everything flowed.
+TEST(ServeTest, ThinkStreamerStreamsLiveThinking) {
   tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
-  EXPECT_TRUE(streamer.Push("abc").content.empty());
+  auto first = streamer.Push("The user said hi. ");
+  EXPECT_EQ(first.reasoning, "The user said hi. ");
+  EXPECT_TRUE(first.content.empty());
+  auto second = streamer.Push("Be brief.");
+  EXPECT_EQ(second.reasoning, "Be brief.");
+  EXPECT_TRUE(second.content.empty());
   const auto tail = streamer.Finish();
   EXPECT_TRUE(tail.reasoning.empty());
-  EXPECT_EQ(tail.content, "abc");
+  EXPECT_TRUE(tail.content.empty());
+}
+
+// A trailing tag fragment is withheld until it resolves, then the
+// closer vanishes as markup while the answer flows as content.
+TEST(ServeTest, ThinkStreamerWithholdsTagFragmentLive) {
+  tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
+  auto first = streamer.Push("idea</thi");
+  EXPECT_EQ(first.reasoning, "idea");
+  EXPECT_TRUE(first.content.empty());
+  auto second = streamer.Push("nk>answer");
+  EXPECT_TRUE(second.reasoning.empty());
+  EXPECT_EQ(second.content, "answer");
+}
+
+// An unclosed think block never strands text: with no closer it all
+// stays thinking, including the Finish remainder.
+TEST(ServeTest, ThinkStreamerFlushesUnclosedThink) {
+  tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
+  auto pushed = streamer.Push("abc");
+  EXPECT_EQ(pushed.reasoning, "abc");
+  EXPECT_TRUE(pushed.content.empty());
+  const auto tail = streamer.Finish();
+  EXPECT_TRUE(tail.reasoning.empty());
+  EXPECT_TRUE(tail.content.empty());
+}
+
+// Live thinking over realistic word pieces: every pre-close delta
+// carries reasoning and no content, the closer itself streams nothing,
+// and the answer flows as content.
+TEST(ServeTest, ThinkStreamerStreamsLiveWordPieces) {
+  tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
+  std::string reasoning;
+  std::string content;
+  for (std::string_view piece : {"We", " need", " to", " answer", "."}) {
+    const auto deltas = streamer.Push(piece);
+    EXPECT_FALSE(deltas.reasoning.empty());
+    EXPECT_TRUE(deltas.content.empty());
+    reasoning += deltas.reasoning;
+    content += deltas.content;
+  }
+  const auto close = streamer.Push("</think>");
+  EXPECT_TRUE(close.reasoning.empty());
+  EXPECT_TRUE(close.content.empty());
+  for (std::string_view piece : {"Hi", "!"}) {
+    const auto deltas = streamer.Push(piece);
+    EXPECT_TRUE(deltas.reasoning.empty());
+    EXPECT_FALSE(deltas.content.empty());
+    reasoning += deltas.reasoning;
+    content += deltas.content;
+  }
+  const auto tail = streamer.Finish();
+  reasoning += tail.reasoning;
+  content += tail.content;
+  EXPECT_EQ(reasoning, "We need to answer.");
+  EXPECT_EQ(content, "Hi!");
+}
+
+// A mid-stream opener falls back to withholding; a cutoff there still
+// flushes everything as reasoning, never as answer text.
+TEST(ServeTest, ThinkStreamerFlushesOpenerFallbackAsReasoning) {
+  tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
+  auto pushed = streamer.Push("foo <think> bar");
+  EXPECT_TRUE(pushed.reasoning.empty());
+  EXPECT_TRUE(pushed.content.empty());
+  const auto tail = streamer.Finish();
+  EXPECT_EQ(tail.reasoning, "foo <think> bar");
+  EXPECT_TRUE(tail.content.empty());
 }
 
 // An unclosed span is withheld, never leaked: nothing streams until
@@ -531,13 +604,15 @@ TEST(ServeTest, ThinkStreamerWithholdsUnclosedSpan) {
 }
 
 // Deltas always concatenate to the post-hoc split, whatever the
-// piece boundaries (fixed seed).
+// piece boundaries (fixed seed). Non-expected mode: leading plain
+// text is content here (expected mode treats pre-close text as
+// thinking, like the reference runtimes).
 TEST(ServeTest, ThinkStreamerMatchesPostHocSplit) {
   const std::string text =
       "lead <think>deep thought</think> middle <think>more</think> tail";
   std::mt19937 rng(11);
   for (int round = 0; round < 20; ++round) {
-    tessera::serve::ThinkStreamer streamer(/*think_expected=*/true);
+    tessera::serve::ThinkStreamer streamer(/*think_expected=*/false);
     std::string reasoning;
     std::string content;
     std::size_t pos = 0;

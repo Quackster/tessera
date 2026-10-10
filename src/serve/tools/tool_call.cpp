@@ -259,12 +259,43 @@ bool IsThinkTagPrefix(std::string_view tail) {
          (is_prefix(kOpen, tail) || is_prefix(kClose, tail));
 }
 
+// Length of the trailing tag fragment: only a suffix shorter than a
+// full marker can still grow into one, so the scan stays bounded and
+// decided text always streams.
+std::size_t TagPrefixTail(std::string_view text) {
+  constexpr std::size_t kTagLen = 8;  // longest think marker
+  const std::size_t cap = std::min(text.size(), kTagLen);
+  for (std::size_t len = cap; len > 0; --len) {
+    if (IsThinkTagPrefix(text.substr(text.size() - len))) {
+      return len;
+    }
+  }
+  return 0;
+}
+
 }  // namespace
 
 ThinkStreamer::Deltas ThinkStreamer::Push(std::string_view piece) {
   raw_.append(piece);
   if (think_expected_ && !resolved_) {
-    if (raw_.find(core::kThinkCloseTag) == std::string::npos) {
+    const bool has_close =
+        raw_.find(core::kThinkCloseTag) != std::string::npos;
+    const bool has_open =
+        raw_.find(core::kThinkOpenTag) != std::string::npos;
+    if (!has_close && !has_open) {
+      // Clean thinking prefix: everything before a closer is thinking
+      // by construction, so stream it live as reasoning instead of
+      // holding it until the closer. Only a trailing tag fragment is
+      // withheld (it may yet grow into a tag).
+      const std::string_view visible = std::string_view(raw_).substr(
+          0, raw_.size() - TagPrefixTail(raw_));
+      Deltas deltas;
+      deltas.reasoning = std::string(visible).substr(
+          CommonPrefix(emitted_reasoning_, visible));
+      emitted_reasoning_ += deltas.reasoning;
+      return deltas;
+    }
+    if (!has_close) {
       return {};
     }
     resolved_ = true;
@@ -302,8 +333,17 @@ ThinkStreamer::Deltas ThinkStreamer::Push(std::string_view piece) {
 }
 
 ThinkStreamer::Deltas ThinkStreamer::Finish() {
+  const bool cutoff_in_think = think_expected_ && !resolved_;
   resolved_ = true;
   withhold_ = false;
+  if (cutoff_in_think) {
+    // Cut off mid-think: everything pending is thinking by
+    // construction, so it flushes as reasoning, never as answer text.
+    Deltas deltas;
+    deltas.reasoning = raw_.substr(CommonPrefix(emitted_reasoning_, raw_));
+    emitted_reasoning_ += deltas.reasoning;
+    return deltas;
+  }
   return Push({});
 }
 

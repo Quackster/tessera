@@ -2295,6 +2295,15 @@ through RADV GFX1201, rocm through the system ROCm).
   ahead of thinking: the web UI shows it as a loading line and the
   CLI image path logs its rows.
 
+- 2026-10-10: **Thinking streams live (346/346 `ctest` on vulkan).**
+  The session streamer withheld all thinking until the think-close
+  arrived, so long thinks showed nothing and a turn cut mid-think
+  dumped the thinking as one answer blob (root-caused live against
+  the served 27B target). Pending thought now streams live as
+  `reasoning_content` (only a trailing tag fragment is held back),
+  and a cutoff mid-think flushes the remainder as reasoning, never
+  as answer text. Takes effect on a server rebuild and restart.
+
 ## Next (in order)
 
 - **Speculation (seam done; acceptance fixed; speed remains).**
