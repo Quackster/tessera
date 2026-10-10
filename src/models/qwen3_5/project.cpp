@@ -198,13 +198,30 @@ std::expected<void, StatusCode> ProjectBatch(
   // non-speculative baseline is unchanged. TESSERA_MXFP4_WMMA=0 disables it.
   const char* wmma_env = std::getenv("TESSERA_MXFP4_WMMA");
   const bool wmma_on = wmma_env == nullptr || std::atoi(wmma_env) != 0;
-  if (dtype == DType::F4E2M1 && wmma_on && m >= 2 && m <= 16) {
+  if (dtype == DType::F4E2M1 && wmma_on && m >= 1 && m <= 16) {
     auto projected = ProjectWmma(backend, h, a, w, out, m, n, k);
     if (!projected) {
       return std::unexpected(projected.error());
     }
     if (*projected) {
       return {};
+    }
+  }
+  // The vocab-wide bf16 output head (lm_head) reads its 2.5 GB weight every
+  // step. The bf16 tensor-core kernel streams it coalesced at ~600 GB/s while
+  // the tiled kernel reaches only ~270 GB/s. Route both the m=1 greedy head
+  // and the m=1+draft verify head through the same kernel so they share
+  // numerics. Falls through where the backend lacks it (Vulkan).
+  if (dtype == DType::BF16 && wmma_on && m >= 1 && m <= 16 &&
+      n >= detail::kGemmTiledMinCols) {
+    auto wmma = detail::CachedKernel(backend, h.gemms,
+                                     static_cast<int>(DType::BF16) + 0x4000,
+                                     "gemm_bf16_wmma");
+    if (wmma) {
+      return detail::ProjectDevice(backend, **wmma, a, w, out, m, n, k);
+    }
+    if (wmma.error() != StatusCode::UnsupportedFeature) {
+      return std::unexpected(wmma.error());
     }
   }
   if (auto quantized = QuantizeMxFp4Input(backend, h, dtype, a, m, k);

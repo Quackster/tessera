@@ -593,6 +593,12 @@ std::expected<std::size_t, StatusCode> Engine::GenerateStreaming(
         if (!anchored) {
           return std::unexpected(anchored.error());
         }
+        // A folding strategy defers its context append to Commit, so commit
+        // the anchor alone (zero accepted drafts) to keep the context in step.
+        auto committed = strategy->Commit(*backend_, model, cache, 0);
+        if (!committed) {
+          return std::unexpected(committed.error());
+        }
         next = pick(*logits);
         ++position;
         continue;

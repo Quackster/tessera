@@ -144,9 +144,11 @@ through RADV GFX1201, rocm through the system ROCm).
   kernel for small verify batches, tiled quantized attention, and
   four-way ILP in the scan and norm kernels. Vulkan launches pipeline
   through a four-slot ring instead of waiting on a fence per launch.
-  ROCm copies use async device-to-device transfer. Greedy runs at
-  about 25 tok/s on the 27B MXFP4 target. DFlash2 runs slower than
-  greedy. See the newest Done entries for the numbers.
+  ROCm copies use async device-to-device transfer. On the 27B MXFP4
+  target (ROCm) greedy runs at about 23 tok/s (43 ms/token, the fp8
+  WMMA path) and DFlash2 at about 55 tok/s, faster than greedy with the
+  output equal to greedy. The speculative step is about 84 ms. See the
+  newest Done entries for the numbers.
 - Single GoogleTest target. Device dependent tests skip cleanly when
   no device is present. Numerical checks use per backend tolerance.
 
@@ -2185,6 +2187,50 @@ through RADV GFX1201, rocm through the system ROCm).
   quadratic: a full 220k prefill is hours of single GPU work on any
   runtime. A FlashAttention class kernel is the remaining speed work
   (see Next item 6).
+
+- 2026-10-10: **DFlash2 output no longer equals greedy: the fp8-WMMA
+  verify used different MXFP4 numerics than the scalar greedy path.**
+  The fp8 tensor-core MXFP4 GEMM (the served target's W4A8 path) was
+  wired for the verify at m in [2, 16] while the m=1 greedy path kept
+  the scalar GEMV. On the 27B MXFP4 target the two disagree on the
+  argmax after about 20 tokens, so `EngineTest.DFlash2MatchesGreedyOnModel`
+  fails at 128 tokens (it passes at 16, which is why the regression was
+  not seen). `ProjectBatch` now routes m>=1 through the same fp8-WMMA
+  MXFP4 kernel, so greedy and the verify share numerics and the output
+  equals greedy again. Measured on the 27B MXFP4 target with the real
+  DFlash2 draft (ROCm, GPU1), 128 tokens: DFlash2 55 tok/s, accepted
+  101 of 182 draft tokens, and output equals greedy. `TESSERA_MXFP4_WMMA=0`
+  still selects the all-scalar path (correct, 38 tok/s), which is the
+  fallback where the backend has no fp8 tensor cores (Vulkan). Greedy
+  on the MXFP4 target is 43 ms/token with the WMMA (the scalar GEMV was
+  34 ms/token); the WMMA is the served path and is required for the
+  speculative output to stay equal to greedy.
+
+- 2026-10-10: **The wide bf16 output head runs on the bf16 tensor-core
+  kernel.** `rocprofv3` showed the verify's vocab-sized head projection
+  (`gemm_bf16_batched`, m=9, grid 31040) at 273 GB/s, half the draft
+  head's 598 GB/s on the same 2.5 GB weight. The tiled kernel's 32-row
+  tile leaves 23 of 32 rows idle at the draft/verify size. `ProjectBatch`
+  now routes a bf16 projection with `n >= kGemmTiledMinCols` and
+  `m <= 16` through `gemm_bf16_wmma`, the same kernel the DFlash2 draft
+  head already uses, so the greedy head (m=1) and the verify head (m=9)
+  share numerics and the head streams coalesced. The verify head drops
+  from 9.3 to 4.25 ms/step. The `DFlash2Strategy` also defers its context
+  append to `Commit`, so the anchor row and the accepted draft rows append
+  in one call (the fc and the per-layer context K/V projections run once
+  per step instead of twice). DFlash2 on the 27B MXFP4 target moves from
+  about 88 to 82 ms per speculative step (256 tokens: 55 tok/s, accepted
+  199 of 392, output equals greedy). 330/330 `ctest` on ROCm; the
+  Vulkan build compiles and falls through to the tiled kernel where the
+  backend has no bf16 tensor cores.
+  Profiling the DFlash2 step (ROCm, 64 tokens, `rocprofv3`): MXFP4
+  verify 30 ms/step (424 GB/s), draft forward 16 ms/step, delta scan
+  5.5, verify head 4.25, L2 norm 2.4, fp8 activation pack 1.7,
+  split-K reduce 1.4, attention 1.0. The draft's small-n bf16 GEMMs
+  (n = 1024 to 5120) run at 160 to 300 GB/s because grid is only 16 to
+  80 workgroups. The next levers are the draft (fuse the per-layer
+  context K/V and the q/k/v projections, as the reference does) and
+  the small-n GEMM occupancy.
 
 ## Next (in order)
 

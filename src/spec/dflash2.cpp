@@ -254,8 +254,10 @@ class DFlash2Strategy final : public SpeculativeStrategy {
     (void)position;
     (void)hidden;
     anchor_ = token;
-    // Row 0 of the verify's capture is the anchor.
-    return drafter_.AppendContext(backend, capture_const_, /*row_offset=*/0, 1);
+    // The append is deferred to Commit, which appends the anchor (capture
+    // row 0) and the accepted drafts in one call, so the fc and the per-layer
+    // context K/V projections run once per step instead of twice.
+    return {};
   }
 
   std::expected<std::size_t, StatusCode> Draft(
@@ -450,13 +452,11 @@ class DFlash2Strategy final : public SpeculativeStrategy {
                                          std::size_t accepted) override {
     (void)target;
     (void)cache;
-    if (accepted == 0) {
-      return {};
-    }
-    // The accepted drafts are capture rows 1..accepted (row 0 is the anchor,
-    // appended by OnAnchor).
-    return drafter_.AppendContext(backend, capture_const_, /*row_offset=*/1,
-                                  accepted);
+    // The anchor and the accepted drafts are capture rows 0..accepted (row 0
+    // is the anchor). Appending them in one call avoids a separate m=1 append
+    // for the anchor, so the fc and the context K/V projections run once.
+    return drafter_.AppendContext(backend, capture_const_, /*row_offset=*/0,
+                                  1 + accepted);
   }
 
  private:
