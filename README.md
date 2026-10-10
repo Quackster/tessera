@@ -165,6 +165,51 @@ curl http://127.0.0.1:8080/health
 
 With `--api-key` set, requests need `Authorization: Bearer <key>`. `GET /health` and `GET /metrics` stay public.
 
+## Command-line arguments
+
+The first argument selects the mode: `run` decodes a prompt, `serve` starts the HTTP server, and `--list-gpus` lists the devices and exits. The table gives every flag, its scope, and its default.
+
+| Argument | Scope | Default | Meaning |
+| --- | --- | --- | --- |
+| `--model <path>` | both | required | A `.gguf` file or an MXFP4 model directory. |
+| `--draft <dir>` | both | none | DFlash2 draft checkpoint directory. |
+| `--context <n>` | both | 4096 | Maximum context length. |
+| `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
+| `--draft-block <n>` | both | 0 | Draft block tokens. 0 keeps the draft checkpoint's configured block. |
+| `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects the automatic default (512). |
+| `--quiet` | both | off | Suppress progress and info logs. |
+| `--prompt-text <str>` | run | none | Text prompt. It is tokenized, so the model needs a tokenizer. |
+| `--mmproj <path>` | run | none | Vision projector (mmproj) GGUF. |
+| `--image <path>` | run | none | Binary PPM image to prepend as tokens. |
+| `--no-chat` | run | off | Do not apply the chat template. |
+| `--max-completion-tokens <n>` | run | 0 | Completion tokens. 0 fills the remaining context. |
+| `--max-thinking-tokens <n>` | run | 0 | Think-block budget per turn. 0 leaves thinking unlimited. |
+| `--speculate` | run | off | Verify MTP drafts instead of plain greedy decode. |
+| `--sample` | run | off | Sample instead of greedy decode. |
+| `--temperature <f>` | run | 0.6 | Sampling temperature. |
+| `--top-p <f>` | run | 0.95 | Nucleus probability. |
+| `--top-k <n>` | run | 20 | Keep the top n tokens. |
+| `--min-p <f>` | run | 0.0 | Minimum probability. |
+| `--presence-penalty <f>` | run | 0.0 | Presence penalty. |
+| `--repetition-penalty <f>` | run | 1.0 | Repetition penalty. |
+| `--seed <n>` | run | 0 | Sampling RNG seed. |
+| `--kv-f16` | run | off | Store the KV cache in fp16. |
+| `--kv-q8` | run | off | Store the KV cache in int8. |
+| `--kv-q4` | run | off | Store the KV cache in 4-bit. |
+| `--kv-fp8` | run | off | Store the KV cache in FP8 E4M3. |
+| `--host <ip>` | serve | 127.0.0.1 | Bind address. |
+| `--port <n>` | serve | 8080 | Bind port. |
+| `--no-auto-title` | serve | off | Keep the first user line as the chat title instead of asking the model. |
+| `--api-key <k>` | serve | none | Accepted API key. Repeatable. |
+| `--allow-origin <o>` | serve | none | CORS origin. Repeatable. `*` allows all origins. |
+
+The KV cache is fp32 when no `--kv-*` flag is set. The sampling defaults match the Qwen 3.8 27B defaults.
+
+Environment variables:
+
+* `TESSERA_API_KEY` supplies `--api-key` when the flag is absent.
+* `TESSERA_MXFP4_W4A8=1` enables the served MXFP4 target's W4A8 linear activation.
+
 ## Build and test
 
 Requirements:
