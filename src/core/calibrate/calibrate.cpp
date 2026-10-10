@@ -1,6 +1,7 @@
 #include "tessera/calibrate.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <utility>
 
@@ -481,6 +482,102 @@ void ApplyToGenerateOptions(const CalibrationConfig& config,
   if (config.mxfp4_split_target != 0) {
     options.mxfp4_split_target = config.mxfp4_split_target;
   }
+}
+
+std::string FormatCalibrationReport(const CalibrationReport& report) {
+  const auto row = [](const std::string& label, const std::string& value,
+                      std::size_t width) {
+    std::string line = label;
+    if (line.size() < width) {
+      line.append(width - line.size(), ' ');
+    }
+    return line + value + "\n";
+  };
+  const auto default_for = [&](Setting setting) -> std::size_t {
+    switch (setting) {
+      case Setting::MxFp4SplitTarget:
+        return report.defaults.mxfp4_split_target;
+      case Setting::PrefillChunkTokens:
+        return report.defaults.prefill_chunk_tokens;
+      case Setting::DraftTokens:
+        return report.defaults.draft_tokens;
+    }
+    return 0;
+  };
+  char rate[32];
+  const auto format_rate = [&](double value) {
+    std::snprintf(rate, sizeof(rate), "%.2f", value);
+    return std::string(rate);
+  };
+
+  std::string out;
+  out += "Tessera calibration report\n";
+  out += "==========================\n";
+  out += row("backend", report.backend, 14);
+  out += row("device", report.device, 14);
+  out += row("model", report.model, 14);
+  out += row("kv cache", report.kv_type, 14);
+  out += row("strategy", report.strategy, 14);
+  out += row("key context", std::to_string(report.key_context), 14);
+  out += row("max context", std::to_string(report.max_context) + " token(s), " +
+                                report.kv_type + " memory bound",
+             14);
+  out += "\nSweep\n-----\n";
+  for (Setting setting : {Setting::MxFp4SplitTarget, Setting::PrefillChunkTokens,
+                          Setting::DraftTokens}) {
+    out += std::string(ToString(setting)) + "\n";
+    bool any = false;
+    for (const SweepPoint& point : report.points) {
+      if (point.setting != setting) {
+        continue;
+      }
+      any = true;
+      std::string note;
+      if (point.value == default_for(setting)) {
+        note += " (default)";
+      }
+      if (point.kept) {
+        note += " (kept)";
+      }
+      out += row("  " + std::to_string(point.value),
+                 format_rate(point.tps) + " tok/s" + note, 8);
+    }
+    if (!any) {
+      out += "  not applicable on " + report.backend + "\n";
+    }
+  }
+  out += "\nChosen\n------\n";
+  out += row("mxfp4_split_target",
+             std::to_string(report.chosen.mxfp4_split_target), 21);
+  out += row("prefill_chunk_tokens",
+             std::to_string(report.chosen.prefill_chunk_tokens), 21);
+  out += row("draft_tokens",
+             report.chosen.draft_tokens == 0
+                 ? std::string("(none)")
+                 : std::to_string(report.chosen.draft_tokens),
+             21);
+  out += row("decode", format_rate(report.decode_tps) + " tok/s", 21);
+  out += row("prefill", format_rate(report.prefill_tps) + " tok/s", 21);
+  out += "\nWrote " + report.file + "\n";
+  std::string example =
+      "  tessera-cli run --model " + report.model_path + " " + report.kv_flag;
+  example += "\\\n      --prefill-chunk " +
+             std::to_string(report.chosen.prefill_chunk_tokens);
+  if (report.split_applicable) {
+    example +=
+        " --split-target " + std::to_string(report.chosen.mxfp4_split_target);
+  }
+  if (report.draft_attached && report.chosen.draft_tokens > 0) {
+    example += " --draft-block " + std::to_string(report.chosen.draft_tokens);
+  }
+  example += " --prompt-text \"Hello\"";
+  out += "\nExample\n-------\n";
+  out += example + "\n";
+  out += "  # or apply the saved entry directly:\n";
+  out += "  tessera-cli run --model " + report.model_path + " " +
+         report.kv_flag + "\\\n      --calibration " + report.file +
+         " --prompt-text \"Hello\"\n";
+  return out;
 }
 
 }  // namespace tessera

@@ -21,7 +21,9 @@
 using tessera::CalibrationConfig;
 using tessera::CalibrationEntry;
 using tessera::CalibrationFile;
+using tessera::CalibrationReport;
 using tessera::CandidateValues;
+using tessera::FormatCalibrationReport;
 using tessera::HardwareKey;
 using tessera::kMinGain;
 using tessera::KvCacheType;
@@ -397,6 +399,50 @@ TEST(CalibrateTest, SweepReportsNotApplicable) {
   ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
   EXPECT_EQ(outcome->points.size(), 0u);
   EXPECT_EQ(outcome->not_applicable.size(), 3u);
+}
+
+// The report lists the sweep, the chosen settings, the memory-bound
+// context, and an example run command that reproduces the choices.
+TEST(CalibrateTest, ReportShowsSweepChosenAndExample) {
+  CalibrationReport report;
+  report.backend = "rocm";
+  report.device = "R9700";
+  report.model = "Qwen3.8-27B-MXFP4-MTPFP8";
+  report.model_path = "/models/qwen3.8";
+  report.kv_type = "int8";
+  report.kv_flag = "--kv-q8 ";
+  report.strategy = "none";
+  report.key_context = 4096;
+  report.max_context = 359872;
+  report.defaults.mxfp4_split_target = 320;
+  report.defaults.prefill_chunk_tokens = 512;
+  report.points = {
+      {Setting::MxFp4SplitTarget, 120, 24.30, false},
+      {Setting::MxFp4SplitTarget, 320, 23.90, true},
+      {Setting::PrefillChunkTokens, 512, 73.60, true},
+      {Setting::PrefillChunkTokens, 768, 73.50, false},
+  };
+  report.not_applicable = {Setting::DraftTokens};
+  report.chosen.mxfp4_split_target = 320;
+  report.chosen.prefill_chunk_tokens = 512;
+  report.decode_tps = 23.85;
+  report.prefill_tps = 73.42;
+  report.file = "/tmp/calibration.json";
+  report.split_applicable = true;
+  const std::string text = FormatCalibrationReport(report);
+  EXPECT_NE(text.find("Tessera calibration report"), std::string::npos);
+  EXPECT_NE(text.find("max context"), std::string::npos);
+  EXPECT_NE(text.find("359872"), std::string::npos);
+  EXPECT_NE(text.find("mxfp4_split_target"), std::string::npos);
+  EXPECT_NE(text.find("(default)"), std::string::npos);
+  EXPECT_NE(text.find("(kept)"), std::string::npos);
+  EXPECT_NE(text.find("draft_tokens"), std::string::npos);
+  EXPECT_NE(text.find("not applicable"), std::string::npos);
+  EXPECT_NE(text.find("--kv-q8"), std::string::npos);
+  EXPECT_NE(text.find("--prefill-chunk 512"), std::string::npos);
+  EXPECT_NE(text.find("--split-target 320"), std::string::npos);
+  EXPECT_NE(text.find("--calibration /tmp/calibration.json"),
+            std::string::npos);
 }
 
 // A calibrated value must equal the default: the greedy token sequence is

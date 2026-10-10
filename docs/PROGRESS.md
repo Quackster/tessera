@@ -186,7 +186,9 @@ RADV GFX1201, rocm through the system ROCm).
   (free memory minus a 2 GiB reserve, divided by the per-token KV
   bytes over the full-attention layers). It writes a JSON calibration
   file keyed by backend, device, model, context, KV type and
-  strategy, and reports the backend used. `run` and `serve` accept
+  strategy, and reports the backend used. It prints a formatted
+  report (the identity, the sweep, the chosen settings and an example
+  `run` command that reproduces them). `run` and `serve` accept
   `--calibration <file>` (or `TESSERA_CALIBRATION`): a saved entry is
   applied unless an explicit flag overrides it. The sweep, candidate
   lists, pick rule, hardware key, context bound and file reader/writer

@@ -205,4 +205,34 @@ class CalibrationFile {
 void ApplyToGenerateOptions(const CalibrationConfig& config,
                             GenerateOptions& options);
 
+// The inputs of the human-readable calibration report.
+struct CalibrationReport {
+  std::string backend;
+  std::string device;
+  std::string model;       // model identity in the key
+  std::string model_path;  // the path a run command would take
+  std::string kv_type;     // display name, "int8"
+  std::string kv_flag;     // run flag prefix, "--kv-q8 " (empty for fp32)
+  std::string strategy;
+  std::size_t key_context = 0;
+  std::size_t max_context = 0;  // memory-bound context for the KV type
+  CalibrationConfig defaults;
+  std::vector<SweepPoint> points;
+  std::vector<Setting> not_applicable;
+  CalibrationConfig chosen;
+  double decode_tps = 0.0;
+  double prefill_tps = 0.0;
+  std::string file;
+  bool split_applicable = false;
+  bool draft_attached = false;
+};
+
+// Format the report as plain text: the identity, the sweep, the chosen
+// settings, and an example `run` command that reproduces them.
+//
+// Usage:
+//   std::puts(FormatCalibrationReport(report).c_str());
+[[nodiscard]] std::string FormatCalibrationReport(
+    const CalibrationReport& report);
+
 }  // namespace tessera

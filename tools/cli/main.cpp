@@ -85,6 +85,8 @@ int main(int argc, char** argv) {
   std::size_t context = kDefaultContext;
   std::size_t draft_block = kDefaultDraftBlock;
   std::size_t prefill_chunk = kDefaultPrefillChunk;
+  std::size_t split_target = 0;
+  std::size_t split_cap = 0;
   int gpu = 0;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
@@ -122,6 +124,10 @@ int main(int argc, char** argv) {
       draft_block = std::stoul(argv[++i]);
     } else if (arg == "--prefill-chunk" && i + 1 < argc) {
       prefill_chunk = std::stoul(argv[++i]);
+    } else if (arg == "--split-target" && i + 1 < argc) {
+      split_target = std::stoul(argv[++i]);
+    } else if (arg == "--split-cap" && i + 1 < argc) {
+      split_cap = std::stoul(argv[++i]);
     } else if (arg == "--speculate") {
       speculate = true;
     } else if (arg == "--sample") {
@@ -306,6 +312,7 @@ int main(int argc, char** argv) {
   tessera::CalibrationConfig applied;
   applied.prefill_chunk_tokens = prefill_chunk;
   applied.draft_tokens = draft_block;
+  applied.mxfp4_split_target = split_target;
   if (!calibration_path.empty()) {
     const std::string strategy =
         draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
@@ -325,6 +332,7 @@ int main(int argc, char** argv) {
     gen.draft_tokens = applied.draft_tokens;
     gen.prefill_chunk_tokens = applied.prefill_chunk_tokens;
     gen.mxfp4_split_target = applied.mxfp4_split_target;
+    gen.mxfp4_split_cap = split_cap;
     gen.kv_type = kv_type;
     gen.progress_every = quiet ? 0 : 64;
     if (!quiet) {

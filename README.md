@@ -48,7 +48,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
 | MoE, MLP, norms | Todo | Norms and MLP kernels done. No MoE kernels yet (planned Ornith-1.5-35B-A3B). |
-| Calibration | Done | `calibrate` sweeps the split-K target (ROCm), the prefill chunk (multiples of 256 from 512) and the draft block, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8 and reports the memory-bound max context. JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
+| Calibration | Done | `calibrate` sweeps the split-K target (ROCm), the prefill chunk (multiples of 256 from 512) and the draft block, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8 and reports the memory-bound max context. Prints a report with an example `run` command; writes JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 
@@ -203,6 +203,8 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
 | `--draft-block <n>` | both | 0 | Draft block tokens. 0 keeps the draft checkpoint's configured block. |
 | `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects the automatic default (512). |
+| `--split-target <n>` | both | 0 | fp8 MXFP4 split-K workgroup target (ROCm only). 0 uses the built-in default (320). |
+| `--split-cap <n>` | both | 0 | fp8 MXFP4 split-K factor cap (ROCm only). 0 uses the built-in default (4). |
 | `--quiet` | both | off | Suppress progress and info logs. |
 | `--prompt-text <str>` | run | none | Text prompt. It is tokenized, so the model needs a tokenizer. |
 | `--mmproj <path>` | run | none | Vision projector (mmproj) GGUF. |

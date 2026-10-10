@@ -104,6 +104,23 @@ std::string FormatRate(double rate) {
   return buffer;
 }
 
+// The run flag that selects a KV cache type (empty for the fp32 default).
+std::string KvFlag(KvCacheType type) {
+  switch (type) {
+    case KvCacheType::F16:
+      return "--kv-f16 ";
+    case KvCacheType::Q8:
+      return "--kv-q8 ";
+    case KvCacheType::Q4:
+      return "--kv-q4 ";
+    case KvCacheType::FP8:
+      return "--kv-fp8 ";
+    case KvCacheType::F32:
+      return "";
+  }
+  return "";
+}
+
 std::string TodayIso() {
   const std::time_t now = std::time(nullptr);
   std::tm local{};
@@ -273,26 +290,26 @@ int RunCalibrateCommand(int argc, char** argv) {
   // type: free memory (or total memory minus the weights) minus a reserve,
   // divided by the per-token KV size. Informational; the run's context is
   // the configured --context.
+  const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
+  std::uint64_t model_bytes = 0;
+  for (const auto& weight : loaded.Weights()) {
+    model_bytes += weight.device->Size();
+  }
+  std::uint64_t available = 0;
+  if (memory.free_bytes > 0) {
+    available = memory.free_bytes;
+  } else if (memory.total_bytes > model_bytes) {
+    available = memory.total_bytes - model_bytes;
+  }
+  available = available > kMemoryReserveBytes ? available - kMemoryReserveBytes
+                                              : 0;
+  auto model_config = loaded.Config();
+  std::size_t max_context =
+      model_config ? MaxContextForKv(available, *model_config, kv_type) : 0;
+  if (max_context < kMinReportedContext) {
+    max_context = kMinReportedContext;
+  }
   if (!quiet) {
-    const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
-    std::uint64_t model_bytes = 0;
-    for (const auto& weight : loaded.Weights()) {
-      model_bytes += weight.device->Size();
-    }
-    std::uint64_t available = 0;
-    if (memory.free_bytes > 0) {
-      available = memory.free_bytes;
-    } else if (memory.total_bytes > model_bytes) {
-      available = memory.total_bytes - model_bytes;
-    }
-    available = available > kMemoryReserveBytes ? available - kMemoryReserveBytes
-                                                : 0;
-    auto config = loaded.Config();
-    std::size_t max_context =
-        config ? MaxContextForKv(available, *config, kv_type) : 0;
-    if (max_context < kMinReportedContext) {
-      max_context = kMinReportedContext;
-    }
     log.Info("calibrate",
              std::string("max context for ") + std::string(ToString(kv_type)) +
                  ": " + std::to_string(max_context) + " token(s) (" +
@@ -386,14 +403,10 @@ int RunCalibrateCommand(int argc, char** argv) {
     return kExitError;
   }
   for (const SweepPoint& point : outcome->points) {
-    log.Info("calibrate", std::string(ToString(point.setting)) + " = " +
-                              std::to_string(point.value) + ": " +
+    log.Info("calibrate", std::string(ToString(point.setting)) + " " +
+                              std::to_string(point.value) + " = " +
                               FormatRate(point.tps) + " tok/s" +
                               (point.kept ? "  (kept)" : ""));
-  }
-  for (Setting setting : outcome->not_applicable) {
-    log.Info("calibrate", std::string(ToString(setting)) +
-                              ": not applicable on " + backend);
   }
 
   // Measure the chosen configuration once more for the stored rates: the
@@ -432,6 +445,8 @@ int RunCalibrateCommand(int argc, char** argv) {
   entry.decode_tps = MedianOf(decode_rates);
   entry.prefill_tps = MedianOf(prefill_rates);
   entry.date = TodayIso();
+  // Keep the identity for the report: `entry` is moved into the file below.
+  const std::string model_id = entry.key.model;
 
   CalibrationFile file;
   auto existing = CalibrationFile::Load(calibration_file);
@@ -451,22 +466,31 @@ int RunCalibrateCommand(int argc, char** argv) {
     return kExitError;
   }
 
-  log.Info("calibrate", std::string("result (") + backend + "): " +
-                            std::string(ToString(Setting::MxFp4SplitTarget)) +
-                            "=" +
-                            std::to_string(outcome->config.mxfp4_split_target) +
-                            " " +
-                            std::string(ToString(Setting::PrefillChunkTokens)) +
-                            "=" +
-                            std::to_string(
-                                outcome->config.prefill_chunk_tokens) +
-                            " " + std::string(ToString(Setting::DraftTokens)) +
-                            "=" +
-                            std::to_string(outcome->config.draft_tokens) +
-                            ", decode " + FormatRate(MedianOf(decode_rates)) +
-                            " tok/s, prefill " +
-                            FormatRate(MedianOf(prefill_rates)) +
-                            " tok/s, written to " + calibration_file);
+  // A readable report to stdout: identity, the sweep, the chosen settings,
+  // and an example command that reproduces them. The formatter lives in the
+  // library so it is unit tested.
+  CalibrationReport report;
+  report.backend = backend;
+  report.device = std::string(engine.Owner().DeviceName());
+  report.model = model_id;
+  report.model_path = model_path;
+  report.kv_type = std::string(ToString(kv_type));
+  report.kv_flag = KvFlag(kv_type);
+  report.strategy = strategy_label;
+  report.key_context = context;
+  report.max_context = max_context;
+  report.defaults = defaults;
+  report.points = outcome->points;
+  report.not_applicable = outcome->not_applicable;
+  report.chosen = outcome->config;
+  report.decode_tps = MedianOf(decode_rates);
+  report.prefill_tps = MedianOf(prefill_rates);
+  report.file = calibration_file;
+  report.split_applicable = backend == "rocm";
+  report.draft_attached = draft_attached;
+  std::fputs("\n", stdout);
+  std::fputs(FormatCalibrationReport(report).c_str(), stdout);
+  std::fflush(stdout);
   return kExitOk;
 }
 
