@@ -51,6 +51,12 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 
+## Chat UI
+
+Lightweight, dark-mode AI chat UI with a simple sidebar for API keys and conversation management. It supports streamed model responses, collapsible thinking output, retry controls, token limits, and rendering rich content like inline SVGs directly in the chat.
+
+<img width="1575" height="986" alt="image" src="https://github.com/user-attachments/assets/57f9b3a9-31b2-4a66-9489-0f616c00dd4e" />
+
 ## Architecture
 
 Core code is backend agnostic. All device work goes through the `Backend` interface. Only `src/backends/vulkan/` includes Vulkan headers. Only `src/backends/rocm/` includes HIP and ROCm headers. No vendor type crosses the backend boundary.
