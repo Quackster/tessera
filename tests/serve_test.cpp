@@ -557,6 +557,43 @@ TEST(ServeTest, ThinkStreamerMatchesPostHocSplit) {
   }
 }
 
+// The template ends the think prompt with "<think>\n": the
+// streamer must still withhold thinking until its closer.
+TEST(ServeTest, ThinkExpectedAllowsTrailingWhitespace) {
+  using tessera::serve::ThinkExpected;
+  EXPECT_TRUE(ThinkExpected("<|im_start|>assistant\n<think>", true));
+  EXPECT_TRUE(ThinkExpected("<|im_start|>assistant\n<think>\n", true));
+  EXPECT_TRUE(ThinkExpected("<think> \t\r\n", true));
+  EXPECT_FALSE(ThinkExpected("<|im_start|>assistant\n<think>\n", false));
+  EXPECT_FALSE(
+      ThinkExpected("<|im_start|>assistant\n<think>\n\n</think>\n\n", true));
+  EXPECT_FALSE(ThinkExpected("plain prompt", true));
+}
+
+// Regression: with a "<think>\n" prompt the greeting thinking never
+// leaks into the content and never streams twice.
+TEST(ServeTest, ThinkStreamerWithholdsLeadingThinkNewline) {
+  using tessera::serve::ThinkExpected;
+  using tessera::serve::ThinkStreamer;
+  ASSERT_TRUE(ThinkExpected("<|im_start|>assistant\n<think>\n", true));
+  ThinkStreamer streamer(
+      ThinkExpected("<|im_start|>assistant\n<think>\n", true));
+  std::string reasoning;
+  std::string content;
+  for (std::string_view piece :
+       {"The user said hi. ", "Be brief.</think>", "Hi", "!", " How"}) {
+    const auto deltas = streamer.Push(piece);
+    reasoning += deltas.reasoning;
+    content += deltas.content;
+  }
+  const auto tail = streamer.Finish();
+  reasoning += tail.reasoning;
+  content += tail.content;
+  EXPECT_EQ(reasoning, "The user said hi. Be brief.");
+  EXPECT_EQ(content, "Hi! How");
+  EXPECT_EQ(content.find("The user said"), std::string::npos);
+}
+
 // The default cap is 32k tokens: an unspecified request never
 // decodes to the end of a large context window.
 TEST(ServeTest, DefaultMaxTokensIs32k) {

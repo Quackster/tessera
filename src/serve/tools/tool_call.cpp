@@ -212,6 +212,20 @@ std::vector<ToolCall> ParseToolCalls(std::string_view text,
   return calls;
 }
 
+bool ThinkExpected(std::string_view prompt, bool enable_thinking) {
+  if (!enable_thinking) {
+    return false;
+  }
+  std::size_t end = prompt.size();
+  while (end > 0 && (prompt[end - 1] == ' ' || prompt[end - 1] == '\t' ||
+                     prompt[end - 1] == '\r' || prompt[end - 1] == '\n')) {
+    --end;
+  }
+  constexpr std::string_view kOpen = "<think>";
+  return end >= kOpen.size() &&
+         prompt.substr(end - kOpen.size(), kOpen.size()) == kOpen;
+}
+
 ThinkStreamer::ThinkStreamer(bool think_expected)
     : think_expected_(think_expected) {}
 

@@ -30,6 +30,14 @@ struct ToolCall {
                                                     std::string* text_before,
                                                     std::string* reasoning = nullptr);
 
+// True when streamed thinking must be withheld until its closer:
+// thinking is enabled and the prompt ends with an open <think>,
+// trailing whitespace allowed (templates emit "<think>\n").
+// A strict suffix match misses that newline and leaks thinking
+// into the content while also reporting it as reasoning.
+[[nodiscard]] bool ThinkExpected(std::string_view prompt,
+                                 bool enable_thinking);
+
 // Incremental think/content splitter for live session streaming.
 // Feed detokenized pieces in order; each push returns the new
 // reasoning/content text since the last call, each word exactly once

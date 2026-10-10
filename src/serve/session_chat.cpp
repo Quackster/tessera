@@ -16,12 +16,6 @@ namespace {
 
 using core::Json;
 
-// EndsWith for the think-mode prompt check.
-bool EndsWith(std::string_view text, std::string_view suffix) {
-  return text.size() >= suffix.size() &&
-         text.substr(text.size() - suffix.size()) == suffix;
-}
-
 Json MessageJson(const SessionMessage& message) {
   Json item = Json::Object();
   item.Set("role", Json::String(message.role));
@@ -206,7 +200,7 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
   GenerateOptions options;
   options.max_tokens = max_tokens;
   options.prompt_tokens = *ids;
-  ThinkStreamer streamer(EndsWith(prompt, "<think>"));
+  ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
   std::string reasoning_text;
   std::string content_text;
   bool saw_stop = false;
