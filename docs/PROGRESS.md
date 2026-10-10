@@ -177,6 +177,13 @@ RADV GFX1201, rocm through the system ROCm).
   Before, all 256 threads scanned the tile, so a long context
   paid 256 scans per tile. Same order, same numerics. Covered
   by multi-tile device tests on both backends.
+- Attention ILP: the score dot, the tile weight sum and the
+  value accumulation keep four independent partial sums per
+  thread instead of one dependent chain. The chain stalled on
+  its own latency. Q8 attention at 32k keys drops from 8.4 to
+  4.8 ms per layer and fp32 from 13.1 to 7.7 ms. Order changes,
+  so results match within tolerance and DFlash2 still equals
+  greedy on the 27B target.
 
 ## Next (in order)
 

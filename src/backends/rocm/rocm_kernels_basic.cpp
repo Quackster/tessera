@@ -119,8 +119,18 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     if (tile + e <= last) {
       const unsigned long long j = tile + e;
       const unsigned long long kb = (j * kv_heads + kv) * head_dim;
-      float dot = 0.0f;
-      for (unsigned long long d = 0; d < head_dim; ++d) {
+      // Four independent partial sums keep the FMA pipeline full;
+      // one chain stalls on its own latency (see the tiled GEMMs).
+      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+      unsigned long long d = 0;
+      for (; d + 3 < head_dim; d += 4) {
+        dot0 = fmaf(q_s[d], kat(kb + d), dot0);
+        dot1 = fmaf(q_s[d + 1], kat(kb + d + 1), dot1);
+        dot2 = fmaf(q_s[d + 2], kat(kb + d + 2), dot2);
+        dot3 = fmaf(q_s[d + 3], kat(kb + d + 3), dot3);
+      }
+      float dot = (dot0 + dot1) + (dot2 + dot3);
+      for (; d < head_dim; ++d) {
         dot = fmaf(q_s[d], kat(kb + d), dot);
       }
       s = dot * scale;
@@ -136,31 +146,52 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
       }
       const float m_new = fmaxf(run_max, tmax);
       const float corr = expf(run_max - m_new);
-      float l = 0.0f;
-      for (unsigned long long t = 0; t < kTile; ++t) {
-        const float w = expf(sc[t] - m_new);
-        wt[t] = w;
-        l += w;
+      float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
+      for (unsigned long long t = 0; t < kTile; t += 4) {
+        const float w0 = expf(sc[t] - m_new);
+        const float w1 = expf(sc[t + 1] - m_new);
+        const float w2 = expf(sc[t + 2] - m_new);
+        const float w3 = expf(sc[t + 3] - m_new);
+        wt[t] = w0;
+        wt[t + 1] = w1;
+        wt[t + 2] = w2;
+        wt[t + 3] = w3;
+        l0 += w0;
+        l1 += w1;
+        l2 += w2;
+        l3 += w3;
       }
       tile_bc[0] = m_new;
       tile_bc[1] = corr;
-      tile_bc[2] = l;
+      tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
     __syncthreads();
     const float m_new = tile_bc[0];
     const float corr = tile_bc[1];
     const float l = tile_bc[2];
+    // Four independent accumulators, as in the score dot above.
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     float a = 0.0f;
     // Only lanes below head_dim have an output element; the others read
     // past the value row if they run this loop, so guard it.
     if (e < head_dim) {
-      for (unsigned long long t = 0; t < kTile; ++t) {
-        const unsigned long long j = tile + t;
-        if (j > last) {
-          break;
-        }
-        const unsigned long long vb = (j * kv_heads + kv) * head_dim;
-        a = fmaf(wt[t], vat(vb + e), a);
+      const unsigned long long count =
+          (tile + kTile - 1 <= last) ? kTile : (last - tile + 1);
+      unsigned long long t = 0;
+      for (; t + 3 < count; t += 4) {
+        const unsigned long long b0 = (tile + t) * kv_heads + kv;
+        const unsigned long long b1 = (tile + t + 1) * kv_heads + kv;
+        const unsigned long long b2 = (tile + t + 2) * kv_heads + kv;
+        const unsigned long long b3 = (tile + t + 3) * kv_heads + kv;
+        a0 = fmaf(wt[t], vat((b0 * head_dim) + e), a0);
+        a1 = fmaf(wt[t + 1], vat((b1 * head_dim) + e), a1);
+        a2 = fmaf(wt[t + 2], vat((b2 * head_dim) + e), a2);
+        a3 = fmaf(wt[t + 3], vat((b3 * head_dim) + e), a3);
+      }
+      a = (a0 + a1) + (a2 + a3);
+      for (; t < count; ++t) {
+        const unsigned long long vb = (tile + t) * kv_heads + kv;
+        a = fmaf(wt[t], vat(vb * head_dim + e), a);
       }
     }
     acc = fmaf(corr, acc, a);
@@ -1577,8 +1608,18 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
     if (tile + e <= last) {
       const unsigned long long j = tile + e;
       const unsigned long long kb = (j * kv_heads + kv) * head_dim;
-      float dot = 0.0f;
-      for (unsigned long long d = 0; d < head_dim; ++d) {
+      // Four independent partial sums keep the FMA pipeline full;
+      // one chain stalls on its own latency (see the tiled GEMMs).
+      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+      unsigned long long d = 0;
+      for (; d + 3 < head_dim; d += 4) {
+        dot0 = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot0);
+        dot1 = fmaf(q_s[d + 1], QuantKvAt<Kind>(k, kb + d + 1, ks[j]), dot1);
+        dot2 = fmaf(q_s[d + 2], QuantKvAt<Kind>(k, kb + d + 2, ks[j]), dot2);
+        dot3 = fmaf(q_s[d + 3], QuantKvAt<Kind>(k, kb + d + 3, ks[j]), dot3);
+      }
+      float dot = (dot0 + dot1) + (dot2 + dot3);
+      for (; d < head_dim; ++d) {
         dot = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot);
       }
       s = dot * scale;
@@ -1594,29 +1635,55 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
       }
       const float m_new = fmaxf(run_max, tmax);
       const float corr = expf(run_max - m_new);
-      float l = 0.0f;
-      for (unsigned long long t = 0; t < kTile; ++t) {
-        const float w = expf(sc[t] - m_new);
-        wt[t] = w;
-        l += w;
+      float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
+      for (unsigned long long t = 0; t < kTile; t += 4) {
+        const float w0 = expf(sc[t] - m_new);
+        const float w1 = expf(sc[t + 1] - m_new);
+        const float w2 = expf(sc[t + 2] - m_new);
+        const float w3 = expf(sc[t + 3] - m_new);
+        wt[t] = w0;
+        wt[t + 1] = w1;
+        wt[t + 2] = w2;
+        wt[t + 3] = w3;
+        l0 += w0;
+        l1 += w1;
+        l2 += w2;
+        l3 += w3;
       }
       tile_bc[0] = m_new;
       tile_bc[1] = corr;
-      tile_bc[2] = l;
+      tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
     __syncthreads();
     const float m_new = tile_bc[0];
     const float corr = tile_bc[1];
     const float l = tile_bc[2];
+    // Four independent accumulators, as in the score dot above.
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     float a = 0.0f;
     if (e < head_dim) {
-      for (unsigned long long t = 0; t < kTile; ++t) {
-        const unsigned long long j = tile + t;
-        if (j > last) {
-          break;
-        }
-        const unsigned long long vb = (j * kv_heads + kv) * head_dim;
-        a = fmaf(wt[t], QuantKvAt<Kind>(v, vb + e, vs[j]), a);
+      const unsigned long long count =
+          (tile + kTile - 1 <= last) ? kTile : (last - tile + 1);
+      unsigned long long t = 0;
+      for (; t + 3 < count; t += 4) {
+        const unsigned long long b0 = (tile + t) * kv_heads + kv;
+        const unsigned long long b1 = (tile + t + 1) * kv_heads + kv;
+        const unsigned long long b2 = (tile + t + 2) * kv_heads + kv;
+        const unsigned long long b3 = (tile + t + 3) * kv_heads + kv;
+        a0 = fmaf(wt[t], QuantKvAt<Kind>(v, b0 * head_dim + e, vs[tile + t]),
+                  a0);
+        a1 = fmaf(wt[t + 1],
+                  QuantKvAt<Kind>(v, b1 * head_dim + e, vs[tile + t + 1]), a1);
+        a2 = fmaf(wt[t + 2],
+                  QuantKvAt<Kind>(v, b2 * head_dim + e, vs[tile + t + 2]), a2);
+        a3 = fmaf(wt[t + 3],
+                  QuantKvAt<Kind>(v, b3 * head_dim + e, vs[tile + t + 3]), a3);
+      }
+      a = (a0 + a1) + (a2 + a3);
+      for (; t < count; ++t) {
+        const unsigned long long vb = (tile + t) * kv_heads + kv;
+        a = fmaf(wt[t], QuantKvAt<Kind>(v, vb * head_dim + e, vs[tile + t]),
+                 a);
       }
     }
     acc = fmaf(corr, acc, a);

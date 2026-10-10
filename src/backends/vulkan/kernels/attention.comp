@@ -100,8 +100,17 @@ void main() {
     if (tile + e <= last) {
       uint j = tile + e;
       uint kb = (j * kv_heads + kv) * head_dim;
-      float dot = 0.0;
-      for (uint d = 0; d < head_dim; ++d) {
+      // Four independent partial sums keep the FMA pipeline full.
+      float dot0 = 0.0, dot1 = 0.0, dot2 = 0.0, dot3 = 0.0;
+      uint d = 0u;
+      for (; d + 3u < head_dim; d += 4u) {
+        dot0 = fma(q_s[d], load_k(kb + d, kv_f16), dot0);
+        dot1 = fma(q_s[d + 1u], load_k(kb + d + 1u, kv_f16), dot1);
+        dot2 = fma(q_s[d + 2u], load_k(kb + d + 2u, kv_f16), dot2);
+        dot3 = fma(q_s[d + 3u], load_k(kb + d + 3u, kv_f16), dot3);
+      }
+      float dot = (dot0 + dot1) + (dot2 + dot3);
+      for (; d < head_dim; ++d) {
         dot = fma(q_s[d], load_k(kb + d, kv_f16), dot);
       }
       s = dot * scale;
@@ -116,31 +125,51 @@ void main() {
       }
       float m_new = max(run_max, tmax);
       float corr = exp(run_max - m_new);
-      float l = 0.0;
-      for (uint t = 0u; t < kTile; ++t) {
-        float w = exp(sc[t] - m_new);
-        wt[t] = w;
-        l += w;
+      float l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
+      for (uint t = 0u; t < kTile; t += 4u) {
+        float w0 = exp(sc[t] - m_new);
+        float w1 = exp(sc[t + 1u] - m_new);
+        float w2 = exp(sc[t + 2u] - m_new);
+        float w3 = exp(sc[t + 3u] - m_new);
+        wt[t] = w0;
+        wt[t + 1u] = w1;
+        wt[t + 2u] = w2;
+        wt[t + 3u] = w3;
+        l0 += w0;
+        l1 += w1;
+        l2 += w2;
+        l3 += w3;
       }
       tile_bc[0] = m_new;
       tile_bc[1] = corr;
-      tile_bc[2] = l;
+      tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
     barrier();
     float m_new = tile_bc[0];
     float corr = tile_bc[1];
     float l = tile_bc[2];
+    // Four independent accumulators, as in the score dot above.
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
     float a = 0.0;
     // Only lanes below head_dim have an output element; the others would
     // read past the value row, so guard the loop.
     if (e < head_dim) {
-      for (uint t = 0; t < kTile; ++t) {
-        uint j = tile + t;
-        if (j > last) {
-          break;
-        }
-        uint vb = (j * kv_heads + kv) * head_dim;
-        a = fma(wt[t], load_v(vb + e, kv_f16), a);
+      uint count = (tile + kTile - 1u <= last) ? kTile : (last - tile + 1u);
+      uint t = 0u;
+      for (; t + 3u < count; t += 4u) {
+        uint b0 = (tile + t) * kv_heads + kv;
+        uint b1 = (tile + t + 1u) * kv_heads + kv;
+        uint b2 = (tile + t + 2u) * kv_heads + kv;
+        uint b3 = (tile + t + 3u) * kv_heads + kv;
+        a0 = fma(wt[t], load_v(b0 * head_dim + e, kv_f16), a0);
+        a1 = fma(wt[t + 1u], load_v(b1 * head_dim + e, kv_f16), a1);
+        a2 = fma(wt[t + 2u], load_v(b2 * head_dim + e, kv_f16), a2);
+        a3 = fma(wt[t + 3u], load_v(b3 * head_dim + e, kv_f16), a3);
+      }
+      a = (a0 + a1) + (a2 + a3);
+      for (; t < count; ++t) {
+        uint vb = (tile + t) * kv_heads + kv;
+        a = fma(wt[t], load_v(vb * head_dim + e, kv_f16), a);
       }
     }
     acc = fma(corr, acc, a);

@@ -127,8 +127,17 @@ void main() {
     if (tile + e <= last) {
       uint j = tile + e;
       uint kb = (j * kv_heads + kv) * head_dim;
-      float dot = 0.0;
-      for (uint d = 0; d < head_dim; ++d) {
+      // Four independent partial sums keep the FMA pipeline full.
+      float dot0 = 0.0, dot1 = 0.0, dot2 = 0.0, dot3 = 0.0;
+      uint d = 0u;
+      for (; d + 3u < head_dim; d += 4u) {
+        dot0 += q_s[d] * kv_at(kind, kb + d, ks[j]);
+        dot1 += q_s[d + 1u] * kv_at(kind, kb + d + 1u, ks[j]);
+        dot2 += q_s[d + 2u] * kv_at(kind, kb + d + 2u, ks[j]);
+        dot3 += q_s[d + 3u] * kv_at(kind, kb + d + 3u, ks[j]);
+      }
+      float dot = (dot0 + dot1) + (dot2 + dot3);
+      for (; d < head_dim; ++d) {
         dot += q_s[d] * kv_at(kind, kb + d, ks[j]);
       }
       s = dot * scale;
@@ -143,29 +152,49 @@ void main() {
       }
       float m_new = max(run_max, tmax);
       float corr = exp(run_max - m_new);
-      float l = 0.0;
-      for (uint t = 0u; t < 256u; ++t) {
-        float w = exp(sc[t] - m_new);
-        wt[t] = w;
-        l += w;
+      float l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
+      for (uint t = 0u; t < 256u; t += 4u) {
+        float w0 = exp(sc[t] - m_new);
+        float w1 = exp(sc[t + 1u] - m_new);
+        float w2 = exp(sc[t + 2u] - m_new);
+        float w3 = exp(sc[t + 3u] - m_new);
+        wt[t] = w0;
+        wt[t + 1u] = w1;
+        wt[t + 2u] = w2;
+        wt[t + 3u] = w3;
+        l0 += w0;
+        l1 += w1;
+        l2 += w2;
+        l3 += w3;
       }
       tile_bc[0] = m_new;
       tile_bc[1] = corr;
-      tile_bc[2] = l;
+      tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
     barrier();
     float m_new = tile_bc[0];
     float corr = tile_bc[1];
     float l = tile_bc[2];
+    // Four independent accumulators, as in the score dot above.
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
     float a = 0.0;
     if (e < head_dim) {
-      for (uint t = 0u; t < 256u; ++t) {
-        uint j = tile + t;
-        if (j > last) {
-          break;
-        }
-        uint vb = (j * kv_heads + kv) * head_dim;
-        a += wt[t] * kv_at_v(kind, vb + e, vs[j]);
+      uint count = (tile + 255u <= last) ? 256u : (last - tile + 1u);
+      uint t = 0u;
+      for (; t + 3u < count; t += 4u) {
+        uint b0 = (tile + t) * kv_heads + kv;
+        uint b1 = (tile + t + 1u) * kv_heads + kv;
+        uint b2 = (tile + t + 2u) * kv_heads + kv;
+        uint b3 = (tile + t + 3u) * kv_heads + kv;
+        a0 += wt[t] * kv_at_v(kind, b0 * head_dim + e, vs[tile + t]);
+        a1 += wt[t + 1u] * kv_at_v(kind, b1 * head_dim + e, vs[tile + t + 1u]);
+        a2 += wt[t + 2u] * kv_at_v(kind, b2 * head_dim + e, vs[tile + t + 2u]);
+        a3 += wt[t + 3u] * kv_at_v(kind, b3 * head_dim + e, vs[tile + t + 3u]);
+      }
+      a = (a0 + a1) + (a2 + a3);
+      for (; t < count; ++t) {
+        uint vb = (tile + t) * kv_heads + kv;
+        a += wt[t] * kv_at_v(kind, vb * head_dim + e, vs[tile + t]);
       }
     }
     acc = corr * acc + a;
