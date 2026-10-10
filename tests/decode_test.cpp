@@ -261,6 +261,131 @@ inline std::filesystem::path WriteLinearHybridFixture(
   return path;
 }
 
+// A tiny gated-attention hybrid GGUF with a sparse mixture-of-experts
+// feed-forward: one full-attention block, hidden 256, 8 heads, vocab 32,
+// 4 experts, top-2, expert and shared width 256. Projections are Q4_K,
+// vectors F32.
+inline std::filesystem::path WriteMoeHybridFixture(const std::string& name) {
+  std::mt19937 rng(31);
+  struct Spec {
+    const char* tensor;
+    std::uint32_t type;  // 0 F32, 12 Q4_K
+    std::vector<std::uint64_t> dims;
+  };
+  const std::vector<Spec> specs = {
+      {"token_embd.weight", 12, {256, 32}},
+      {"output_norm.weight", 0, {256}},
+      {"output.weight", 12, {256, 32}},
+      {"blk.0.attn_norm.weight", 0, {256}},
+      {"blk.0.attn_q.weight", 12, {256, 512}},
+      {"blk.0.attn_k.weight", 12, {256, 256}},
+      {"blk.0.attn_v.weight", 12, {256, 256}},
+      {"blk.0.attn_output.weight", 12, {256, 256}},
+      {"blk.0.attn_q_norm.weight", 0, {32}},
+      {"blk.0.attn_k_norm.weight", 0, {32}},
+      {"blk.0.post_attention_norm.weight", 0, {256}},
+      {"blk.0.ffn_gate_inp.weight", 0, {256, 4}},
+      {"blk.0.ffn_gate_inp_shexp.weight", 0, {256}},
+      {"blk.0.ffn_gate_exps.weight", 12, {256, 256, 4}},
+      {"blk.0.ffn_up_exps.weight", 12, {256, 256, 4}},
+      {"blk.0.ffn_down_exps.weight", 12, {256, 256, 4}},
+      {"blk.0.ffn_gate_shexp.weight", 12, {256, 256}},
+      {"blk.0.ffn_up_shexp.weight", 12, {256, 256}},
+      {"blk.0.ffn_down_shexp.weight", 12, {256, 256}},
+  };
+  const auto elements = [](const std::vector<std::uint64_t>& dims) {
+    std::size_t numel = 1;
+    for (auto d : dims) {
+      numel *= static_cast<std::size_t>(d);
+    }
+    return numel;
+  };
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, specs.size(), 26);
+  builder.KvString("general.name", "tiny-moe");
+  builder.KvString("general.architecture", "qwen35moe");
+  builder.KvU32("qwen35moe.block_count", 1);
+  builder.KvU32("qwen35moe.embedding_length", 256);
+  builder.KvF32("qwen35moe.attention.layer_norm_rms_epsilon", 1e-5f);
+  builder.KvU32("qwen35moe.attention.head_count", 8);
+  builder.KvU32("qwen35moe.attention.head_count_kv", 8);
+  builder.KvU32("qwen35moe.attention.key_length", 32);
+  builder.KvU32("qwen35moe.attention.value_length", 32);
+  builder.KvU32("qwen35moe.rope.dimension_count", 32);
+  builder.KvF32("qwen35moe.rope.freq_base", 10000.0f);
+  builder.PushString("qwen35moe.rope.dimension_sections");
+  builder.PushU32(9);
+  builder.PushU32(4);
+  builder.PushU64(4);
+  for (std::uint32_t s : {4u, 4u, 4u, 0u}) {
+    builder.PushU32(s);
+  }
+  builder.KvU32("qwen35moe.ssm.conv_kernel", 1);
+  builder.KvU32("qwen35moe.ssm.state_size", 1);
+  builder.KvU32("qwen35moe.ssm.group_count", 1);
+  builder.KvU32("qwen35moe.ssm.time_step_rank", 1);
+  builder.KvU32("qwen35moe.ssm.inner_size", 1);
+  builder.KvU32("qwen35moe.full_attention_interval", 1);
+  builder.KvU32("qwen35moe.expert_count", 4);
+  builder.KvU32("qwen35moe.expert_used_count", 2);
+  builder.KvU32("qwen35moe.expert_feed_forward_length", 256);
+  builder.KvU32("qwen35moe.expert_shared_feed_forward_length", 256);
+  builder.KvString("tokenizer.ggml.model", "gpt2");
+  builder.KvArrayString("tokenizer.ggml.tokens",
+                        {"<think>", "</think>", "a", "b", "c", "d", "e", "f",
+                         "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+                         "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+                         "0", "1", "2", "3"});
+  builder.KvArrayI32("tokenizer.ggml.token_type",
+                     {3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1});
+  builder.KvArrayString("tokenizer.ggml.merges", {});
+  std::uint64_t offset = 0;
+  for (const auto& spec : specs) {
+    const std::uint64_t placed = offset;
+    const std::size_t numel = elements(spec.dims);
+    const std::size_t cols = static_cast<std::size_t>(spec.dims[0]);
+    const std::size_t bytes =
+        spec.type == 0 ? numel * 4 : (numel / cols) * (cols / 256) * 144;
+    offset = (offset + bytes + 31) & ~31u;
+    if (spec.dims.size() == 1) {
+      builder.Tensor(spec.tensor, 1, {spec.dims[0]}, spec.type, placed);
+    } else if (spec.dims.size() == 2) {
+      builder.Tensor(spec.tensor, 2, {spec.dims[0], spec.dims[1]}, spec.type,
+                     placed);
+    } else {
+      builder.Tensor(spec.tensor, 3,
+                     {spec.dims[0], spec.dims[1], spec.dims[2]}, spec.type,
+                     placed);
+    }
+  }
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  for (const auto& spec : specs) {
+    const std::size_t numel = elements(spec.dims);
+    if (spec.type == 0) {
+      const bool is_norm =
+          std::string(spec.tensor).find("norm") != std::string::npos;
+      for (std::size_t i = 0; i < numel; ++i) {
+        builder.PushF32(is_norm ? 1.0f : DrawValue(rng));
+      }
+    } else {
+      std::vector<float> values(numel);
+      for (auto& v : values) {
+        v = DrawValue(rng);
+      }
+      const std::size_t cols = static_cast<std::size_t>(spec.dims[0]);
+      auto block = QuantizeRows(values, numel / cols, cols);
+      for (auto b : block) {
+        builder.bytes.push_back(b);
+      }
+    }
+    builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  }
+  auto dir = FreshTempDir("tessera_tests_moe_hybrid");
+  auto path = dir / name;
+  WriteBytes(path, builder.bytes);
+  return path;
+}
 
 }  // namespace tessera::testing
 
@@ -270,6 +395,7 @@ using tessera::Tokenizer;
 using tessera::testing::MakeEngineOrSkip;
 using tessera::testing::WriteGatedHybridFixture;
 using tessera::testing::WriteLinearHybridFixture;
+using tessera::testing::WriteMoeHybridFixture;
 
 namespace {
 
@@ -302,6 +428,39 @@ TEST(HybridDecodeTest, GatedFullAttentionDecodesDeterministically) {
 
 TEST(HybridDecodeTest, LinearAttentionDecodesDeterministically) {
   ExpectDeterministicDecode(WriteLinearHybridFixture("linear.gguf").string());
+}
+
+// The sparse mixture-of-experts block decodes deterministically on the
+// tiny fixture (single-token path).
+TEST(MoeDecodeTest, TinyMoeDecodesDeterministically) {
+  ExpectDeterministicDecode(WriteMoeHybridFixture("moe.gguf").string());
+}
+
+// The row-serial MoE batch path must equal the sequential decode.
+TEST(MoeDecodeTest, TinyMoeBatchedMatchesSequential) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteMoeHybridFixture("moe-batch.gguf").string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const std::vector<std::uint32_t> tokens = {0, 1, 0, 26};
+  tessera::core::DecodeCache batched_cache;
+  auto batched = tessera::core::DecodeLogitsBatch(engine->Owner(), **model,
+                                                  batched_cache, tokens);
+  ASSERT_TRUE(batched.has_value()) << tessera::ToString(batched.error());
+  ASSERT_EQ(batched->size(), tokens.size());
+  tessera::core::DecodeCache seq_cache;
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    auto one = tessera::core::DecodeLogits(engine->Owner(), **model, seq_cache,
+                                           tokens[i]);
+    ASSERT_TRUE(one.has_value()) << tessera::ToString(one.error());
+    ASSERT_EQ((*batched)[i].size(), one->size());
+    float max_abs = 0.0f;
+    for (std::size_t j = 0; j < one->size(); ++j) {
+      max_abs = std::max(max_abs, std::abs((*batched)[i][j] - (*one)[j]));
+    }
+    EXPECT_LE(max_abs, 1e-3f) << "row " << i << " max_abs " << max_abs;
+  }
 }
 
 namespace {

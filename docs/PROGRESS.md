@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 204/204 `ctest` on vulkan. 204/204 `ctest` on ROCm.
+Latest suite: 206/206 `ctest` on vulkan. 206/206 `ctest` on ROCm.
 The suite is trimmed to the coverage that catches a decode break: the
 kernel correctness tests (vs host references), the decode/speculation
 tests, the model loaders, and the calibration device test. The serving,

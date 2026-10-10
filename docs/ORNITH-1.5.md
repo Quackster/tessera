@@ -226,16 +226,28 @@ with the reference ordering.
   prefill chunks (about 27 prompt tokens per second). A grouped-expert
   GEMM is the performance follow-up.
 
+## Reference match
+
+The routing behavior was checked against the served reference stack
+(the vLLM tree at `~/models/venv`). In
+`vllm/model_executor/models/qwen3_next.py` the MoE block builds the
+router with `renormalize = getattr(config, "norm_topk_prob", True)`,
+and the shared-expert gate applies
+`out = sigmoid(shared_expert_gate(x)) * out`
+(`vllm/model_executor/models/qwen2_moe.py`). Qwen3-Next is the hybrid
+mixture-of-experts predecessor of the Qwen3.5 family this model
+extends. Tessera matches: `moe_gate` renormalizes the selected top-k
+weights, and the shared expert is scaled by the sigmoid of
+`ffn_gate_inp_shexp`. No routed scaling factor is applied (the config
+carries none).
+
 ## Open questions
 
-- `norm_topk_prob`: the served reference must be read to fix the exact
-  routing normalization. The config and the GGUF metadata do not carry
-  it.
-- Expert weight data type (Q4_K, Q5_K, Q6_K) coverage for the expert
-  GEMV kernel.
-- Batched (prefill and verify) MoE: the efficient design groups tokens
-  by expert. A correct first path can loop rows; a grouped path is the
-  performance target.
+- Expert weight data type coverage for the expert GEMM: Q4_K, Q5_K,
+  Q6_K are exercised by the Q4_K_M checkpoint; Q8_0 experts are not
+  yet tested.
+- Batched (prefill and verify) MoE performance: the current row-serial
+  path is correct but slow. A grouped-expert GEMM is the target.
 
 ## Verification log
 
