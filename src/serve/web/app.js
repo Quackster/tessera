@@ -293,6 +293,11 @@ function messageMeta(message) {
 
 function renderMessages(messages, liveThinkingOpen, scroll) {
   const box = $('messages');
+  // Preserve thinking boxes across re-renders: rebuilding the list
+  // would force every box back to the streamed default, so a box the
+  // user closed would snap open on the next token.
+  const openStates = [...box.querySelectorAll('details.thinking')]
+      .map((details) => details.open);
   // Sticky scroll: follow the stream only while the view sits at the
   // bottom, so reading back never yanks. A fresh session opens at the
   // bottom instead.
@@ -301,6 +306,9 @@ function renderMessages(messages, liveThinkingOpen, scroll) {
   box.innerHTML = messages.map((message) =>
       '<div class="message' + (message.stopped ? ' stopped' : '') + '">' +
       messageHtml(message, liveThinkingOpen) + '</div>').join('');
+  box.querySelectorAll('details.thinking').forEach((details, index) => {
+    if (index < openStates.length) details.open = openStates[index];
+  });
   if (scroll === 'bottom' || sticky) box.scrollTop = box.scrollHeight;
 }
 

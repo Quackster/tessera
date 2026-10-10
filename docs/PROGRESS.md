@@ -2304,6 +2304,12 @@ through RADV GFX1201, rocm through the system ROCm).
   and a cutoff mid-think flushes the remainder as reasoning, never
   as answer text. Takes effect on a server rebuild and restart.
 
+- 2026-10-10: **Thinking boxes keep their open state while streaming.**
+  Every streamed token rebuilds the message list, which recreated each
+  thinking box with the streamed default: a box the user closed snapped
+  open on the next token. Re-renders now preserve every box's open
+  state by index, so expanding and collapsing works mid-stream.
+
 ## Next (in order)
 
 - **Speculation (seam done; acceptance fixed; speed remains).**
