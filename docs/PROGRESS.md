@@ -368,6 +368,16 @@ through RADV GFX1100, rocm through the system ROCm).
   and from 0.129 to 0.082 on Vulkan. The MTP default chain is now two
   drafts, and the 2-row verify costs about 1.1x a single-row forward on
   ROCm (1.3x on Vulkan).
+- Vulkan upload batching. `CopyH2D` used to flush and wait on every host
+  upload, so a decode step's token ids, position triples and activation
+  vectors (about seven uploads per MTP step) each broke the whole-step
+  command buffer and paid a submit. A host-visible buffer is now written
+  through its mapping, and a small device upload records into the pending
+  command buffer as a `vkCmdUpdateBuffer`; only weights and other large
+  transfers still stage and submit. Vulkan greedy went from 15-16 to 17
+  tok/s and GGUF MTP from 31/30/26 to 32/30/27 (loop/planets/paragraph).
+  The batch path also carries the deep profiler phases (full-attention,
+  linear-attention, FFN) like the single-token path.
 - Vulkan GEMV byte access. The Vulkan decode shaders read the weight
   bytes through 8-bit storage buffers (`GL_EXT_shader_8bit_storage`,
   Vulkan 1.2) instead of a word load plus a shift per byte, and reduce
@@ -378,10 +388,10 @@ through RADV GFX1100, rocm through the system ROCm).
 - GGUF MTP now beats greedy. On the 27B Q4_K_M GGUF (7900 XTX), decode
   with `--speculate` (two drafts) reached 37 tok/s on a repetitive loop,
   34 on a 120-token planet list and 31 on a 128-token paragraph on ROCm,
-  and 31, 30 and 26 on Vulkan, against 18 tok/s greedy on both. A short
-  factual prompt that stops after 25 tokens is 24 on both. Acceptance is
-  identical on the two backends (30 of 36, 71 of 96, 51 of 88) and output
-  equals greedy token for token.
+  and 32, 30 and 27 on Vulkan, against 19 tok/s greedy on ROCm and 17 on
+  Vulkan. A short factual prompt that stops after 25 tokens is 24 on both.
+  Acceptance is identical on the two backends (30 of 36, 71 of 96, 51 of
+  88) and output equals greedy token for token.
 - Split-K tuning: the target workgroup count dropped from 4096 to 2048
   blocks, measured 6-8% faster end to end (a higher split pays more in
   the reduce pass than it gains).
@@ -441,12 +451,16 @@ through RADV GFX1100, rocm through the system ROCm).
 
 ## Next (in order)
 
-- Vulkan GEMV speed. The 8-bit storage buffers and fixed-row shaders
-  closed most of the gap (a paragraph is 26 tok/s against 31 on ROCm),
-  but the Vulkan batch verify is still 1.3x the ROCm one (73 against 57
-  ms) and its GEMV kernels stream at about 85% of the ROCm rate. Next:
-  measure the Vulkan non-GEMM batch work (GDN and attention row loops)
-  and the per-dispatch barrier overhead in the batched forward.
+- Vulkan batch verify. The Vulkan 2-row verify is still 1.3x the ROCm
+  one (73 against 57 ms) while the single-row forward is only 1.05x
+  (54 against 51), so a paragraph is 27 tok/s against 31 on ROCm. The
+  GEMV kernels, the non-GEMM batch kernels and the state-copy barriers
+  each measured equal or better than ROCm in isolation, so the cost is
+  in the command-buffer path itself (about 1500 dispatches, each with an
+  inter-operation barrier, plus ~190 small state snapshot/restore
+  copies). Next: profile the recorded command buffer, or batch the
+  recurrent-state history into one contiguous buffer so a verify needs
+  one copy per direction instead of 48.
 - Speculative cost. The verifier still runs the full target trunk
   at the draft size. The draft forward still costs more than
   greedy (fp32 weights, many small kernels, per-layer context K/V

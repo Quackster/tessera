@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "core/decode_internal.hpp"
+#include "core/profile.hpp"
 #include "core/numerics/conv.hpp"
 #include "models/qwen3_5/architecture.hpp"
 #include "models/qwen3_5/internal.hpp"
@@ -137,6 +138,9 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
                                             Qwen35State& h,
                                             std::size_t layer,
                                             std::size_t rows) {
+  core::Profile* const deep =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
+  core::PhaseScope ffn_scope(deep, core::Phase::kFfn);
   const std::string base = "blk." + std::to_string(layer) + ".";
   auto mlp_norm =
       NeedWeight(model, base + "post_attention_norm.weight", DType::F32);
@@ -164,6 +168,9 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
                  rows * cfg.hidden_dim)) {
     return std::unexpected(StatusCode::DeviceError);
   }
+  if (deep != nullptr) {
+    backend.Synchronize();  // profile attribution only
+  }
   return {};
 }
 
@@ -172,6 +179,9 @@ std::expected<void, StatusCode> RunFullBlockBatch(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     Qwen35State& h, std::size_t layer, std::uint64_t pos,
     Qwen35State::FullKv& kv, std::size_t rows) {
+  core::Profile* const deep =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
+  core::PhaseScope layer_scope(deep, core::Phase::kFullLayer);
   const std::size_t hidden = cfg.hidden_dim;
   const std::size_t heads = cfg.attention.heads;
   const std::size_t kv_heads = cfg.attention.kv_heads;
@@ -267,6 +277,9 @@ std::expected<void, StatusCode> RunFullBlockBatch(
                  rows * hidden)) {
     return std::unexpected(StatusCode::DeviceError);
   }
+  if (deep != nullptr) {
+    backend.Synchronize();  // profile attribution only
+  }
   return RunFfnBatch(backend, model, cfg, h, layer, rows);
 }
 
@@ -276,6 +289,9 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     Qwen35State& h, std::size_t layer, const LinearGeometry& g,
     std::size_t rows) {
+  core::Profile* const deep =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
+  core::PhaseScope layer_scope(deep, core::Phase::kLinearLayer);
   const std::size_t hidden = cfg.hidden_dim;
   const std::string base = "blk." + std::to_string(layer) + ".";
   auto norm = NeedWeight(model, base + "attn_norm.weight", DType::F32);
@@ -363,6 +379,9 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
         !AddDevice(backend, *h.add_kernel, *b.x, *b.proj, *b.x, rows * hidden)) {
       return std::unexpected(StatusCode::DeviceError);
     }
+    if (deep != nullptr) {
+      backend.Synchronize();  // profile attribution only
+    }
     return RunFfnBatch(backend, model, cfg, h, layer, rows);
   }
   for (std::size_t t = 0; t < rows; ++t) {
@@ -408,6 +427,9 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
       !AddDevice(backend, *h.add_kernel, *b.x, *b.proj, *b.x,
                  rows * hidden)) {
     return std::unexpected(StatusCode::DeviceError);
+  }
+  if (deep != nullptr) {
+    backend.Synchronize();  // profile attribution only
   }
   return RunFfnBatch(backend, model, cfg, h, layer, rows);
 }

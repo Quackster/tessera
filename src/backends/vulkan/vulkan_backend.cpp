@@ -410,6 +410,26 @@ class VulkanBackend final : public Backend {
     if (src.size() > dst.Size()) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
+    auto record = LookupRecord(dst.Handle());
+    if (!record) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    // A host-visible buffer is written through its mapping, so the caller
+    // sees the bytes at once (the round-trip test relies on it).
+    if (record->mapped != nullptr) {
+      std::memcpy(record->mapped, src.data(), src.size());
+      return {};
+    }
+    // A small upload (the decode loop's token ids, position triples and
+    // activation vectors) records straight into the pending command buffer
+    // as a vkCmdUpdateBuffer, so it stays ordered with the dispatches
+    // around it without flushing and waiting between them; a full flush
+    // here broke the whole-step batching (about seven uploads per MTP
+    // step). Weights and other large uploads still stage through host
+    // memory with their own submit.
+    if (!src.empty() && src.size() <= 65536 && src.size() % 4 == 0) {
+      return compute_.RecordUpdate(record->buffer, 0, src);
+    }
     // Drain any pending compute work first: the copy is submitted on its
     // own command buffer and must not overtake the dispatches before it.
     auto flushed = compute_.Synchronize();
@@ -421,10 +441,6 @@ class VulkanBackend final : public Backend {
       return std::unexpected(staging.error());
     }
     std::memcpy(staging->mapped, src.data(), src.size());
-    auto record = LookupRecord(dst.Handle());
-    if (!record) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
     auto copy = SubmitCopy(*staging, *record, 0, 0, src.size());
     ReleaseStaging(*staging);
     return copy;

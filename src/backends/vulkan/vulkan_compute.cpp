@@ -421,6 +421,29 @@ std::expected<void, StatusCode> VulkanCompute::Synchronize() {
   return FlushAndWait();
 }
 
+std::expected<void, StatusCode> VulkanCompute::RecordUpdate(
+    VkBuffer dst, std::size_t dst_offset, std::span<const std::byte> data) {
+  if (!ready_ || data.empty() || data.size() > 65536 ||
+      data.size() % 4 != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  auto recording = EnsureRecording();
+  if (!recording) {
+    return recording;
+  }
+  // Order this write after every earlier recorded operation.
+  VkMemoryBarrier barrier{};
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
+                       nullptr, 0, nullptr);
+  vkCmdUpdateBuffer(cmd_, dst, dst_offset,
+                    static_cast<VkDeviceSize>(data.size()), data.data());
+  return {};
+}
+
 std::expected<void, StatusCode> VulkanCompute::RecordCopy(
     VkBuffer src, VkBuffer dst, std::size_t src_offset, std::size_t dst_offset,
     std::size_t bytes) {

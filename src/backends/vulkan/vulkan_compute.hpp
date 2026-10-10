@@ -74,6 +74,12 @@ class VulkanCompute {
                                              std::size_t src_offset,
                                              std::size_t dst_offset,
                                              std::size_t bytes);
+  // Record a small host-to-device update into the pending command buffer
+  // (vkCmdUpdateBuffer), so a decode step's token id, position and
+  // activation uploads do not flush and wait between dispatches. The data
+  // must be at most 64 KiB and a multiple of 4 bytes.
+  std::expected<void, StatusCode> RecordUpdate(
+      VkBuffer dst, std::size_t dst_offset, std::span<const std::byte> data);
   // Flush the pending command buffer (submit) and wait for it. Idempotent.
   [[nodiscard]] std::expected<void, StatusCode> Synchronize();
 

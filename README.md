@@ -39,7 +39,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Weight upload | Done | Manifest to device buffers. One batched upload per load, staged through a pinned window on ROCm. Each load phase is timed. |
 | Decode loop | Done | Single-token vanilla and hybrid GGUF loops. |
 | Hybrid SSM | Partial | Load, kernels, both decode paths, MTP head done. Some host glue remains. |
-| Speculative decode | Partial | MTP and DFlash2 end to end. Output equals greedy. MTP folds the anchor into the verify batch and matches the reference hidden pairing, defaulting to a two-draft chain; GGUF MTP reaches 31-37 tok/s on the 27B Q4_K_M target (ROCm) and 26-31 on Vulkan against 18 greedy. DFlash2 about 60 vs 23 tok/s on 27B. |
+| Speculative decode | Partial | MTP and DFlash2 end to end. Output equals greedy. MTP folds the anchor into the verify batch and matches the reference hidden pairing, defaulting to a two-draft chain; GGUF MTP reaches 31-37 tok/s on the 27B Q4_K_M target (ROCm) and 27-32 on Vulkan against 17-19 greedy. DFlash2 about 60 vs 23 tok/s on 27B. |
 | MXFP4 path | Done | Parse, kernels, HF config, tokenizer. Matches GGUF greedy output. |
 | DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |
 | Baseline pinning | Done | Fixed-seed fixtures identical on Vulkan and ROCm. |
