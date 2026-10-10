@@ -160,7 +160,8 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
     // parallel windows and parallel API clients each get their turn.
     serve::SessionHandler session_handler(engine, model, *tokenizer, sessions,
                                           generation,
-                                          options.default_max_completion_tokens);
+                                          options.default_max_completion_tokens,
+                                          options.auto_title);
     if (path == "/api/sessions") {
       if (request.method == "GET") {
         session_handler.HandleList(writer);

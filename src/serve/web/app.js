@@ -11,6 +11,11 @@ let readerAbort = null;
 // so a stale turn never paints over the current view.
 let activeTurn = 0;
 let streamingId = null;
+// Browser-side chat cache (localStorage): instant paint on reload.
+// The server stays authoritative: a miss, or an id the server no
+// longer knows, falls back to fetching (the prefill path).
+let cachedFull = {};
+let cacheWriteFailed = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -373,19 +378,10 @@ function updateControls() {
   $('resume').hidden = !streaming || !paused;
 }
 
-async function refreshSessions() {
-  sessions = (await api('GET', '/api/sessions')).sessions || [];
-  if (!sessions.some((s) => s.id === currentId)) {
-    currentId = sessions.length ? sessions[0].id : null;
-  }
-  renderSidebar();
-  updateControls();
-}
-
-async function openSession(id) {
-  currentId = id;
-  const session = await api('GET', '/api/sessions/' + id);
-  currentMessages = session.messages.map((m) => ({
+// One stored or cached message to the rendered shape; unknown fields
+// default so older caches still paint.
+function normalizeMessage(m) {
+  return {
     role: m.role,
     content: m.content || '',
     reasoning_content: m.reasoning_content || '',
@@ -394,11 +390,89 @@ async function openSession(id) {
     tokens_per_second: m.tokens_per_second || 0,
     prompt_tokens: m.prompt_tokens || 0,
     completion_tokens: m.completion_tokens || 0,
-  }));
+  };
+}
+
+// Read the browser chat cache; null when absent or malformed.
+function readCache() {
+  try {
+    const raw = localStorage.getItem('tessera.sessions.v1');
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object' || !data.full ||
+        typeof data.full !== 'object') {
+      return null;
+    }
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Persist the open chats to the browser cache. Quota or privacy mode
+// drops the cache silently; the server stays the source of truth.
+function writeCache() {
+  if (cacheWriteFailed) return;
+  try {
+    localStorage.setItem('tessera.sessions.v1', JSON.stringify({
+      currentId,
+      full: cachedFull,
+    }));
+  } catch (e) {
+    cacheWriteFailed = true;
+    try {
+      localStorage.removeItem('tessera.sessions.v1');
+    } catch (ignored) { /* already giving up */ }
+  }
+}
+
+async function refreshSessions() {
+  sessions = (await api('GET', '/api/sessions')).sessions || [];
+  const ids = new Set(sessions.map((s) => s.id));
+  for (const id of Object.keys(cachedFull)) {
+    if (!ids.has(id)) delete cachedFull[id];
+  }
+  for (const session of sessions) {
+    if (cachedFull[session.id]) cachedFull[session.id].title = session.title;
+  }
+  if (!sessions.some((s) => s.id === currentId)) {
+    currentId = sessions.length ? sessions[0].id : null;
+  }
+  writeCache();
+  renderSidebar();
+  updateControls();
+}
+
+async function openSession(id) {
+  currentId = id;
+  const session = await api('GET', '/api/sessions/' + id);
+  currentMessages = session.messages.map(normalizeMessage);
+  cachedFull[session.id] = {
+    id: session.id,
+    title: session.title,
+    messages: currentMessages,
+  };
+  writeCache();
   renderMessages(currentMessages, false, 'bottom');
   renderSidebar();
   updateControls();
   setStatus(session.busy ? 'Generating\u2026' : 'Ready');
+}
+
+// Paint a cached chat without fetching (instant reload path); false
+// on a miss, which falls back to the server fetch above.
+function paintCached(id) {
+  const cached = cachedFull[id];
+  if (!cached || !Array.isArray(cached.messages)) {
+    return false;
+  }
+  currentId = id;
+  currentMessages = cached.messages.map(normalizeMessage);
+  renderMessages(currentMessages, false, 'bottom');
+  renderSidebar();
+  updateControls();
+  setStatus('Ready');
+  return true;
 }
 
 // Stream one turn (chat or retry) over `base` history: the user bubble
@@ -648,9 +722,36 @@ function init() {
   $('retry').addEventListener('click', () => {
     retryTurn().catch((error) => showError(String(error)));
   });
+  // Cache-aside boot: paint the browser cache instantly, then refresh
+  // from the server (a miss falls back to fetching). A dead server
+  // keeps the cached view instead of an error page.
+  const cached = readCache();
+  if (cached) {
+    cachedFull = cached.full;
+    sessions = Object.values(cachedFull)
+        .filter((s) => s && typeof s.id === 'string')
+        .map((s) => ({
+          id: s.id,
+          title: s.title || 'New chat',
+          message_count:
+              Array.isArray(s.messages) ? s.messages.length : 0,
+          busy: false,
+        }));
+    if (cached.currentId && cachedFull[cached.currentId]) {
+      currentId = cached.currentId;
+    } else if (sessions.length) {
+      currentId = sessions[0].id;
+    }
+    renderSidebar();
+    updateControls();
+    if (currentId) paintCached(currentId);
+  }
   refreshSessions()
       .then(() => { if (currentId) return openSession(currentId); })
-      .catch((error) => showError(String(error)));
+      .catch((error) => {
+        if (!sessions.length) showError(String(error));
+        else setStatus('Offline: showing cached chats');
+      });
 }
 
 document.addEventListener('DOMContentLoaded', init);

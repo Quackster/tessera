@@ -12,6 +12,7 @@
 #include <string_view>
 #include <thread>
 
+#include "serve/auto_title.hpp"
 #include "serve/http.hpp"
 #include "serve/respond.hpp"
 #include "serve/session.hpp"
@@ -1156,4 +1157,25 @@ TEST(ServeTest, SessionJsonExposesMessageStats) {
   EXPECT_DOUBLE_EQ(first.Find("prompt_tokens")->AsNumber(), 128.0);
   EXPECT_DOUBLE_EQ(first.Find("completion_tokens")->AsNumber(), 50.0);
   EXPECT_DOUBLE_EQ(first.Find("tokens_per_second")->AsNumber(), 25.0);
+}
+
+// The title prompt carries the first user text with thinking off.
+TEST(ServeTest, TitlePromptBodyDisablesThinking) {
+  const Json body = tessera::serve::TitlePromptBody("hello there");
+  const Json* messages = body.Find("messages");
+  ASSERT_NE(messages, nullptr);
+  ASSERT_TRUE(messages->isArray());
+  ASSERT_EQ(messages->AsArray().size(), 1u);
+  const Json& first = messages->AsArray()[0];
+  EXPECT_EQ(first.Find("role")->AsString(), "user");
+  EXPECT_NE(first.Find("content")->AsString().find("hello there"),
+            std::string::npos);
+  const Json* thinking = body.Find("enable_thinking");
+  ASSERT_NE(thinking, nullptr);
+  EXPECT_FALSE(thinking->AsBool());
+}
+
+// Serve options default to model-generated titles.
+TEST(ServeTest, ServeOptionsDefaultAutoTitle) {
+  EXPECT_TRUE(tessera::ServeOptions{}.auto_title);
 }

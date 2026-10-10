@@ -71,8 +71,10 @@ void PrintUsage() {
                "  --kv-q8           store the KV cache in int8\n"
                "  --kv-q4           store the KV cache in 4-bit\n"
                "  --kv-fp8          store the KV cache in FP8 E4M3\n"
-               "  --host <ip>       serve bind address (default 127.0.0.1)\n"
-               "  --port <n>        serve port (default 8080)\n"
+  "  --host <ip>       serve bind address (default 127.0.0.1)\n"
+  "  --port <n>        serve port (default 8080)\n"
+  "  --no-auto-title   keep the first user line as the chat title "
+  "instead of asking the model\n"
                "  --api-key <k>     accepted API key (repeatable; env "
                 "TESSERA_API_KEY)\n"
   "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
@@ -113,6 +115,7 @@ int main(int argc, char** argv) {
   bool quiet = false;
   bool no_chat = false;
   std::string host = "127.0.0.1";
+  bool auto_title = true;
   std::vector<std::string> api_keys;
   std::vector<std::string> allow_origins;
   bool speculate = false;
@@ -149,6 +152,8 @@ int main(int argc, char** argv) {
       allow_origins.emplace_back(argv[++i]);
     } else if (arg == "--host" && i + 1 < argc) {
       host = argv[++i];
+    } else if (arg == "--no-auto-title") {
+      auto_title = false;
     } else if (arg == "--port" && i + 1 < argc) {
       port = static_cast<std::uint16_t>(std::stoul(argv[++i]));
     } else if (arg == "--context" && i + 1 < argc) {
@@ -277,6 +282,7 @@ int main(int argc, char** argv) {
     serve_options.port = port;
     serve_options.api_keys = api_keys;
     serve_options.allow_origins = allow_origins;
+    serve_options.auto_title = auto_title;
     auto served = tessera::Serve(engine, loaded, serve_options);
     if (!served) {
       log.Warn("cli", std::string("serve failed (") +

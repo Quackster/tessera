@@ -41,7 +41,7 @@ class SessionHandler {
  public:
   SessionHandler(Engine& engine, Model& model, const Tokenizer& tokenizer,
                  SessionStore& sessions, std::mutex& generation,
-                 std::size_t default_max_completion_tokens);
+                 std::size_t default_max_completion_tokens, bool auto_title);
 
   // Session CRUD over JSON bodies; 404 for an unknown id.
   void HandleList(ResponseWriter& writer) const;
@@ -81,6 +81,7 @@ class SessionHandler {
   SessionStore& sessions_;
   std::mutex& generation_;
   std::size_t default_max_completion_tokens_;
+  bool auto_title_;
 };
 
 }  // namespace tessera::serve

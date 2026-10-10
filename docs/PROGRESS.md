@@ -2310,6 +2310,15 @@ through RADV GFX1201, rocm through the system ROCm).
   open on the next token. Re-renders now preserve every box's open
   state by index, so expanding and collapsing works mid-stream.
 
+- 2026-10-10: **Browser chat cache and model-generated titles (351/351
+  `ctest` on vulkan).** The web UI caches open chats in browser
+  localStorage and paints instantly on reload; the server stays
+  authoritative, so a miss (or an id the server no longer knows)
+  falls back to fetching. After the first prompt of a new session the
+  model itself names the chat window from the opening exchange
+  (`ServeOptions::auto_title`, CLI `--no-auto-title` opts out); renamed
+  sessions and the history are never touched.
+
 ## Next (in order)
 
 - **Speculation (seam done; acceptance fixed; speed remains).**

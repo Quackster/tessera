@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -13,6 +14,7 @@
 #include "core/decode_internal.hpp"
 #include "core/think_budget.hpp"
 #include "models/qwen3_5/state.hpp"
+#include "serve/auto_title.hpp"
 #include "spec/dflash2_mask.hpp"
 #include "test_helpers.hpp"
 #include "tessera/engine.hpp"
@@ -51,7 +53,7 @@ inline std::filesystem::path WriteGatedHybridFixture(const std::string& name) {
       {"blk.0.ffn_down.weight", 12, {256, 256}, 256, 256},
   };
   GgufBuilder builder;
-  builder.Header(0x46554747, 3, specs.size(), 23);
+  builder.Header(0x46554747, 3, specs.size(), 24);
   builder.KvString("general.name", "tiny-gated");
   builder.KvString("general.architecture", "qwen35");
   builder.KvU32("qwen35.block_count", 1);
@@ -90,6 +92,12 @@ inline std::filesystem::path WriteGatedHybridFixture(const std::string& name) {
                      {3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
                       1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1});
   builder.KvArrayString("tokenizer.ggml.merges", {});
+  // A minimal chat template so template-driven paths (title prompts)
+  // render on the fixture.
+  builder.KvString("tokenizer.chat_template",
+                   "Title this chat. {% for message in messages %}"
+                   "{{ message['role'] }} says {{ message['content'] }}. "
+                   "{% endfor %}");
   std::uint64_t offset = 0;
   for (const auto& spec : specs) {
     const std::uint64_t placed = offset;
@@ -1553,4 +1561,66 @@ TEST(HybridDecodeTest, PrefillProgressHookFires) {
   }
   EXPECT_EQ(calls.back().first, 2u);
   EXPECT_EQ(calls.back().second, 2u);
+}
+
+// The model names a fresh session from its first exchange: the title
+// lands bounded, and the history is untouched.
+TEST(HybridDecodeTest, MaybeAutoTitleNamesFromModel) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated_title.gguf").string(),
+                   1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const Tokenizer* tokenizer = (*model)->GetTokenizer();
+  ASSERT_NE(tokenizer, nullptr);
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hello there", {}, {}, {}, false, {}, 0});
+  std::mutex generation;
+  std::unique_lock<std::mutex> slot(generation);
+  tessera::serve::MaybeAutoTitle(*engine, **model, *tokenizer, session, true);
+  const auto view = session->View();
+  EXPECT_NE(view.title, "New chat");
+  EXPECT_LE(view.title.size(), 48u);
+  ASSERT_EQ(view.messages.size(), 1u);
+  EXPECT_EQ(view.messages[0].content, "hello there");
+}
+
+// With auto-title off the first user line names the session.
+TEST(HybridDecodeTest, MaybeAutoTitleDisabledKeepsFirstLine) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated_title_off.gguf").string(),
+                   1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const Tokenizer* tokenizer = (*model)->GetTokenizer();
+  ASSERT_NE(tokenizer, nullptr);
+  tessera::serve::SessionStore store;
+  auto session = store.Create({});
+  session->Append({"user", "hello there", {}, {}, {}, false, {}, 0});
+  std::mutex generation;
+  std::unique_lock<std::mutex> slot(generation);
+  tessera::serve::MaybeAutoTitle(*engine, **model, *tokenizer, session, false);
+  EXPECT_EQ(session->View().title, "hello there");
+}
+
+// A renamed session keeps its title.
+TEST(HybridDecodeTest, MaybeAutoTitleKeepsCustomTitle) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated_title_custom.gguf").string(),
+                   1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const Tokenizer* tokenizer = (*model)->GetTokenizer();
+  ASSERT_NE(tokenizer, nullptr);
+  tessera::serve::SessionStore store;
+  auto session = store.Create("my chat");
+  session->Append({"user", "hello there", {}, {}, {}, false, {}, 0});
+  std::mutex generation;
+  std::unique_lock<std::mutex> slot(generation);
+  tessera::serve::MaybeAutoTitle(*engine, **model, *tokenizer, session, true);
+  EXPECT_EQ(session->View().title, "my chat");
 }

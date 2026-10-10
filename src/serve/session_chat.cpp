@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/json.hpp"
+#include "serve/auto_title.hpp"
 #include "serve/render.hpp"
 #include "serve/respond.hpp"
 #include "serve/tools/tool_call.hpp"
@@ -186,13 +187,15 @@ bool BodyFlag(const Json& body, std::string_view key, bool fallback) {
 SessionHandler::SessionHandler(Engine& engine, Model& model,
                                const Tokenizer& tokenizer,
                                SessionStore& sessions, std::mutex& generation,
-                               std::size_t default_max_completion_tokens)
+                               std::size_t default_max_completion_tokens,
+                               bool auto_title)
     : engine_(engine),
       model_(model),
       tokenizer_(tokenizer),
       sessions_(sessions),
       generation_(generation),
-      default_max_completion_tokens_(default_max_completion_tokens) {}
+      default_max_completion_tokens_(default_max_completion_tokens),
+      auto_title_(auto_title) {}
 
 void SessionHandler::HandleList(ResponseWriter& writer) const {
   Json items = Json::Array();
@@ -438,7 +441,7 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   session->Append(SessionMessage{"user", message->AsString(), /*reasoning=*/{},
                                  /*tool_calls_json=*/{}, /*tool_call_id=*/{},
                                  false, /*stats=*/{}, /*created_ms=*/0});
-  if (first) {
+  if (first && !auto_title_) {
     auto view = session->View();
     if (view.title == kDefaultTitle) {
       session->SetTitle(TitleFromText(message->AsString()));
@@ -454,6 +457,7 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body));
+  MaybeAutoTitle(engine_, model_, tokenizer_, session, auto_title_);
 }
 
 void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,

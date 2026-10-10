@@ -34,6 +34,9 @@ struct ServeOptions {
   std::vector<std::string> api_keys;
   // CORS allowlist. Empty disables CORS. "*" allows any origin.
   std::vector<std::string> allow_origins;
+  // Ask the model for a chat title after the first prompt of a new
+  // session; off keeps the first user line as the title.
+  bool auto_title = true;
 };
 
 // Serve a blocking HTTP API for `model` on the engine: OpenAI-style
