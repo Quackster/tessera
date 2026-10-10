@@ -6,19 +6,21 @@
 #include <utility>
 #include <vector>
 
+#include "core/think_budget.hpp"
+
 namespace tessera::serve {
 
 namespace {
 
-// Qwen tool-call XML markers emitted by the model.
+// Qwen tool-call XML markers emitted by the model. The think markers
+// are the shared core protocol tags (the engine force-closes the same
+// spans under a thinking budget).
 constexpr char kCallOpen[] = "<tool_call>";
 constexpr char kCallClose[] = "</tool_call>";
 constexpr char kFunctionOpen[] = "<function=";
 constexpr char kFunctionClose[] = "</function>";
 constexpr char kParameterOpen[] = "<parameter=";
 constexpr char kParameterClose[] = "</parameter>";
-constexpr char kThinkOpen[] = "<think>";
-constexpr char kThinkClose[] = "</think>";
 constexpr char kCallIdPrefix[] = "call_";
 constexpr std::size_t kMissing = std::string_view::npos;
 
@@ -47,21 +49,21 @@ struct ThinkSplit {
 ThinkSplit SplitThink(std::string_view input) {
   ThinkSplit split{std::string(), std::string(input)};
   while (true) {
-    const std::size_t close = split.text.find(kThinkClose);
+    const std::size_t close = split.text.find(core::kThinkCloseTag);
     if (close == std::string::npos) {
       return split;
     }
     std::size_t begin = 0;
     std::size_t inner = 0;
     if (close > 0) {
-      const std::size_t open = split.text.rfind(kThinkOpen, close - 1);
+      const std::size_t open = split.text.rfind(core::kThinkOpenTag, close - 1);
       if (open != std::string::npos) {
         begin = open;
-        inner = open + sizeof(kThinkOpen) - 1;
+        inner = open + sizeof(core::kThinkOpenTag) - 1;
       }
     }
     split.reasoning += split.text.substr(inner, close - inner);
-    split.text.erase(begin, close + sizeof(kThinkClose) - 1 - begin);
+    split.text.erase(begin, close + sizeof(core::kThinkCloseTag) - 1 - begin);
   }
 }
 
@@ -262,7 +264,7 @@ bool IsThinkTagPrefix(std::string_view tail) {
 ThinkStreamer::Deltas ThinkStreamer::Push(std::string_view piece) {
   raw_.append(piece);
   if (think_expected_ && !resolved_) {
-    if (raw_.find(kThinkClose) == std::string::npos) {
+    if (raw_.find(core::kThinkCloseTag) == std::string::npos) {
       return {};
     }
     resolved_ = true;
@@ -274,9 +276,9 @@ ThinkStreamer::Deltas ThinkStreamer::Push(std::string_view piece) {
   // opener still arriving piece by piece.
   std::string_view visible = split.text;
   if (withhold_) {
-    const std::size_t open = split.text.rfind(kThinkOpen);
+    const std::size_t open = split.text.rfind(core::kThinkOpenTag);
     if (open != std::string::npos &&
-        split.text.find(kThinkClose, open) == std::string::npos) {
+        split.text.find(core::kThinkCloseTag, open) == std::string::npos) {
       visible = std::string_view(split.text).substr(0, open);
     } else {
       const std::size_t bracket = split.text.rfind('<');

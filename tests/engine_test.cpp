@@ -309,7 +309,7 @@ TEST(EngineTest, GenerateStopsAtStopToken) {
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions free_opts;
   free_opts.first_token = 0;
-  free_opts.max_tokens = 8;
+  free_opts.max_completion_tokens = 8;
   auto ids = engine->Generate(**model, free_opts);
   ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
   ASSERT_GE(ids->size(), 3u);
@@ -324,9 +324,9 @@ TEST(EngineTest, GenerateStopsAtStopToken) {
   EXPECT_EQ((*stopped)[1], (*ids)[1]);
 }
 
-// A zero max_tokens fills the remaining context: context minus prompt,
+// A zero max_completion_tokens fills the remaining context: context minus prompt,
 // saturating at zero when the prompt already fills it.
-TEST(EngineTest, GenerateZeroMaxTokensFillsContext) {
+TEST(EngineTest, GenerateZeroMaxCompletionTokensFillsContext) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
   auto path = WriteTinyModelFixture("generate_fill.gguf");
@@ -358,7 +358,7 @@ TEST(EngineTest, GenerateRejectsPromptBeyondContext) {
   auto model = engine->LoadModel(ModelOptions{path.string(), 6});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
-  options.max_tokens = 4;
+  options.max_completion_tokens = 4;
   options.prompt_tokens = {0, 1, 2, 3, 4, 5, 6, 7};
   auto rejected = engine->Generate(**model, options);
   ASSERT_FALSE(rejected.has_value());
@@ -401,7 +401,7 @@ TEST(EngineTest, GenerateWithPromptTokensPrefills) {
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
   options.first_token = 0;
-  options.max_tokens = 4;
+  options.max_completion_tokens = 4;
   options.prompt_tokens = {0, 1, 2};
   auto ids = engine->Generate(**model, options);
   ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
@@ -422,7 +422,7 @@ TEST(EngineTest, GenerateStreamingEmitsIncrementally) {
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
   options.first_token = 0;
-  options.max_tokens = 4;
+  options.max_completion_tokens = 4;
   auto blocked = engine->Generate(**model, options);
   ASSERT_TRUE(blocked.has_value()) << tessera::ToString(blocked.error());
   ASSERT_EQ(blocked->size(), 4u);
@@ -497,7 +497,7 @@ TEST(EngineTest, MxFp4GeneratesWhenProvided) {
   EXPECT_TRUE(config->hybrid);
   EXPECT_EQ(config->layers, 64u);
   GenerateOptions options;
-  options.max_tokens = 4;
+  options.max_completion_tokens = 4;
   options.prompt_tokens = {760, 6511, 314, 9338, 369};
   auto generated = engine->Generate(**model, options);
   ASSERT_TRUE(generated.has_value()) << tessera::ToString(generated.error());
@@ -519,7 +519,7 @@ TEST(EngineTest, GgufGeneratesWhenProvided) {
   auto model = engine->LoadModel(ModelOptions{path, 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
-  options.max_tokens = 4;
+  options.max_completion_tokens = 4;
   options.prompt_tokens = {760, 6511, 314, 9338, 369};
   auto generated = engine->Generate(**model, options);
   ASSERT_TRUE(generated.has_value()) << tessera::ToString(generated.error());
@@ -1375,7 +1375,7 @@ TEST(EngineTest, SampleGenerationIsDeterministic) {
   auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
-  options.max_tokens = 4;
+  options.max_completion_tokens = 4;
   options.sample = true;
   options.seed = 42;
   auto first = engine->Generate(**model, options);
@@ -1404,12 +1404,12 @@ TEST(EngineTest, DFlash2MatchesGreedyOnModel) {
   auto model = engine->LoadModel(ModelOptions{target, 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
-  options.max_tokens = 8;
+  options.max_completion_tokens = 8;
   if (const char* tokens = std::getenv("TESSERA_DFLASH2_TOKENS");
       tokens != nullptr) {
     const int value = std::atoi(tokens);
     if (value > 0) {
-      options.max_tokens = static_cast<std::size_t>(value);
+      options.max_completion_tokens = static_cast<std::size_t>(value);
     }
   }
   if (const char* kv = std::getenv("TESSERA_DFLASH2_KV"); kv != nullptr) {
@@ -1444,12 +1444,12 @@ TEST(EngineTest, MtpDecodeOnModel) {
   auto model = engine->LoadModel(ModelOptions{target, 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   GenerateOptions options;
-  options.max_tokens = 32;
+  options.max_completion_tokens = 32;
   if (const char* tokens = std::getenv("TESSERA_MTP_TOKENS");
       tokens != nullptr) {
     const int value = std::atoi(tokens);
     if (value > 0) {
-      options.max_tokens = static_cast<std::size_t>(value);
+      options.max_completion_tokens = static_cast<std::size_t>(value);
     }
   }
   if (const char* block = std::getenv("TESSERA_MTP_BLOCK");

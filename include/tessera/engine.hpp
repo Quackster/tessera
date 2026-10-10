@@ -49,9 +49,10 @@ struct SamplingOptions {
 
 // Options for Engine::Generate.
 struct GenerateOptions {
-  // Decode steps to run; 0 fills the remaining context (see
-  // Model::EffectiveMaxTokens) instead of producing no tokens.
-  std::size_t max_tokens = 0;
+  // Completion tokens to produce; 0 (the default) fills the remaining
+  // context (see Model::EffectiveMaxTokens) instead of producing no
+  // tokens.
+  std::size_t max_completion_tokens = 0;
   // The first token fed to the decoder when prompt_tokens is empty.
   std::uint32_t first_token = 0;
   // Prompt tokens fed before generation; when non-empty they take the
@@ -66,6 +67,13 @@ struct GenerateOptions {
   // Draft tokens per speculative step for the DFlash2 draft; 0 uses the
   // draft checkpoint's configured block size.
   std::size_t draft_tokens = 0;
+  // Thinking budget per think block; 0 (the default) leaves thinking
+  // unlimited. When set, the engine force-closes the think block once
+  // it runs over budget (feeding the think-close tokens) and keeps
+  // decoding the answer, so the turn always continues past thinking.
+  // Ignored without a tokenizer or when the think tags do not resolve
+  // to token ids.
+  std::size_t max_thinking_tokens = 0;
   // Log progress every this many prefill steps (0 disables progress logs).
   std::size_t progress_every = 64;
   // Storage type of the full-attention KV cache (default fp32).
@@ -83,6 +91,17 @@ struct GenerateOptions {
   //   GenerateOptions gen;
   //   gen.prefill_chunk_tokens = 512;
   std::size_t prefill_chunk_tokens = 0;
+  // Per-chunk prefill progress hook, called as (done_rows, total_rows)
+  // from the generation thread. Runs alongside the progress_every log
+  // lines (null disables it); the serving layer forwards it as stream
+  // events so a long prefill shows movement instead of silence.
+  //
+  // Usage:
+  //   GenerateOptions gen;
+  //   gen.prefill_progress = [](std::size_t done, std::size_t total) {
+  //     std::printf("prefill %zu/%zu\n", done, total);
+  //   };
+  std::function<void(std::size_t, std::size_t)> prefill_progress;
 };
 
 // Tokens per prefill forward when neither the engine nor the request
@@ -134,14 +153,14 @@ class Engine {
       std::unique_ptr<SpeculativeStrategy>&& strategy);
 
   // Greedy single-token generation on the non-speculative (reference
-  // baseline) path: run `options.max_tokens` decode steps from
+  // baseline) path: run `options.max_completion_tokens` decode steps from
   // `options.first_token` and return the produced token ids. A zero
   // count fills the remaining context; a prompt that already fills it
   // returns an empty vector. MalformedFile/UnsupportedFeature
   // when the model config cannot drive the decoder.
   //
   // Usage:
-  //   auto ids = engine->Generate(*model, {.max_tokens = 4});
+  //   auto ids = engine->Generate(*model, {.max_completion_tokens = 4});
   [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
   Generate(Model& model, const GenerateOptions& options = {});
 
@@ -180,7 +199,7 @@ class Engine {
   // never changes the output). UnsupportedFeature on a non-hybrid model.
   //
   // Usage:
-  //   auto ids = engine->GenerateSpeculative(*model, {.max_tokens = 8});
+  //   auto ids = engine->GenerateSpeculative(*model, {.max_completion_tokens = 8});
   [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
   GenerateSpeculative(Model& model, const GenerateOptions& options = {});
 

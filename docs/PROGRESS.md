@@ -2277,6 +2277,24 @@ through RADV GFX1201, rocm through the system ROCm).
   view sits at the bottom, so reading back never yanks. Verified through
   the unit suite and the embedded assets; no live GPU run yet.
 
+- 2026-10-10: **Completion/thinking token budgets and prefill progress
+  (342/342 `ctest` on vulkan).** The completion budget is renamed to
+  `max_completion_tokens` (CLI `--max-completion-tokens`, default 0:
+  an unspecified request fills the remaining context instead of
+  stopping at 32k) and a `max_thinking_tokens` budget is added (CLI
+  `--max-thinking-tokens`, default unlimited). The old `max_tokens`
+  and `--tokens` names are gone without aliases; requests that still
+  send `max_tokens` get a warning naming the replacement. A past-the-
+  context prompt is rejected whatever the budget, so an unlimited
+  request never decodes empty. `ThinkBudget` tracks think spans over
+  token ids (multi-token tags match as sequences); the decode loop
+  force-closes the block past budget by feeding the think-close ids
+  through the normal target advance (with the folding/non-folding
+  drafter bookkeeping) and re-picks the answer token, so the turn
+  always continues. A per-chunk `prefill_progress` hook streams
+  ahead of thinking: the web UI shows it as a loading line and the
+  CLI image path logs its rows.
+
 
 - **PERF (DEFERRED)**: make MXFP4 inference fast. Targets: the whole load
   under 60 s (met, about 54 s), and 35 to 40 tokens/s decode without MTP.

@@ -84,12 +84,14 @@ bool BeginChatTurn(const std::shared_ptr<Session>& session,
 }
 
 // Prompt body for a session turn: the full stored history plus the
-// request-level fields (system prompt, tools, thinking flag).
+// request-level fields (system prompt, tools, thinking flag, budgets
+// and streaming flag).
 Json SessionPromptBody(const Json& body, const SessionView& view) {
   Json prompt_body = Json::Object();
   prompt_body.Set("messages", SessionHistoryJson(view));
   for (const char* key : {"system", "tools", "tool_choice",
-                          "enable_thinking"}) {
+                          "enable_thinking", "stream",
+                          "max_completion_tokens", "max_thinking_tokens"}) {
     if (const Json* value = body.Find(key)) {
       prompt_body.Set(key, *value);
     }
@@ -121,6 +123,7 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
                     SessionStore& sessions, std::mutex& generation,
                     ResponseWriter& writer, const Json& body,
                     std::size_t default_max) {
+  WarnRetiredMaxTokens(engine.Diagnostics(), body);
   const std::string session_id = SessionIdFrom(body);
   const Json* prompt = body.Find("prompt");
   if (prompt == nullptr || !prompt->isString()) {
@@ -157,13 +160,14 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
     SendError(writer, 500, "tokenization failed");
     return;
   }
-  const std::size_t max_tokens = MaxTokensFrom(body, default_max);
+  const std::size_t max_completion_tokens =
+      MaxCompletionTokensFrom(body, default_max);
   const bool stream = WantsStream(body);
   GenerateOptions options;
-  options.max_tokens = max_tokens;
+  options.max_completion_tokens = max_completion_tokens;
+  options.max_thinking_tokens = MaxThinkingTokensFrom(body);
   options.prompt_tokens = *ids;
-  if (RejectOversizePrompt(writer, ids->size(), max_tokens,
-                           model.MaxContextLength())) {
+  if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;
   }
   TurnStats stats;
@@ -276,6 +280,7 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
                 SessionStore& sessions, std::mutex& generation,
                 ResponseWriter& writer, const Json& body,
                 std::size_t default_max, bool anthropic) {
+  WarnRetiredMaxTokens(engine.Diagnostics(), body);
   const std::string session_id = SessionIdFrom(body);
   std::shared_ptr<Session> session;
   SessionTurn turn;
@@ -317,13 +322,14 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
     SendError(writer, 500, "tokenization failed");
     return;
   }
-  const std::size_t max_tokens = MaxTokensFrom(prompt_body, default_max);
+  const std::size_t max_completion_tokens =
+      MaxCompletionTokensFrom(prompt_body, default_max);
   const bool stream = WantsStream(prompt_body);
   GenerateOptions options;
-  options.max_tokens = max_tokens;
+  options.max_completion_tokens = max_completion_tokens;
+  options.max_thinking_tokens = MaxThinkingTokensFrom(prompt_body);
   options.prompt_tokens = *ids;
-  if (RejectOversizePrompt(writer, ids->size(), max_tokens,
-                           model.MaxContextLength())) {
+  if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;
   }
   const std::string model_name(model.Name());

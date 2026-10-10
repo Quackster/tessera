@@ -41,7 +41,7 @@ class SessionHandler {
  public:
   SessionHandler(Engine& engine, Model& model, const Tokenizer& tokenizer,
                  SessionStore& sessions, std::mutex& generation,
-                 std::size_t default_max_tokens);
+                 std::size_t default_max_completion_tokens);
 
   // Session CRUD over JSON bodies; 404 for an unknown id.
   void HandleList(ResponseWriter& writer) const;
@@ -66,8 +66,9 @@ class SessionHandler {
   private:
   // Shared turn core for chat and retry (see the .cpp for the flow).
   void RunTurn(const std::shared_ptr<Session>& session,
-               ResponseWriter& writer, std::size_t max_tokens,
-               bool enable_thinking, bool stream) const;
+               ResponseWriter& writer, std::size_t max_completion_tokens,
+               std::size_t max_thinking_tokens, bool enable_thinking,
+               bool stream) const;
   // 409 when the session is busy; otherwise take the turn and queue
   // for the device behind running generations. The guard releases it.
   bool BeginTurn(const std::shared_ptr<Session>& session,
@@ -79,7 +80,7 @@ class SessionHandler {
   const Tokenizer& tokenizer_;
   SessionStore& sessions_;
   std::mutex& generation_;
-  std::size_t default_max_tokens_;
+  std::size_t default_max_completion_tokens_;
 };
 
 }  // namespace tessera::serve

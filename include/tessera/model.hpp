@@ -67,8 +67,8 @@ class Model {
   // (MaxContextLength minus `prompt_size`, saturating at zero).
   //
   // Usage:
-  //   const std::size_t max_tokens = model.EffectiveMaxTokens(
-  //       prompt.size(), options.max_tokens);
+  //   const std::size_t max_completion_tokens = model.EffectiveMaxTokens(
+  //       prompt.size(), options.max_completion_tokens);
   [[nodiscard]] std::size_t EffectiveMaxTokens(std::size_t prompt_size,
                                               std::size_t requested) const;
   // Model name from the file metadata when present ("" otherwise).

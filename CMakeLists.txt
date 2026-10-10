@@ -30,6 +30,9 @@ add_library(tessera STATIC
     src/models/qwen3_5/weights.cpp
     src/models/qwen3_5/convert.cpp
     src/core/engine.cpp
+    src/core/generate.cpp
+    src/core/generate_helpers.cpp
+    src/core/generate_multimodal.cpp
     src/core/model.cpp
     src/core/files.cpp
     src/core/tokenizer.cpp
@@ -40,6 +43,7 @@ add_library(tessera STATIC
     src/core/loaders/mxfp4.cpp
     src/core/json.cpp
     src/core/sampling.cpp
+    src/core/think_budget.cpp
     src/core/vision.cpp
     src/core/vision_block.cpp
     src/core/vision_stack.cpp

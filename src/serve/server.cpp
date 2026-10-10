@@ -160,7 +160,7 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
     // parallel windows and parallel API clients each get their turn.
     serve::SessionHandler session_handler(engine, model, *tokenizer, sessions,
                                           generation,
-                                          options.default_max_tokens);
+                                          options.default_max_completion_tokens);
     if (path == "/api/sessions") {
       if (request.method == "GET") {
         session_handler.HandleList(writer);
@@ -314,7 +314,7 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
         return;
       }
       serve::OpenAiComplete(engine, model, *tokenizer, sessions, generation,
-                            writer, *body, options.default_max_tokens);
+                            writer, *body, options.default_max_completion_tokens);
       return;
     }
     if (request.method == "POST" &&
@@ -325,7 +325,7 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
         return;
       }
       serve::OpenAiChat(engine, model, *tokenizer, sessions, generation,
-                        writer, *body, options.default_max_tokens, false);
+                        writer, *body, options.default_max_completion_tokens, false);
       return;
     }
     if (request.method == "POST" &&
@@ -356,7 +356,7 @@ std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
         return;
       }
       serve::OpenAiChat(engine, model, *tokenizer, sessions, generation,
-                        writer, *body, options.default_max_tokens, true);
+                        writer, *body, options.default_max_completion_tokens, true);
       return;
     }
     // Live session states: one entry per chat with its id, title,

@@ -41,13 +41,33 @@ core::Json UsageJson(std::size_t prompt, std::size_t completion) {
   return usage;
 }
 
-std::size_t MaxTokensFrom(const core::Json& body, std::size_t fallback) {
-  const core::Json* value = body.Find("max_tokens");
+std::size_t MaxCompletionTokensFrom(const core::Json& body,
+                                     std::size_t fallback) {
+  const core::Json* value = body.Find("max_completion_tokens");
   if (value != nullptr && value->type() == core::Json::Type::Number &&
       value->AsNumber() > 0) {
     return static_cast<std::size_t>(value->AsNumber());
   }
   return fallback;
+}
+
+std::size_t MaxThinkingTokensFrom(const core::Json& body) {
+  const core::Json* value = body.Find("max_thinking_tokens");
+  if (value != nullptr && value->type() == core::Json::Type::Number &&
+      value->AsNumber() > 0) {
+    return static_cast<std::size_t>(value->AsNumber());
+  }
+  return 0;
+}
+
+void WarnRetiredMaxTokens(log::Diagnostics& diagnostics,
+                          const core::Json& body) {
+  if (body.Find("max_tokens") != nullptr &&
+      body.Find("max_completion_tokens") == nullptr) {
+    diagnostics.Warn("serve", "request uses retired max_tokens, which is "
+                              "ignored; use max_completion_tokens (0 fills "
+                              "the remaining context)");
+  }
 }
 
 std::string SessionIdFrom(const core::Json& body) {
@@ -97,8 +117,10 @@ void SendGenerationError(ResponseWriter& writer, StatusCode code) {
 }
 
 bool RejectOversizePrompt(ResponseWriter& writer, std::size_t prompt,
-                           std::size_t max_tokens, std::size_t context) {
-  if (max_tokens > 0 && prompt > context) {
+                           std::size_t context) {
+  // A prompt past the context fails before any device work, whatever
+  // the completion budget (an unlimited request must not decode empty).
+  if (prompt > context) {
     SendGenerationError(writer, StatusCode::InvalidArgument);
     return true;
   }
@@ -116,12 +138,13 @@ void WriteSse(ResponseWriter& writer, const std::string& event,
 }
 
 std::string InjectWebDefaults(std::string_view page) {
-  constexpr std::string_view kMaxTokens = "@TESSERA_DEFAULT_MAX_TOKENS@";
-  const std::string value = std::to_string(kDefaultMaxTokens);
+  constexpr std::string_view kMaxCompletionTokens =
+      "@TESSERA_DEFAULT_MAX_COMPLETION_TOKENS@";
+  const std::string value = std::to_string(kDefaultMaxCompletionTokens);
   std::string out(page);
   std::size_t pos = 0;
-  while ((pos = out.find(kMaxTokens, pos)) != std::string::npos) {
-    out.replace(pos, kMaxTokens.size(), value);
+  while ((pos = out.find(kMaxCompletionTokens, pos)) != std::string::npos) {
+    out.replace(pos, kMaxCompletionTokens.size(), value);
     pos += value.size();
   }
   return out;

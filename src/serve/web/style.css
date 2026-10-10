@@ -58,6 +58,15 @@ main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 }
 .message .content { flex: 1; min-width: 0; }
 .message .role { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+.message .prefill {
+  color: var(--dim);
+  font-size: 13px;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
 .message .body { background: var(--panel); border-radius: 8px; padding: 10px 12px; }
 .message.stopped .body { border: 1px solid var(--danger); }
 .message .stopped-badge { color: var(--danger); font-size: 12px; }

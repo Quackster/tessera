@@ -36,7 +36,7 @@ void PrintUsage() {
                "usage: tessera-cli run --model <path> [--draft <dir>]\n"
                "       [--context <n>] [--draft-block <n>]\n"
                "       [--prefill-chunk <n>]\n"
-               "       --prompt-text <str> [--tokens <n>]\n"
+               "       --prompt-text <str> [--max-completion-tokens <n>]\n"
                "       tessera-cli serve --model <path> [--host <ip>] "
                "[--port <n>]\n"
                "       tessera-cli --list-gpus\n"
@@ -49,8 +49,11 @@ void PrintUsage() {
                "default, %zu)\n"
                "  --prefill-chunk <n> prefill tokens per forward (0 = auto, "
                "%zu)\n"
-  "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
-  "  --tokens <n>      decode steps (default %zu)\n"
+   "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
+   "  --max-completion-tokens <n> completion tokens (0 fills the "
+   "remaining context, default %zu)\n"
+   "  --max-thinking-tokens <n> think-block budget per turn (0 leaves "
+   "thinking unlimited, default 0)\n"
                "  --speculate       verify MTP drafts instead of plain greedy\n"
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
@@ -73,8 +76,8 @@ void PrintUsage() {
                "  --api-key <k>     accepted API key (repeatable; env "
                 "TESSERA_API_KEY)\n"
   "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
-                kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk,
-                tessera::kDefaultMaxTokens);
+                 kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk,
+                 tessera::kDefaultMaxCompletionTokens);
 }
 
 }  // namespace
@@ -118,7 +121,8 @@ int main(int argc, char** argv) {
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   std::uint64_t seed = 0;
   std::uint16_t port = 8080;
-  std::size_t tokens = 0;
+  std::size_t max_completion_tokens = 0;
+  std::size_t max_thinking_tokens = 0;
   std::size_t context = kDefaultContext;
   std::size_t draft_block = kDefaultDraftBlock;
   std::size_t prefill_chunk = kDefaultPrefillChunk;
@@ -181,8 +185,10 @@ int main(int argc, char** argv) {
       sampling.repetition_penalty = std::stof(argv[++i]);
     } else if (arg == "--seed" && i + 1 < argc) {
       seed = std::stoull(argv[++i]);
-    } else if (arg == "--tokens" && i + 1 < argc) {
-      tokens = std::stoul(argv[++i]);
+    } else if (arg == "--max-completion-tokens" && i + 1 < argc) {
+      max_completion_tokens = std::stoul(argv[++i]);
+    } else if (arg == "--max-thinking-tokens" && i + 1 < argc) {
+      max_thinking_tokens = std::stoul(argv[++i]);
     } else {
       std::fprintf(stderr, "cli: unknown or unterminated argument '%s'\n",
                    arg.data());
@@ -279,12 +285,13 @@ int main(int argc, char** argv) {
     }
     return kExitOk;
   }
-  if (!prompt_text.empty() || !image_path.empty() || tokens > 0) {
+  if (!prompt_text.empty() || !image_path.empty() ||
+      max_completion_tokens > 0 || max_thinking_tokens > 0) {
     tessera::GenerateOptions gen;
-    // Zero (flag absent) selects the default cap instead of filling
-    // the remaining context.
-    gen.max_tokens =
-        tokens == 0 ? tessera::kDefaultMaxTokens : tokens;
+    // Zero (the default) fills the remaining context; an explicit
+    // budget caps the completion instead.
+    gen.max_completion_tokens = max_completion_tokens;
+    gen.max_thinking_tokens = max_thinking_tokens;
     gen.sample = sample;
     gen.sampling = sampling;
     gen.seed = seed;
@@ -402,6 +409,12 @@ int main(int argc, char** argv) {
       const std::size_t count = embeddings->size() / vision->Config().projection_dim;
       if (!quiet) {
         log.Info("cli", "image encoded: " + std::to_string(count) + " token(s)");
+        // The multimodal path logs no row progress of its own, so the
+        // hook shows the image-token prefill before decoding starts.
+        gen.prefill_progress = [&log](std::size_t done, std::size_t total) {
+          log.Info("cli", "prefill: " + std::to_string(done) + "/" +
+                              std::to_string(total) + " rows");
+        };
       }
       std::vector<std::uint32_t> prompt(count, image_token);
       prompt.insert(prompt.end(), gen.prompt_tokens.begin(),
@@ -418,7 +431,7 @@ int main(int argc, char** argv) {
       const tessera::Tokenizer* stream_tokenizer = loaded.GetTokenizer();
       if (!quiet) {
         const std::size_t budget = loaded.EffectiveMaxTokens(
-            gen.prompt_tokens.size(), gen.max_tokens);
+            gen.prompt_tokens.size(), gen.max_completion_tokens);
         log.Info("cli", "generating up to " + std::to_string(budget) +
                             " token(s); streaming output below");
       }

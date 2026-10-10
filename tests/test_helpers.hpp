@@ -202,6 +202,30 @@ struct GgufBuilder {
     }
   }
 
+  // Metadata string array (GGUF array of strings, element type 8).
+  void KvArrayString(const char* key,
+                     std::initializer_list<const char*> values) {
+    PushString(key);
+    PushU32(9);
+    PushU32(8);  // element type string
+    PushU64(values.size());
+    for (const char* value : values) {
+      PushString(value);
+    }
+  }
+
+  // Metadata int32 array (element type 5; GGUF has no byte-wide int).
+  void KvArrayI32(const char* key,
+                  std::initializer_list<std::int32_t> values) {
+    PushString(key);
+    PushU32(9);
+    PushU32(5);  // element type int32
+    PushU64(values.size());
+    for (std::int32_t value : values) {
+      PushU32(static_cast<std::uint32_t>(value));
+    }
+  }
+
   // Tensor entry: name, rank, rank dims (u64), ggml type, offset.
   void Tensor(const char* name, std::uint32_t rank,
               std::initializer_list<std::uint64_t> dims, std::uint32_t ggml_type,

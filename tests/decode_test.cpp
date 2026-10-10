@@ -5,10 +5,13 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "core/think_budget.hpp"
 #include "models/qwen3_5/state.hpp"
 #include "spec/dflash2_mask.hpp"
 #include "test_helpers.hpp"
@@ -48,7 +51,7 @@ inline std::filesystem::path WriteGatedHybridFixture(const std::string& name) {
       {"blk.0.ffn_down.weight", 12, {256, 256}, 256, 256},
   };
   GgufBuilder builder;
-  builder.Header(0x46554747, 3, specs.size(), 19);
+  builder.Header(0x46554747, 3, specs.size(), 23);
   builder.KvString("general.name", "tiny-gated");
   builder.KvString("general.architecture", "qwen35");
   builder.KvU32("qwen35.block_count", 1);
@@ -74,6 +77,19 @@ inline std::filesystem::path WriteGatedHybridFixture(const std::string& name) {
   builder.KvU32("qwen35.ssm.time_step_rank", 1);
   builder.KvU32("qwen35.ssm.inner_size", 1);
   builder.KvU32("qwen35.full_attention_interval", 1);
+  // A 32-entry byte-level tokenizer so engine paths that resolve tag
+  // ids (thinking budget) run on the fixture: the think markers are
+  // control tokens, the rest single-character fillers.
+  builder.KvString("tokenizer.ggml.model", "gpt2");
+  builder.KvArrayString("tokenizer.ggml.tokens",
+                        {"<think>", "</think>", "a", "b", "c", "d", "e", "f",
+                         "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+                         "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+                         "0", "1", "2", "3"});
+  builder.KvArrayI32("tokenizer.ggml.token_type",
+                     {3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1});
+  builder.KvArrayString("tokenizer.ggml.merges", {});
   std::uint64_t offset = 0;
   for (const auto& spec : specs) {
     const std::uint64_t placed = offset;
@@ -241,6 +257,7 @@ inline std::filesystem::path WriteLinearHybridFixture(
 
 using tessera::Engine;
 using tessera::ModelOptions;
+using tessera::Tokenizer;
 using tessera::testing::MakeEngineOrSkip;
 using tessera::testing::WriteGatedHybridFixture;
 using tessera::testing::WriteLinearHybridFixture;
@@ -940,7 +957,7 @@ TEST(HybridDecodeTest, SpeculativeFallbackMatchesGreedy) {
     auto model = engine->LoadModel(ModelOptions{path, 1024});
     ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
     tessera::GenerateOptions options;
-    options.max_tokens = 6;
+    options.max_completion_tokens = 6;
     options.first_token = 0;
     auto greedy = engine->Generate(**model, options);
     ASSERT_TRUE(greedy.has_value()) << tessera::ToString(greedy.error());
@@ -962,12 +979,12 @@ TEST(HybridDecodeTest, SpeculativeMatchesGreedyOnModel) {
   auto model = engine->LoadModel(ModelOptions{path, 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   tessera::GenerateOptions options;
-  options.max_tokens = 4;
+  options.max_completion_tokens = 4;
   if (const char* count = std::getenv("TESSERA_SPEC_TOKENS");
       count != nullptr) {
     const int value = std::atoi(count);
     if (value > 0) {
-      options.max_tokens = static_cast<std::size_t>(value);
+      options.max_completion_tokens = static_cast<std::size_t>(value);
     }
   }
   options.first_token = 0;
@@ -1261,7 +1278,7 @@ TEST(HybridDecodeTest, MultimodalGenerate) {
   std::vector<float> embeddings(2 * hidden);
   for (auto& v : embeddings) v = tessera::testing::DrawValue(rng) * 0.1f;
   tessera::GenerateOptions options;
-  options.max_tokens = 4;
+  options.max_completion_tokens = 4;
   options.prompt_tokens = {0, 0, 5, 7};
   auto first = engine->GenerateMultimodal(**model, options, embeddings, 2, 0);
   ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
@@ -1269,4 +1286,271 @@ TEST(HybridDecodeTest, MultimodalGenerate) {
   auto again = engine->GenerateMultimodal(**model, options, embeddings, 2, 0);
   ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
   EXPECT_EQ(*first, *again);
+}
+
+// Open/close id pairs for the state-machine tests below.
+const std::vector<std::uint32_t> kThinkOpen{10};
+const std::vector<std::uint32_t> kThinkClose{11};
+const std::vector<std::uint32_t> kThinkOpen2{10, 12};
+const std::vector<std::uint32_t> kThinkClose2{11, 13};
+const std::vector<std::uint32_t> kThinkEmpty{};
+
+// A disengaged budget tracks nothing and never owes a close.
+TEST(ThinkBudgetTest, DisengagedTracksNothing) {
+  tessera::core::ThinkBudget think;
+  EXPECT_FALSE(think.engaged());
+  think.noteEmitted(7);
+  EXPECT_FALSE(think.closeOwed());
+  EXPECT_FALSE(think.inThink());
+  EXPECT_EQ(think.thinkCount(), 0u);
+  tessera::core::ThinkBudget zero;
+  zero.engage(kThinkOpen, kThinkClose, 0);
+  EXPECT_FALSE(zero.engaged());
+}
+
+// An empty tag sequence cannot engage the budget.
+TEST(ThinkBudgetTest, EmptyTagsStayDisengaged) {
+  tessera::core::ThinkBudget think;
+  think.engage(kThinkEmpty, kThinkClose, 4);
+  EXPECT_FALSE(think.engaged());
+}
+
+// The prompt scan enters thinking on a trailing open tag.
+TEST(ThinkBudgetTest, PromptScanEntersThinking) {
+  tessera::core::ThinkBudget think;
+  think.engage(kThinkOpen, kThinkClose, 2);
+  EXPECT_TRUE(think.engaged());
+  think.noteEmitted(3);
+  think.noteEmitted(10);
+  EXPECT_TRUE(think.inThink());
+  EXPECT_EQ(think.thinkCount(), 0u);
+  EXPECT_FALSE(think.closeOwed());
+}
+
+// Thinking tokens count until the budget runs out, then a close is owed.
+TEST(ThinkBudgetTest, BudgetRunsOutAfterCount) {
+  tessera::core::ThinkBudget think;
+  think.engage(kThinkOpen, kThinkClose, 2);
+  think.noteEmitted(10);
+  think.noteEmitted(20);
+  EXPECT_EQ(think.thinkCount(), 1u);
+  EXPECT_FALSE(think.closeOwed());
+  think.noteEmitted(21);
+  EXPECT_EQ(think.thinkCount(), 2u);
+  EXPECT_TRUE(think.closeOwed());
+}
+
+// The model's own close ends thinking with nothing owed.
+TEST(ThinkBudgetTest, OwnCloseEndsThinking) {
+  tessera::core::ThinkBudget think;
+  think.engage(kThinkOpen, kThinkClose, 1);
+  think.noteEmitted(10);
+  think.noteEmitted(20);
+  EXPECT_TRUE(think.closeOwed());
+  think.noteEmitted(11);
+  EXPECT_FALSE(think.inThink());
+  EXPECT_FALSE(think.closeOwed());
+}
+
+// A new think block after a close restarts the count.
+TEST(ThinkBudgetTest, NewBlockRestartsCount) {
+  tessera::core::ThinkBudget think;
+  think.engage(kThinkOpen, kThinkClose, 1);
+  think.noteEmitted(10);
+  think.noteEmitted(20);
+  think.noteEmitted(11);
+  think.noteEmitted(10);
+  EXPECT_TRUE(think.inThink());
+  EXPECT_EQ(think.thinkCount(), 0u);
+  EXPECT_FALSE(think.closeOwed());
+  think.noteEmitted(30);
+  EXPECT_TRUE(think.closeOwed());
+}
+
+// Multi-token tags match as id sequences on both sides.
+TEST(ThinkBudgetTest, MultiTokenTagsMatchAsSequences) {
+  tessera::core::ThinkBudget think;
+  think.engage(kThinkOpen2, kThinkClose2, 1);
+  think.noteEmitted(10);
+  EXPECT_FALSE(think.inThink());
+  think.noteEmitted(12);
+  EXPECT_TRUE(think.inThink());
+  think.noteEmitted(20);
+  EXPECT_TRUE(think.closeOwed());
+  think.noteEmitted(11);
+  EXPECT_TRUE(think.inThink());
+  think.noteEmitted(13);
+  EXPECT_FALSE(think.inThink());
+  EXPECT_FALSE(think.closeOwed());
+}
+
+// Recording stand-in for a speculative drafter: never proposes, so the
+// loop decodes plainly while exercising the strategy bookkeeping.
+struct RecordingStrategy : public tessera::SpeculativeStrategy {
+  explicit RecordingStrategy(bool folding) : folding_(folding) {}
+  std::string_view Name() const override {
+    return "recording";
+  }
+  std::expected<void, tessera::StatusCode> Attach(
+      const tessera::StrategyOptions&) override {
+    return {};
+  }
+  std::expected<void, tessera::StatusCode> Prepare(
+      tessera::Backend&, tessera::Model&) override {
+    return {};
+  }
+  std::size_t DraftBlock() const override {
+    return 4;
+  }
+  bool FoldsAnchor() const override {
+    return folding_;
+  }
+  std::span<const std::size_t> CaptureLayers() const override {
+    return {};
+  }
+  std::span<tessera::Buffer* const> CaptureBuffers() override {
+    return {};
+  }
+  std::expected<void, tessera::StatusCode> AppendPrefill(
+      tessera::Backend&, tessera::Model&, tessera::core::DecodeCache&,
+      std::span<const std::uint32_t>, std::uint64_t,
+      std::span<tessera::Buffer* const>) override {
+    return std::unexpected(tessera::StatusCode::UnsupportedFeature);
+  }
+  std::expected<void, tessera::StatusCode> OnAnchor(
+      tessera::Backend&, tessera::Model&, tessera::core::DecodeCache&,
+      std::uint32_t token, std::uint64_t position,
+      std::span<const float>) override {
+    anchors.emplace_back(token, position);
+    return {};
+  }
+  std::expected<std::size_t, tessera::StatusCode> Draft(
+      tessera::Backend&, tessera::Model&, tessera::core::DecodeCache&,
+      std::span<const float>, std::uint32_t,
+      std::span<std::uint32_t>) override {
+    return 0;
+  }
+  std::expected<void, tessera::StatusCode> Commit(
+      tessera::Backend&, tessera::Model&, tessera::core::DecodeCache&,
+      std::size_t accepted) override {
+    commits.push_back(accepted);
+    return {};
+  }
+  bool folding_ = false;
+  std::vector<std::pair<std::uint32_t, std::uint64_t>> anchors;
+  std::vector<std::size_t> commits;
+};
+
+// The thinking budget force-closes on the plain path: the close ids
+// lead the output and decoding continues past them to the full length.
+TEST(HybridDecodeTest, ThinkingBudgetForceClosesPlain) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated_think.gguf").string(),
+                   1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const Tokenizer* tokenizer = (*model)->GetTokenizer();
+  ASSERT_NE(tokenizer, nullptr);
+  const auto open = tokenizer->SpecialTokenId("<think>");
+  const auto close = tokenizer->SpecialTokenId("</think>");
+  ASSERT_TRUE(open.has_value() && close.has_value());
+  tessera::GenerateOptions options;
+  options.prompt_tokens = {*open, 5};
+  options.max_completion_tokens = 8;
+  options.max_thinking_tokens = 1;
+  auto produced = engine->Generate(**model, options);
+  ASSERT_TRUE(produced.has_value()) << tessera::ToString(produced.error());
+  ASSERT_EQ(produced->size(), 8u);
+  EXPECT_EQ((*produced)[0], *close);
+}
+
+// The forced close rides the folding bookkeeping: one anchor plus a
+// zero-accept commit per close id.
+TEST(HybridDecodeTest, ThinkingBudgetForceClosesFolding) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated_think_fold.gguf").string(),
+                   1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const Tokenizer* tokenizer = (*model)->GetTokenizer();
+  ASSERT_NE(tokenizer, nullptr);
+  const auto open = tokenizer->SpecialTokenId("<think>");
+  const auto close = tokenizer->SpecialTokenId("</think>");
+  ASSERT_TRUE(open.has_value() && close.has_value());
+  auto fake = std::make_unique<RecordingStrategy>(true);
+  RecordingStrategy* watched = fake.get();
+  ASSERT_TRUE(engine->AttachSpeculative(std::move(fake)).has_value());
+  tessera::GenerateOptions options;
+  options.prompt_tokens = {*open, 5};
+  options.max_completion_tokens = 8;
+  options.max_thinking_tokens = 1;
+  auto produced = engine->Generate(**model, options);
+  ASSERT_TRUE(produced.has_value()) << tessera::ToString(produced.error());
+  ASSERT_EQ(produced->size(), 8u);
+  EXPECT_EQ((*produced)[0], *close);
+  // Empty capture layers skip the strategy during prefill, so the
+  // first anchor is the forced close at the prompt end.
+  ASSERT_GE(watched->anchors.size(), 2u);
+  EXPECT_EQ(watched->anchors[0].first, *close);
+  EXPECT_EQ(watched->anchors[0].second, 2u);
+  ASSERT_GE(watched->commits.size(), 2u);
+  EXPECT_EQ(watched->commits[0], 0u);
+  EXPECT_EQ(watched->commits[1], 0u);
+}
+
+// The non-folding path records the forced close without committing.
+TEST(HybridDecodeTest, ThinkingBudgetForceClosesNonFolding) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated_think_flat.gguf").string(),
+                   1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  const Tokenizer* tokenizer = (*model)->GetTokenizer();
+  ASSERT_NE(tokenizer, nullptr);
+  const auto open = tokenizer->SpecialTokenId("<think>");
+  const auto close = tokenizer->SpecialTokenId("</think>");
+  ASSERT_TRUE(open.has_value() && close.has_value());
+  auto fake = std::make_unique<RecordingStrategy>(false);
+  RecordingStrategy* watched = fake.get();
+  ASSERT_TRUE(engine->AttachSpeculative(std::move(fake)).has_value());
+  tessera::GenerateOptions options;
+  options.prompt_tokens = {*open, 5};
+  options.max_completion_tokens = 8;
+  options.max_thinking_tokens = 1;
+  auto produced = engine->Generate(**model, options);
+  ASSERT_TRUE(produced.has_value()) << tessera::ToString(produced.error());
+  ASSERT_EQ(produced->size(), 8u);
+  EXPECT_EQ((*produced)[0], *close);
+  ASSERT_GE(watched->anchors.size(), 2u);
+  EXPECT_EQ(watched->anchors[0].first, *close);
+  EXPECT_EQ(watched->anchors[0].second, 2u);
+  EXPECT_TRUE(watched->commits.empty());
+}
+
+// The prefill progress hook fires per chunk and ends at done == total.
+TEST(HybridDecodeTest, PrefillProgressHookFires) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto model = engine->LoadModel(
+      ModelOptions{WriteGatedHybridFixture("gated_progress.gguf").string(),
+                   1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  tessera::GenerateOptions options;
+  options.prompt_tokens = {0, 5};
+  options.max_completion_tokens = 2;
+  std::vector<std::pair<std::size_t, std::size_t>> calls;
+  options.prefill_progress = [&](std::size_t done, std::size_t total) {
+    calls.emplace_back(done, total);
+  };
+  auto produced = engine->Generate(**model, options);
+  ASSERT_TRUE(produced.has_value()) << tessera::ToString(produced.error());
+  ASSERT_FALSE(calls.empty());
+  for (std::size_t i = 1; i < calls.size(); ++i) {
+    EXPECT_GE(calls[i].first, calls[i - 1].first);
+  }
+  EXPECT_EQ(calls.back().first, 2u);
+  EXPECT_EQ(calls.back().second, 2u);
 }

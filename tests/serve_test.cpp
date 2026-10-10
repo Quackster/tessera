@@ -597,21 +597,62 @@ TEST(ServeTest, ThinkStreamerWithholdsLeadingThinkNewline) {
   EXPECT_EQ(content.find("The user said"), std::string::npos);
 }
 
-// The default cap is 32k tokens: an unspecified request never
-// decodes to the end of a large context window.
-TEST(ServeTest, DefaultMaxTokensIs32k) {
-  EXPECT_EQ(tessera::kDefaultMaxTokens, 32u * 1024u);
-  EXPECT_EQ(tessera::ServeOptions{}.default_max_tokens,
-            tessera::kDefaultMaxTokens);
+// The default is unlimited (0): an unspecified request fills the
+// remaining context instead of stopping after a fixed budget.
+TEST(ServeTest, DefaultMaxCompletionTokensIsZero) {
+  EXPECT_EQ(tessera::kDefaultMaxCompletionTokens, 0u);
+  EXPECT_EQ(tessera::ServeOptions{}.default_max_completion_tokens,
+            tessera::kDefaultMaxCompletionTokens);
   auto empty = Json::Parse(R"({})");
   ASSERT_NE(empty, nullptr);
-  EXPECT_EQ(tessera::serve::MaxTokensFrom(*empty, 7u), 7u);
-  auto capped = Json::Parse(R"({"max_tokens":0})");
+  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*empty, 7u), 7u);
+  auto capped = Json::Parse(R"({"max_completion_tokens":0})");
   ASSERT_NE(capped, nullptr);
-  EXPECT_EQ(tessera::serve::MaxTokensFrom(*capped, 7u), 7u);
-  auto explicit_count = Json::Parse(R"({"max_tokens":64})");
+  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*capped, 7u), 7u);
+  auto explicit_count = Json::Parse(R"({"max_completion_tokens":64})");
   ASSERT_NE(explicit_count, nullptr);
-  EXPECT_EQ(tessera::serve::MaxTokensFrom(*explicit_count, 7u), 64u);
+  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*explicit_count, 7u),
+            64u);
+  // The retired name is ignored: an old client falls back to the default.
+  auto retired = Json::Parse(R"({"max_tokens":64})");
+  ASSERT_NE(retired, nullptr);
+  EXPECT_EQ(tessera::serve::MaxCompletionTokensFrom(*retired, 7u), 7u);
+}
+
+// The thinking budget defaults to unlimited and needs a positive value.
+TEST(ServeTest, MaxThinkingTokensFromReadsBudget) {
+  auto empty = Json::Parse(R"({})");
+  ASSERT_NE(empty, nullptr);
+  EXPECT_EQ(tessera::serve::MaxThinkingTokensFrom(*empty), 0u);
+  auto budget = Json::Parse(R"({"max_thinking_tokens":16})");
+  ASSERT_NE(budget, nullptr);
+  EXPECT_EQ(tessera::serve::MaxThinkingTokensFrom(*budget), 16u);
+  auto zero = Json::Parse(R"({"max_thinking_tokens":0})");
+  ASSERT_NE(zero, nullptr);
+  EXPECT_EQ(tessera::serve::MaxThinkingTokensFrom(*zero), 0u);
+}
+
+// The retired field warns with its replacement, and only then.
+TEST(ServeTest, WarnRetiredMaxTokensNamesReplacement) {
+  tessera::log::Diagnostics log;
+  std::string lines;
+  log.SetSink([&lines](tessera::log::Level, std::string_view prefix,
+                       std::string_view message) {
+    lines += std::string(prefix) + ": " + std::string(message) + "\n";
+  });
+  auto retired = Json::Parse(R"({"max_tokens":64})");
+  ASSERT_NE(retired, nullptr);
+  tessera::serve::WarnRetiredMaxTokens(log, *retired);
+  EXPECT_NE(lines.find("max_completion_tokens"), std::string::npos);
+  lines.clear();
+  auto current = Json::Parse(R"({"max_completion_tokens":64})");
+  ASSERT_NE(current, nullptr);
+  tessera::serve::WarnRetiredMaxTokens(log, *current);
+  EXPECT_TRUE(lines.empty());
+  auto empty = Json::Parse(R"({})");
+  ASSERT_NE(empty, nullptr);
+  tessera::serve::WarnRetiredMaxTokens(log, *empty);
+  EXPECT_TRUE(lines.empty());
 }
 
 // The served page carries the same default: one constant, every
@@ -620,9 +661,10 @@ TEST(ServeTest, InjectWebDefaultsFillsMaxTokens) {
   EXPECT_EQ(tessera::serve::InjectWebDefaults("no placeholders here"),
             "no placeholders here");
   const std::string want = "<input value=\"" +
-                           std::to_string(tessera::kDefaultMaxTokens) + "\">";
+                           std::to_string(tessera::kDefaultMaxCompletionTokens) +
+                           "\">";
   EXPECT_EQ(tessera::serve::InjectWebDefaults(
-                R"(<input value="@TESSERA_DEFAULT_MAX_TOKENS@">)"),
+                R"(<input value="@TESSERA_DEFAULT_MAX_COMPLETION_TOKENS@">)"),
             want);
 }
 

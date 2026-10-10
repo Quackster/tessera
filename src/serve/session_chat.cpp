@@ -186,13 +186,13 @@ bool BodyFlag(const Json& body, std::string_view key, bool fallback) {
 SessionHandler::SessionHandler(Engine& engine, Model& model,
                                const Tokenizer& tokenizer,
                                SessionStore& sessions, std::mutex& generation,
-                               std::size_t default_max_tokens)
+                               std::size_t default_max_completion_tokens)
     : engine_(engine),
       model_(model),
       tokenizer_(tokenizer),
       sessions_(sessions),
       generation_(generation),
-      default_max_tokens_(default_max_tokens) {}
+      default_max_completion_tokens_(default_max_completion_tokens) {}
 
 void SessionHandler::HandleList(ResponseWriter& writer) const {
   Json items = Json::Array();
@@ -256,7 +256,9 @@ void SessionHandler::HandleRename(ResponseWriter& writer, std::string_view id,
 // stop flag aborts the decode loop (prefill has no token hook and runs
 // to completion); pause blocks it between tokens.
 void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
-                             ResponseWriter& writer, std::size_t max_tokens,
+                             ResponseWriter& writer,
+                             std::size_t max_completion_tokens,
+                             std::size_t max_thinking_tokens,
                              bool enable_thinking, bool stream) const {
   auto view = sessions_.View(session->Id());
   Json prompt_body = Json::Object();
@@ -273,12 +275,13 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     SendError(writer, 500, "tokenization failed");
     return;
   }
-  if (RejectOversizePrompt(writer, ids->size(), max_tokens,
+  if (RejectOversizePrompt(writer, ids->size(),
                            model_.MaxContextLength())) {
     return;
   }
   GenerateOptions options;
-  options.max_tokens = max_tokens;
+  options.max_completion_tokens = max_completion_tokens;
+  options.max_thinking_tokens = max_thinking_tokens;
   options.prompt_tokens = *ids;
   ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
   std::string reasoning_text;
@@ -325,6 +328,16 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     Json role = Json::Object();
     role.Set("role", Json::String("assistant"));
     WriteSse(writer, "", SseDelta(std::move(role), ""), false);
+    // Prefill progress rides the stream ahead of thinking: the UI
+    // shows it as a loading line until the first deltas arrive.
+    options.prefill_progress = [&](std::size_t done, std::size_t total) {
+      Json prefill = Json::Object();
+      prefill.Set("done", Json::Number(static_cast<double>(done)));
+      prefill.Set("total", Json::Number(static_cast<double>(total)));
+      Json delta = Json::Object();
+      delta.Set("prefill", std::move(prefill));
+      WriteSse(writer, "", SseDelta(std::move(delta), ""), false);
+    };
     const auto gen_started = std::chrono::steady_clock::now();
     auto streamed = engine_.GenerateStreaming(
         model_, options,
@@ -436,8 +449,10 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
   }
-  RunTurn(session, writer, MaxTokensFrom(body, default_max_tokens_),
-          BodyFlag(body, "enable_thinking", true),
+  WarnRetiredMaxTokens(engine_.Diagnostics(), body);
+  RunTurn(session, writer,
+          MaxCompletionTokensFrom(body, default_max_completion_tokens_),
+          MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body));
 }
 
@@ -458,8 +473,10 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
   if (!BeginTurn(session, writer, gpu, guard)) {
     return;
   }
-  RunTurn(session, writer, MaxTokensFrom(body, default_max_tokens_),
-          BodyFlag(body, "enable_thinking", true),
+  WarnRetiredMaxTokens(engine_.Diagnostics(), body);
+  RunTurn(session, writer,
+          MaxCompletionTokensFrom(body, default_max_completion_tokens_),
+          MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body));
 }
 

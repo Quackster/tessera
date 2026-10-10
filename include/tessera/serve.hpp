@@ -12,23 +12,23 @@
 
 namespace tessera {
 
-// Default completion length (32k tokens) when a request omits
-// max_tokens and the caller leaves the default below. Bounding the
-// default keeps an unspecified request from decoding to the end of a
-// large context window.
+// Zero default completion length: a request that omits
+// max_completion_tokens fills the remaining context (see
+// Model::EffectiveMaxTokens) instead of stopping after a fixed budget.
 //
 // Usage:
 //   ServeOptions options;
-//   options.default_max_tokens = kDefaultMaxTokens;
-constexpr std::size_t kDefaultMaxTokens = 32u * 1024u;
+//   options.default_max_completion_tokens = kDefaultMaxCompletionTokens;
+constexpr std::size_t kDefaultMaxCompletionTokens = 0;
 
 // Options for Serve.
 struct ServeOptions {
   // Interface to bind (dotted IPv4 literal).
   std::string host = "127.0.0.1";
   std::uint16_t port = 8080;
-  // Default completion length when a request omits max_tokens.
-  std::size_t default_max_tokens = kDefaultMaxTokens;
+  // Default completion length when a request omits max_completion_tokens
+  // (0 fills the remaining context).
+  std::size_t default_max_completion_tokens = kDefaultMaxCompletionTokens;
   // Accepted API keys. Empty means no authentication. /health and
   // /metrics stay public.
   std::vector<std::string> api_keys;

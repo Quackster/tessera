@@ -29,8 +29,8 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Backends | Done | Init and buffer alloc on Vulkan and ROCm. Copy and sync on both. |
 | Kernel launch | Done | Binds buffers and 64 bit scalars. `fill` and `gemm_q4k` kernels verified by read back on both backends. ROCm launches are asynchronous; Vulkan pipelines launches through a four-slot command-buffer and fence ring, so the host does not wait on a fence after every kernel. |
 | DFlash2 | Partial | Draft forward built: grouped dynamic convolution, sliding attention, candidate selector and target-hidden fusion. The real draft loads and runs the block. The 27B MXFP4 target accepts 4.4 tokens per step. Output equals greedy. The draft step costs more than greedy, so speed work remains. |
-| CLI | Partial | Loads a model, prints a tensor summary, streams generated text to stdout (`--tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). It serves HTTP (`serve`), samples (`--sample` and parameter flags), selects the KV cache (`--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`), speculates (`--speculate`, `--draft`) and encodes images (`--mmproj`, `--image`). Text prompts work for GGUF and MXFP4. |
-| Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in chunk-sized batched forwards (512 by default, `--prefill-chunk`), so a 220k-token prompt on the 8-bit KV cache (`--context 220000 --kv-q8`) prefills in bounded memory. Each forward is also clamped to the attention work budget, so a long prompt cannot wedge the device with one oversized launch. A prompt past the context is rejected before any device work. A zero `max_tokens` fills the remaining context. Requests without `max_tokens` cap at 32k output tokens. Generation stops at the model's declared stop tokens (GGUF `tokenizer.ggml.eos_token_id`, HuggingFace `eos_token_id`) and does not emit them; callers add stops through `GenerateOptions::stop_tokens`. Runtime options: `--context`, `--tokens`, `--prefill-chunk`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) or FP8 (`--kv-fp8`) KV cache. |
+| CLI | Partial | Loads a model, prints a tensor summary, streams generated text to stdout (`--max-completion-tokens`), caps thinking per turn (`--max-thinking-tokens`), picks the GPU (`--gpu`) and lists them (`--list-gpus`). It serves HTTP (`serve`), samples (`--sample` and parameter flags), selects the KV cache (`--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`), speculates (`--speculate`, `--draft`) and encodes images (`--mmproj`, `--image`). Text prompts work for GGUF and MXFP4. |
+| Generation | Done | `Engine::Generate` greedy decode on the non-speculative path; the prompt prefills in chunk-sized batched forwards (512 by default, `--prefill-chunk`), so a 220k-token prompt on the 8-bit KV cache (`--context 220000 --kv-q8`) prefills in bounded memory. Each forward is also clamped to the attention work budget, so a long prompt cannot wedge the device with one oversized launch. A prompt past the context is rejected before any device work. A zero `max_completion_tokens` fills the remaining context, which is also the default for requests that omit it. A `max_thinking_tokens` budget force-closes the think block past budget and decoding continues with the answer. Generation stops at the model's declared stop tokens (GGUF `tokenizer.ggml.eos_token_id`, HuggingFace `eos_token_id`) and does not emit them; callers add stops through `GenerateOptions::stop_tokens`. Runtime options: `--context`, `--max-completion-tokens`, `--max-thinking-tokens`, `--prefill-chunk`, `--draft-block`, fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) or FP8 (`--kv-fp8`) KV cache. |
 | KV cache | Done | fp32 (default), fp16 (`--kv-f16`), int8 (`--kv-q8`), 4-bit (`--kv-q4`) and FP8 E4M3 (`--kv-fp8`, the served target's cache quant) full-attention storage on both backends. |
 | Sampling | Done | Optional seeded sampling with the Qwen 3.8 27B defaults (temperature, top_p, top_k, min_p, presence/repetition penalties); `--sample` and parameter flags. |
 | GEMM | Done | Generic GEMM with Q4_K, Q5_K, Q6_K, Q3_K, Q8_0, IQ, FP8/MXFP4 dequant, block-scaled FP8, plain fp32 and bf16. Tiled batched kernels for the hot formats (four partial sums per thread) and warp-per-output decode GEMVs. An fp8 tensor-core MXFP4 GEMM and a bf16 tensor-core GEMM cover the m=1 to 16 decode and verify batch. The vocab-width bf16 head uses the bf16 tensor-core kernel, so it streams coalesced. Host reference check. Per backend tolerance. |
@@ -44,7 +44,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | DFlash2 decode | Partial | DFlash2 speculation runs end to end with the real draft (target hidden capture, mask block, selector, accept/reject). The draft conditions on a device-resident per-layer context K/V cache built from committed target positions. The concatenated target hidden is quantized per token to FP8 E4M3 before `fc`. Output equals greedy. On the 27B MXFP4 target the draft accepts 3.5 to 4.4 tokens per step, above the served reference (2.7 to 2.85), and decodes faster than greedy (about 55 against 23 tok/s). The speculative step is about 84 ms; the remaining gap to the reference is the draft forward cost. Two defects were fixed (the candidate extraction ranked only the first 16 token ids on rows after the first, and the selector added the predecessor unary logit instead of the successor). |
 | Baseline pinning | Done | Fixed-seed hybrid fixtures pin exact greedy sequences; identical on Vulkan and ROCm. |
 | Tokenizer and chat | Done | Byte-level BPE tokenizer from GGUF metadata or HuggingFace `tokenizer.json`. Jinja2-subset chat template renderer. Generation stops at the declared stop tokens and never emits them. |
-| Serving | Partial | Blocking HTTP/1.1 server with buffered and chunked (SSE) responses, API-key auth and CORS. First endpoint set done. `/v1/chat/completions` supports OpenAI-form tool calls (template-rendered tools, `tool_calls` answers, `tool_choice`). Generations queue in arrival order on the single device, so parallel windows wait instead of failing. Each chat lives in a server session (`/api/sessions`, `/v1/sessions` aliases); the OpenAI endpoints continue one through `session_id`, and `GET /slots` reports the live sessions. The model thinking block is reported as `reasoning_content` instead of leaking into the reply. A dependency-free web chat UI at `/` offers session history with retry, pause and stop, per-message timestamps and generation speed, an expandable thinking box, and sticky scrolling that never yanks the view, and renders SVG, HTML and images. A closed window or cancelled request aborts its generation and frees the device. More surfaces deferred. |
+| Serving | Partial | Blocking HTTP/1.1 server with buffered and chunked (SSE) responses, API-key auth and CORS. First endpoint set done. `/v1/chat/completions` supports OpenAI-form tool calls (template-rendered tools, `tool_calls` answers, `tool_choice`). Generations queue in arrival order on the single device, so parallel windows wait instead of failing. Each chat lives in a server session (`/api/sessions`, `/v1/sessions` aliases); the OpenAI endpoints continue one through `session_id`, and `GET /slots` reports the live sessions. The model thinking block is reported as `reasoning_content` instead of leaking into the reply. A dependency-free web chat UI at `/` offers session history with retry, pause and stop, per-message timestamps and generation speed, an expandable thinking box, and sticky scrolling that never yanks the view, and renders SVG, HTML and images. Turns take `max_completion_tokens` and `max_thinking_tokens` budgets. Prefill progress streams ahead of thinking. A closed window or cancelled request aborts its generation and frees the device. More surfaces deferred. |
 | Vision | Partial | CLIP encoder plus merger, PPM load and resize, image-embedding injection, CLI wiring with auto `<|image_pad|>` detection. Image prefill speed work remains. |
 | Architecture modules | Done | One `Architecture` module per model family (`src/models/qwen3_5/`). The hybrid trunk and state live behind it. Core names no model. |
 | MoE, MLP, norms | Todo | RMSNorm, sigmoid-gate, add, silu_mul and the f32/bf16/Q4_K embedding gather kernels are done. The gated MLP runs as gemm plus silu_mul plus gemm on the device. No MoE kernels exist yet. MoE is planned for Ornith-1.5-35B-A3B. No per model branches. |
@@ -108,7 +108,7 @@ CLI example:
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --draft ~/models/Qwen3.8-27B-DFlash2-FP8
 ```
 
-The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count, total elements and device bytes. With `--tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head. `--draft` drafts with the DFlash2 checkpoint. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
+The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` is set. It prints tensor count, total elements and device bytes. With `--max-completion-tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head. `--draft` drafts with the DFlash2 checkpoint. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
 
 ## Usage
 
@@ -118,10 +118,10 @@ Simple text prompt with the CLI:
 ./cmake-build-vulkan/tessera-cli run \
   --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
   --prompt-text "Explain gravity in one sentence." \
-  --tokens 64
+  --max-completion-tokens 64
 ```
 
-`--tokens` is optional. Without it the run fills the remaining context. Output tokens stream to stdout during the run, so the first token shows at once instead of after the full run.
+`--max-completion-tokens` is optional. Without it the run fills the remaining context. Output tokens stream to stdout during the run, so the first token shows at once instead of after the full run.
 
 The CLI applies the model chat template by default. It uses the raw text with `--no-chat`. String prompts need a model with a tokenizer. Both formats provide one: GGUF carries it in metadata, and the MXFP4 loader parses the HuggingFace `tokenizer.json` (and the chat template from `tokenizer_config.json` or `chat_template.jinja`). The CLI and the HTTP server accept string prompts for either format. String prompts still fail on a model without a tokenizer, such as a bare DFlash2 draft directory.
 
@@ -142,7 +142,7 @@ if (auto rendered = (*model)->ChatPrompt(text)) text = *rendered;
 auto ids = tokenizer->Encode(text);
 
 tessera::GenerateOptions options;
-options.max_tokens = 64;  // Optional. Zero fills the remaining context.
+options.max_completion_tokens = 64;  // Optional. Zero fills the remaining context.
 options.prompt_tokens = *ids;
 auto generated = (*engine)->Generate(**model, options);
 if (!generated) return 1;
@@ -157,11 +157,11 @@ HTTP API with the server:
   --port 8080
 curl -X POST http://127.0.0.1:8080/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Explain gravity in one sentence.", "max_tokens": 64}'
+  -d '{"prompt": "Explain gravity in one sentence.", "max_completion_tokens": 64}'
 curl http://127.0.0.1:8080/health
 ```
 
-`max_tokens` is optional. Without it the server fills the remaining context.
+`max_completion_tokens` is optional. Without it the server fills the remaining context.
 
 With `--api-key` set, requests need `Authorization: Bearer <key>`. `GET /health` and `GET /metrics` stay public.
 

@@ -227,9 +227,10 @@ bool ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
     return false;
   }
   GenerateOptions options;
-  options.max_tokens = MaxTokensFrom(body, default_max);
+  options.max_completion_tokens = MaxCompletionTokensFrom(body, default_max);
+  options.max_thinking_tokens = MaxThinkingTokensFrom(body);
   options.prompt_tokens = *ids;
-  if (RejectOversizePrompt(writer, ids->size(), options.max_tokens,
+  if (RejectOversizePrompt(writer, ids->size(),
                            model.MaxContextLength())) {
     return false;
   }

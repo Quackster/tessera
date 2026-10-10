@@ -29,7 +29,8 @@
 <button id="pause" type="button" hidden>Pause</button>
 <button id="resume" type="button" hidden>Resume</button>
 <button id="retry" type="button">Retry</button>
-<label>Max tokens <input id="max-tokens" type="number" min="1" value="@TESSERA_DEFAULT_MAX_TOKENS@"></label>
+<label>Max completion tokens <input id="max-completion-tokens" type="number" min="0" value="@TESSERA_DEFAULT_MAX_COMPLETION_TOKENS@"></label>
+<label>Max thinking tokens <input id="max-thinking-tokens" type="number" min="0" value="0"></label>
 <label><input id="thinking" type="checkbox" checked> Thinking</label>
 </div>
 <div id="error" hidden></div>

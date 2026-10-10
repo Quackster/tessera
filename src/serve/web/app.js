@@ -255,6 +255,10 @@ function renderBareMedia(line) {
 }
 
 function messageHtml(message, thinkingOpen) {
+  const prefill = (!message.reasoning_content && !message.content &&
+      message.prefill)
+      ? '<div class="prefill">' + escapeHtml(message.prefill) + '</div>'
+      : '';
   const thinking = message.reasoning_content
       ? '<details class="thinking"' + (thinkingOpen ? ' open' : '') +
         '><summary>Thinking</summary><div class="thinking-body">' +
@@ -264,7 +268,7 @@ function messageHtml(message, thinkingOpen) {
       ? ' <span class="stopped-badge">(stopped)</span>' : '';
   return messageMeta(message) +
       '<div class="content"><div class="role">' + escapeHtml(message.role) +
-      stopped + '</div><div class="body">' + thinking +
+      stopped + '</div><div class="body">' + prefill + thinking +
       renderMarkdown(message.content || '') + '</div></div>';
 }
 
@@ -407,6 +411,8 @@ async function streamTurn(path, payload, base, sid) {
   showError('');
   let thinking = '';
   let content = '';
+  let prefill = '';
+  let generating = false;
   const turnStarted = Date.now();
   const draw = (thinkingOpen) => {
     if (myTurn !== activeTurn) return;
@@ -419,6 +425,7 @@ async function streamTurn(path, payload, base, sid) {
       tokens_per_second: 0,
       prompt_tokens: 0,
       completion_tokens: 0,
+      prefill: (!thinking && !content) ? prefill : '',
     }]), thinkingOpen, 'sticky');
   };
   draw(true);
@@ -454,6 +461,21 @@ async function streamTurn(path, payload, base, sid) {
           if (data === '[DONE]') break;
           const chunk = JSON.parse(data);
           const delta = ((chunk.choices || [])[0] || {}).delta || {};
+          if (delta.prefill) {
+            const done = Number(delta.prefill.done) || 0;
+            const total = Number(delta.prefill.total) || 0;
+            prefill = total > 0
+                ? 'Prefill ' + done + '/' + total + ' (' +
+                  Math.round(done / total * 100) + '%)'
+                : 'Prefill ' + done + ' tokens';
+            setStatus(prefill);
+            draw(true);
+            continue;
+          }
+          if (!generating) {
+            generating = true;
+            setStatus('Generating\u2026');
+          }
           if (delta.reasoning_content) thinking += delta.reasoning_content;
           if (delta.content) content += delta.content;
           draw(!content);
@@ -516,8 +538,8 @@ async function sendMessage() {
   await streamTurn('/api/sessions/' + currentId + '/chat', {
     message: text,
     stream: true,
-    max_tokens: Number($('max-tokens').value) ||
-        Number($('max-tokens').defaultValue),
+    max_completion_tokens: completionBudget(),
+    max_thinking_tokens: thinkingBudget(),
     enable_thinking: $('thinking').checked,
   }, base, currentId);
 }
@@ -532,10 +554,22 @@ async function retryTurn() {
   }
   await streamTurn('/api/sessions/' + currentId + '/retry', {
     stream: true,
-    max_tokens: Number($('max-tokens').value) ||
-        Number($('max-tokens').defaultValue),
+    max_completion_tokens: completionBudget(),
+    max_thinking_tokens: thinkingBudget(),
     enable_thinking: $('thinking').checked,
   }, base, currentId);
+}
+
+// Budgets from the composer inputs: 0 (including a cleared field)
+// means unlimited and fills the remaining context.
+function completionBudget() {
+  const input = $('max-completion-tokens');
+  return Number(input.value) || Number(input.defaultValue);
+}
+
+function thinkingBudget() {
+  const input = $('max-thinking-tokens');
+  return Number(input.value) || 0;
 }
 
 // Controls target the live turn when one runs, else the open session.
