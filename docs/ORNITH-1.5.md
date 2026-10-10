@@ -292,5 +292,5 @@ carries none).
   37 to 84 tok/s (ROCm) and 88 tok/s (Vulkan); prefill 27 to 81 tok/s.
   Both backends return the same answers. A host-reference test for the
   fused expert kernels caught a Vulkan launch-convention bug (the gate/up
-  grid processed a single expert), now fixed. Suite is 207 tests on both
+  grid processed a single expert), now fixed. Suite is 208 tests on both
   backends.

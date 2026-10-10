@@ -26,7 +26,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Public API | Done | `Engine`, `Backend`, `SpeculativeStrategy`. |
 | GGUF loader | Done | v2/v3 headers, bounds-checked, memory-mapped (not copied). |
 | MXFP4 loader | Done | Tensor map, weight upload. FP8 and MXFP4 GEMM verified. |
-| Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched H2D upload (`CopyH2DBatch`); ROCm drains a 256 MiB pinned window, one sync per chunk. |
+| Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched H2D upload (`CopyH2DBatch`); ROCm drains a 256 MiB pinned window, one sync per chunk. ROCm re-selects the configured GPU on every thread that touches the device. |
 | Kernel launch | Done | Vulkan records a whole decode step into one command buffer. ROCm runs one blocking stream with pinned staging. |
 | DFlash2 | Partial | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. Draft cost still high. |
 | CLI | Partial | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, calibrate. |
@@ -44,7 +44,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |
 | Baseline pinning | Done | Fixed-seed fixtures identical on Vulkan and ROCm. |
 | Tokenizer and chat | Done | Byte-level BPE, Jinja2-subset templates, stop tokens. |
-| Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. |
+| Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. Capability harness (`tools/harness/probe_harness.py`) drives task steering, long-horizon context and session memory over the API on both backends. |
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
 | MoE, MLP, norms | Partial | Norms and MLP kernels done. Sparse mixture-of-experts (Ornith-1.5) decodes on Vulkan and ROCm with fused routed-expert kernels (84 tok/s ROCm, 88 Vulkan). Grouped-expert batch GEMM is the follow-up. |

@@ -264,6 +264,9 @@ class RocmBackend final : public Backend {
     if (!initialized_) {
       return std::unexpected(StatusCode::DeviceError);
     }
+    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+      return std::unexpected(device);
+    }
     void* ptr = nullptr;
     auto error =
         kind == MemoryKind::Device
@@ -281,6 +284,7 @@ class RocmBackend final : public Backend {
   }
 
   void FreeBuffer(MemoryKind kind, void* handle) override {
+    (void)SelectDevice();
     auto error =
         kind == MemoryKind::Device ? hipFree(handle) : hipFreeHost(handle);
     if (error != hipSuccess) {
@@ -292,6 +296,9 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyH2D(Buffer& dst,
                                          std::span<const std::byte> src) override {
+    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+      return std::unexpected(device);
+    }
     if (src.size() > dst.Size()) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
@@ -316,6 +323,9 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyH2DBatch(
       std::span<const Backend::HostCopy> copies) override {
+    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+      return std::unexpected(device);
+    }
     for (const Backend::HostCopy& copy : copies) {
       if (copy.dst == nullptr || copy.src.size() > copy.dst->Size()) {
         return std::unexpected(StatusCode::InvalidArgument);
@@ -391,6 +401,9 @@ class RocmBackend final : public Backend {
   std::expected<void, StatusCode> CopyD2HAt(
       const Buffer& src, std::size_t offset, std::byte* dst,
       std::size_t bytes) override {
+    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+      return std::unexpected(device);
+    }
     if (offset > src.Size() || bytes > src.Size() - offset) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
@@ -419,6 +432,9 @@ class RocmBackend final : public Backend {
   std::expected<void, StatusCode> CopyD2D(
       const Buffer& src, std::size_t src_offset, Buffer& dst,
       std::size_t dst_offset, std::size_t bytes) override {
+    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+      return std::unexpected(device);
+    }
     if (src_offset > src.Size() || bytes > src.Size() - src_offset ||
         dst_offset > dst.Size() || bytes > dst.Size() - dst_offset) {
       return std::unexpected(StatusCode::InvalidArgument);
@@ -468,6 +484,9 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> LaunchKernel(const Kernel& kernel,
                                               const KernelLaunch& launch) override {
+    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+      return std::unexpected(device);
+    }
     auto invalid = ValidateLaunch(launch);
     if (invalid != StatusCode::Ok) {
       return std::unexpected(invalid);
@@ -523,6 +542,7 @@ class RocmBackend final : public Backend {
   }
 
   void Synchronize() override {
+    (void)SelectDevice();
     auto error = hipStreamSynchronize(stream_);
     if (error != hipSuccess) {
       LogError(std::string("hipStreamSynchronize failed (") +
@@ -532,6 +552,26 @@ class RocmBackend final : public Backend {
   }
 
  private:
+  // HIP's current device is per-thread; Init selects it only on the
+  // creating thread, so the serve loader and other workers start on the
+  // default device. Every device entry point re-selects it here, and the
+  // thread-local cache keeps the hot path to one comparison.
+  StatusCode SelectDevice() {
+    static thread_local int selected = -1;
+    if (selected == device_index_) {
+      return StatusCode::Ok;
+    }
+    auto error = hipSetDevice(device_index_);
+    if (error != hipSuccess) {
+      LogError(std::string("hipSetDevice(") + std::to_string(device_index_) +
+               ") failed on this thread (" + HipErrorName(error) +
+               "); the backend cannot touch that GPU here");
+      return FromHip(error);
+    }
+    selected = device_index_;
+    return StatusCode::Ok;
+  }
+
   // A reusable pinned host staging buffer. A device<->host copy to pageable
   // memory makes hipMemcpyAsync synchronous and busy-waits in the runtime,
   // so every host readback and upload goes through pinned memory instead.

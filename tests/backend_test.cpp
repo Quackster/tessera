@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "core/decode_internal.hpp"
@@ -86,6 +87,59 @@ TEST(BackendTest, CreateAndInit) {
   // Init is idempotent.
   auto second = backend->Init();
   ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
+}
+
+// HIP's current device is per-thread, so a launch from a worker thread
+// (the serve loader) lands on device 0 unless every backend entry point
+// re-selects the configured device. Before the fix, serve on any GPU
+// other than the first failed with hipErrorInvalidHandle. Needs a
+// second device to exercise a non-default index.
+TEST(BackendTest, WorkerThreadLaunchTargetsConfiguredDevice) {
+  auto names = tessera::ListGpuNames();
+  if (!names || names->size() < 2) {
+    GTEST_SKIP() << "needs two devices to exercise a non-default device index";
+  }
+  constexpr int kDevice = 1;
+  std::unique_ptr<Backend> backend = CreateBackend();
+  ASSERT_TRUE(backend != nullptr);
+  backend->SetDeviceIndex(kDevice);
+  auto init = backend->Init();
+  if (!init) {
+    GTEST_SKIP() << "device " << kDevice << " unavailable: "
+                 << tessera::ToString(init.error());
+  }
+  constexpr std::uint64_t kCount = 512;
+  constexpr int kValue = 7;
+  auto out = backend->AllocateBuffer(kCount * sizeof(int), MemoryKind::Device);
+  auto kernel = backend->LoadKernel("fill", {});
+  ASSERT_TRUE(out.has_value()) << tessera::ToString(out.error());
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::uint32_t launch_error = 0;
+  std::thread worker([&] {
+    tessera::KernelLaunch launch;
+    launch.grid_x = static_cast<std::uint32_t>((kCount + 255) / 256);
+    launch.block_x = 256;
+    launch.buffers = {(*out).get()};
+    launch.scalars = {static_cast<std::uint64_t>(kValue), kCount};
+    auto launched = backend->LaunchKernel(**kernel, launch);
+    if (!launched) {
+      launch_error = static_cast<std::uint32_t>(launched.error());
+      return;
+    }
+    backend->Synchronize();
+  });
+  worker.join();
+  EXPECT_EQ(launch_error, 0u)
+      << "a launch from a worker thread failed; the backend did not select "
+      << "device " << kDevice;
+  std::vector<int> readback(kCount);
+  auto download = backend->CopyD2H(
+      **out, reinterpret_cast<std::byte*>(readback.data()),
+      readback.size() * sizeof(int));
+  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+  for (int value : readback) {
+    EXPECT_EQ(value, kValue);
+  }
 }
 
 // GPU-only enumeration: a CPU rasterizer must never appear in the GPU

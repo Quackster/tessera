@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 207/207 `ctest` on vulkan. 207/207 `ctest` on ROCm.
+Latest suite: 208/208 `ctest` on vulkan. 208/208 `ctest` on ROCm.
 The suite is trimmed to the coverage that catches a decode break: the
 kernel correctness tests (vs host references), the decode/speculation
 tests, the model loaders, and the calibration device test. The serving,
@@ -51,6 +51,27 @@ through RADV GFX1100, rocm through the system ROCm).
   `hipSyncPolicyBlockingSync`, so host waits sleep instead of busy
    waiting in the runtime. Covered by the launch and copy device
    tests on both backends.
+- ROCm selects the configured GPU on every thread that touches the
+  device. HIP's current device is thread-local and was set only in
+  `Init`, so the serve loader thread (a different thread from the one
+  that created the engine) launched kernels on device 0. `serve` on
+  any GPU other than the first failed at warmup with
+  `kernel embedding_q4k launch failed (hipErrorInvalidHandle)`; a
+  remapped `HIP_VISIBLE_DEVICES` hid it. Every backend entry point now
+  re-selects `device_index_` through one helper with a thread-local
+  cache, so the hot path stays one comparison per launch. Covered by
+  `BackendTest.WorkerThreadLaunchTargetsConfiguredDevice`, which
+  launches from a worker thread on a non-default GPU and skips without
+  two devices. Verified on ROCm (gfx1201).
+- HTTP API capability harness (`tools/harness/probe_harness.py`). It
+  launches `serve`, waits on `/health`, and drives three probe families
+  over the OpenAI-compatible API: task steering (system-prompt format,
+  suffix and language constraints), long-horizon context (a needle at
+  about 450 and 900 tokens), and memory fetching (a chat session
+  recalls a fact from an earlier turn and the stored history is
+  checked). On the first-class targets all probes pass on both
+  backends: Qwen3.8 27B GGUF (rocm, vulkan), MXFP4 (rocm, vulkan, with
+  MTP, with DFlash2) and Ornith-1.5 MoE GGUF (rocm, vulkan).
 - Quantized KV append is row-parallel. `quantize_q8`, `quantize_q4`
    and `quantize_fp8_pack` are one workgroup per row: the workgroup
    reduces the row absmax in shared memory and packs the codes
