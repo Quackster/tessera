@@ -66,14 +66,16 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
                                 unsigned long long head_dim,
                                 unsigned long long q_base,
                                 unsigned long long window,
-                                unsigned long long kv_f16,
-                                unsigned long long causal) {
+                                 unsigned long long kv_f16,
+                                 unsigned long long causal) {
   // One workgroup per (query row, head); the query/key dot product is
   // computed once per key, so the cost is O(n * head_dim) per query/head.
   constexpr unsigned long long kTile = 256;
   __shared__ float q_s[256];
   __shared__ float sc[256];
   __shared__ float wt[256];
+  // Tile reduction broadcast: thread 0 computes the max/weights once.
+  __shared__ float tile_bc[3];
   const std::uint16_t* kh = reinterpret_cast<const std::uint16_t*>(k);
   const std::uint16_t* vh = reinterpret_cast<const std::uint16_t*>(v);
   const auto kat = [&](unsigned long long idx) {
@@ -125,19 +127,29 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     }
     sc[e] = s;
     __syncthreads();
-    float tmax = -1e30f;
-    for (unsigned long long t = 0; t < kTile; ++t) {
-      tmax = fmaxf(tmax, sc[t]);
-    }
-    const float m_new = fmaxf(run_max, tmax);
-    const float corr = expf(run_max - m_new);
-    float l = 0.0f;
-    for (unsigned long long t = 0; t < kTile; ++t) {
-      const float w = expf(sc[t] - m_new);
-      wt[t] = w;
-      l += w;
+    // One thread reduces the tile so a long context pays one scan,
+    // not one scan per thread. Same order as before, same numerics.
+    if (e == 0) {
+      float tmax = -1e30f;
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        tmax = fmaxf(tmax, sc[t]);
+      }
+      const float m_new = fmaxf(run_max, tmax);
+      const float corr = expf(run_max - m_new);
+      float l = 0.0f;
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        const float w = expf(sc[t] - m_new);
+        wt[t] = w;
+        l += w;
+      }
+      tile_bc[0] = m_new;
+      tile_bc[1] = corr;
+      tile_bc[2] = l;
     }
     __syncthreads();
+    const float m_new = tile_bc[0];
+    const float corr = tile_bc[1];
+    const float l = tile_bc[2];
     float a = 0.0f;
     // Only lanes below head_dim have an output element; the others read
     // past the value row if they run this loop, so guard it.
@@ -1531,6 +1543,8 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
   __shared__ float q_s[256];
   __shared__ float sc[256];
   __shared__ float wt[256];
+  // Tile reduction broadcast: thread 0 computes the max/weights once.
+  __shared__ float tile_bc[3];
   const unsigned long long g = blockIdx.x;
   if (g >= m * heads) {
     return;
@@ -1571,19 +1585,29 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
     }
     sc[e] = s;
     __syncthreads();
-    float tmax = -1e30f;
-    for (unsigned long long t = 0; t < kTile; ++t) {
-      tmax = fmaxf(tmax, sc[t]);
-    }
-    const float m_new = fmaxf(run_max, tmax);
-    const float corr = expf(run_max - m_new);
-    float l = 0.0f;
-    for (unsigned long long t = 0; t < kTile; ++t) {
-      const float w = expf(sc[t] - m_new);
-      wt[t] = w;
-      l += w;
+    // One thread reduces the tile so a long context pays one scan,
+    // not one scan per thread. Same order as before, same numerics.
+    if (e == 0) {
+      float tmax = -1e30f;
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        tmax = fmaxf(tmax, sc[t]);
+      }
+      const float m_new = fmaxf(run_max, tmax);
+      const float corr = expf(run_max - m_new);
+      float l = 0.0f;
+      for (unsigned long long t = 0; t < kTile; ++t) {
+        const float w = expf(sc[t] - m_new);
+        wt[t] = w;
+        l += w;
+      }
+      tile_bc[0] = m_new;
+      tile_bc[1] = corr;
+      tile_bc[2] = l;
     }
     __syncthreads();
+    const float m_new = tile_bc[0];
+    const float corr = tile_bc[1];
+    const float l = tile_bc[2];
     float a = 0.0f;
     if (e < head_dim) {
       for (unsigned long long t = 0; t < kTile; ++t) {

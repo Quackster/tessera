@@ -26,6 +26,7 @@ layout(set = 0, binding = 5) buffer Out { float out_values[]; };
 shared float q_s[256];
 shared float sc[256];
 shared float wt[256];
+shared float tile_bc[3];
 
 // OCP FP8 E4M3 byte -> fp32 (port of the core Fp8E4M3ToFloat).
 float fp8_e4m3_value(uint bits) {
@@ -134,19 +135,28 @@ void main() {
     }
     sc[e] = s;
     barrier();
-    float tmax = -1e30;
-    for (uint t = 0u; t < 256u; ++t) {
-      tmax = max(tmax, sc[t]);
-    }
-    float m_new = max(run_max, tmax);
-    float corr = exp(run_max - m_new);
-    float l = 0.0;
-    for (uint t = 0u; t < 256u; ++t) {
-      float w = exp(sc[t] - m_new);
-      wt[t] = w;
-      l += w;
+    // One thread reduces the tile so a long context pays one scan.
+    if (e == 0u) {
+      float tmax = -1e30;
+      for (uint t = 0u; t < 256u; ++t) {
+        tmax = max(tmax, sc[t]);
+      }
+      float m_new = max(run_max, tmax);
+      float corr = exp(run_max - m_new);
+      float l = 0.0;
+      for (uint t = 0u; t < 256u; ++t) {
+        float w = exp(sc[t] - m_new);
+        wt[t] = w;
+        l += w;
+      }
+      tile_bc[0] = m_new;
+      tile_bc[1] = corr;
+      tile_bc[2] = l;
     }
     barrier();
+    float m_new = tile_bc[0];
+    float corr = tile_bc[1];
+    float l = tile_bc[2];
     float a = 0.0;
     if (e < head_dim) {
       for (uint t = 0u; t < 256u; ++t) {

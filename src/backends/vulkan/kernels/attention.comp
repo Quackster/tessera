@@ -40,6 +40,7 @@ const uint kTile = 256;
 shared float q_s[256];
 shared float sc[256];
 shared float wt[256];
+shared float tile_bc[3];
 
 float load_k(uint idx, uint kv_f16) {
   if (kv_f16 != 0u) {
@@ -107,21 +108,28 @@ void main() {
     }
     sc[e] = s;
     barrier();
-    // Tile max and softmax weights (each thread scans the tile; the
-    // inactive slots hold -1e30 and contribute nothing).
-    float tmax = -1e30;
-    for (uint t = 0; t < kTile; ++t) {
-      tmax = max(tmax, sc[t]);
-    }
-    float m_new = max(run_max, tmax);
-    float corr = exp(run_max - m_new);
-    float l = 0.0;
-    for (uint t = 0; t < kTile; ++t) {
-      float w = exp(sc[t] - m_new);
-      wt[t] = w;
-      l += w;
+    // One thread reduces the tile so a long context pays one scan.
+    if (e == 0u) {
+      float tmax = -1e30;
+      for (uint t = 0u; t < kTile; ++t) {
+        tmax = max(tmax, sc[t]);
+      }
+      float m_new = max(run_max, tmax);
+      float corr = exp(run_max - m_new);
+      float l = 0.0;
+      for (uint t = 0u; t < kTile; ++t) {
+        float w = exp(sc[t] - m_new);
+        wt[t] = w;
+        l += w;
+      }
+      tile_bc[0] = m_new;
+      tile_bc[1] = corr;
+      tile_bc[2] = l;
     }
     barrier();
+    float m_new = tile_bc[0];
+    float corr = tile_bc[1];
+    float l = tile_bc[2];
     float a = 0.0;
     // Only lanes below head_dim have an output element; the others would
     // read past the value row, so guard the loop.

@@ -6721,6 +6721,127 @@ TEST(BackendTest, AttentionFp8DeviceMatchesRef) {
       << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
+// Device: fp32 attention over multiple 256-key tiles matches the host
+// reference. The tiled kernel reduces each tile once (single thread),
+// so a long context must agree across tile boundaries.
+TEST(BackendTest, AttentionMultiTileMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(121);
+  constexpr std::size_t kM = 2, kN = 600, kHeads = 4, kKvHeads = 2, kDim = 16;
+  constexpr std::uint64_t kQBase = 598;
+  std::vector<float> q(kM * kHeads * kDim), k(kN * kKvHeads * kDim);
+  std::vector<float> v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  auto up = [&backend](const void* data, std::size_t bytes) {
+    auto b = backend->AllocateBuffer(bytes, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(data), bytes));
+    return std::move(*b);
+  };
+  auto q_buf = up(q.data(), q.size() * 4);
+  auto k_buf = up(k.data(), k.size() * 4);
+  auto v_buf = up(v.data(), v.size() * 4);
+  auto out_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(out_buf.has_value());
+  auto kernel = backend->LoadKernel("attention", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = kM * kHeads;
+  launch.block_x = 256;
+  launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), out_buf->get()};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 1};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(q.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(q.size());
+  ASSERT_TRUE(core::AttentionRef(std::span<const float>(q),
+                                 std::span<const float>(k),
+                                 std::span<const float>(v),
+                                 std::span<float>(ref), kM, kN, kHeads, kKvHeads,
+                                 kDim, kQBase)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: int8 KV attention over multiple tiles matches the host
+// reference. Same multi-tile coverage as above for the q8 path.
+TEST(BackendTest, AttentionQ8MultiTileMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(122);
+  constexpr std::size_t kM = 2, kN = 600, kHeads = 4, kKvHeads = 2, kDim = 16;
+  constexpr std::uint64_t kQBase = 598;
+  std::vector<float> q(kM * kHeads * kDim);
+  std::vector<float> k(kN * kKvHeads * kDim), v(kN * kKvHeads * kDim);
+  for (auto& x : q) x = DrawValue(rng);
+  for (auto& x : k) x = DrawValue(rng);
+  for (auto& x : v) x = DrawValue(rng);
+  const std::size_t kv_dim = kKvHeads * kDim;
+  std::vector<std::byte> k8(k.size()), v8(v.size());
+  std::vector<float> ks(kN), vs(kN);
+  ASSERT_TRUE(core::QuantizeQ8Ref(std::span<const float>(k),
+                                  std::span<std::byte>(k8),
+                                  std::span<float>(ks), kN, kv_dim)
+                  .has_value());
+  ASSERT_TRUE(core::QuantizeQ8Ref(std::span<const float>(v),
+                                  std::span<std::byte>(v8),
+                                  std::span<float>(vs), kN, kv_dim)
+                  .has_value());
+  auto up = [&backend](const void* data, std::size_t bytes) {
+    auto b = backend->AllocateBuffer(bytes, MemoryKind::Device);
+    backend->CopyH2D(**b, std::span<const std::byte>(
+                              reinterpret_cast<const std::byte*>(data), bytes));
+    return std::move(*b);
+  };
+  auto q_buf = up(q.data(), q.size() * 4);
+  auto k_buf = up(k8.data(), k8.size());
+  auto v_buf = up(v8.data(), v8.size());
+  auto ks_buf = up(ks.data(), ks.size() * 4);
+  auto vs_buf = up(vs.data(), vs.size() * 4);
+  auto out_buf = backend->AllocateBuffer(q.size() * 4, MemoryKind::Device);
+  ASSERT_TRUE(out_buf.has_value());
+  auto kernel = backend->LoadKernel("attention_q8", {});
+  ASSERT_TRUE(kernel.has_value());
+  tessera::KernelLaunch launch;
+  launch.grid_x = kM * kHeads;
+  launch.block_x = 256;
+  launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), ks_buf.get(),
+                    vs_buf.get(), out_buf->get()};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(q.size() * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(q.size());
+  ASSERT_TRUE(core::AttentionQ8Ref(
+                  std::span<const float>(q), std::span<const std::byte>(k8),
+                  std::span<const std::byte>(v8), std::span<const float>(ks),
+                  std::span<const float>(vs), std::span<float>(ref), kM, kN,
+                  kHeads, kKvHeads, kDim, kQBase, 0)
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol = AttentionToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
 // Device: symmetric 4-bit quantization matches the host reference.
 TEST(BackendTest, QuantizeQ4MatchesRef) {
   std::unique_ptr<Backend> backend;

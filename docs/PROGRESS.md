@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 351/351 `ctest` on vulkan. 330/330 `ctest` on ROCm.
+Latest suite: 373/373 `ctest` on vulkan. 373/373 `ctest` on ROCm.
 Both builds verified on AMD Radeon AI PRO R9700 (vulkan through
 RADV GFX1201, rocm through the system ROCm).
 
@@ -172,6 +172,11 @@ RADV GFX1201, rocm through the system ROCm).
   tiled attention, scan and norm ILP, Vulkan launch ring, async
   ROCm copies, cached host weights, chunked and bounded prefill.
   Greedy 23 tok/s. DFlash2 60 tok/s. Load 54 s.
+- Attention tile reduction: each 256-key tile now computes its
+  max and softmax weights once on one thread and shares them.
+  Before, all 256 threads scanned the tile, so a long context
+  paid 256 scans per tile. Same order, same numerics. Covered
+  by multi-tile device tests on both backends.
 
 ## Next (in order)
 
