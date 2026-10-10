@@ -157,6 +157,15 @@ class RocmBackend final : public Backend {
     return device_name_;
   }
 
+  DeviceMemoryInfo MemoryInfo() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+      return {};
+    }
+    return DeviceMemoryInfo{total_bytes, free_bytes};
+  }
+
   std::expected<void, StatusCode> Init() override {
     if (initialized_) {
       return {};

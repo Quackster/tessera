@@ -78,7 +78,7 @@ Hardware-dependent knobs in the tree today:
 | Setting | What it controls | Default | Candidates | Metric |
 | --- | --- | --- | --- | --- |
 | `mxfp4_split_target` | Split-K workgroups for the fp8 tensor-core MXFP4 GEMM. A small GPU is latency-bound with one split, a large GPU wants more. | `320` | `120`, `320`, `640` | decode tok/s |
-| `prefill_chunk_tokens` | Tokens per prefill forward. A larger chunk cuts launch overhead and raises scratch. A smaller chunk bounds memory. | auto `512` | `256`, `512`, `1024` | prefill tok/s |
+| `prefill_chunk_tokens` | Tokens per prefill forward. A larger chunk cuts launch overhead and raises scratch. A smaller chunk bounds memory. | auto `512` | `512`, `768`, `1024`, `1536`, `2048` | prefill tok/s |
 | `draft_tokens` | Draft block for speculative decode. A larger block trades acceptance against verify cost. | checkpoint value (DFlash2 block `8`) | `4`, `8`, and the checkpoint value | decode tok/s |
 
 The first and third settings target decode speed, as in Strata. The second
@@ -108,8 +108,10 @@ block.
 - Run the whole sweep in one process with one model load. Do not load the model
   per candidate (`AGENTS.md` rule 20). Each candidate is a per-request value,
   so no restart is needed.
-- Cap the run at five minutes. A longer run means the sweep is too heavy or a
-  kernel regressed. Stop and fix the cause.
+- Cap the run at fifteen minutes. A longer run means the sweep is too heavy or a
+  kernel regressed. Stop and fix the cause. The decode settings sweep a short
+  prompt and the prefill chunk a long one, so each measurement pays only the
+  phase it tunes.
 
 The default path is the floor. A candidate is kept only when it is faster and
 its output matches the default within the per-backend tolerance. Do not trade
@@ -166,7 +168,10 @@ tessera-cli calibrate --model <path> [--draft <dir>]
 The command loads the model once, warms it, sweeps the candidates, prints one
 line per sweep point and a final report, and writes the calibration file. On
 ROCm it sweeps the split target. On both backends it sweeps the prefill chunk
-and, when a draft is attached, the draft block.
+and, when a draft is attached, the draft block. It defaults the KV cache to
+int8 (kv8) and reports the maximum context length the device allows for that
+cache type: free device memory minus a 2 GiB reserve, divided by the per-token
+KV bytes over the full-attention layers.
 
 `run` and `serve` accept `--calibration <file>`. When the file has an entry for
 the current key, the engine uses the saved values unless an explicit flag

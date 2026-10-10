@@ -55,6 +55,15 @@ struct GenerateOptions {
   std::size_t max_completion_tokens = 0;
   // The first token fed to the decoder when prompt_tokens is empty.
   std::uint32_t first_token = 0;
+  // Split-K workgroup target for the fp8 tensor-core MXFP4 GEMM, the
+  // ROCm-only WMMA path (0 uses kDefaultMxFp4SplitTarget). A small GPU is
+  // latency-bound with one split; a large one wants more. The value is
+  // inert on Vulkan, where the kernel does not exist. This is the
+  // per-request tuning channel (see docs/CALIBRATE.md).
+  std::size_t mxfp4_split_target = 0;
+  // Upper bound on the split-K factor, the cap that keeps one projection
+  // from over-splitting (0 uses kDefaultMxFp4SplitCap).
+  std::size_t mxfp4_split_cap = 0;
   // Prompt tokens fed before generation; when non-empty they take the
   // place of first_token and the last one seeds generation.
   std::vector<std::uint32_t> prompt_tokens;
@@ -142,6 +151,14 @@ enum class FinishReason { Stop, Length, Aborted };
 struct GenerateOutcome {
   std::size_t produced = 0;
   FinishReason reason = FinishReason::Length;
+  // Prompt tokens fed before decoding. Zero when first_token was used.
+  std::size_t prompt_tokens = 0;
+  // Wall time of the prompt forward(s) and of the decode loop, in
+  // milliseconds, measured with a steady clock. The calibration sweep
+  // divides produced/prompt_tokens by these. Zero when the phase did not
+  // run.
+  double prefill_ms = 0.0;
+  double decode_ms = 0.0;
 };
 
 // Top-level facade: owns the backend and the loaded models.

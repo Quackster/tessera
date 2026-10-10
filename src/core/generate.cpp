@@ -84,6 +84,8 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   }
   core::DecodeCache cache;
   cache.kv_type = options.kv_type;
+  cache.tuning.mxfp4_split_target = options.mxfp4_split_target;
+  cache.tuning.mxfp4_split_cap = options.mxfp4_split_cap;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);
@@ -475,27 +477,34 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
                           " draft token(s) over " + std::to_string(spec_steps) +
                           " step(s)");
   }
+  const double decode_ms = static_cast<double>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - decode_started)
+          .count());
   if (produced > 0) {
-    const long long decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now() -
-                                    decode_started)
-                                    .count();
+    const long long decode_ms_ll = static_cast<long long>(decode_ms);
     const long long decode_tps =
-        decode_ms > 0
-            ? static_cast<long long>(produced) * 1000 / decode_ms
+        decode_ms_ll > 0
+            ? static_cast<long long>(produced) * 1000 / decode_ms_ll
             : 0;
     diagnostics_.Info(
         "engine", std::string("decode: ") + std::to_string(produced) +
-                      " token(s) in " + std::to_string(decode_ms) + " ms (" +
+                      " token(s) in " + std::to_string(decode_ms_ll) + " ms (" +
                       std::to_string(decode_tps) + " tok/s, " +
-                      std::to_string(decode_ms /
+                      std::to_string(decode_ms_ll /
                                      static_cast<long long>(produced)) +
                       " ms/token)");
   }
   const FinishReason reason = stopped    ? FinishReason::Stop
                               : aborted  ? FinishReason::Aborted
                                          : FinishReason::Length;
-  return GenerateOutcome{produced, reason};
+  GenerateOutcome outcome;
+  outcome.produced = produced;
+  outcome.reason = reason;
+  outcome.prompt_tokens = prompt.size();
+  outcome.prefill_ms = static_cast<double>(prefill_ms);
+  outcome.decode_ms = decode_ms;
+  return outcome;
 }
 
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::Generate(

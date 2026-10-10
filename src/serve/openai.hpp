@@ -7,6 +7,7 @@
 #include "core/json.hpp"
 #include "serve/http.hpp"
 #include "serve/session.hpp"
+#include "tessera/calibrate.hpp"
 
 // OpenAI-format completions over the chat model: POST /v1/completions
 // (raw prompt), POST /v1/chat/completions (messages) and POST
@@ -33,12 +34,14 @@ namespace serve {
 void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
                     SessionStore& sessions, std::mutex& generation,
                     ResponseWriter& writer, const core::Json& body,
-                    std::size_t default_max);
+                    std::size_t default_max,
+                    const CalibrationConfig& calibration = {});
 
 void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
                 SessionStore& sessions, std::mutex& generation,
                 ResponseWriter& writer, const core::Json& body,
-                std::size_t default_max, bool anthropic);
+                std::size_t default_max, bool anthropic,
+                const CalibrationConfig& calibration = {});
 
 }  // namespace serve
 

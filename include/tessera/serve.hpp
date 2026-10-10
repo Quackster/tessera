@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
@@ -40,6 +41,11 @@ struct ServeOptions {
   // Ask the model for a chat title after the first prompt of a new
   // session; off keeps the first user line as the title.
   bool auto_title = true;
+  // Saved calibration stamped onto every generated turn (see
+  // docs/CALIBRATE.md). A zero field uses the engine default. The server
+  // applies these to each request's tuning fields, so a calibrated serve
+  // reproduces `run` with --calibration.
+  CalibrationConfig calibration;
 };
 
 // Reports the loader's current step (for example "loading weights" or

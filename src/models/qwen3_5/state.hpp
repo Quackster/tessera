@@ -93,6 +93,13 @@ struct Qwen35State final : core::ArchState {
   std::size_t wmma_pack_rows = 0;
   std::size_t wmma_pack_cols = 0;
   bool wmma_pack_valid = false;
+  // Request split-K tuning for the fp8 tensor-core MXFP4 GEMM, copied from
+  // the cache when the state is created. 0 means the built-in default
+  // (kDefaultMxFp4SplitTarget / kDefaultMxFp4SplitCap). The
+  // TESSERA_MXFP4_SPLIT and TESSERA_MXFP4_SPLITCAP environment variables
+  // still win as a diagnostic override.
+  std::size_t mxfp4_split_target = 0;
+  std::size_t mxfp4_split_cap = 0;
   std::unordered_map<const void*, std::unique_ptr<Buffer>> mxfp4_wref;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
@@ -145,10 +152,15 @@ struct Qwen35State final : core::ArchState {
 };
 
 // The state for `cache`, created on first use. One architecture module per
-// cache.
+// cache. The request tuning the request carried into the cache is copied
+// onto the state here, so the architecture reads it without the core
+// naming an architecture field.
 inline Qwen35State& State(core::DecodeCache& cache) {
   if (!cache.arch) {
-    cache.arch = std::make_unique<Qwen35State>();
+    auto state = std::make_unique<Qwen35State>();
+    state->mxfp4_split_target = cache.tuning.mxfp4_split_target;
+    state->mxfp4_split_cap = cache.tuning.mxfp4_split_cap;
+    cache.arch = std::move(state);
   }
   return *static_cast<Qwen35State*>(cache.arch.get());
 }

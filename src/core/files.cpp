@@ -40,7 +40,10 @@ std::expected<std::vector<std::byte>, StatusCode> ReadFile(
 std::expected<void, StatusCode> WriteFile(
     const std::filesystem::path& path, std::span<const std::byte> data) {
   std::error_code ec;
-  if (std::filesystem::is_directory(path, ec) || ec) {
+  // Only an existing directory is rejected here. A status error for a path
+  // that does not exist yet is expected: the file is being created, and the
+  // ofstream open below reports any real I/O failure.
+  if (std::filesystem::is_directory(path, ec)) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);

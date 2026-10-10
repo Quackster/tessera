@@ -139,8 +139,15 @@ std::expected<bool, StatusCode> ProjectWmma(Backend& backend, Qwen35State& h,
   // device on the narrow projections (n ~ 5120) where one block per 64
   // columns leaves it latency-bound. Each split writes its K partial to its
   // own region of a scratch buffer; a reduce kernel sums the regions into the
-  // output (no atomics, no pre-zeroing). Both bounds are overridable.
-  std::uint64_t target = 320, cap = 4;
+  // output (no atomics, no pre-zeroing). The request tuning carried on the
+  // state sets both bounds; a zero uses the built-in default. The
+  // TESSERA_MXFP4_SPLIT / TESSERA_MXFP4_SPLITCAP environment variables stay
+  // as a diagnostic override and win over the request value.
+  std::uint64_t target = h.mxfp4_split_target != 0
+                             ? h.mxfp4_split_target
+                             : kDefaultMxFp4SplitTarget;
+  std::uint64_t cap = h.mxfp4_split_cap != 0 ? h.mxfp4_split_cap
+                                             : kDefaultMxFp4SplitCap;
   if (const char* e = std::getenv("TESSERA_MXFP4_SPLIT")) {
     target = std::strtoull(e, nullptr, 10);
   }

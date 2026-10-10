@@ -9,6 +9,7 @@
 #include "core/json.hpp"
 #include "serve/http.hpp"
 #include "serve/session.hpp"
+#include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
 #include "tessera/tokenizer.hpp"
@@ -42,7 +43,8 @@ class SessionHandler {
  public:
   SessionHandler(Engine& engine, Model& model, const Tokenizer& tokenizer,
                  SessionStore& sessions, std::mutex& generation,
-                 std::size_t default_max_completion_tokens, bool auto_title);
+                 std::size_t default_max_completion_tokens, bool auto_title,
+                 CalibrationConfig calibration = {});
 
   // Session CRUD over JSON bodies; 404 for an unknown id.
   void HandleList(ResponseWriter& writer) const;
@@ -84,6 +86,7 @@ class SessionHandler {
   std::mutex& generation_;
   std::size_t default_max_completion_tokens_;
   bool auto_title_;
+  CalibrationConfig calibration_;
 };
 
 }  // namespace tessera::serve

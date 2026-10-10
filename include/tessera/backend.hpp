@@ -24,6 +24,14 @@ enum class MemoryKind : int {
   HostVisible = 1,  // pinned host memory, mappable by the accelerator
 };
 
+// Device-local memory in bytes. `free_bytes` is the memory available for
+// new allocations at query time; it is zero when the backend cannot report
+// it (the caller then works from `total_bytes`).
+struct DeviceMemoryInfo {
+  std::uint64_t total_bytes = 0;
+  std::uint64_t free_bytes = 0;
+};
+
 // Kernel argument binding limits: the layout both backends expose to a
 // kernel (descriptor bindings and scalar/push-constant arguments).
 constexpr std::size_t kMaxBoundBuffers = 16;
@@ -808,6 +816,11 @@ class Backend {
   [[nodiscard]] virtual std::string_view Name() const = 0;
   // Human-readable device name, for diagnostics.
   [[nodiscard]] virtual std::string_view DeviceName() const = 0;
+
+  // Total and free device-local memory, for sizing a KV cache or a
+  // context length. Both fields are zero when the backend cannot report
+  // it. Safe to call after Init.
+  [[nodiscard]] virtual DeviceMemoryInfo MemoryInfo() const = 0;
 
   // Point the backend at the engine's diagnostics channel (called once
   // after construction; before Init).

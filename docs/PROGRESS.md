@@ -3,9 +3,9 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 391/391 `ctest` on vulkan. 391/391 `ctest` on ROCm.
-Both builds verified on AMD Radeon RX 7900 XTX (vulkan through
-RADV GFX1100, rocm through the system ROCm).
+Latest suite: 402/402 `ctest` on vulkan. 402/402 `ctest` on ROCm.
+Both builds verified on AMD Radeon AI PRO R9700 (vulkan through
+RADV GFX1201, rocm through the system ROCm).
 
 ## Current status
 
@@ -171,6 +171,40 @@ RADV GFX1100, rocm through the system ROCm).
   `--image-token`, `--mtp`, `--prompt`, `--tokens`, or
   `--max-tokens` flags. Opt-in env toggles: `TESSERA_MXFP4_W4A8=1`
   (off, no acceptance gain), `TESSERA_TARGET_BF16=1` (off).
+- Calibration (docs/CALIBRATE.md). A `calibrate` subcommand loads
+  the model once, warms it, sweeps the hardware dependent settings
+  (the MXFP4 fp8 split-K target on ROCm, the prefill chunk on both
+  backends, the draft block when a draft is attached), applies the
+  pick rule (keep a candidate only when it beats the default by more
+  than MIN_GAIN 0.03) and confirms a winner with an interleaved
+  re-measurement (three rounds each, median). The prefill candidates
+  are ascending multiples of 256 from the 512 default (512, 768,
+  1024, 1536, 2048); decode settings sweep a 64-token prompt, the
+  prefill chunk a long prompt, so the run stays within its cap. The
+  command defaults the KV cache to int8 (kv8) and reports the
+  maximum context length the device allows for that cache type
+  (free memory minus a 2 GiB reserve, divided by the per-token KV
+  bytes over the full-attention layers). It writes a JSON calibration
+  file keyed by backend, device, model, context, KV type and
+  strategy, and reports the backend used. `run` and `serve` accept
+  `--calibration <file>` (or `TESSERA_CALIBRATION`): a saved entry is
+  applied unless an explicit flag overrides it. The sweep, candidate
+  lists, pick rule, hardware key, context bound and file reader/writer
+  live in one module (`src/core/calibrate/`) behind
+  `include/tessera/calibrate.hpp`; the CLI is a thin front end. The
+  MXFP4 split-K target and cap moved from environment-only reads to
+  `GenerateOptions`, carried through the request tuning into the
+  architecture state (`TESSERA_MXFP4_SPLIT`/`SPLITCAP` still win as a
+  diagnostic override). Measured on the 27B MXFP4 target (ROCm,
+  GPU0, int8 KV, the default three-prompt set, 6m36s): the default
+  split target 320 and prefill chunk 512 were kept (every candidate
+  inside the noise floor; prefill held at about 73 tok/s for all
+  chunk sizes), 23.8 decode tok/s, 73.4 prefill tok/s. The reported
+  memory bound for the int8 cache is 359872 tokens. A calibrated run
+  produces the same tokens as the default. Covered by `CalibrateTest`
+  (stand-in engine sweep, candidate/pick/key/file/context units, and
+  a device test that confirms a calibrated split matches the default
+  within the per-backend tolerance).
 - Architecture modules: one `Architecture` module per model
   family (`src/models/qwen3_5/`). Core names no model. The Qwen3.5
   module handles HF config parse, weight rename, value-head
@@ -337,8 +371,10 @@ RADV GFX1100, rocm through the system ROCm).
   row count. Tiled GEMMs still dequantize each weight block once
   per tile, not once per prompt. Total work stays quadratic in
   prompt length. Measure prompt tok/s on text and image prompts.
-- Runtime options. Still to wire: batch caps for features that do
-  not exist yet. No hard-coded paths or sizes.
+- Runtime options. Calibration landed (see Current status): the
+  hardware dependent settings (split-K target, prefill chunk, draft
+  block) are measured and persisted. Still to wire: batch caps for
+  features that do not exist yet. No hard-coded paths or sizes.
 - Serving (deferred unless the owner asks). Still deferred: thread
   pool, keep-alive, `/v1/responses`, render/derender/batch,
   `/tokenizer_info`, `/load` and LoRA, 501 embedding/rerank/audio
@@ -373,6 +409,17 @@ RADV GFX1100, rocm through the system ROCm).
   ROCm sees real GPUs only.
 - No model names in tests. A qwen shaped test covers the generic
   path with qwen shaped parameters.
+- Calibration and the split-K target. The fp8 tensor-core MXFP4
+  split-K reassociates the fp32 accumulation, so a different split
+  target moves the logits within the fp8 reference-exponent scheme's
+  own noise (measured on the 27B MXFP4 target: the plain scalar
+  accumulation already differs from the default tensor-core path by
+  about 0.5 max absolute, and a split change by up to about 0.9) while
+  the greedy token is unchanged. `CalibrateTest.CalibratedSplitMatches
+  DefaultWithinTolerance` asserts the produced tokens are identical and
+  the first-step logits stay within a per-backend bound (exact on
+  Vulkan, where the split is inert). The split target is a speed knob
+  only: the produced tokens are the reference.
 - Logging: `tessera::log::Diagnostics` with a pluggable sink.
   Every line carries `prefix: message` context.
 - Kernel contract: `grid_*` is the workgroup count on both

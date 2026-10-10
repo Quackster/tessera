@@ -9,6 +9,10 @@
 #include <string_view>
 #include <vector>
 
+#include "calibrate_command.hpp"
+#include "cli_common.hpp"
+#include "cli_helpers.hpp"
+#include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/image.hpp"
 #include "tessera/vision.hpp"
@@ -18,100 +22,17 @@
 
 namespace {
 
+using tessera::cli::kDefaultContext;
+using tessera::cli::kDefaultDraftBlock;
+using tessera::cli::kDefaultPrefillChunk;
+using tessera::cli::LogModelSummary;
+using tessera::cli::MatchKvType;
+using tessera::cli::PrintUsage;
+using tessera::cli::ResolveCalibration;
+
 constexpr int kExitOk = 0;
 constexpr int kExitError = 1;
 constexpr int kExitUsage = 2;
-// How many tensor names to print when summarizing a model.
-constexpr std::size_t kPrintedTensorNames = 5;
-// Defaults for the runtime options; override with the flags below.
-constexpr std::size_t kDefaultContext = 4096;
-// 0 keeps the draft checkpoint's configured block size. A block-diffusion
-// drafter is trained for one fixed block; a mismatched block silently
-// lowers acceptance (the DFlash2 checkpoint is trained for block 8).
-constexpr std::size_t kDefaultDraftBlock = 0;
-// 0 resolves automatically to kDefaultPrefillChunkTokens (512):
-// long prompts prefill in chunk-sized forwards.
-constexpr std::size_t kDefaultPrefillChunk = 0;
-
-// One summary line plus the first few tensor names for a loaded model,
-// so both `run` and the deferred `serve` loader report it identically.
-void LogModelSummary(tessera::Engine& engine, tessera::Model& model) {
-  const auto& tensors = model.Tensors();
-  std::size_t total_numel = 0;
-  for (const auto& tensor : tensors) {
-    total_numel += tensor.shape.Numel();
-  }
-  std::size_t device_bytes = 0;
-  for (const auto& weight : model.Weights()) {
-    device_bytes += weight.device->Size();
-  }
-  std::string summary =
-      std::string(model.Format() == tessera::ModelFormat::Gguf ? "gguf"
-                                                               : "mxfp4") +
-      " model, " + std::to_string(tensors.size()) + " tensors, " +
-      std::to_string(total_numel) + " total elements, " +
-      std::to_string(device_bytes) + " bytes on device";
-  if (!model.Name().empty()) {
-    summary = std::string(model.Name()) + " (" + summary + ")";
-  }
-  auto& log = engine.Diagnostics();
-  log.Info("cli", summary);
-  for (std::size_t i = 0; i < tensors.size() && i < kPrintedTensorNames; ++i) {
-    log.Info("cli", "tensor " + std::to_string(i) + ": " + tensors[i].name +
-                        " [" + std::to_string(tensors[i].shape.Numel()) + "]");
-  }
-}
-
-void PrintUsage() {
-  std::fprintf(stderr,
-               "usage: tessera-cli run --model <path> [--draft <dir>]\n"
-               "       [--context <n>] [--draft-block <n>]\n"
-               "       [--prefill-chunk <n>]\n"
-               "       --prompt-text <str> [--max-completion-tokens <n>]\n"
-               "       tessera-cli serve --model <path> [--host <ip>] "
-               "[--port <n>]\n"
-               "       tessera-cli --list-gpus\n"
-               "  --list-gpus       list the GPUs the backend sees and exit\n"
-               "  --model <path>    a .gguf file or an MXFP4 model directory\n"
-               "  --draft <dir>     DFlash2 draft checkpoint directory\n"
-               "  --context <n>     maximum context length (default %zu)\n"
-               "  --gpu <n>         GPU index to use (default 0, the first)\n"
-               "  --draft-block <n> draft block tokens (0 = checkpoint "
-               "default, %zu)\n"
-               "  --prefill-chunk <n> prefill tokens per forward (0 = auto, "
-               "%zu)\n"
-   "  --prompt-text <s> text prompt (tokenized; needs a tokenizer)\n"
-   "  --max-completion-tokens <n> completion tokens (0 fills the "
-   "remaining context, default %zu)\n"
-   "  --max-thinking-tokens <n> think-block budget per turn (0 leaves "
-   "thinking unlimited, default 0)\n"
-               "  --speculate       draft with the MTP head (run and serve)\n"
-               "  --mmproj <path>   vision projector (mmproj) GGUF\n"
-               "  --image <path>    image (binary PPM) to prepend as tokens\n"
-               "  --quiet           suppress progress and info logs\n"
-               "  --no-chat         do not apply the chat template\n"
-               "  --sample          sample instead of greedy decode\n"
-               "  --temperature <f> sampling temperature (default 0.6)\n"
-               "  --top-p <f>       nucleus probability (default 0.95)\n"
-               "  --top-k <n>       keep the top n tokens (default 20)\n"
-               "  --min-p <f>       minimum probability (default 0.0)\n"
-               "  --presence-penalty <f>   presence penalty (default 0.0)\n"
-               "  --repetition-penalty <f> repetition penalty (default 1.0)\n"
-               "  --seed <n>        sampling RNG seed (default 0)\n"
-               "  --kv-f16          store the KV cache in fp16 (default fp32)\n"
-               "  --kv-q8           store the KV cache in int8\n"
-               "  --kv-q4           store the KV cache in 4-bit\n"
-               "  --kv-fp8          store the KV cache in FP8 E4M3\n"
-  "  --host <ip>       serve bind address (default 127.0.0.1)\n"
-  "  --port <n>        serve port (default 8080)\n"
-  "  --no-auto-title   keep the first user line as the chat title "
-  "instead of asking the model\n"
-               "  --api-key <k>     accepted API key (repeatable; env "
-                "TESSERA_API_KEY)\n"
-  "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
-                 kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk,
-                 tessera::kDefaultMaxCompletionTokens);
-}
 
 }  // namespace
 
@@ -133,6 +54,9 @@ int main(int argc, char** argv) {
     }
     return kExitOk;
   }
+  if (command == "calibrate") {
+    return tessera::cli::RunCalibrateCommand(argc, argv);
+  }
   if (command != "run" && command != "serve") {
     PrintUsage();
     return kExitUsage;
@@ -140,6 +64,7 @@ int main(int argc, char** argv) {
   std::string model_path;
   std::string draft_path;
   std::string prompt_text;
+  std::string calibration_path;
   std::string mmproj_path;
   std::string image_path;
   std::uint32_t image_token = 0;
@@ -191,6 +116,8 @@ int main(int argc, char** argv) {
       context = std::stoul(argv[++i]);
     } else if (arg == "--gpu" && i + 1 < argc) {
       gpu = std::stoi(argv[++i]);
+    } else if (arg == "--calibration" && i + 1 < argc) {
+      calibration_path = argv[++i];
     } else if (arg == "--draft-block" && i + 1 < argc) {
       draft_block = std::stoul(argv[++i]);
     } else if (arg == "--prefill-chunk" && i + 1 < argc) {
@@ -199,14 +126,8 @@ int main(int argc, char** argv) {
       speculate = true;
     } else if (arg == "--sample") {
       sample = true;
-    } else if (arg == "--kv-f16") {
-      kv_type = tessera::KvCacheType::F16;
-    } else if (arg == "--kv-q8") {
-      kv_type = tessera::KvCacheType::Q8;
-    } else if (arg == "--kv-q4") {
-      kv_type = tessera::KvCacheType::Q4;
-    } else if (arg == "--kv-fp8") {
-      kv_type = tessera::KvCacheType::FP8;
+    } else if (MatchKvType(arg, kv_type)) {
+      // handled by MatchKvType
     } else if (arg == "--temperature" && i + 1 < argc) {
       sampling.temperature = std::stof(argv[++i]);
     } else if (arg == "--top-p" && i + 1 < argc) {
@@ -241,6 +162,12 @@ int main(int argc, char** argv) {
     if (const char* key = std::getenv("TESSERA_API_KEY");
         key != nullptr && *key != '\0') {
       api_keys.emplace_back(key);
+    }
+  }
+  if (calibration_path.empty()) {
+    if (const char* env = std::getenv("TESSERA_CALIBRATION");
+        env != nullptr && *env != '\0') {
+      calibration_path = env;
     }
   }
 
@@ -290,6 +217,48 @@ int main(int argc, char** argv) {
     serve_options.api_keys = api_keys;
     serve_options.allow_origins = allow_origins;
     serve_options.auto_title = auto_title;
+    if (!calibration_path.empty()) {
+      // The calibration key depends on the loaded model, so resolve the
+      // saved settings up front and serve the already-loaded model. Without
+      // --calibration the deferred loader below binds the socket first.
+      auto calibration_model =
+          engine.LoadModel(tessera::ModelOptions{model_path, context});
+      if (!calibration_model) {
+        log.Error("cli", std::string("model load failed (") +
+                             std::string(tessera::ToString(
+                                 calibration_model.error())) +
+                             ")");
+        return kExitError;
+      }
+      LogModelSummary(engine, **calibration_model);
+      const std::string strategy =
+          draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
+      tessera::CalibrationConfig explicit_config;
+      explicit_config.prefill_chunk_tokens = prefill_chunk;
+      explicit_config.draft_tokens = draft_block;
+      serve_options.calibration = ResolveCalibration(
+          engine, **calibration_model, context, kv_type, strategy,
+          calibration_path, explicit_config);
+      tessera::GenerateOptions warm;
+      warm.max_completion_tokens = 1;
+      warm.progress_every = 0;
+      tessera::ApplyToGenerateOptions(serve_options.calibration, warm);
+      auto warmed = engine.Generate(**calibration_model, warm);
+      if (!warmed) {
+        log.Error("cli", std::string("kernel warmup failed (") +
+                             std::string(tessera::ToString(warmed.error())) +
+                             "); the model cannot serve");
+        return kExitError;
+      }
+      auto served = tessera::Serve(engine, **calibration_model, serve_options);
+      if (!served) {
+        log.Warn("cli", std::string("serve failed (") +
+                            std::string(tessera::ToString(served.error())) +
+                            ")");
+        return kExitError;
+      }
+      return kExitOk;
+    }
     // Load and warm on the serve thread: the server binds first, so a
     // client can reach /health while the weights and kernels load.
     auto loader = [&](const tessera::ServeProgress& report)
@@ -332,6 +301,17 @@ int main(int argc, char** argv) {
   }
   tessera::Model& loaded = **model;
   LogModelSummary(engine, loaded);
+  // Resolve any saved calibration (explicit CLI values win) before building
+  // the request options.
+  tessera::CalibrationConfig applied;
+  applied.prefill_chunk_tokens = prefill_chunk;
+  applied.draft_tokens = draft_block;
+  if (!calibration_path.empty()) {
+    const std::string strategy =
+        draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
+    applied = ResolveCalibration(engine, loaded, context, kv_type, strategy,
+                                 calibration_path, applied);
+  }
   if (!prompt_text.empty() || !image_path.empty() ||
       max_completion_tokens > 0 || max_thinking_tokens > 0) {
     tessera::GenerateOptions gen;
@@ -342,7 +322,9 @@ int main(int argc, char** argv) {
     gen.sample = sample;
     gen.sampling = sampling;
     gen.seed = seed;
-    gen.draft_tokens = draft_block;
+    gen.draft_tokens = applied.draft_tokens;
+    gen.prefill_chunk_tokens = applied.prefill_chunk_tokens;
+    gen.mxfp4_split_target = applied.mxfp4_split_target;
     gen.kv_type = kv_type;
     gen.progress_every = quiet ? 0 : 64;
     if (!quiet) {

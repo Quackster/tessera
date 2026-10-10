@@ -188,14 +188,15 @@ SessionHandler::SessionHandler(Engine& engine, Model& model,
                                const Tokenizer& tokenizer,
                                SessionStore& sessions, std::mutex& generation,
                                std::size_t default_max_completion_tokens,
-                               bool auto_title)
+                               bool auto_title, CalibrationConfig calibration)
     : engine_(engine),
       model_(model),
       tokenizer_(tokenizer),
       sessions_(sessions),
       generation_(generation),
       default_max_completion_tokens_(default_max_completion_tokens),
-      auto_title_(auto_title) {}
+      auto_title_(auto_title),
+      calibration_(calibration) {}
 
 void SessionHandler::HandleList(ResponseWriter& writer) const {
   Json items = Json::Array();
@@ -294,6 +295,7 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
   options.max_completion_tokens = max_completion_tokens;
   options.max_thinking_tokens = max_thinking_tokens;
   options.prompt_tokens = *ids;
+  ApplyToGenerateOptions(calibration_, options);
   ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
   std::string reasoning_text;
   std::string content_text;

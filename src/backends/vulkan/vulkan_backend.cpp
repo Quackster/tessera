@@ -157,6 +157,25 @@ class VulkanBackend final : public Backend {
     return device_name_;
   }
 
+  DeviceMemoryInfo MemoryInfo() const override {
+    if (state_.physical == VK_NULL_HANDLE) {
+      return {};
+    }
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(state_.physical, &properties);
+    std::uint64_t total = 0;
+    for (std::uint32_t i = 0; i < properties.memoryHeapCount; ++i) {
+      if ((properties.memoryHeaps[i].flags &
+           VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+        total += properties.memoryHeaps[i].size;
+      }
+    }
+    // Vulkan has no portable free-memory query (that needs
+    // VK_EXT_memory_budget), so report the device-local total; a caller
+    // works from it.
+    return DeviceMemoryInfo{total, 0};
+  }
+
   std::expected<void, StatusCode> Init() override {
     if (initialized_) {
       return {};

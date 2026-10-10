@@ -33,6 +33,7 @@ add_library(tessera STATIC
     src/core/generate.cpp
     src/core/generate_helpers.cpp
     src/core/generate_multimodal.cpp
+    src/core/calibrate/calibrate.cpp
     src/core/model.cpp
     src/core/files.cpp
     src/core/tokenizer.cpp
@@ -242,7 +243,9 @@ else()
     message(FATAL_ERROR "TESSERA_BACKEND must be 'vulkan' or 'rocm' (got '${TESSERA_BACKEND}')")
 endif()
 
-add_executable(tessera-cli tools/cli/main.cpp)
+add_executable(tessera-cli tools/cli/main.cpp
+                            tools/cli/calibrate_command.cpp
+                            tools/cli/cli_helpers.cpp)
 target_link_libraries(tessera-cli PRIVATE tessera)
 
 enable_testing()
@@ -268,6 +271,7 @@ add_executable(tessera-tests
     tests/jinja_test.cpp
     tests/backend_test.cpp
     tests/spec_test.cpp
+    tests/calibrate_test.cpp
 )
 target_link_libraries(tessera-tests PRIVATE tessera GTest::gtest GTest::gtest_main)
 target_include_directories(tessera-tests PRIVATE src)

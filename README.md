@@ -48,7 +48,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
 | MoE, MLP, norms | Todo | Norms and MLP kernels done. No MoE kernels yet (planned Ornith-1.5-35B-A3B). |
-| Calibration | Done | Measures machine-dependent settings, keeps only gains above the noise floor, writes a JSON keyed by backend, device and model. |
+| Calibration | Done | `calibrate` sweeps the split-K target (ROCm), the prefill chunk (multiples of 256 from 512) and the draft block, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8 and reports the memory-bound max context. JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 

@@ -24,6 +24,15 @@ struct ArchState {
   virtual ~ArchState() = default;
 };
 
+// Host tuning values one request carries into the decode loop. Generic
+// numeric knobs only: the core stores them and the architecture module
+// reads the ones it owns. Zero means the built-in default.
+struct RequestTuning {
+  // Split-K workgroup target and cap for the fp8 tensor-core MXFP4 GEMM.
+  std::size_t mxfp4_split_target = 0;
+  std::size_t mxfp4_split_cap = 0;
+};
+
 // Per-step state for single-token vanilla decoding: the host key/value
 // cache per layer plus the loaded kernels. The cache grows one row per
 // step; kernels load once and are reused.
@@ -41,6 +50,9 @@ struct DecodeCache {
   // Storage type of the full-attention KV cache (default fp32). Set
   // before the first step.
   KvCacheType kv_type = KvCacheType::F32;
+  // Request tuning the architecture module reads from its state (copied
+  // when the state is created). Set before the first step.
+  RequestTuning tuning;
   // Architecture-specific state (built by the model's Architecture
   // module); null until the first step, and null for the generic path.
   std::unique_ptr<ArchState> arch;

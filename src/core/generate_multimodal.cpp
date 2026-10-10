@@ -34,6 +34,8 @@ Engine::GenerateMultimodal(Model& model, const GenerateOptions& options,
   };
   core::DecodeCache cache;
   cache.kv_type = options.kv_type;
+  cache.tuning.mxfp4_split_target = options.mxfp4_split_target;
+  cache.tuning.mxfp4_split_cap = options.mxfp4_split_cap;
   std::vector<std::uint32_t> prompt = options.prompt_tokens;
   if (prompt.empty()) {
     prompt.push_back(options.first_token);

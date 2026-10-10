@@ -293,4 +293,12 @@ struct TensorManifest {
   }
 };
 
+// Built-in split-K workgroup target and cap for the fp8 tensor-core
+// MXFP4 GEMM (the ROCm-only WMMA path). A request that leaves
+// GenerateOptions::mxfp4_split_target or ::mxfp4_split_cap at 0 selects
+// these. One canonical definition; the kernel launcher and the option
+// docs both read it.
+constexpr std::size_t kDefaultMxFp4SplitTarget = 320;
+constexpr std::size_t kDefaultMxFp4SplitCap = 4;
+
 }  // namespace tessera

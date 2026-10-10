@@ -66,3 +66,12 @@ project, the version, the license, and where it is used.
   qwen3_dflash.py): the causal sliding-window mask used by
   the DFlash2 draft layers. Design reference for the
   attention window parameter.
+- Strata (a hybrid CPU and GPU inference engine, no version
+  recorded) tools/calibrate.py, setup.py and tools/test_calibrate.py:
+  the calibration approach. Strata measures machine dependent
+  settings with a fixed candidate sweep, keeps a value only when it
+  beats the default by a noise floor (MIN_GAIN 0.03), confirms the
+  winner with an interleaved re-measurement, and stores the result
+  per machine and model keyed by a hardware key. Reimplemented in
+  src/core/calibrate/calibrate.cpp and tools/cli/calibrate_command.cpp;
+  no code copied.
