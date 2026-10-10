@@ -12,17 +12,17 @@ layout(push_constant) uniform PushConstants {
   uint v[8];
 } pc;
 
-layout(set = 0, binding = 0) buffer A {
+layout(set = 0, binding = 0) readonly buffer A {
   float a[];
 };
 
 // Q4_K blocks are 144 bytes (a multiple of 4), so the whole buffer can
 // be viewed as uint words; bytes are extracted with a shift and mask.
-layout(set = 0, binding = 1) buffer W {
+layout(set = 0, binding = 1) readonly buffer W {
   uint w[];
 };
 
-layout(set = 0, binding = 2) buffer C {
+layout(set = 0, binding = 2) writeonly buffer C {
   float c[];
 };
 

@@ -10,12 +10,12 @@ layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
 
-layout(set = 0, binding = 0) buffer ALog { float a_log[]; };
-layout(set = 0, binding = 1) buffer Dt { float dt[]; };
-layout(set = 0, binding = 2) buffer AlphaRaw { float alpha_raw[]; };
-layout(set = 0, binding = 3) buffer BetaRaw { float beta_raw[]; };
-layout(set = 0, binding = 4) buffer Alpha { float alpha[]; };
-layout(set = 0, binding = 5) buffer Beta { float beta[]; };
+layout(set = 0, binding = 0) readonly buffer ALog { float a_log[]; };
+layout(set = 0, binding = 1) readonly buffer Dt { float dt[]; };
+layout(set = 0, binding = 2) readonly buffer AlphaRaw { float alpha_raw[]; };
+layout(set = 0, binding = 3) readonly buffer BetaRaw { float beta_raw[]; };
+layout(set = 0, binding = 4) writeonly buffer Alpha { float alpha[]; };
+layout(set = 0, binding = 5) writeonly buffer Beta { float beta[]; };
 
 void main() {
   uint t = gl_GlobalInvocationID.x;

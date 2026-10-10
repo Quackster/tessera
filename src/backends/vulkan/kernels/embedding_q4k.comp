@@ -13,12 +13,12 @@ layout(push_constant) uniform PushConstants {
   uint v[8];
 } pc;
 
-layout(set = 0, binding = 0) buffer Ids { uint ids[]; };
+layout(set = 0, binding = 0) readonly buffer Ids { uint ids[]; };
 
 // Q4_K blocks are 144 bytes (a multiple of 4), so the whole table can
 // be viewed as uint words; bytes are extracted with a shift and mask.
-layout(set = 0, binding = 1) buffer W { uint w[]; };
-layout(set = 0, binding = 2) buffer O { float o[]; };
+layout(set = 0, binding = 1) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 2) writeonly buffer O { float o[]; };
 
 // Byte `offset` of the Q4_K table (little-endian extraction).
 uint wbyte(uint offset) {

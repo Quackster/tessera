@@ -17,7 +17,7 @@ layout(set = 0, binding = 0) buffer Data {
   float data[];
 };
 
-layout(set = 0, binding = 1) buffer Pos {
+layout(set = 0, binding = 1) readonly buffer Pos {
   uint pos[];
 };
 

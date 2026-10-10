@@ -19,19 +19,19 @@ layout(push_constant) uniform PushConstants {
   uint v[24];
 } pc;
 
-layout(set = 0, binding = 0) buffer Q {
+layout(set = 0, binding = 0) readonly buffer Q {
   float q[];
 };
 
-layout(set = 0, binding = 1) buffer K {
+layout(set = 0, binding = 1) readonly buffer K {
   uint k[];
 };
 
-layout(set = 0, binding = 2) buffer V {
+layout(set = 0, binding = 2) readonly buffer V {
   uint v[];
 };
 
-layout(set = 0, binding = 3) buffer Result {
+layout(set = 0, binding = 3) writeonly buffer Result {
   float values[];
 };
 

@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 #include <vulkan/vulkan.h>
 
@@ -38,9 +39,17 @@ struct VkBinding {
 };
 
 // A loaded Vulkan kernel: one compute pipeline on the shared layout.
+// read_mask/write_mask have bit i set when binding i is read/written, decoded
+// from the SPIR-V NonWritable/NonReadable decorations. They drive the
+// inter-dispatch memory barriers: a barrier is needed only when a dispatch
+// reads a buffer written since the last barrier, or writes a buffer touched
+// since the last barrier. All-access (the default) reproduces the
+// conservative one-barrier-per-dispatch behavior.
 struct VkKernel {
   VkPipeline pipeline = VK_NULL_HANDLE;
   std::string name;
+  std::uint32_t read_mask = 0xffffffffu;
+  std::uint32_t write_mask = 0xffffffffu;
 };
 
 // Kernel launch plumbing for the vulkan backend: SPIR-V pipelines on one
@@ -91,6 +100,16 @@ class VulkanCompute {
   [[nodiscard]] std::expected<void, StatusCode> FlushAndWait();
   // Start the pending command buffer if it is not recording.
   [[nodiscard]] std::expected<void, StatusCode> EnsureRecording();
+  // Decide whether a dispatch over `bindings` (with the given per-binding
+  // access masks) needs a barrier, record one when it does, and fold the
+  // bindings into the pending hazard sets.
+  void OrderAccess(std::span<const VkBinding> bindings, std::uint32_t read_mask,
+                   std::uint32_t write_mask);
+
+  // Buffers touched since the last barrier, split by access. A dispatch needs
+  // a barrier only against these sets, so independent dispatches overlap.
+  std::unordered_set<VkBuffer> read_pending_;
+  std::unordered_set<VkBuffer> write_pending_;
 
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;

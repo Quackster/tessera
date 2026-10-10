@@ -16,12 +16,12 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 layout(set = 0, binding = 0) buffer S { float s[]; };
-layout(set = 0, binding = 1) buffer K { float k[]; };
-layout(set = 0, binding = 2) buffer V { float v[]; };
-layout(set = 0, binding = 3) buffer Q { float q[]; };
-layout(set = 0, binding = 4) buffer O { float o[]; };
-layout(set = 0, binding = 5) buffer Alpha { float alpha[]; };
-layout(set = 0, binding = 6) buffer Beta { float beta[]; };
+layout(set = 0, binding = 1) readonly buffer K { float k[]; };
+layout(set = 0, binding = 2) readonly buffer V { float v[]; };
+layout(set = 0, binding = 3) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 4) writeonly buffer O { float o[]; };
+layout(set = 0, binding = 5) readonly buffer Alpha { float alpha[]; };
+layout(set = 0, binding = 6) readonly buffer Beta { float beta[]; };
 
 void main() {
   uint idx = gl_GlobalInvocationID.x;

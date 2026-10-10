@@ -1,5 +1,7 @@
 #include "backends/vulkan/vulkan_compute.hpp"
 
+#include "backends/vulkan/spirv_binding_access.hpp"
+
 // Generated at configure time from src/backends/vulkan/kernels/*.comp.
 #include "kernels_spirv.hpp"
 
@@ -312,6 +314,13 @@ VulkanCompute::LoadKernel(std::string_view name,
   }
   auto kernel = std::make_unique<VkKernel>();
   kernel->name = name;
+  std::uint32_t read_mask = 0;
+  std::uint32_t write_mask = 0;
+  ParseSpirvBindingAccess(code, &read_mask, &write_mask);
+  if (read_mask != 0 || write_mask != 0) {
+    kernel->read_mask = read_mask;
+    kernel->write_mask = write_mask;
+  }
   VkPipelineShaderStageCreateInfo stage{};
   stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -348,6 +357,10 @@ std::expected<void, StatusCode> VulkanCompute::EnsureRecording() {
   if (recording_) {
     return {};
   }
+  // A fresh command buffer follows a completed submission, so nothing it
+  // records can hazard against earlier work.
+  read_pending_.clear();
+  write_pending_.clear();
   auto result = vkResetCommandBuffer(cmd_, 0);
   if (result != VK_SUCCESS) {
     LogError(std::string("vkResetCommandBuffer failed (") +
@@ -421,6 +434,49 @@ std::expected<void, StatusCode> VulkanCompute::Synchronize() {
   return FlushAndWait();
 }
 
+void VulkanCompute::OrderAccess(std::span<const VkBinding> bindings,
+                                std::uint32_t read_mask,
+                                std::uint32_t write_mask) {
+  bool hazard = false;
+  for (std::size_t i = 0; i < bindings.size() && !hazard; ++i) {
+    const VkBuffer buffer = bindings[i].buffer;
+    const bool reads = (read_mask >> i) & 1u;
+    const bool writes = (write_mask >> i) & 1u;
+    // RAW (read after write) needs the producer visible; WAR and WAW need
+    // execution ordering against the earlier access.
+    if (reads && write_pending_.count(buffer) != 0) {
+      hazard = true;
+    } else if (writes && (read_pending_.count(buffer) != 0 ||
+                          write_pending_.count(buffer) != 0)) {
+      hazard = true;
+    }
+  }
+  if (hazard) {
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = barrier.srcAccessMask;
+    vkCmdPipelineBarrier(
+        cmd_,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    read_pending_.clear();
+    write_pending_.clear();
+  }
+  for (std::size_t i = 0; i < bindings.size(); ++i) {
+    const VkBuffer buffer = bindings[i].buffer;
+    if ((read_mask >> i) & 1u) {
+      read_pending_.insert(buffer);
+    }
+    if ((write_mask >> i) & 1u) {
+      write_pending_.insert(buffer);
+    }
+  }
+}
+
 std::expected<void, StatusCode> VulkanCompute::RecordUpdate(
     VkBuffer dst, std::size_t dst_offset, std::span<const std::byte> data) {
   if (!ready_ || data.empty() || data.size() > 65536 ||
@@ -431,14 +487,9 @@ std::expected<void, StatusCode> VulkanCompute::RecordUpdate(
   if (!recording) {
     return recording;
   }
-  // Order this write after every earlier recorded operation.
-  VkMemoryBarrier barrier{};
-  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
-                       nullptr, 0, nullptr);
+  const VkBinding binding{dst, 0};
+  OrderAccess(std::span<const VkBinding>(&binding, 1), /*read_mask=*/0,
+              /*write_mask=*/1);
   vkCmdUpdateBuffer(cmd_, dst, dst_offset,
                     static_cast<VkDeviceSize>(data.size()), data.data());
   return {};
@@ -454,14 +505,9 @@ std::expected<void, StatusCode> VulkanCompute::RecordCopy(
   if (!recording) {
     return recording;
   }
-  // Order this copy after every earlier recorded operation.
-  VkMemoryBarrier barrier{};
-  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
-                       nullptr, 0, nullptr);
+  const VkBinding pair[2] = {VkBinding{src, 0}, VkBinding{dst, 0}};
+  OrderAccess(std::span<const VkBinding>(pair, 2), /*read_mask=*/0b01,
+              /*write_mask=*/0b10);
   VkBufferCopy copy{};
   copy.srcOffset = src_offset;
   copy.dstOffset = dst_offset;
@@ -480,17 +526,10 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   if (!recording) {
     return recording;
   }
-  // Order this dispatch after every earlier recorded operation. The
-  // deferred command buffer has no implicit inter-dispatch synchronization,
-  // so a conservative full barrier keeps every producer/consumer pair
-  // ordered.
-  VkMemoryBarrier barrier{};
-  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
-                       nullptr, 0, nullptr);
+  // Barrier only on a real buffer conflict: a decode step records about
+  // fifteen hundred small dispatches, and a barrier before each one
+  // serializes the whole step.
+  OrderAccess(bindings, kernel.read_mask, kernel.write_mask);
   vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
   VkDescriptorSetAllocateInfo set_alloc{};
   set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;

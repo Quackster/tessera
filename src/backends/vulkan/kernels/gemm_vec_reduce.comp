@@ -9,11 +9,11 @@ layout(push_constant) uniform PushConstants {
   uint v[8];
 } pc;
 
-layout(set = 0, binding = 0) buffer Part {
+layout(set = 0, binding = 0) readonly buffer Part {
   float part[];
 };
 
-layout(set = 0, binding = 1) buffer C {
+layout(set = 0, binding = 1) writeonly buffer C {
   float c[];
 };
 

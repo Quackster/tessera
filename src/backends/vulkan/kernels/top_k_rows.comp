@@ -13,9 +13,9 @@ layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
 
-layout(set = 0, binding = 0) buffer Logits { float logits[]; };
-layout(set = 0, binding = 1) buffer Ids { uint ids[]; };
-layout(set = 0, binding = 2) buffer Vals { float vals[]; };
+layout(set = 0, binding = 0) readonly buffer Logits { float logits[]; };
+layout(set = 0, binding = 1) writeonly buffer Ids { uint ids[]; };
+layout(set = 0, binding = 2) writeonly buffer Vals { float vals[]; };
 
 shared float rv[256];
 shared uint ri[256];

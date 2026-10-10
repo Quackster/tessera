@@ -11,15 +11,15 @@ layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
 
-layout(set = 0, binding = 0) buffer Fused {
+layout(set = 0, binding = 0) readonly buffer Fused {
   float fused[];
 };
 
-layout(set = 0, binding = 1) buffer Q {
+layout(set = 0, binding = 1) writeonly buffer Q {
   float q[];
 };
 
-layout(set = 0, binding = 2) buffer G {
+layout(set = 0, binding = 2) writeonly buffer G {
   float g[];
 };
 
