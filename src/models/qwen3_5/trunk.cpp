@@ -674,6 +674,10 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
   core::Profile* const deep_profile =
       h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
   for (std::size_t l = layer_begin; l < layer_end; ++l) {
+    // Stage the layer's RAM-backed weights (a no-op without paging).
+    if (auto ensured = model.EnsureLayerResident(l); !ensured) {
+      return std::unexpected(ensured.error());
+    }
     if (cfg.IsFullAttentionLayer(l)) {
       core::PhaseScope layer_scope(deep_profile, core::Phase::kFullLayer);
       if (auto block = RunFullBlock(backend, model, cfg, h, l, p, h.full[l]);

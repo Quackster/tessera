@@ -14,6 +14,7 @@
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "core/loaders/shard.hpp"
 #include "core/sampling.hpp"
 #include "core/timing.hpp"
 #include "test_helpers.hpp"
@@ -53,10 +54,12 @@ std::filesystem::path WriteGgufFixture(const std::string& name) {
   return path;
 }
 
-// A 1-layer vanilla transformer GGUF: hidden 256, 4 heads over 2 kv
+// A tiny vanilla transformer GGUF: hidden 256, 4 heads over 2 kv
 // groups of dim 64, ffn 512, vocab 32. Projections are Q4_K, vectors
-// F32, tensor names follow the llama.cpp convention.
-std::filesystem::path WriteTinyModelFixture(const std::string& name) {
+// F32, tensor names follow the llama.cpp convention. `layers` repeats
+// the block specs as blk.0 through blk.(layers - 1).
+std::filesystem::path WriteTinyModelFixture(const std::string& name,
+                                            std::size_t layers = 1) {
   std::mt19937 rng(7);
   struct Spec {
     const char* tensor;
@@ -65,25 +68,54 @@ std::filesystem::path WriteTinyModelFixture(const std::string& name) {
     std::size_t rows;  // Q4_K row count (0 for F32)
     std::size_t cols;  // Q4_K row length (0 for F32)
   };
-  const std::vector<Spec> specs = {
-      {"token_embd.weight", 0, {256, 32}, 0, 0},
-      {"blk.0.attn_norm.weight", 0, {256}, 0, 0},
-      {"blk.0.attn_q.weight", 12, {256, 256}, 256, 256},
-      {"blk.0.attn_k.weight", 12, {256, 128}, 128, 256},
-      {"blk.0.attn_v.weight", 12, {256, 128}, 128, 256},
-      {"blk.0.attn_output.weight", 12, {256, 256}, 256, 256},
-      {"blk.0.ffn_norm.weight", 0, {256}, 0, 0},
-      {"blk.0.ffn_gate.weight", 12, {256, 512}, 512, 256},
-      {"blk.0.ffn_up.weight", 12, {256, 512}, 512, 256},
-      {"blk.0.ffn_down.weight", 12, {512, 256}, 256, 512},
-      {"output_norm.weight", 0, {256}, 0, 0},
-      {"output.weight", 12, {256, 32}, 32, 256},
+  std::vector<Spec> specs;
+  specs.push_back({"token_embd.weight", 0, {256, 32}, 0, 0});
+  struct BlockSpec {
+    const char* suffix;
+    std::uint32_t type;
+    std::vector<std::uint64_t> dims;
+    std::size_t rows;
+    std::size_t cols;
   };
+  // One block's tensors; the layer loop below stamps them as blk.l.*.
+  const std::vector<BlockSpec> block = {
+      {"attn_norm.weight", 0, {256}, 0, 0},
+      {"attn_q.weight", 12, {256, 256}, 256, 256},
+      {"attn_k.weight", 12, {256, 128}, 128, 256},
+      {"attn_v.weight", 12, {256, 128}, 128, 256},
+      {"attn_output.weight", 12, {256, 256}, 256, 256},
+      {"ffn_norm.weight", 0, {256}, 0, 0},
+      {"ffn_gate.weight", 12, {256, 512}, 512, 256},
+      {"ffn_up.weight", 12, {256, 512}, 512, 256},
+      {"ffn_down.weight", 12, {512, 256}, 256, 512},
+  };
+  // Own every block tensor name before the specs borrow them, so no
+  // push reallocates while a spec points at it.
+  std::vector<std::string> block_names;
+  block_names.reserve(layers * block.size());
+  for (std::size_t l = 0; l < layers; ++l) {
+    const std::string base = "blk." + std::to_string(l) + ".";
+    for (const auto& part : block) {
+      block_names.push_back(base + part.suffix);
+    }
+  }
+  std::size_t next = 0;
+  for (std::size_t l = 0; l < layers; ++l) {
+    (void)l;
+    for (const auto& part : block) {
+      specs.push_back({block_names[next].c_str(), part.type, part.dims,
+                       part.rows, part.cols});
+      ++next;
+    }
+  }
+  specs.push_back({"output_norm.weight", 0, {256}, 0, 0});
+  specs.push_back({"output.weight", 12, {256, 32}, 32, 256});
   GgufBuilder builder;
   builder.Header(0x46554747, 3, specs.size(), 10);
   builder.KvString("general.name", "tiny-vanilla");
   builder.KvString("general.architecture", "test-vanilla");
-  builder.KvU32("test-vanilla.block_count", 1);
+  builder.KvU32("test-vanilla.block_count",
+                static_cast<std::uint32_t>(layers));
   builder.KvU32("test-vanilla.embedding_length", 256);
   builder.KvU32("test-vanilla.feed_forward_length", 512);
   builder.KvU32("test-vanilla.attention.head_count", 4);
@@ -254,6 +286,35 @@ TEST(EngineTest, GenerateTinyModelGreedy) {
   auto again = engine->Generate(**model, GenerateOptions{4, 0});
   ASSERT_TRUE(again.has_value()) << tessera::ToString(again.error());
   EXPECT_EQ(*ids, *again);
+}
+
+// A paged load keeps early layers in RAM and decodes exactly like the
+// full upload: a paged name misses before its layer is ensured, resolves
+// after, and the generated tokens match the resident baseline.
+TEST(EngineTest, PagedModelMatchesFullUpload) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("paged.gguf", 2);
+  auto full = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(full.has_value()) << tessera::ToString(full.error());
+  auto full_ids = engine->Generate(**full, GenerateOptions{4, 0});
+  ASSERT_TRUE(full_ids.has_value()) << tessera::ToString(full_ids.error());
+  ModelOptions paged_options{path.string(), 1024};
+  paged_options.gpu_layers = 2;
+  auto paged = engine->LoadModel(paged_options);
+  ASSERT_TRUE(paged.has_value()) << tessera::ToString(paged.error());
+  // Two resident layers: the head plus blk.1; blk.0 pages.
+  EXPECT_EQ((*paged)->FindDeviceTensor("blk.0.attn_q.weight"), nullptr);
+  EXPECT_NE((*paged)->FindDeviceTensor("blk.1.attn_q.weight"), nullptr);
+  EXPECT_NE((*paged)->FindDeviceTensor("output.weight"), nullptr);
+  EXPECT_LT((*paged)->Weights().size(), (*full)->Weights().size());
+  EXPECT_FALSE((*paged)->Paged().empty());
+  auto ensured = (*paged)->EnsureLayerResident(0);
+  ASSERT_TRUE(ensured.has_value()) << tessera::ToString(ensured.error());
+  EXPECT_NE((*paged)->FindDeviceTensor("blk.0.attn_q.weight"), nullptr);
+  auto paged_ids = engine->Generate(**paged, GenerateOptions{4, 0});
+  ASSERT_TRUE(paged_ids.has_value()) << tessera::ToString(paged_ids.error());
+  EXPECT_EQ(*paged_ids, *full_ids);
 }
 
 // The model exposes the stop token ids its definition declares (the scalar
@@ -953,3 +1014,28 @@ TEST(EngineTest, MtpDecodeOnModel) {
 
 // A GGUF load reports one line per phase through the engine diagnostics,
 // so a slow load is traceable from the log alone.
+
+TEST(EngineTest, GpuLayerResidentSplitsLastLayers) {
+  using tessera::core::GpuLayerResident;
+  constexpr std::size_t kTrunk = 40;
+  // Zero keeps everything: the full-upload default.
+  EXPECT_TRUE(GpuLayerResident("blk.0.attn_q.weight", 0, kTrunk));
+  EXPECT_TRUE(GpuLayerResident("blk.39.ffn_down.weight", 0, kTrunk));
+  // One keeps the head only: no trunk block stays resident.
+  EXPECT_TRUE(GpuLayerResident("output.weight", 1, kTrunk));
+  EXPECT_TRUE(GpuLayerResident("token_embd.weight", 1, kTrunk));
+  EXPECT_TRUE(GpuLayerResident("blk.40.nextn.eh_proj.weight", 1, kTrunk));
+  EXPECT_FALSE(GpuLayerResident("blk.39.attn_q.weight", 1, kTrunk));
+  EXPECT_FALSE(GpuLayerResident("blk.0.attn_q.weight", 1, kTrunk));
+  // Twenty keeps the output plus the last 19 blocks (21 through 39).
+  EXPECT_FALSE(GpuLayerResident("blk.20.attn_q.weight", 20, kTrunk));
+  EXPECT_TRUE(GpuLayerResident("blk.21.attn_q.weight", 20, kTrunk));
+  EXPECT_TRUE(GpuLayerResident("blk.39.ffn_down_exps.weight", 20, kTrunk));
+  // Past the layer count keeps everything resident.
+  EXPECT_TRUE(GpuLayerResident("blk.0.attn_q.weight", 41, kTrunk));
+  EXPECT_TRUE(GpuLayerResident("blk.0.attn_q.weight", 999, kTrunk));
+  // An unknown trunk count keeps everything: blocks cannot be ordered.
+  EXPECT_TRUE(GpuLayerResident("blk.3.attn_q.weight", 5, 0));
+  // Non-block globals stay resident at any setting.
+  EXPECT_TRUE(GpuLayerResident("position_embd.weight", 1, kTrunk));
+}

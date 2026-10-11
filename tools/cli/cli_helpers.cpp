@@ -41,6 +41,19 @@ void LogModelSummary(Engine& engine, Model& model) {
   }
   auto& log = engine.Diagnostics();
   log.Info("cli", summary);
+  if (!model.Paged().empty()) {
+    std::size_t paged_bytes = 0;
+    for (const auto& paged : model.Paged()) {
+      auto sized = TensorBytes(paged.manifest.dtype,
+                               paged.manifest.shape.Numel());
+      if (sized) {
+        paged_bytes += *sized;
+      }
+    }
+    log.Info("cli", "paged weights: " + std::to_string(model.Paged().size()) +
+                        " tensors, " + std::to_string(paged_bytes) +
+                        " bytes in RAM, rest on device");
+  }
   for (std::size_t i = 0; i < tensors.size() && i < kPrintedTensorNames; ++i) {
     log.Info("cli", "tensor " + std::to_string(i) + ": " + tensors[i].name +
                         " [" + std::to_string(tensors[i].shape.Numel()) + "]");
@@ -64,8 +77,10 @@ void PrintUsage() {
                "  --list-gpus       list the GPUs the backend sees and exit\n"
                "  --model <path>    a .gguf file or an MXFP4 model directory\n"
                "  --draft <dir>     DFlash2 draft checkpoint directory\n"
-               "  --context <n>     maximum context length (default %zu)\n"
-               "  --gpu <n>         GPU index to use (default 0, the first)\n"
+                "  --context <n>     maximum context length (default %zu)\n"
+                "  --gpu <n>         GPU index to use (default 0, the first)\n"
+                "  --gpu-layers <n|all> layers kept in VRAM (0 uploads all, "
+                "default 0)\n"
                "  --gpus <a,b>      serve one model replica per GPU for "
                "parallel requests\n"
                "  --pipeline        run the model split across --gpus devices "

@@ -709,6 +709,10 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     layer_end = shard.last_layer;
   }
   for (std::size_t l = layer_begin; l < layer_end; ++l) {
+    // Stage the layer's RAM-backed weights (a no-op without paging).
+    if (auto ensured = model.EnsureLayerResident(l); !ensured) {
+      return std::unexpected(ensured.error());
+    }
     if (cfg.IsFullAttentionLayer(l)) {
       auto block = RunFullBlockBatch(backend, model, cfg, h, *h.batch, l, start,
                                      h.full[l], rows);
@@ -969,6 +973,10 @@ Qwen35Architecture::GreedyBatchMulti(
     layer_end = shard.last_layer;
   }
   for (std::size_t l = layer_begin; l < layer_end; ++l) {
+    // Stage the layer's RAM-backed weights (a no-op without paging).
+    if (auto ensured = model.EnsureLayerResident(l); !ensured) {
+      return std::unexpected(ensured.error());
+    }
     if (cfg.IsFullAttentionLayer(l)) {
       auto block = RunFullBlockBatchMulti(backend, model, cfg, driver, b, l,
                                           seqs, pos, rows);

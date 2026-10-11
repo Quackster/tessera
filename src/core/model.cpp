@@ -2,11 +2,14 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -415,12 +418,19 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
              std::optional<TransformerConfig> config,
              std::vector<DeviceTensor> weights,
              std::optional<Tokenizer> tokenizer, std::string chat_template,
-             std::vector<std::uint32_t> stop_tokens)
+             std::vector<std::uint32_t> stop_tokens,
+             std::vector<PagedTensor> paged,
+             std::vector<std::pair<std::string, std::unique_ptr<Buffer>>> staged,
+             std::shared_ptr<const void> file_backing,
+             std::shared_ptr<const void> retained_backing)
     : backend_(backend), options_(std::move(options)), format_(format),
       tensors_(std::move(tensors)), name_(std::move(name)),
       architecture_(std::move(architecture)),
       attention_(std::move(attention)), config_(std::move(config)),
-      weights_(std::move(weights)), tokenizer_(std::move(tokenizer)),
+      weights_(std::move(weights)), paged_(std::move(paged)),
+      file_backing_(std::move(file_backing)),
+      retained_backing_(std::move(retained_backing)),
+      tokenizer_(std::move(tokenizer)),
       chat_template_(std::move(chat_template)),
       stop_tokens_(std::move(stop_tokens)) {
   // Index the weights by name once, so the decode loop's per-op lookups do
@@ -429,6 +439,17 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
   weight_index_.reserve(weights_.size());
   for (std::size_t i = 0; i < weights_.size(); ++i) {
     weight_index_.emplace(weights_[i].manifest.name, i);
+  }
+  paged_index_.reserve(paged_.size());
+  for (std::size_t i = 0; i < paged_.size(); ++i) {
+    paged_index_.emplace(paged_[i].manifest.name, i);
+  }
+  // One staging view per paged kind; the manifest is filled when a layer
+  // is ensured and the device buffer is the kind's staging slot.
+  stage_views_.reserve(staged.size());
+  for (auto& slot : staged) {
+    stage_index_.emplace(slot.first, stage_views_.size());
+    stage_views_.push_back(DeviceTensor{TensorEntry{}, std::move(slot.second)});
   }
   module_ = CreateArchitecture(architecture_);
 }
@@ -442,20 +463,32 @@ const TensorShard& Model::Tensor() const { return options_.tensor; }
 // Upload every manifest tensor to a device buffer. `bytes` is the
 // whole file; offsets come from the parsed manifest. `log` receives one
 // phase line per upload stage (allocation, transfer) so a slow load is
-// traceable to a stage; it may be null.
-std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
+// traceable to a stage; it may be null. Under `--gpu-layers` paging only
+// the resident tensors are uploaded; the rest return as RAM-backed paged
+// entries with spans into `bytes` (or the returned sliced copies), and
+// stage_sizes carries one staging size per paged tensor kind.
+struct SplitUpload {
+  std::vector<DeviceTensor> resident;
+  std::vector<PagedTensor> paged;
+  std::vector<std::vector<std::byte>> sliced;
+  std::vector<std::pair<std::string, std::size_t>> stage_sizes;
+};
+
+std::expected<SplitUpload, StatusCode> UploadWeights(
     Backend& backend, const std::vector<TensorEntry>& tensors,
     const std::vector<std::uint64_t>& offsets, std::uint64_t data_start,
     std::span<const std::byte> bytes, const log::Diagnostics* log,
     const ModelShard& shard, std::size_t trunk_layers,
-    const TensorShard& tensor, const Architecture* module) {
-  std::vector<DeviceTensor> weights;
-  weights.reserve(tensors.size());
+    const TensorShard& tensor, const Architecture* module,
+    std::size_t gpu_layers) {
+  SplitUpload out;
+  out.resident.reserve(tensors.size());
   std::vector<Backend::HostCopy> copies;
   copies.reserve(tensors.size());
   // Sliced tensor bytes must outlive the batched upload below, so keep them
   // in one stable vector (moving the inner vectors preserves their data).
   std::vector<std::vector<std::byte>> sliced_storage;
+  std::unordered_map<std::string, std::size_t> stage_max;
   std::uint64_t total_bytes = 0;
   {
     core::PhaseTimer timer(log, "model", "allocate device buffers");
@@ -510,13 +543,43 @@ std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
           payload = sliced_storage.back();
         }
       }
+      // Under paging the early trunk blocks stay RAM-backed: no device
+      // buffer is allocated now; the decode loop stages them per layer.
+      // Anything outside `blk.<layer>.` (or past the trunk) stays
+      // resident, as does everything when paging is off.
+      bool resident =
+          core::GpuLayerResident(entry.name, gpu_layers, trunk_layers);
+      std::size_t layer = 0;
+      std::string block_kind;
+      if (!resident) {
+        std::string_view kind_view;
+        if (!core::SplitBlockName(entry.name, &layer, &kind_view) ||
+            layer >= trunk_layers) {
+          resident = true;
+        } else {
+          block_kind = std::string(kind_view);
+        }
+      }
+      if (!resident) {
+        auto staged = stage_max.find(block_kind);
+        if (staged == stage_max.end()) {
+          stage_max.emplace(block_kind, payload.size());
+        } else if (staged->second < payload.size()) {
+          staged->second = payload.size();
+        }
+        out.paged.push_back(PagedTensor{std::move(entry), payload, layer,
+                                        std::move(block_kind)});
+        continue;
+      }
       auto buffer = backend.AllocateBuffer(payload.size(), MemoryKind::Device);
       if (!buffer) {
         return std::unexpected(buffer.error());
       }
       total_bytes += payload.size();
-      weights.push_back(DeviceTensor{std::move(entry), std::move(*buffer)});
-      copies.push_back(Backend::HostCopy{weights.back().device.get(), payload});
+      out.resident.push_back(
+          DeviceTensor{std::move(entry), std::move(*buffer)});
+      copies.push_back(Backend::HostCopy{out.resident.back().device.get(),
+                                         payload});
     }
     timer.Stop(std::to_string(tensors.size()) + " tensors");
   }
@@ -530,7 +593,94 @@ std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
     timer.Stop(std::to_string(total_bytes) + " bytes in " +
                std::to_string(copies.size()) + " copies");
   }
-  return weights;
+  for (const auto& staged : stage_max) {
+    out.stage_sizes.emplace_back(staged.first, staged.second);
+  }
+  out.sliced = std::move(sliced_storage);
+  return out;
+}
+
+// One staging slot per paged tensor kind; the decode loop reuses them for
+// every paged layer.
+std::expected<std::vector<std::pair<std::string, std::unique_ptr<Buffer>>>,
+              StatusCode>
+AllocateStaging(
+    Backend& backend,
+    const std::vector<std::pair<std::string, std::size_t>>& stage_sizes) {
+  std::vector<std::pair<std::string, std::unique_ptr<Buffer>>> staged;
+  staged.reserve(stage_sizes.size());
+  for (const auto& sized : stage_sizes) {
+    auto slot = backend.AllocateBuffer(sized.second, MemoryKind::Device);
+    if (!slot) {
+      return std::unexpected(slot.error());
+    }
+    staged.emplace_back(sized.first, std::move(*slot));
+  }
+  return staged;
+}
+
+// RAM backing produced by downloading: resident device tensors plus the
+// downloaded overflow under `--gpu-layers` paging.
+struct EvictedWeights {
+  std::vector<DeviceTensor> resident;
+  std::vector<PagedTensor> paged;
+  std::vector<std::vector<std::byte>> converted;
+  std::vector<std::pair<std::string, std::size_t>> stage_sizes;
+};
+
+// Download every non-resident weight to RAM and release its device buffer,
+// so a loader that must upload everything (MXFP4 conversion) still pages.
+// The resident path is untouched; only paged tensors pay the extra
+// download. Transiently holds the full model on the device, so a model
+// that never fits cannot load paged either.
+std::expected<EvictedWeights, StatusCode> EvictPagedLayers(
+    Backend& backend, std::vector<DeviceTensor> uploaded,
+    std::size_t trunk_layers, std::size_t gpu_layers) {
+  EvictedWeights out;
+  out.resident.reserve(uploaded.size());
+  std::unordered_map<std::string, std::size_t> stage_max;
+  for (auto& weight : uploaded) {
+    bool resident = weight.device == nullptr ||
+                    core::GpuLayerResident(weight.manifest.name, gpu_layers,
+                                           trunk_layers);
+    std::size_t layer = 0;
+    std::string block_kind;
+    if (!resident) {
+      std::string_view kind_view;
+      if (!core::SplitBlockName(weight.manifest.name, &layer, &kind_view) ||
+          layer >= trunk_layers) {
+        resident = true;
+      } else {
+        block_kind = std::string(kind_view);
+      }
+    }
+    if (resident) {
+      out.resident.push_back(std::move(weight));
+      continue;
+    }
+    std::vector<std::byte> host(weight.device->Size());
+    if (auto down = backend.CopyD2H(*weight.device, host.data(), host.size());
+        !down) {
+      return std::unexpected(down.error());
+    }
+    auto staged = stage_max.find(block_kind);
+    if (staged == stage_max.end()) {
+      stage_max.emplace(block_kind, host.size());
+    } else if (staged->second < host.size()) {
+      staged->second = host.size();
+    }
+    out.converted.push_back(std::move(host));
+    TensorEntry manifest = weight.manifest;
+    weight.device.reset();
+    out.paged.push_back(PagedTensor{
+        std::move(manifest),
+        std::span<const std::byte>(out.converted.back()), layer,
+        std::move(block_kind)});
+  }
+  for (const auto& staged : stage_max) {
+    out.stage_sizes.emplace_back(staged.first, staged.second);
+  }
+  return out;
 }
 
 std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
@@ -587,14 +737,33 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     // The module answers the tensor-parallel role of each internal tensor
     // so the loader can slice it; a null module loads every tensor whole.
     std::unique_ptr<Architecture> module = CreateArchitecture(architecture);
-    auto weights =
+    auto uploaded =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
                       gguf->tensor_data_start, bytes, log, options.shard,
                       config->has_value() ? (*config)->layers : 0,
-                      options.tensor, module.get());
-    if (!weights) {
-      return std::unexpected(weights.error());
+                      options.tensor, module.get(), options.gpu_layers);
+    if (!uploaded) {
+      return std::unexpected(uploaded.error());
     }
+    // One staging slot per paged tensor kind; the decode loop reuses them
+    // for every paged layer. The mapped file stays alive in the model so
+    // the paged host spans outlive the load.
+    auto staged = AllocateStaging(backend, uploaded->stage_sizes);
+    if (!staged) {
+      return std::unexpected(staged.error());
+    }
+    auto file_backing = uploaded->paged.empty()
+                              ? std::shared_ptr<const void>{}
+                              : std::make_shared<core::MappedFile>(
+                                    std::move(*mapped));
+    // Retained slices back paged tensors under tensor parallelism; without
+    // paging the resident slices are already uploaded and dropped as
+    // before, so the default path keeps its memory behavior.
+    std::shared_ptr<const void> retained_backing =
+        uploaded->paged.empty() || uploaded->sliced.empty()
+            ? nullptr
+            : std::make_shared<std::vector<std::vector<std::byte>>>(
+                  std::move(uploaded->sliced));
     std::expected<std::optional<Tokenizer>, StatusCode> tokenizer;
     {
       core::PhaseTimer tokenizer_timer(log, "model", "build tokenizer");
@@ -614,8 +783,10 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     return std::unique_ptr<Model>(new Model(
         backend, options, ModelFormat::Gguf, std::move(gguf->tensors),
         std::move(name), std::move(architecture), std::move(*attention),
-        std::move(*config), std::move(*weights), std::move(*tokenizer),
-        std::move(chat_template), std::move(stop_tokens)));
+        std::move(*config), std::move(uploaded->resident),
+        std::move(*tokenizer), std::move(chat_template),
+        std::move(stop_tokens), std::move(uploaded->paged), std::move(*staged),
+        std::move(file_backing), std::move(retained_backing)));
   }
   if (std::filesystem::is_directory(path, ec) && !ec) {
     auto layout = core::InspectMxFp4Directory(path);
@@ -662,10 +833,35 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         if (!weights) {
           return std::unexpected(weights.error());
         }
+        // Converted weights upload fully; paging downloads the early
+        // trunk blocks back to RAM afterwards. A zero layer count keeps
+        // the full upload with no extra traffic.
+        std::vector<DeviceTensor> resident = std::move(*weights);
+        std::vector<PagedTensor> paged;
+        std::vector<std::vector<std::byte>> converted;
+        std::vector<std::pair<std::string, std::size_t>> stage_sizes;
+        if (options.gpu_layers != 0) {
+          auto evicted = EvictPagedLayers(backend, std::move(resident),
+                                          config->layers, options.gpu_layers);
+          if (!evicted) {
+            return std::unexpected(evicted.error());
+          }
+          resident = std::move(evicted->resident);
+          paged = std::move(evicted->paged);
+          converted = std::move(evicted->converted);
+          stage_sizes = std::move(evicted->stage_sizes);
+        }
+        auto staged = AllocateStaging(backend, stage_sizes);
+        if (!staged) {
+          return std::unexpected(staged.error());
+        }
         std::vector<TensorEntry> tensors;
-        tensors.reserve(weights->size());
-        for (const auto& weight : *weights) {
+        tensors.reserve(resident.size() + paged.size());
+        for (const auto& weight : resident) {
           tensors.push_back(weight.manifest);
+        }
+        for (const auto& entry : paged) {
+          tensors.push_back(entry.manifest);
         }
         auto tokenizer = core::LoadHfTokenizer(path);
         if (!tokenizer) {
@@ -675,12 +871,21 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         std::vector<std::uint32_t> stop_tokens = core::LoadHfStopTokens(path);
         std::optional<AttentionParams> attention = config->attention;
         std::optional<TransformerConfig> parsed_config = std::move(*config);
+        // The downloaded blobs stay alive in the model while paged spans
+        // point at them; null without paging, so the default path keeps
+        // its memory behavior.
+        std::shared_ptr<const void> retained_backing =
+            converted.empty()
+                ? nullptr
+                : std::make_shared<std::vector<std::vector<std::byte>>>(
+                      std::move(converted));
         return std::unique_ptr<Model>(new Model(
             backend, options, ModelFormat::MxFp4, std::move(tensors),
             std::string{}, std::move(architecture), std::move(attention),
-            std::move(parsed_config), std::move(*weights),
+            std::move(parsed_config), std::move(resident),
             std::move(*tokenizer), std::move(chat_template),
-            std::move(stop_tokens)));
+            std::move(stop_tokens), std::move(paged), std::move(*staged),
+            nullptr, std::move(retained_backing)));
       }
     }
     std::vector<TensorEntry> tensors;
@@ -692,16 +897,34 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       offsets.push_back(tensor.begin);
     }
     // Map offsets count from the file start, so the base is zero.
-    auto weights = UploadWeights(backend, tensors, offsets, 0, file_bytes, log,
-                                 options.shard, 0, options.tensor, nullptr);
-    if (!weights) {
-      return std::unexpected(weights.error());
+    // A raw directory has no trunk count, so every tensor stays resident;
+    // the backing is still retained for uniformity.
+    auto uploaded = UploadWeights(backend, tensors, offsets, 0, file_bytes,
+                                  log, options.shard, 0, options.tensor,
+                                  nullptr, options.gpu_layers);
+    if (!uploaded) {
+      return std::unexpected(uploaded.error());
     }
+    auto staged = AllocateStaging(backend, uploaded->stage_sizes);
+    if (!staged) {
+      return std::unexpected(staged.error());
+    }
+    auto file_backing = uploaded->paged.empty()
+                              ? std::shared_ptr<const void>{}
+                              : std::make_shared<core::MappedFile>(
+                                    std::move(*mapped));
+    std::shared_ptr<const void> retained_backing =
+        uploaded->paged.empty() || uploaded->sliced.empty()
+            ? nullptr
+            : std::make_shared<std::vector<std::vector<std::byte>>>(
+                  std::move(uploaded->sliced));
     return std::unique_ptr<Model>(new Model(
         backend, options, ModelFormat::MxFp4, std::move(tensors),
         std::string{}, std::string{}, std::nullopt, std::nullopt,
-        std::move(*weights), std::nullopt, std::string{},
-        core::LoadHfStopTokens(path)));
+        std::move(uploaded->resident), std::nullopt, std::string{},
+        core::LoadHfStopTokens(path), std::move(uploaded->paged),
+        std::move(*staged), std::move(file_backing),
+        std::move(retained_backing)));
   }
   return std::unexpected(StatusCode::InvalidArgument);
 }
@@ -773,12 +996,74 @@ std::span<const DeviceTensor> Model::Weights() const {
 
 const DeviceTensor* Model::FindDeviceTensor(std::string_view name) const {
   const auto it = weight_index_.find(name);
-  return it == weight_index_.end() ? nullptr : &weights_[it->second];
+  if (it != weight_index_.end()) {
+    return &weights_[it->second];
+  }
+  // A paged name resolves only while its layer is staged; otherwise the
+  // caller missed its EnsureLayerResident and gets a miss, which the
+  // NeedWeight helpers report as MalformedFile.
+  const auto paged = paged_index_.find(name);
+  if (paged == paged_index_.end()) {
+    return nullptr;
+  }
+  const PagedTensor& entry = paged_[paged->second];
+  if (!ensured_layer_.has_value() || *ensured_layer_ != entry.layer) {
+    return nullptr;
+  }
+  const auto staged = stage_index_.find(entry.kind);
+  return staged == stage_index_.end() ? nullptr
+                                      : &stage_views_[staged->second];
 }
 
 const Buffer* Model::FindWeight(std::string_view name) const {
   const DeviceTensor* found = FindDeviceTensor(name);
   return found == nullptr ? nullptr : found->device.get();
+}
+
+std::span<const PagedTensor> Model::Paged() const {
+  return std::span<const PagedTensor>(paged_);
+}
+
+std::expected<void, StatusCode> Model::EnsureLayerResident(
+    std::size_t layer) const {
+  if (paged_.empty()) {
+    return {};
+  }
+  if (ensured_layer_.has_value() && *ensured_layer_ == layer) {
+    return {};
+  }
+  // One batched upload for the layer's paged tensors, then point the
+  // kind views at this layer's manifests. Resident layers stage nothing
+  // but still mark the layer ensured.
+  std::vector<Backend::HostCopy> copies;
+  for (const PagedTensor& entry : paged_) {
+    if (entry.layer != layer) {
+      continue;
+    }
+    const auto staged = stage_index_.find(entry.kind);
+    if (staged == stage_index_.end()) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    copies.push_back(Backend::HostCopy{stage_views_[staged->second].device.get(),
+                                       entry.host});
+  }
+  if (!copies.empty()) {
+    if (auto uploaded = backend_.CopyH2DBatch(copies); !uploaded) {
+      return std::unexpected(uploaded.error());
+    }
+  }
+  for (const PagedTensor& entry : paged_) {
+    if (entry.layer != layer) {
+      continue;
+    }
+    const auto staged = stage_index_.find(entry.kind);
+    if (staged == stage_index_.end()) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    stage_views_[staged->second].manifest = entry.manifest;
+  }
+  ensured_layer_ = layer;
+  return {};
 }
 
 const std::string& Model::Path() const {

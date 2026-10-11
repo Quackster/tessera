@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "tessera/architecture.hpp"
@@ -62,6 +63,16 @@ struct ModelOptions {
   ModelShard shard;
   // Tensor-parallel shard; disabled loads the whole model.
   TensorShard tensor;
+  // Layers kept in VRAM; 0 (the default) keeps every layer on the device,
+  // the current full-upload behavior. A nonzero value pages the early
+  // trunk blocks from system RAM per token while the output layer and the
+  // last gpu_layers - 1 trunk blocks stay resident (llama.cpp -ngl
+  // order). A value past the layer count keeps everything resident.
+  //
+  // Usage:
+  //   ModelOptions options{path};
+  //   options.gpu_layers = 20;
+  std::size_t gpu_layers = 0;
 };
 
 // A loaded model: format + options + parsed tensor manifest.
@@ -70,6 +81,22 @@ struct ModelOptions {
 struct DeviceTensor {
   TensorEntry manifest;
   std::unique_ptr<Buffer> device;
+};
+
+// A RAM-backed tensor under `--gpu-layers` paging: its manifest entry
+// plus a span into the model-owned host backing (the mapped file or a
+// retained converted copy). The bytes reach the device through
+// Model::EnsureLayerResident before the layer that owns them runs.
+//
+// Usage:
+//   for (const auto& paged : model.Paged()) upload(paged.host);
+struct PagedTensor {
+  TensorEntry manifest;
+  std::span<const std::byte> host;
+  // Trunk layer index that owns this tensor.
+  std::size_t layer = 0;
+  // Name after the "blk.<layer>." prefix; staging is keyed by it.
+  std::string kind;
 };
 
 // A loaded model: format + options + parsed tensor manifest + the
@@ -99,9 +126,17 @@ class Model {
 
   [[nodiscard]] ModelFormat Format() const;
   [[nodiscard]] std::span<const TensorEntry> Tensors() const;
-  // Uploaded weights, parallel to Tensors() (empty for MXFP4, whose
-  // manifest is parsed in a later milestone).
+  // Resident uploaded weights. Without `--gpu-layers` paging this is
+  // parallel to Tensors(); with paging it holds only the resident subset
+  // and the paged tensors resolve through FindDeviceTensor once their
+  // layer is ensured (see EnsureLayerResident).
   [[nodiscard]] std::span<const DeviceTensor> Weights() const;
+  // RAM-backed tensors (empty without paging). Their host spans stay
+  // valid for the model's lifetime.
+  //
+  // Usage:
+  //   for (const auto& paged : model.Paged()) ...
+  [[nodiscard]] std::span<const PagedTensor> Paged() const;
   // The uploaded weight with this name, or nullptr when absent. Backed by
   // a name index, so the decode loop's per-op lookups are O(1) instead of
   // a scan over every tensor.
@@ -109,6 +144,16 @@ class Model {
       std::string_view name) const;
   // Device buffer for the tensor with this name; nullptr when absent.
   [[nodiscard]] const Buffer* FindWeight(std::string_view name) const;
+  // Upload the paged tensors of trunk layer `layer` into the staging
+  // buffers, so FindDeviceTensor resolves that layer's names afterwards.
+  // A no-op when paging is off or the layer is already ensured. Resident
+  // names resolve without it. Confined to the generation thread: not safe
+  // for concurrent use with generation on the same model.
+  //
+  // Usage:
+  //   if (auto ensured = model.EnsureLayerResident(l); !ensured) return ensured.error();
+  [[nodiscard]] std::expected<void, StatusCode> EnsureLayerResident(
+      std::size_t layer) const;
   [[nodiscard]] const std::string& Path() const;
   [[nodiscard]] std::size_t MaxContextLength() const;
   // New tokens to generate for `requested` after a prompt of
@@ -192,7 +237,10 @@ class Model {
         std::optional<TransformerConfig> config,
         std::vector<DeviceTensor> weights,
         std::optional<Tokenizer> tokenizer, std::string chat_template,
-        std::vector<std::uint32_t> stop_tokens);
+        std::vector<std::uint32_t> stop_tokens, std::vector<PagedTensor> paged,
+        std::vector<std::pair<std::string, std::unique_ptr<Buffer>>> staged,
+        std::shared_ptr<const void> file_backing,
+        std::shared_ptr<const void> retained_backing);
   Backend& backend_;
   ModelOptions options_;
   ModelFormat format_;
@@ -205,6 +253,25 @@ class Model {
   // Weight-name index: name -> position in weights_. Keys are string_views
   // into the (immutable) DeviceTensor names, so no string is copied.
   std::unordered_map<std::string_view, std::size_t> weight_index_;
+  // RAM-backed tensors and their name index; empty without paging.
+  std::vector<PagedTensor> paged_;
+  std::unordered_map<std::string_view, std::size_t> paged_index_;
+  // Staging views keyed by tensor kind, one per paged kind, each sized
+  // to the largest paged tensor of that kind. FindDeviceTensor answers
+  // paged names from the matching view once the layer is ensured.
+  // Mutable: ensuring stages bytes but never changes which tensors exist,
+  // and generation is confined to one thread (see EnsureLayerResident).
+  mutable std::vector<DeviceTensor> stage_views_;
+  std::unordered_map<std::string, std::size_t> stage_index_;
+  // Trunk layer whose paged tensors are staged; nullopt before the first
+  // EnsureLayerResident. Mutable for the same reason as stage_views_.
+  mutable std::optional<std::size_t> ensured_layer_;
+  // Lifetime holders for the RAM backing the paged host spans point into:
+  // the mapped weight file and any retained owned copies (tensor-parallel
+  // slices, converted MXFP4 blobs). The shared_ptr<const void> type erases
+  // the holder so no loader header leaks into this public header.
+  std::shared_ptr<const void> file_backing_;
+  std::shared_ptr<const void> retained_backing_;
   std::optional<Tokenizer> tokenizer_;
   std::string chat_template_;
   std::vector<std::uint32_t> stop_tokens_;

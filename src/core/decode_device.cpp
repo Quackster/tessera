@@ -159,6 +159,10 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
     }
   }
   for (std::size_t l = 0; l < cfg.layers; ++l) {
+    // Stage the layer's RAM-backed weights (a no-op without paging).
+    if (auto ensured = model.EnsureLayerResident(l); !ensured) {
+      return std::unexpected(ensured.error());
+    }
     const std::string base = "blk." + std::to_string(l) + ".";
     auto norm = NeedWeight(model, base + "attn_norm.weight", DType::F32);
     auto wq = NeedWeightAny(model, base + "attn_q.weight");

@@ -123,6 +123,7 @@ int main(int argc, char** argv) {
   std::size_t split_cap = 0;
   std::size_t attention_split = 0;
   std::size_t draft_context = 0;
+  std::size_t gpu_layers = 0;
   int gpu = 0;
   std::vector<int> gpus;
   for (int i = 2; i < argc; ++i) {
@@ -173,6 +174,14 @@ int main(int argc, char** argv) {
       attention_split = std::stoul(argv[++i]);
     } else if (arg == "--draft-context" && i + 1 < argc) {
       draft_context = std::stoul(argv[++i]);
+    } else if (arg == "--gpu-layers" && i + 1 < argc) {
+      // How many layers stay in VRAM; the rest page from system RAM per
+      // token. 0 (the default) uploads everything; `all` also keeps
+      // everything resident. Larger than the layer count caps cleanly.
+      const std::string_view layers_value = argv[++i];
+      gpu_layers = layers_value == "all"
+                       ? 0
+                       : std::stoul(std::string(layers_value));
     } else if (arg == "--speculate") {
       speculate = true;
     } else if (arg == "--pipeline") {
@@ -303,11 +312,14 @@ int main(int argc, char** argv) {
         }
         std::unique_ptr<tessera::Engine> engine_ptr = std::move(*created);
         // Refuse a device that cannot hold the weights before the load
-        // starts, so a two-device serve does not half-load.
+        // starts, so a two-device serve does not half-load. Skipped under
+        // paging: only the resident set lands in VRAM, so the file size
+        // is not the resident size; the load itself still fails cleanly
+        // when the resident set does not fit.
         const std::uint64_t needed = PathSizeBytes(model_path);
         const tessera::DeviceMemoryInfo memory =
             engine_ptr->Owner().MemoryInfo();
-        if (memory.total_bytes != 0 && needed != 0 &&
+        if (gpu_layers == 0 && memory.total_bytes != 0 && needed != 0 &&
             memory.free_bytes < needed) {
           std::fprintf(stderr,
                        "cli: gpu %d has %s MiB free but the model needs about "
@@ -317,8 +329,9 @@ int main(int argc, char** argv) {
                        std::to_string(needed / (1024 * 1024)).c_str());
           return std::unexpected(tessera::StatusCode::OutOfMemory);
         }
-        auto model =
-            engine_ptr->LoadModel(tessera::ModelOptions{model_path, context});
+        tessera::ModelOptions model_options{model_path, context};
+        model_options.gpu_layers = gpu_layers;
+        auto model = engine_ptr->LoadModel(model_options);
         if (!model) {
           return std::unexpected(model.error());
         }
@@ -650,7 +663,9 @@ int main(int argc, char** argv) {
   auto& log = engine.Diagnostics();
   attach_strategy(engine);
 
-  auto model = engine.LoadModel(tessera::ModelOptions{model_path, context});
+  tessera::ModelOptions model_options{model_path, context};
+  model_options.gpu_layers = gpu_layers;
+  auto model = engine.LoadModel(model_options);
   if (!model) {
     std::fprintf(stderr, "cli: model load failed (%s)\n",
                  tessera::ToString(model.error()).data());
