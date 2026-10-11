@@ -270,10 +270,6 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--draft <dir>` | both | none | DFlash2 draft checkpoint directory. |
 | `--context <n>` | both | 4096 | Maximum context length. |
 | `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
-| `--gpus <a,b>` | both | none | Serve one model replica per listed GPU for parallel requests (for example `--gpus 0,1`). Overrides `--gpu`. |
-| `--pipeline` | run | off | Split the model layers across the `--gpus` devices. |
-| `--tp` | run | off | Split attention, FFN and MoE experts across the `--gpus` devices with a rank reduce. |
-| `--cp` | run | off | Split the key range across the `--gpus` devices with a per-layer partial combine. |
 | `--draft-block <n>` | both | 0 | Draft block tokens. 0 keeps the draft checkpoint's configured block. |
 | `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects the automatic default (512). |
 | `--split-target <n>` | both | 0 | fp8 MXFP4 split-K workgroup target (ROCm only). 0 uses the built-in default (320). |
@@ -288,9 +284,6 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--max-completion-tokens <n>` | run | 0 | Completion tokens. 0 fills the remaining context. |
 | `--max-thinking-tokens <n>` | run | 0 | Think-block budget per turn. 0 leaves thinking unlimited. |
 | `--speculate` | both | off | MTP speculative decode. It drafts from the target's own nextn head, so it needs no checkpoint path and drives both `run` and served turns. |
-| `--spec-split` | run | off | Run the MTP draft head on the second `--gpus` device; needs `--speculate`. |
-| `--hybrid` | run | off | Data-parallel groups of model-parallel teams; needs `--batch-prompt` (one per group). |
-| `--dp <n>` | run | 1 | Data-parallel group count for `--hybrid`. |
 | `--sample` | run | off | Sample instead of greedy decode. |
 | `--temperature <f>` | run | 0.6 | Sampling temperature. |
 | `--top-p <f>` | run | 0.95 | Nucleus probability. |
@@ -310,6 +303,14 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--allow-origin <o>` | serve | none | CORS origin. Repeatable. `*` allows all origins. |
 | `--calibration <file>` | run, serve, calibrate | env `TESSERA_CALIBRATION` | Calibration file. `run` and `serve` apply a saved entry for the current machine and model unless an explicit flag overrides it. `calibrate` reads and writes it. |
 | `--prompts <file>` | calibrate | three fixed prompts | Fixed prompts, one per non-empty line, for the calibration sweep. |
+| **Parallelism** | | | The flags below spread work across the `--gpus` devices. |
+| `--gpus <a,b>` | both | none | Serve one model replica per listed GPU for parallel requests (for example `--gpus 0,1`). Overrides `--gpu`. |
+| `--pipeline` | run | off | Split the model layers across the `--gpus` devices. |
+| `--tp` | run | off | Split attention, FFN and MoE experts across the `--gpus` devices with a rank reduce. |
+| `--cp` | run | off | Split the key range across the `--gpus` devices with a per-layer partial combine. |
+| `--spec-split` | run | off | Run the MTP draft head on the second `--gpus` device; needs `--speculate`. |
+| `--hybrid` | run | off | Data-parallel groups of model-parallel teams; the `--prompt-text` prompt runs on every group. |
+| `--dp <n>` | run | 1 | Data-parallel group count for `--hybrid`. |
 
 The KV cache is fp32 when no `--kv-*` flag is set. The sampling defaults match the Qwen 3.8 27B defaults.
 

@@ -92,7 +92,6 @@ int main(int argc, char** argv) {
   std::string model_path;
   std::string draft_path;
   std::string prompt_text;
-  std::vector<std::string> batch_prompts;
   std::string calibration_path;
   std::string mmproj_path;
   std::string image_path;
@@ -134,9 +133,6 @@ int main(int argc, char** argv) {
       draft_path = argv[++i];
     } else if (arg == "--prompt-text" && i + 1 < argc) {
       prompt_text = argv[++i];
-    } else if (arg == "--batch-prompt" && i + 1 < argc) {
-      // Repeatable: each occurrence is one sequence in a batched run.
-      batch_prompts.emplace_back(argv[++i]);
     } else if (arg == "--mmproj" && i + 1 < argc) {
       mmproj_path = argv[++i];
     } else if (arg == "--image" && i + 1 < argc) {
@@ -384,12 +380,9 @@ int main(int argc, char** argv) {
   }
 
   if (pipeline_mode) {
-    // Layer-split the model across the selected devices. One --prompt-text
-    // streams a single request; repeated --batch-prompt runs several
-    // requests overlapped across the stages.
-    if (prompt_text.empty() && batch_prompts.empty()) {
-      std::fprintf(stderr,
-                   "cli: --pipeline needs --prompt-text or --batch-prompt\n");
+    // Layer-split the model across the selected devices for one request.
+    if (prompt_text.empty()) {
+      std::fprintf(stderr, "cli: --pipeline needs --prompt-text\n");
       return kExitUsage;
     }
     tessera::PipelineOptions pipeline_options;
@@ -424,31 +417,6 @@ int main(int argc, char** argv) {
       *ids = std::move(*encoded);
       return true;
     };
-    if (!batch_prompts.empty()) {
-      std::vector<std::vector<std::uint32_t>> prompts;
-      prompts.reserve(batch_prompts.size());
-      for (const std::string& source : batch_prompts) {
-        std::vector<std::uint32_t> ids;
-        if (!encode(source, &ids)) {
-          std::fprintf(stderr, "cli: prompt encode failed\n");
-          return kExitError;
-        }
-        prompts.push_back(std::move(ids));
-      }
-      auto outputs =
-          (*pipeline)->GenerateMany(prompts, max_completion_tokens);
-      if (!outputs) {
-        std::fprintf(stderr, "cli: pipeline batch generation failed (%s)\n",
-                     tessera::ToString(outputs.error()).data());
-        return kExitError;
-      }
-      for (std::size_t i = 0; i < outputs->size(); ++i) {
-        auto text = tokenizer->Decode((*outputs)[i]);
-        std::fprintf(stdout, "batch %zu: %s\n", i, text ? text->c_str() : "");
-      }
-      std::fflush(stdout);
-      return kExitOk;
-    }
     std::vector<std::uint32_t> ids;
     if (!encode(prompt_text, &ids)) {
       std::fprintf(stderr, "cli: prompt encode failed\n");
@@ -631,16 +599,10 @@ int main(int argc, char** argv) {
 
   if (hybrid_mode) {
     // Hybrid: data-parallel groups of model-parallel teams behind one
-    // device mesh. One --batch-prompt per group; --tp/--cp selects the
-    // model-parallel route inside each multi-rank group.
-    if (batch_prompts.empty()) {
-      std::fprintf(stderr, "cli: --hybrid needs --batch-prompt\n");
-      return kExitUsage;
-    }
-    if (batch_prompts.size() != dp_groups) {
-      std::fprintf(stderr, "cli: --hybrid needs one --batch-prompt per group");
-      std::fprintf(stderr, " (%zu groups, %zu prompts)\n", dp_groups,
-                   batch_prompts.size());
+    // device mesh. The one prompt runs on every group; --tp/--cp selects
+    // the model-parallel route inside each multi-rank group.
+    if (prompt_text.empty()) {
+      std::fprintf(stderr, "cli: --hybrid needs --prompt-text\n");
       return kExitUsage;
     }
     tessera::HybridOptions hybrid_options;
@@ -663,11 +625,11 @@ int main(int argc, char** argv) {
       return kExitError;
     }
     std::vector<std::vector<std::uint32_t>> prompts;
-    prompts.reserve(batch_prompts.size());
-    for (const std::string& source : batch_prompts) {
-      std::string text = source;
+    prompts.reserve(dp_groups);
+    for (std::size_t g = 0; g < dp_groups; ++g) {
+      std::string text = prompt_text;
       if (!no_chat) {
-        auto chat = (*hybrid)->ChatPrompt(source);
+        auto chat = (*hybrid)->ChatPrompt(prompt_text);
         if (chat) {
           text = *chat;
         }
@@ -711,50 +673,6 @@ int main(int argc, char** argv) {
   }
   tessera::Model& loaded = **model;
   LogModelSummary(engine, loaded);
-  if (!batch_prompts.empty()) {
-    // Batched greedy: one sequence per --batch-prompt, decoded together.
-    const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
-    if (tokenizer == nullptr) {
-      log.Warn("cli", "this model has no tokenizer; batch prompts unavailable");
-      return kExitError;
-    }
-    std::vector<tessera::GenerateOptions> requests;
-    requests.reserve(batch_prompts.size());
-    for (const std::string& text : batch_prompts) {
-      std::string prompt = text;
-      if (!no_chat) {
-        auto chat = loaded.ChatPrompt(text);
-        if (chat) {
-          prompt = *chat;
-        }
-      }
-      auto ids = tokenizer->Encode(prompt);
-      if (!ids) {
-        log.Warn("cli", std::string("prompt encode failed (") +
-                            std::string(tessera::ToString(ids.error())) + ")");
-        return kExitError;
-      }
-      tessera::GenerateOptions gen;
-      gen.prompt_tokens = *ids;
-      gen.max_completion_tokens = max_completion_tokens;
-      gen.kv_type = kv_type;
-      gen.progress_every = 0;
-      requests.push_back(std::move(gen));
-    }
-    auto outputs = engine.GenerateBatch(loaded, requests);
-    if (!outputs) {
-      log.Warn("cli", std::string("batch generation failed (") +
-                          std::string(tessera::ToString(outputs.error())) + ")");
-      return kExitError;
-    }
-    for (std::size_t i = 0; i < outputs->size(); ++i) {
-      auto text = tokenizer->Decode((*outputs)[i]);
-      std::fprintf(stdout, "batch %zu: %s\n", i,
-                   text ? text->c_str() : "");
-    }
-    std::fflush(stdout);
-    return kExitOk;
-  }
   // Resolve any saved calibration (explicit CLI values win) before building
   // the request options.
   tessera::CalibrationConfig applied;

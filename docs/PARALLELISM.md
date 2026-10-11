@@ -738,12 +738,14 @@ model-parallel team per group (a lone engine/model for a one-rank
 group, otherwise a TensorParallel or ContextParallel team) and runs one
 thread per group over one prompt each. No new transport and no new
 kernels: it reuses the F2 copies and the P4/P6 drivers. The CLI runs it
-with `--hybrid --gpus 0,1 --dp 2` plus repeatable `--batch-prompt`;
-`--tp` or `--cp` selects the route inside each multi-rank group.
+with `--hybrid --gpus 0,1 --dp 2 --prompt-text ...`, broadcasting the
+one prompt to every group; `--tp` or `--cp` selects the route inside
+each multi-rank group.
 Verified on the 27B Q4_K_M GGUF across GPUs 0 and 1: a DP(2)xMP(1)
-batch reproduces two sequential single-device runs token for token,
-and a DP(1)xMP(2) tensor run matches the `--tp` output. An invalid mesh
-(a group count that does not divide the device list) fails cleanly.
+broadcast reproduces the single-device run on both groups token for
+token, and a DP(1)xMP(2) tensor run matches the `--tp` output. An
+invalid mesh (a group count that does not divide the device list)
+fails cleanly.
 Both backends build and both suites pass 212 tests. A non-degenerate
 mesh (several multi-rank groups) needs four devices.
 
