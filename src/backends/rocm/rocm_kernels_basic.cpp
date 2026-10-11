@@ -107,7 +107,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
   if (e < head_dim) {
     q_s[e] = q[qb + e];
   }
-  __syncthreads();
+  LdsBarrier();
   float run_max = -1e30f;
   float run_sum = 0.0f;
   float acc = 0.0f;
@@ -136,7 +136,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
       s = dot * scale;
     }
     sc[e] = s;
-    __syncthreads();
+    LdsBarrier();
     // One thread reduces the tile so a long context pays one scan,
     // not one scan per thread. Same order as before, same numerics.
     if (e == 0) {
@@ -165,7 +165,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
       tile_bc[1] = corr;
       tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
-    __syncthreads();
+    LdsBarrier();
     const float m_new = tile_bc[0];
     const float corr = tile_bc[1];
     const float l = tile_bc[2];
@@ -197,7 +197,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     acc = fmaf(corr, acc, a);
     run_sum = fmaf(corr, run_sum, l);
     run_max = m_new;
-    __syncthreads();
+    LdsBarrier();
     if (tile_last >= last) {
       break;
     }
@@ -276,7 +276,7 @@ __global__ void AttentionSplitKernel(
   if (e < head_dim) {
     q_s[e] = q[qb + e];
   }
-  __syncthreads();
+  LdsBarrier();
   float run_max = -1e30f;
   float run_sum = 0.0f;
   float acc = 0.0f;
@@ -303,7 +303,7 @@ __global__ void AttentionSplitKernel(
       s = dot * scale;
     }
     sc[e] = s;
-    __syncthreads();
+    LdsBarrier();
     if (e == 0) {
       float tmax = -1e30f;
       for (unsigned long long t = 0; t < kTile; ++t) {
@@ -321,7 +321,7 @@ __global__ void AttentionSplitKernel(
       tile_bc[1] = corr;
       tile_bc[2] = l;
     }
-    __syncthreads();
+    LdsBarrier();
     const float m_new = tile_bc[0];
     const float corr = tile_bc[1];
     const float l = tile_bc[2];
@@ -350,7 +350,7 @@ __global__ void AttentionSplitKernel(
     acc = fmaf(corr, acc, a);
     run_sum = fmaf(corr, run_sum, l);
     run_max = m_new;
-    __syncthreads();
+    LdsBarrier();
     if (tile_last >= cend) {
       break;
     }
@@ -478,12 +478,12 @@ __global__ void QuantizeFp8Kernel(float* data, float* scale,
   }
   red[tid] = amax;
   for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    __syncthreads();
+    LdsBarrier();
     if (tid < s) {
       red[tid] = fmaxf(red[tid], red[tid + s]);
     }
   }
-  __syncthreads();
+  LdsBarrier();
   float sc = red[0] / 448.0f;
   const float min_s = 1.0f / (448.0f * 512.0f);
   if (sc < min_s) {
@@ -502,24 +502,6 @@ __global__ void QuantizeFp8Kernel(float* data, float* scale,
 // E8M0ToFloatDev and kE2M1Dev (the MXFP4 codec) now live in
 // rocm_kernels.hpp so the batched MXFP4 kernel in this translation unit
 // and any other share one definition.
-
-// bf16 -> fp32 on the device: shift the 16 bits into the high half.
-__device__ float Bf16ToFloatDev(unsigned short bits) {
-  unsigned int wide = static_cast<unsigned int>(bits) << 16;
-  float value;
-  memcpy(&value, &wide, sizeof(value));
-  return value;
-}
-
-// fp32 -> bf16 round-to-nearest-even, the activation precision the bf16
-// tensor-core GEMM stages.
-__device__ unsigned short Bf16FromFloatDev(float value) {
-  unsigned int bits;
-  memcpy(&bits, &value, sizeof(bits));
-  const unsigned int rounding = (bits >> 16) & 1u;
-  bits += 0x7FFFu + rounding;
-  return static_cast<unsigned short>(bits >> 16);
-}
 
 // Built-in "gemm_bf16": C = A x W^T with bf16 weights and fp32
 // sequential accumulation.
@@ -540,7 +522,7 @@ __global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
   const unsigned short* w_row = w + row_w * k;
   float acc = 0.0f;
   for (unsigned long long t = lane; t < k; t += 32) {
-    acc = fmaf(a_row[t], Bf16ToFloatDev(w_row[t]), acc);
+    acc = fmaf(a_row[t], Bf16ToF32(w_row[t]), acc);
   }
   for (int offset = 16; offset > 0; offset >>= 1) {
     acc += __shfl_down(acc, offset);
@@ -653,13 +635,13 @@ __global__ void GemmBf16BatchedKernel(const float* a, const unsigned short* w,
   float p3 = 0.0f;
   unsigned long long t = 0;
   for (; t + 4 <= k; t += 4) {
-    p0 = fmaf(ar[t], Bf16ToFloatDev(wr[t]), p0);
-    p1 = fmaf(ar[t + 1], Bf16ToFloatDev(wr[t + 1]), p1);
-    p2 = fmaf(ar[t + 2], Bf16ToFloatDev(wr[t + 2]), p2);
-    p3 = fmaf(ar[t + 3], Bf16ToFloatDev(wr[t + 3]), p3);
+    p0 = fmaf(ar[t], Bf16ToF32(wr[t]), p0);
+    p1 = fmaf(ar[t + 1], Bf16ToF32(wr[t + 1]), p1);
+    p2 = fmaf(ar[t + 2], Bf16ToF32(wr[t + 2]), p2);
+    p3 = fmaf(ar[t + 3], Bf16ToF32(wr[t + 3]), p3);
   }
   for (; t < k; ++t) {
-    p0 = fmaf(ar[t], Bf16ToFloatDev(wr[t]), p0);
+    p0 = fmaf(ar[t], Bf16ToF32(wr[t]), p0);
   }
   c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
 }
@@ -1078,7 +1060,7 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
             *reinterpret_cast<WmmaU4*>(outw);
       }
     }
-    __syncthreads();
+    LdsBarrier();
 #pragma unroll
     for (int ks = 0; ks < kWmmaDbk / 16; ++ks) {
       WmmaFp8A af, wf;
@@ -1091,7 +1073,7 @@ __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
       }
       acc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af, wf, acc);
     }
-    __syncthreads();
+    LdsBarrier();
   }
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
@@ -1157,7 +1139,7 @@ __global__ void GemmBf16WmmaKernel(const float* a, const unsigned short* w,
       unsigned short* dst = &sA[r * kWmmaBstr + col];
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
-        dst[e] = Bf16FromFloatDev(src[e]);
+        dst[e] = F32ToBf16(src[e]);
       }
     }
     // W tile: the wave's 16 columns, DBK bf16 each, already bf16 in DRAM.
@@ -1171,7 +1153,7 @@ __global__ void GemmBf16WmmaKernel(const float* a, const unsigned short* w,
                 &w[static_cast<unsigned long long>(nrc) * k + k0 + cg * 8]);
       }
     }
-    __syncthreads();
+    LdsBarrier();
 #pragma unroll
     for (int ks = 0; ks < kWmmaDbk / 16; ++ks) {
       WmmaBf16A af, wf;
@@ -1183,7 +1165,7 @@ __global__ void GemmBf16WmmaKernel(const float* a, const unsigned short* w,
       }
       acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(af, wf, acc);
     }
-    __syncthreads();
+    LdsBarrier();
   }
 #pragma unroll
   for (int j = 0; j < 8; ++j) {
@@ -1217,12 +1199,12 @@ __global__ void RmsnormKernel(const float* x, const float* w, float* y,
     sum = fmaf(x[r * cols + c], x[r * cols + c], sum);
   }
   partial[tid] = sum;
-  __syncthreads();
+  LdsBarrier();
   for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
     if (tid < s) {
       partial[tid] += partial[tid + s];
     }
-    __syncthreads();
+    LdsBarrier();
   }
   const float mean = partial[0] / static_cast<float>(cols);
   const float gain = 1.0f / sqrtf(mean + eps);
@@ -1270,12 +1252,12 @@ __global__ void L2NormKernel(const float* x, float* y,
   }
   red[tid] = sum;
   for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    __syncthreads();
+    LdsBarrier();
     if (tid < s) {
       red[tid] += red[tid + s];
     }
   }
-  __syncthreads();
+  LdsBarrier();
   const float gain = scale / sqrtf(red[0] + eps);
   for (unsigned long long c = tid; c < cols; c += blockDim.x) {
     y[base + c] = x[base + c] * gain;
@@ -1309,12 +1291,12 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
   }
   red[tid] = sum;
   for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    __syncthreads();
+    LdsBarrier();
     if (tid < s) {
       red[tid] += red[tid + s];
     }
   }
-  __syncthreads();
+  LdsBarrier();
   const float mean = red[0] / static_cast<float>(cols);
   const float gain = 1.0f / sqrtf(mean + eps);
   for (unsigned long long c = tid; c < cols; c += blockDim.x) {
@@ -1475,12 +1457,12 @@ __global__ void MoeGateKernel(const float* vals, const float* x,
     dot += x[t] * w[t];
   }
   red[tid] = dot;
-  __syncthreads();
+  LdsBarrier();
   for (unsigned int s = stride / 2u; s > 0u; s >>= 1u) {
     if (tid < s) {
       red[tid] += red[tid + s];
     }
-    __syncthreads();
+    LdsBarrier();
   }
   if (tid == 0u) {
     float m = -3.402823466e+38f;
@@ -1771,12 +1753,12 @@ __device__ void QuantizeKvRowBody(const float* in, unsigned int* packed,
   }
   red[tid] = amax;
   for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    __syncthreads();
+    LdsBarrier();
     if (tid < s) {
       red[tid] = fmaxf(red[tid], red[tid + s]);
     }
   }
-  __syncthreads();
+  LdsBarrier();
   float sc = 1.0f;
   if (Kind == kKvRowFp8) {
     sc = red[0] / 448.0f;
@@ -1886,7 +1868,7 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
   if (e < head_dim) {
     q_s[e] = q[qb + e];
   }
-  __syncthreads();
+  LdsBarrier();
   float run_max = -1e30f;
   float run_sum = 0.0f;
   float acc = 0.0f;
@@ -1915,7 +1897,7 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
       s = dot * scale;
     }
     sc[e] = s;
-    __syncthreads();
+    LdsBarrier();
     // One thread reduces the tile so a long context pays one scan,
     // not one scan per thread. Same order as before, same numerics.
     if (e == 0) {
@@ -1944,7 +1926,7 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
       tile_bc[1] = corr;
       tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
-    __syncthreads();
+    LdsBarrier();
     const float m_new = tile_bc[0];
     const float corr = tile_bc[1];
     const float l = tile_bc[2];
@@ -1979,7 +1961,7 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
     acc = fmaf(corr, acc, a);
     run_sum = fmaf(corr, run_sum, l);
     run_max = m_new;
-    __syncthreads();
+    LdsBarrier();
     if (tile_last >= last) {
       break;
     }
@@ -2064,7 +2046,7 @@ __device__ void AttentionQuantSplit(const float* q, const unsigned char* k,
   if (e < head_dim) {
     q_s[e] = q[qb + e];
   }
-  __syncthreads();
+  LdsBarrier();
   float run_max = -1e30f;
   float run_sum = 0.0f;
   float acc = 0.0f;
@@ -2091,7 +2073,7 @@ __device__ void AttentionQuantSplit(const float* q, const unsigned char* k,
       s = dot * scale;
     }
     sc[e] = s;
-    __syncthreads();
+    LdsBarrier();
     if (e == 0) {
       float tmax = -1e30f;
       for (unsigned long long t = 0; t < kTile; ++t) {
@@ -2109,7 +2091,7 @@ __device__ void AttentionQuantSplit(const float* q, const unsigned char* k,
       tile_bc[1] = corr;
       tile_bc[2] = l;
     }
-    __syncthreads();
+    LdsBarrier();
     const float m_new = tile_bc[0];
     const float corr = tile_bc[1];
     const float l = tile_bc[2];
@@ -2143,7 +2125,7 @@ __device__ void AttentionQuantSplit(const float* q, const unsigned char* k,
     acc = fmaf(corr, acc, a);
     run_sum = fmaf(corr, run_sum, l);
     run_max = m_new;
-    __syncthreads();
+    LdsBarrier();
     if (tile_last >= cend) {
       break;
     }
@@ -2473,25 +2455,25 @@ __global__ void TopKRowsKernel(const float* logits, unsigned int* ids,
     rv[tid] = (head < count) ? lv[head] : -INFINITY;
     ri[tid] = (head < count) ? li[head] : 0u;
     rown[tid] = static_cast<unsigned int>(tid);
-    __syncthreads();
+    LdsBarrier();
     for (unsigned long long s = dim / 2; s > 0; s >>= 1) {
       if (tid < s && rv[tid + s] > rv[tid]) {
         rv[tid] = rv[tid + s];
         ri[tid] = ri[tid + s];
         rown[tid] = rown[tid + s];
       }
-      __syncthreads();
+      LdsBarrier();
     }
     if (tid == 0) {
       vals[r * top_k + p] = rv[0];
       ids[r * top_k + p] = ri[0];
     }
     const unsigned int owner = rown[0];
-    __syncthreads();
+    LdsBarrier();
     if (tid == owner) {
       ++head;
     }
-    __syncthreads();
+    LdsBarrier();
   }
 }
 

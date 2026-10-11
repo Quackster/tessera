@@ -1,0 +1,107 @@
+#version 450
+
+// Tiled batched Q3_K GEMM: one workgroup covers 32 activation rows x 8
+// weight columns with one thread per output, so every thread computes.
+// Each thread decodes its own column's blocks in the gemm_q3k element
+// order (n2, j, then the low 16 and the high 16). Dispatch is
+// ceil(m / 32) * ceil(n / 8) workgroups of 256.
+layout(local_size_x = 256) in;
+
+// "gemm_q3k_batched" contract (tessera API): buffers and scalars match
+// gemm_q3k (m, n, k, k a multiple of 256). Scalars are 64-bit, so field
+// m lives at pc.v[0], n at pc.v[2], k at pc.v[4].
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) readonly buffer W {
+  uint w[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer C {
+  float c[];
+};
+
+// Byte `offset` of the Q3_K buffer (little-endian extraction).
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+// IEEE binary16 (little-endian) -> fp32, exact.
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+void main() {
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  uint tid = gl_LocalInvocationID.x;
+  uint col_tiles = (n + 7u) / 8u;
+  uint wg = gl_WorkGroupID.x;
+  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
+  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
+  if (row_a >= m || row_w >= n) {
+    return;
+  }
+  uint blocks = k / 256u;
+  uint abase = row_a * k;
+  uint wbase = row_w * (blocks * 110u);
+  float acc = 0.0;
+  for (uint b = 0u; b < blocks; ++b) {
+    uint base = wbase + b * 110u;
+    float d_all = fp16_at(base + 108u);
+    // Unpack the 12 scale bytes into 16 int8 scales.
+    uint aux0 = 0u;
+    uint aux1 = 0u;
+    uint aux2 = 0u;
+    for (uint e = 0u; e < 4u; ++e) {
+      aux0 |= wbyte(base + 96u + e) << (8u * e);
+      aux1 |= wbyte(base + 100u + e) << (8u * e);
+      aux2 |= wbyte(base + 104u + e) << (8u * e);
+    }
+    uint s0 = (aux0 & 0x0f0f0f0fu) | (((aux2 >> 0u) & 0x03030303u) << 4u);
+    uint s1 = (aux1 & 0x0f0f0f0fu) | (((aux2 >> 2u) & 0x03030303u) << 4u);
+    uint s2 = ((aux0 >> 4u) & 0x0f0f0f0fu) | (((aux2 >> 4u) & 0x03030303u) << 4u);
+    uint s3 = ((aux1 >> 4u) & 0x0f0f0f0fu) | (((aux2 >> 6u) & 0x03030303u) << 4u);
+    uint is = 0u;
+    uint mask = 1u;
+    for (uint n2 = 0u; n2 < 2u; ++n2) {
+      uint shift = 0u;
+      for (uint j = 0u; j < 4u; ++j) {
+        for (uint part = 0u; part < 2u; ++part) {
+          uint sword = is < 4u ? s0 : (is < 8u ? s1 : (is < 12u ? s2 : s3));
+          uint sby = (sword >> (8u * (is % 4u))) & 0xFFu;
+          int s8 = sby >= 128u ? int(sby) - 256 : int(sby);
+          float dl = d_all * (float(s8) - 32.0);
+          for (uint l = 0u; l < 16u; ++l) {
+            uint qv =
+                (wbyte(base + 32u + n2 * 32u + part * 16u + l) >> shift) & 3u;
+            uint hb = (wbyte(base + part * 16u + l) & mask) > 0u ? 0u : 4u;
+            acc += a[abase + b * 256u + n2 * 128u + j * 32u + part * 16u + l] *
+                   (dl * (float(qv) - float(hb)));
+          }
+          is += 1u;
+        }
+        shift += 2u;
+        mask <<= 1u;
+      }
+    }
+  }
+  c[row_a * n + row_w] = acc;
+}

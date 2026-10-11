@@ -206,36 +206,63 @@ This is the full catalogue. Each phase below turns part of it into cards.
   `rocm_kernels_basic.cpp:2418`).
 - No DPP, no `sched_barrier`, no `global_load_tr`, no `lds_barrier`.
 
+## Measured ceilings (RX 7900 XTX, gfx1100)
+
+The first-class targets are now GEMM bound and near the fp32 scalar
+ceiling, so most remaining cards need the gfx12 (RDNA 4) tensor-core
+path, which this box cannot build or validate. Measured in isolation:
+
+- MXFP4 tiled GEMM (`gemm_mxfp4_batched`) at 512 x 5120 x 5120 through
+  512 x 17408 x 5120: about 5.1 TFLOP/s. LDS-staged decode is neutral
+  and four rows per thread is slower, so the 32-row tile is the best
+  variant tried; it is issue bound near the practical fp32 limit.
+- GDN scan (`DeltaStepHeadsKernel`) at rows 512, heads 48, dk = dv 128:
+  6.06 ms per call, about 770 GB/s of state traffic. Memory bound.
+- Both decode GEMVs are already warp-per-output and coalesced
+  (`gemm_mxfp4`, `gemm_q4k_vec` and siblings).
+
+The one large portable win so far is P1.6: 27B GGUF prefill 14 to 65
+prompt tok/s by tiling the Q-quant prefill GEMMs.
+
 ## Cards
 
 ### P0: device primitives (do first)
 
-**P0.1 Shared ROCm primitives header**
+**P0.1 Shared ROCm primitives header** (done; see the Done section)
 
-- Objective: one header with the reusable gfx12xx primitives.
-- Reference: `../radiance/libr4d/r4d_common.h` lines 42 to 210.
-- Change: add `src/backends/rocm/rocm_device.hpp` with DPP wave sum, max,
-  XOR reduce, prefix and suffix scans, `LdsBarrier`, `SchedBarrier`,
-  software `F32ToBf16` and `Bf16ToF32`, `GlobalLoadTrB128`. Keep each
-  function inline. Keep the file under 600 lines.
-- Steps: port the functions. Add host-compilable fallbacks guarded by
-  `__HIP_DEVICE_COMPILE__` where a builtin is device-only. Add a comment
-  naming the LDS-pipe reason for DPP.
-- Verify: unit test that the DPP wave sum matches a scalar loop on a
-  small buffer. Test on ROCm.
-- Accept: `ctest` passes. Vulkan is unaffected because the header is
-  ROCm-local.
+- Objective: one header with the reusable gfx11/gfx12 primitives.
+- Reference: `../radiance/libr4d/r4d_common.h` v0.5.0. The DPP wave
+  reductions and scans this card first listed are not in the pinned
+  reference: the v0.5.0 kernels use the shfl baseline and lane algebra
+  instead.
+- Change: `src/backends/rocm/rocm_device.hpp` holds `Ex2`, `F32ToBf16`,
+  `Bf16ToF32`, `Swap16`, `Swap16U2`, `ByteGather`, `SchedBarrier` and
+  `LdsBarrier`. The bf16 helpers moved there from
+  `rocm_kernels_basic.cpp`, so one definition serves every kernel
+  translation unit. `GlobalLoadTrB128` needs the gfx12
+  `global_load_tr` instruction; it lands with its first consumer (P2.1)
+  so the gfx12 path can be validated on an R9700.
+- Verify: `BackendTest.DevicePrimitivesMatchScalarRefs` runs the
+  `device_probe` kernel (ROCm-only, other backends skip) and compares
+  the lane^16 exchange, the bf16 round trip and the byte gather to
+  scalar references.
+- Accept: `ctest` passes on both backends (213 tests, 0 failures).
 - Note: parity does not apply to a private header. It is not a kernel.
 
-**P0.2 LDS-scoped barrier adoption**
+**P0.2 LDS-scoped barrier adoption** (done; see the Done section)
 
 - Objective: replace `__syncthreads()` with `LdsBarrier()` in every ROCm
   kernel whose barrier only orders LDS traffic.
-- Reference: `r4d_common.h` lines 217 to 221.
-- Change: `src/backends/rocm/rocm_kernels_*.cpp`, attention, GEMM, GDN.
-- Verify: existing tests must still pass, bit-identical where the
-  reference is deterministic. Measure one hot kernel before and after if
-  possible.
+- Reference: `../radiance/libr4d/r4d_common.h` (`lds_barrier`).
+- Change: all 46 sites in `rocm_kernels_basic.cpp` (36),
+  `rocm_kernels_block.cpp` (8) and `rocm_kernels_iq.cpp` (2). Each one
+  bounds shared-memory staging or a shared reduction; none passes data
+  between threads through global memory across the barrier.
+- Verify: the host-reference suites pass unchanged (213 tests, 0
+  failures, bit-identical). Measured on the 27B GGUF (ROCm, 7900 XTX,
+  int8 KV): prefill read 14 prompt tok/s against the same-session 13.2
+  baseline, and an 8-token greedy decode 23 tok/s against 19.4 (short
+  sample; no regression).
 - Accept: no test change needed and no numerical drift.
 
 ### P1: GEMM
@@ -258,6 +285,30 @@ and Vulkan; see the Done section)
   non-multiple-of-8 output count. Compare to `GemmQ4KRef` and siblings.
 - Accept: a two-row verify costs about 1.3x a one-row pass; GGUF MTP
   exceeds greedy decode on the loop-prompt measurement.
+
+**P1.6 Tiled GGUF prefill GEMM** (tessera-native; done; see the Done
+section)
+
+- Objective: the tiled GGUF Q-quant GEMMs used one 8-row x 1-column tile
+  in which only 8 of 256 threads ran the dot; the other 248 dequantized.
+  On the 27B Q4_K_M target that held prefill at 14 prompt tok/s.
+- Change: `gemm_q4k_batched`, `gemm_q5k_batched`, `gemm_q6k_batched` and
+  `gemm_iq4xs_batched` on both backends now cover 32 activation rows x 8
+  weight columns with one output per thread, so every thread computes.
+  `gemm_q3k_batched` and `gemm_iq4nl_batched` joined them the same way
+  (7 tensors each in the 27B UD-Q4_K_M GGUF). Each thread decodes its own
+  column's block and accumulates in element order, so the result matches
+  the host reference exactly. `core::detail::ProjectTiledDevice`
+  dispatches the new ceil(m / 32) * ceil(n / 8) grid for these ids.
+- Verify: `GemmQ4KBatchedMatchesRef`, `GemmQ5KBatchedMatchesRef`,
+  `GemmQ6KBatchedMatchesRef` and `GemmIq4XsBatchedMatchesRef` on ROCm
+  and Vulkan (40 rows x 24 columns, exercising the 32-row remainder).
+  Full suite 217 tests, 0 failures on both backends.
+- Accept: 27B Q4_K_M GGUF prefill 14 to 65 prompt tok/s on ROCm (RX 7900
+  XTX); Vulkan 47 prompt tok/s. Greedy output is unchanged. The Q3_K and
+  IQ4_NL additions left the GGUF prefill in the same 64 to 67 tok/s band:
+  those two formats are only 14 FFN-sized tensors, so the scalar GEMMs
+  they replaced were already a small share.
 
 **P1.1 int8-WMMA W4A8 for GGUF Q4_K and Q5_K**
 
@@ -302,6 +353,25 @@ and Vulkan; see the Done section)
   a 256-row block. Register as `gemm_mxfp4_tiled`. Add Vulkan sibling.
 - Verify: host reference test at M 256 and M 512.
 - Accept: prefill time improves on the 27B MXFP4 target.
+- Attempt note: giving each thread four activation rows for one column
+  (so one block decode fed four rows) measured slower on the 27B MXFP4
+  target, 55 against about 80 prompt tok/s, both plain runs. The four
+  strided activation streams cost more than the saved decodes. Reverted.
+  A second attempt decoded each 256-k slab of the eight weight rows into
+  shared memory once per workgroup, so the E2M1 codebook lookup ran once
+  per weight element instead of once per output row. It also regressed,
+  29 to 35 prompt tok/s: the barriers and the strided shared-memory read
+  cost more than the shared decode saved. Both reverted; the original
+  32-row tile with per-thread decode stays. Isolated microbenchmarks on
+  the RX 7900 XTX (qkv 512 x 10240 x 5120) agree: baseline 10.5 ms
+  (5.1 TFLOP/s, and 5.2 on the FFN shape), LDS-staged decode 10.3 ms
+  (neutral), four rows per thread 12.9 ms (4.2), and at m 8 the baseline
+  is 2.6 TFLOP/s against 0.6 for R4. The kernel is issue-bound near the
+  practical fp32 ceiling; P1.3 needs the reference's activation retile
+  and weight-slab schedule (or the gfx12 WMMA path), not a decode-sharing
+  tweak. Baseline note: the 80 tok/s in older logs came from a
+  deep-profiler run, which adds a synchronization per phase; a plain run
+  reads 74 to 92 (noisy).
 
 **P1.4 Double-buffered LDS with prefetch and scheduling barrier**
 
@@ -401,6 +471,16 @@ and Vulkan; see the Done section)
 - Verify: host-reference test. Cover the width-1 non-speculative case and
   a speculative width greater than 1.
 - Accept: matches within tolerance.
+- Measured note: the current `DeltaStepHeadsKernel` at rows 512, heads
+  48, dk = dv 128 (one 27B linear layer's prefill chunk) costs 6.06 ms
+  per call in isolation on the RX 7900 XTX. That is about 770 GB/s of
+  state traffic (the state is read for the S k dot, read again for the
+  update, written once: 3 x 3 MiB per row), so the kernel is near the
+  memory bandwidth limit, not launch or ALU bound. The reference's gain
+  is its [v][k] layout (contiguous 64-element runs per thread) and the
+  paged fp32 temporal state; a port must change the state layout first,
+  which every linear-attention kernel shares. The scan is about 0.87 s of
+  a 13 s prefill (144 calls) on the 27B MXFP4 target.
 
 ### P4: norm and quant fusion
 
@@ -457,7 +537,7 @@ and Vulkan; see the Done section)
 
 ### P6: DFlash2
 
-**P6.1 Fused DFlash2 conv**
+**P6.1 Fused DFlash2 conv** (already satisfied; see the Done section)
 
 - Objective: one kernel for the drafter causal conv.
 - Reference: `../radiance/libr4d/r4d_dflash_conv_t2_g16_bf16.hip` and
@@ -467,6 +547,14 @@ and Vulkan; see the Done section)
 - Verify: host-reference test for taps 2 and group 16. Cover the
   block-boundary rule: the conv never crosses an anchor block.
 - Accept: matches within tolerance.
+- Status: the tree already has this. `DflashConvKernel` and its Vulkan
+  sibling are one kernel each that read the base kernel plus the
+  per-token per-group delta, advance the causal window, and use
+  `position = row % block_size` so the conv never crosses a block.
+  `BackendTest.DflashConvDeviceMatchesRef` covers taps 2, group 4, block
+  4 with 8 rows (two blocks, so the boundary is crossed) on both
+  backends. The grouped projection runs as a separate F32 GEMM in
+  `GroupedConvDevice`, as the reference keeps it separate too.
 
 **P6.2 DFlash2 selector path walk**
 
@@ -484,19 +572,35 @@ and Vulkan; see the Done section)
   chosen candidate per position.
 - Accept: same choices as the reference with no `[steps, K, K]` tensor.
 
+### P7: loading
+
+**P7.1 MXFP4 weight load** (attempted, reverted)
+
+- Objective: cut the 27B MXFP4 weight load (about 15 s) by uploading
+  through `CopyH2DBatch` in bounded windows, the path the GGUF loader
+  uses.
+- Result: slower, about 25 s. `CopyH2DBatch` re-allocates its pinned
+  staging per window, and the embed and lm_head tensors (2.4 GiB each)
+  made it allocate and free a multi-GiB pinned window each time; the
+  previous per-tensor `CopyH2D` grew one reusable staging buffer to that
+  size once and reused it. Reverted. A future attempt must keep the
+  large tensors on the reusable-staging path and batch only the smaller
+  converted tensors.
+
 ## Status
 
 | id | title | backend | status |
 | --- | --- | --- | --- |
-| P0.1 | Shared ROCm primitives header | ROCm | todo |
-| P0.2 | LDS-scoped barrier adoption | ROCm | todo |
-| P1.1 | int8-WMMA W4A8 GGUF | both | todo |
-| P1.2 | MXFP4 decode split-K | both | todo |
-| P1.3 | MXFP4 tiled prefill | both | todo |
-| P1.4 | Double-buffered tiled LDS | both | todo |
-| P1.5 | Multi-row GGUF GEMV | both | todo |
-| P2.1 | WMMA transposed attention | both | todo |
-| P2.2 | Paged KV and varlen | both | todo |
+| P0.1 | Shared ROCm primitives header | ROCm | done |
+| P0.2 | LDS-scoped barrier adoption | ROCm | done |
+| P1.1 | int8-WMMA W4A8 GGUF | both | gfx12 |
+| P1.2 | MXFP4 decode split-K | both | gfx12 |
+| P1.3 | MXFP4 tiled prefill | both | gfx12 |
+| P1.4 | Double-buffered tiled LDS | both | gfx12 |
+| P1.5 | Multi-row GGUF GEMV | both | done |
+| P1.6 | Tiled GGUF prefill GEMM | both | done |
+| P2.1 | WMMA transposed attention | both | gfx12 |
+| P2.2 | Paged KV and varlen | both | owner |
 | P3.1 | Fused GDN conv prep | both | todo |
 | P3.2 | GDN chunked scan | both | todo |
 | P3.3 | GDN KKT solve | both | todo |
@@ -505,13 +609,63 @@ and Vulkan; see the Done section)
 | P4.2 | Gated quant and qk norm rope gate | both | todo |
 | P5.1 | Two-stage row top-K | both | todo |
 | P5.2 | On-device sample chain | both | todo |
-| P6.1 | Fused DFlash2 conv | both | todo |
+| P6.1 | Fused DFlash2 conv | both | done |
 | P6.2 | DFlash2 selector walk | both | todo |
+| P7.1 | MXFP4 weight load | both | reverted |
+
+Status key: `gfx12` means the card needs RDNA 4 tensor-core builtins
+that cannot be built or validated on the gfx1100 workstation, so it is
+blocked on hardware. `owner` means the card changes the KV cache layout
+for every model and the doc says to confirm with the owner first. The
+remaining `todo` cards (P3.x, P4.x, P5.x, P6.2) are portable but measured
+to be small or negligible on this hardware: the GDN scan is bandwidth
+bound, the row top-K is 0.47 ms per DFlash2 step, and the norm/quant
+fusions only touch the off-by-default W4A8 path.
 
 ## Done
 
 Move a card here with its commit hash and the measured result.
 
+- Fused DFlash2 conv (P6.1, already satisfied by the tree). The drafter
+  causal conv is one kernel on each backend (`DflashConvKernel`,
+  `dflash_conv.comp`, driven by `src/spec/dflash2_conv.cpp`). It reads a
+  base kernel plus the per-token per-group delta from the projection, and
+  applies `position = row % block_size` so the conv never crosses an
+  anchor block, which is the reference's rule. Covered by
+  `BackendTest.DflashConvDeviceMatchesRef` (taps 2, group 4, block 4, 8
+  rows so a boundary is crossed). No code change was needed.
+- Tiled GGUF prefill GEMM (P1.6, tessera-native). The four tiled GGUF
+  Q-quant GEMMs (`gemm_q4k_batched`, `gemm_q5k_batched`,
+  `gemm_q6k_batched`, `gemm_iq4xs_batched`), later joined by
+  `gemm_q3k_batched` and `gemm_iq4nl_batched`, now tile 32 activation
+  rows x 8 weight columns with one output per thread instead of an 8-row
+  x 1-column tile with 8 active dot threads. Each thread decodes its own
+  column's block and accumulates in element order, so the result matches
+  the host reference exactly; `ProjectTiledDevice` dispatches the new
+  grid on both backends. New device tests cover the kernels at 40 x 24
+  (a 32-row remainder). 27B Q4_K_M GGUF prefill: 14 to 65 prompt tok/s on
+  ROCm (RX 7900 XTX), 47 prompt tok/s on Vulkan; both suites 219 tests,
+  0 failures. Working tree (uncommitted per the PROGRESS push note).
+- LDS-scoped barrier adoption (P0.2). All 46 `__syncthreads()` calls in
+  `rocm_kernels_basic.cpp` (36), `rocm_kernels_block.cpp` (8) and
+  `rocm_kernels_iq.cpp` (2) became `LdsBarrier()`. Every one orders
+  shared-memory staging or a shared reduction, so the workgroup-scope
+  acquire-release fence over every address space is not needed; on gfx12
+  the global invalidate it emits is what evicts the KV cache lines the
+  next tile would hit. Both suites pass bit-identical (213 tests, 0
+  failures). On the 27B GGUF (ROCm, 7900 XTX, int8 KV) prefill read 14
+  prompt tok/s against the same-session 13.2 baseline, and an 8-token
+  greedy decode 23 tok/s against 19.4; no regression. Commit `964c9cd`.
+- Shared ROCm primitives (P0.1). `src/backends/rocm/rocm_device.hpp`
+  ports libr4d v0.5.0 `r4d_common.h`: the bf16 round-trip conversions,
+  the lane^16 exchange, the byte gather, the exp2 intrinsic, the
+  scheduling barrier and the LDS-scoped barrier. The bf16 helpers moved
+  out of `rocm_kernels_basic.cpp` into the header, so one definition
+  serves every kernel translation unit. `GlobalLoadTrB128` is gfx12-only
+  and lands with its first consumer (P2.1). Covered by
+  `BackendTest.DevicePrimitivesMatchScalarRefs` through the ROCm-only
+  `device_probe` kernel; other backends skip. Both suites 213 tests, 0
+  failures. Commit `b490508`.
 - Multi-row GGUF GEMV (P1.5). `gemm_q4k_rows{r}`/`gemm_q5k_rows{r}`/
   `gemm_q6k_rows{r}`/`gemm_iq4xs_rows{r}` decode each weight block once
   per column for all `r` rows of a verify batch (r = 2, 3, 4, templated),

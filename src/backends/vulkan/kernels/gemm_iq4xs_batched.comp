@@ -1,14 +1,13 @@
 #version 450
 
-// Tiled batched IQ4_XS GEMM: one workgroup handles 8 activation rows x one
-// weight column; the 256 IQ4_XS elements of a block are dequantized once
-// into shared memory and reused across the rows. Thread `e` is element
-// `e`: ib = e/32, j = e%16, the nibble byte is `8 + ib*16 + j` (low nibble
+// Tiled batched IQ4_XS GEMM: one workgroup covers 32 activation rows x 8
+// weight columns with one thread per output, so every thread computes.
+// Element e: ib = e/32, the nibble byte is 8 + ib*16 + (e%16) (low nibble
 // for the low half of the sub-block, high for the high half), the 6-bit
-// scale is the 4 low bits at `4 + ib/2` plus the 2 high bits at bit `2*ib`
-// of the u16 at 2, and the value is `d * (scale - 32) * codebook[nibble]`.
-// The dot uses the gemm_iq4xs order (ib, j, low then high). Dispatch is
-// ceil(m / 8) * n workgroups of 256.
+// scale is the 4 low bits at 4 + ib/2 plus the 2 high bits at bit 2*ib of
+// the u16 at 2, and the value is d * (scale - 32) * codebook[nibble]. The
+// dot keeps the gemm_iq4xs order (ib, j, low then high). Dispatch is
+// ceil(m / 32) * ceil(n / 8) workgroups of 256.
 layout(local_size_x = 256) in;
 
 // "gemm_iq4xs_batched" contract (tessera API): buffers and scalars match
@@ -56,49 +55,39 @@ float fp16_at(uint offset) {
   return (h & 32768) > 0 ? -value : value;
 }
 
-shared float wq[256];
-
 void main() {
-  uint wg = gl_WorkGroupID.x;
-  uint tid = gl_LocalInvocationID.x;
   uint m = pc.v[0];
   uint n = pc.v[2];
   uint k = pc.v[4];
-  uint base_row = (wg / n) * 8u;
-  uint row_w = wg % n;
-  bool dot_valid = tid < 8u && base_row + tid < m;
-  uint row_a = base_row + tid;
+  uint tid = gl_LocalInvocationID.x;
+  uint col_tiles = (n + 7u) / 8u;
+  uint wg = gl_WorkGroupID.x;
+  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
+  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
+  if (row_a >= m || row_w >= n) {
+    return;
+  }
   uint blocks = k / 256u;
+  uint abase = row_a * k;
+  uint wbase = row_w * (blocks * 136u);
   float acc = 0.0;
   for (uint b = 0u; b < blocks; ++b) {
-    uint base = row_w * (blocks * 136u) + b * 136u;
+    uint base = wbase + b * 136u;
     float d = fp16_at(base);
     uint scales_h = wbyte(base + 2u) | (wbyte(base + 3u) << 8);
-    uint e = tid;
-    uint ib = e / 32u;
-    uint lane = e % 32u;
-    uint j = lane % 16u;
-    uint byte = wbyte(base + 8u + ib * 16u + j);
-    uint nib = lane < 16u ? (byte & 15u) : (byte >> 4u);
-    uint packed = wbyte(base + 4u + ib / 2u);
-    uint ls = ((packed >> (4u * (ib % 2u))) & 15u) |
-              (((scales_h >> (2u * ib)) & 3u) << 4u);
-    float dl = d * (float(ls) - 32.0);
-    wq[e] = dl * float(kValues[nib]);
-    barrier();
-    if (dot_valid) {
-      uint ab = row_a * k + b * 256u;
-      for (uint g = 0u; g < 8u; ++g) {
-        for (uint jj = 0u; jj < 16u; ++jj) {
-          uint e0 = g * 32u + jj;
-          acc += a[ab + e0] * wq[e0];
-          acc += a[ab + e0 + 16u] * wq[e0 + 16u];
-        }
+    // Element order (0..255): ib = e/32, lane = e%32.
+    for (uint ib = 0u; ib < 8u; ++ib) {
+      uint packed = wbyte(base + 4u + ib / 2u);
+      uint ls = ((packed >> (4u * (ib % 2u))) & 15u) |
+                (((scales_h >> (2u * ib)) & 3u) << 4u);
+      float dl = d * (float(ls) - 32.0);
+      for (uint lane = 0u; lane < 32u; ++lane) {
+        uint byte = wbyte(base + 8u + ib * 16u + (lane % 16u));
+        uint nib = lane < 16u ? (byte & 15u) : (byte >> 4u);
+        acc += a[abase + b * 256u + ib * 32u + lane] *
+               (dl * float(kValues[nib]));
       }
     }
-    barrier();
   }
-  if (dot_valid) {
-    c[row_a * n + row_w] = acc;
-  }
+  c[row_a * n + row_w] = acc;
 }

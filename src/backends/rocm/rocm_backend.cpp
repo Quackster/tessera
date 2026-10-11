@@ -43,6 +43,7 @@ struct BuiltInKernel {
 };
 const BuiltInKernel kBuiltInKernels[] = {
     {"fill", reinterpret_cast<void*>(&FillKernel)},
+    {"device_probe", reinterpret_cast<void*>(&DeviceProbeKernel)},
     {"gemm_q4k", reinterpret_cast<void*>(&GemmQ4KKernel)},
     {"gemm_q4k_row", reinterpret_cast<void*>(&GemmQ4KRowKernel)},
     {"gemm_q4k_vec", reinterpret_cast<void*>(&GemmQ4KVecKernel)},
@@ -81,7 +82,9 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_q6k_rows4", reinterpret_cast<void*>(&GemmQ6KRowsKernel<4>)},
     {"gemm_q6k_batched", reinterpret_cast<void*>(&GemmQ6KBatchedKernel)},
     {"gemm_q3k", reinterpret_cast<void*>(&GemmQ3KKernel)},
+    {"gemm_q3k_batched", reinterpret_cast<void*>(&GemmQ3KBatchedKernel)},
     {"gemm_iq4nl", reinterpret_cast<void*>(&GemmIq4NlKernel)},
+    {"gemm_iq4nl_batched", reinterpret_cast<void*>(&GemmIq4NlBatchedKernel)},
     {"gemm_iq4xs", reinterpret_cast<void*>(&GemmIq4XsKernel)},
     {"gemm_iq4xs_vec", reinterpret_cast<void*>(&GemmIq4XsVecKernel)},
     {"gemm_iq4xs_rows2", reinterpret_cast<void*>(&GemmIq4XsRowsKernel<2>)},

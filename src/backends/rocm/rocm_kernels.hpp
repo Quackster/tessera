@@ -14,6 +14,8 @@
 #include <cstring>
 #include <limits>
 
+#include "backends/rocm/rocm_device.hpp"
+
 namespace tessera::backends::rocm {
 
 // IEEE binary16 (little-endian) -> fp32, exact (device port of the
@@ -257,9 +259,18 @@ __global__ void GemmQ6KKernel(const float* a, const unsigned char* w,
 __global__ void GemmQ3KKernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);
+__global__ void GemmQ3KBatchedKernel(const float* a, const unsigned char* w,
+                                     float* c, unsigned long long m,
+                                     unsigned long long n,
+                                     unsigned long long k);
 __global__ void GemmIq4NlKernel(const float* a, const unsigned char* w,
                                 float* c, unsigned long long m,
                                 unsigned long long n, unsigned long long k);
+__global__ void GemmIq4NlBatchedKernel(const float* a,
+                                       const unsigned char* w, float* c,
+                                       unsigned long long m,
+                                       unsigned long long n,
+                                       unsigned long long k);
 __global__ void GemmIq4XsKernel(const float* a, const unsigned char* w,
                                 float* c, unsigned long long m,
                                 unsigned long long n, unsigned long long k);
@@ -536,5 +547,12 @@ __global__ void EmbeddingQ4KKernel(const unsigned int* ids,
                                    unsigned long long rows,
                                    unsigned long long cols,
                                    unsigned long long vocab);
+
+// Built-in "device_probe": exercises the shared device primitives in
+// rocm_device.hpp so a host test can check them against scalar
+// references. One wave of 32 lanes. Buffers: 0 in (f32), 1 swap (f32),
+// 2 bf16 round trip (f32), 3 byte gather (u32). Grid 1, block 32.
+__global__ void DeviceProbeKernel(const float* in, float* swap, float* bf16,
+                                  unsigned int* gather);
 
 }  // namespace tessera::backends::rocm

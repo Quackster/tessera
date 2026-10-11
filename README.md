@@ -26,7 +26,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Public API | Done | `Engine`, `Backend`, `SpeculativeStrategy`. |
 | GGUF loader | Done | v2/v3 headers, bounds-checked, memory-mapped (not copied). |
 | MXFP4 loader | Done | Tensor map, weight upload. FP8 and MXFP4 GEMM verified. |
-| Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched H2D upload (`CopyH2DBatch`); ROCm drains a 256 MiB pinned window, one sync per chunk. ROCm re-selects the configured GPU on every thread that touches the device. |
+| Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched H2D upload (`CopyH2DBatch`); ROCm drains a 256 MiB pinned window, one sync per chunk. ROCm re-selects the configured GPU on every thread that touches the device. Shared gfx11/gfx12 device primitives (`rocm_device.hpp`, ported from libr4d v0.5.0); the ROCm kernels barrier on LDS scope (`LdsBarrier`). |
 | Parallelism | Partial | Data-parallel request replicas: one engine and model per GPU behind a `RunnerPool` with least-loaded routing. Built on both backends; a two-device serve smoke is pending. Tensor and pipeline split not started. |
 | Kernel launch | Done | Vulkan records a whole decode step into one command buffer. ROCm runs one blocking stream with pinned staging. |
 | DFlash2 | Partial | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. Draft cost still high. |
@@ -34,7 +34,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
 | KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. |
 | Sampling | Done | Seeded sampling with Qwen 27B defaults. |
-| GEMM | Done | Q4_K to IQ, FP8/MXFP4, block-scaled FP8, bf16, fp32. Tensor-core paths for decode and verify. Warp-per-output decode GEMVs plus a multi-row family for the small verify batch (each weight block decoded once per column), with a deterministic split-K pass. |
+| GEMM | Done | Q4_K to IQ, FP8/MXFP4, block-scaled FP8, bf16, fp32. Tensor-core paths for decode and verify. Warp-per-output decode GEMVs plus a multi-row family for the small verify batch (each weight block decoded once per column), with a deterministic split-K pass. Prefill GEMMs tile 32 activation rows x 8 columns with one output per thread. |
 | Activation quant | Done | Per-token FP8 E4M3 quant-dequant. W4A8 opt-in. |
 | Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. |
 | Weight upload | Done | Manifest to device buffers. One batched upload per load, staged through a pinned window on ROCm. Each load phase is timed. |

@@ -1,13 +1,13 @@
 #version 450
 
-// Tiled batched Q6_K GEMM: one workgroup handles 8 activation rows x one
-// weight column; the 256 Q6_K elements of a block are dequantized once
-// into shared memory and reused across the rows. Thread `e` is element
-// `e`: n2 = e/128, q = (e%128)/32, l = e%32; the scale byte is
-// 192 + n2*8 + l/16 + 2*q, the low nibble byte is 0 or 32 (q even or odd)
-// at n2*64 + l, and the 2-bit high comes from byte 128 + n2*32 + l at
-// bits 2*q. The dot uses the gemm_q6k order (n2, l, q1..q4). Dispatch is
-// ceil(m / 8) * n workgroups of 256.
+// Tiled batched Q6_K GEMM: one workgroup covers 32 activation rows x 8
+// weight columns with one thread per output, so every thread computes.
+// Element e = n2*128 + q*32 + l (n2 = e/128, q = (e%128)/32, l = e%32):
+// the scale byte is 192 + n2*8 + l/16 + 2*q, the nibble byte is
+// n2*64 + (q%2)*32 + l, and the 2-bit high comes from byte
+// 128 + n2*32 + l at bits 2*q. The dot keeps the gemm_q6k order
+// (n2, l, q1..q4). Dispatch is ceil(m / 32) * ceil(n / 8) workgroups of
+// 256.
 layout(local_size_x = 256) in;
 
 // "gemm_q6k_batched" contract (tessera API): buffers and scalars match
@@ -52,53 +52,43 @@ float fp16_at(uint offset) {
   return (h & 32768) > 0 ? -value : value;
 }
 
-shared float wq[256];
-
 void main() {
-  uint wg = gl_WorkGroupID.x;
-  uint tid = gl_LocalInvocationID.x;
   uint m = pc.v[0];
   uint n = pc.v[2];
   uint k = pc.v[4];
-  uint base_row = (wg / n) * 8u;
-  uint row_w = wg % n;
-  bool dot_valid = tid < 8u && base_row + tid < m;
-  uint row_a = base_row + tid;
+  uint tid = gl_LocalInvocationID.x;
+  uint col_tiles = (n + 7u) / 8u;
+  uint wg = gl_WorkGroupID.x;
+  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
+  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
+  if (row_a >= m || row_w >= n) {
+    return;
+  }
   uint blocks = k / 256u;
+  uint abase = row_a * k;
+  uint wbase = row_w * (blocks * 210u);
   float acc = 0.0;
   for (uint b = 0u; b < blocks; ++b) {
-    uint base = row_w * (blocks * 210u) + b * 210u;
+    uint base = wbase + b * 210u;
     float d = fp16_at(base + 208u);
-    uint e = tid;
-    uint n2 = e / 128u;
-    uint q = (e % 128u) / 32u;
-    uint l = e % 32u;
-    uint ql = wbyte(base + n2 * 64u + (q % 2u) * 32u + l);
-    uint qh = wbyte(base + 128u + n2 * 32u + l);
-    uint low = q < 2u ? (ql & 15u) : (ql >> 4u);
-    uint high = ((qh >> (2u * q)) & 3u) << 4u;
-    int scale = int(wbyte(base + 192u + n2 * 8u + l / 16u + 2u * q));
-    if (scale >= 128) {
-      scale -= 256;
-    }
-    int qv = int(low | high) - 32;
-    wq[e] = d * float(scale) * float(qv);
-    barrier();
-    if (dot_valid) {
-      uint ab = row_a * k + b * 256u;
-      for (uint g = 0u; g < 2u; ++g) {
-        for (uint li = 0u; li < 32u; ++li) {
-          uint e0 = g * 128u + li;
-          acc += a[ab + e0] * wq[e0];
-          acc += a[ab + e0 + 32u] * wq[e0 + 32u];
-          acc += a[ab + e0 + 64u] * wq[e0 + 64u];
-          acc += a[ab + e0 + 96u] * wq[e0 + 96u];
+    // Element order (0..255): n2 = e/128, q = (e%128)/32, l = e%32.
+    for (uint n2 = 0u; n2 < 2u; ++n2) {
+      for (uint q = 0u; q < 4u; ++q) {
+        for (uint l = 0u; l < 32u; ++l) {
+          uint ql = wbyte(base + n2 * 64u + (q % 2u) * 32u + l);
+          uint qh = wbyte(base + 128u + n2 * 32u + l);
+          uint low = q < 2u ? (ql & 15u) : (ql >> 4u);
+          uint high = ((qh >> (2u * q)) & 3u) << 4u;
+          int scale = int(wbyte(base + 192u + n2 * 8u + l / 16u + 2u * q));
+          if (scale >= 128) {
+            scale -= 256;
+          }
+          int qv = int(low | high) - 32;
+          acc += a[abase + b * 256u + n2 * 128u + q * 32u + l] *
+                 (d * float(scale) * float(qv));
         }
       }
     }
-    barrier();
   }
-  if (dot_valid) {
-    c[row_a * n + row_w] = acc;
-  }
+  c[row_a * n + row_w] = acc;
 }

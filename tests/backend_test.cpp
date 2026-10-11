@@ -1223,6 +1223,79 @@ TEST(BackendTest, LoadAndLaunchFill) {
   }
 }
 
+// Device: the shared ROCm primitives (rocm_device.hpp) match scalar host
+// references: the lane^16 exchange, the bf16 round trip and the byte
+// gather. The probe kernel is ROCm-only; other backends skip.
+TEST(BackendTest, DevicePrimitivesMatchScalarRefs) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("device_probe", {});
+  if (!kernel) {
+    GTEST_SKIP() << "device_probe is a ROCm-only probe kernel";
+  }
+  constexpr std::size_t kLanes = 32;
+  std::vector<float> in(kLanes);
+  for (std::size_t i = 0; i < kLanes; ++i) {
+    in[i] = 0.5f + static_cast<float>(i) * 0.375f;
+  }
+  auto in_buf = backend->AllocateBuffer(kLanes * 4, MemoryKind::Device);
+  auto swap_buf = backend->AllocateBuffer(kLanes * 4, MemoryKind::Device);
+  auto bf16_buf = backend->AllocateBuffer(kLanes * 4, MemoryKind::Device);
+  auto gather_buf = backend->AllocateBuffer(kLanes * 4, MemoryKind::Device);
+  ASSERT_TRUE(in_buf.has_value() && swap_buf.has_value() &&
+              bf16_buf.has_value() && gather_buf.has_value());
+  const std::span<const std::byte> in_bytes(
+      reinterpret_cast<const std::byte*>(in.data()), in.size() * 4);
+  ASSERT_TRUE(backend->CopyH2D(**in_buf, in_bytes).has_value());
+
+  tessera::KernelLaunch launch;
+  launch.grid_x = 1;
+  launch.block_x = kLanes;
+  launch.buffers = {(*in_buf).get(), (*swap_buf).get(), (*bf16_buf).get(),
+                    (*gather_buf).get()};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+
+  std::vector<std::byte> swap_bytes(kLanes * 4);
+  std::vector<std::byte> bf16_bytes(kLanes * 4);
+  std::vector<std::byte> gather_bytes(kLanes * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**swap_buf, swap_bytes.data(), swap_bytes.size())
+          .has_value());
+  ASSERT_TRUE(
+      backend->CopyD2H(**bf16_buf, bf16_bytes.data(), bf16_bytes.size())
+          .has_value());
+  ASSERT_TRUE(
+      backend->CopyD2H(**gather_buf, gather_bytes.data(), gather_bytes.size())
+          .has_value());
+  const auto* swap = reinterpret_cast<const float*>(swap_bytes.data());
+  const auto* bf16 = reinterpret_cast<const float*>(bf16_bytes.data());
+  const auto* gather = reinterpret_cast<const std::uint32_t*>(
+      gather_bytes.data());
+  for (std::size_t i = 0; i < kLanes; ++i) {
+    EXPECT_EQ(swap[i], in[i ^ 16]);
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &in[i], sizeof(bits));
+    const std::uint16_t half = static_cast<std::uint16_t>(
+        (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+    std::uint32_t wide = static_cast<std::uint32_t>(half) << 16;
+    float expected = 0.0f;
+    std::memcpy(&expected, &wide, sizeof(expected));
+    EXPECT_EQ(bf16[i], expected);
+    const std::uint32_t w0 = (static_cast<std::uint32_t>(i) * 7u + 3u) |
+                             0xA5A50000u;
+    const std::uint32_t w1 = (static_cast<std::uint32_t>(i) * 11u + 5u) |
+                             0x5A5A0000u;
+    const std::uint32_t shift = static_cast<std::uint32_t>(i & 1u) * 8u;
+    const std::uint32_t packed =
+        ((w0 >> shift) & 0xFFu) | (((w0 >> (16u + shift)) & 0xFFu) << 8) |
+        (((w1 >> shift) & 0xFFu) << 16) |
+        (((w1 >> (16u + shift)) & 0xFFu) << 24);
+    EXPECT_EQ(gather[i], packed);
+  }
+}
+
 
 
 // The "gemm_q4k" contract (backend.hpp) checked on the device: k must
@@ -1451,9 +1524,328 @@ TEST(BackendTest, GemmQ4KDeviceMatchesRef) {
       << "backend " << backend->Name() << " max_rel " << max_rel;
 }
 
-// Device: the tiled batched Q4_K GEMM (weight blocks dequantized once per
-// 8-row tile) matches the reference, including a row count that is not a
-// multiple of the tile. Skips on backends without the tiled kernel.
+// Device: the tiled batched Q4_K GEMM (one workgroup covers 32 activation
+// rows x 8 weight columns, one output per thread) matches the reference,
+// including a row count that is not a multiple of the 32-row tile.
+TEST(BackendTest, GemmQ4KBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_q4k_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled Q4_K kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(2027);
+  constexpr std::size_t kM = 40;   // 32-row tile plus an 8-row remainder
+  constexpr std::size_t kN = 24;   // 3 column tiles
+  constexpr std::size_t kK = 256;  // 1 block
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 144, 0);
+  for (std::size_t r = 0; r < kN; ++r) {  // small dmin, keeps the min term
+    w[r * 144 + 2] = std::byte{0};
+    w[r * 144 + 3] = std::byte{0x20};
+  }
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf,
+                               std::span<const std::byte>(
+                                   reinterpret_cast<const std::byte*>(a.data()),
+                                   a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ4KRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value()) << tessera::ToString(ref_status.error());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the tiled batched Q6_K GEMM (32 rows x 8 columns, one output per
+// thread) matches the reference, including a non-multiple-of-32 row count.
+TEST(BackendTest, GemmQ6KBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_q6k_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled Q6_K kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(2028);
+  constexpr std::size_t kM = 40;
+  constexpr std::size_t kN = 24;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 210, 208);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf,
+                               std::span<const std::byte>(
+                                   reinterpret_cast<const std::byte*>(a.data()),
+                                   a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ6KRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value()) << tessera::ToString(ref_status.error());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the tiled batched Q5_K GEMM (32 rows x 8 columns, one output per
+// thread) matches the reference, including a non-multiple-of-32 row count.
+TEST(BackendTest, GemmQ5KBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_q5k_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled Q5_K kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(2029);
+  constexpr std::size_t kM = 40;
+  constexpr std::size_t kN = 24;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 176, 0);
+  for (std::size_t r = 0; r < kN; ++r) {  // small dmin, keeps the min term
+    w[r * 176 + 2] = std::byte{0};
+    w[r * 176 + 3] = std::byte{0x20};
+  }
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf,
+                               std::span<const std::byte>(
+                                   reinterpret_cast<const std::byte*>(a.data()),
+                                   a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ5KRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value()) << tessera::ToString(ref_status.error());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the tiled batched IQ4_XS GEMM (32 rows x 8 columns, one output
+// per thread) matches the reference, including a non-multiple-of-32 row
+// count.
+TEST(BackendTest, GemmIq4XsBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_iq4xs_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled IQ4_XS kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(2030);
+  constexpr std::size_t kM = 40;
+  constexpr std::size_t kN = 24;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 136, 0);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf,
+                               std::span<const std::byte>(
+                                   reinterpret_cast<const std::byte*>(a.data()),
+                                   a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmIq4XsRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value()) << tessera::ToString(ref_status.error());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the tiled batched Q3_K GEMM (32 rows x 8 columns, one output per
+// thread) matches the reference, including a non-multiple-of-32 row count.
+TEST(BackendTest, GemmQ3KBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_q3k_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled Q3_K kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(2031);
+  constexpr std::size_t kM = 40;
+  constexpr std::size_t kN = 24;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 110, 108);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf,
+                               std::span<const std::byte>(
+                                   reinterpret_cast<const std::byte*>(a.data()),
+                                   a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmQ3KRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value()) << tessera::ToString(ref_status.error());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the tiled batched IQ4_NL GEMM (32 rows x 8 columns, one output
+// per thread) matches the reference, including a non-multiple-of-32 row
+// count.
+TEST(BackendTest, GemmIq4NlBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_iq4nl_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled IQ4_NL kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(2032);
+  constexpr std::size_t kM = 40;
+  constexpr std::size_t kN = 24;
+  constexpr std::size_t kK = 32;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 18, 0);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  ASSERT_TRUE(backend->CopyH2D(**a_buf,
+                               std::span<const std::byte>(
+                                   reinterpret_cast<const std::byte*>(a.data()),
+                                   a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+  auto launch = core::detail::ProjectTiledDevice(
+      *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+  ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmIq4NlRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value()) << tessera::ToString(ref_status.error());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs, tol.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
 
 // Device: the tiled batched MXFP4 GEMM (weight blocks dequantized once per
 // 8-row tile) matches the reference, including a row count that is not a

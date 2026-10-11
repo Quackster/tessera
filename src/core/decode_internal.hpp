@@ -1059,6 +1059,8 @@ inline std::string_view GemmTiledKernelName(DType dtype) {
     case DType::Q5K: return "gemm_q5k_batched";
     case DType::Q6K: return "gemm_q6k_batched";
     case DType::IQ4_XS: return "gemm_iq4xs_batched";
+    case DType::Q3K: return "gemm_q3k_batched";
+    case DType::IQ4_NL: return "gemm_iq4nl_batched";
     case DType::F4E2M1: return "gemm_mxfp4_batched";
     case DType::F32: return "gemm_f32_batched";
     case DType::BF16: return "gemm_bf16_batched";
@@ -1088,7 +1090,13 @@ inline std::expected<void, StatusCode> ProjectTiledDevice(
   KernelLaunch launch;
   if (kernel.Id() == "gemm_mxfp4_batched" ||
       kernel.Id() == "gemm_f32_batched" ||
-      kernel.Id() == "gemm_bf16_batched") {
+      kernel.Id() == "gemm_bf16_batched" ||
+      kernel.Id() == "gemm_q4k_batched" ||
+      kernel.Id() == "gemm_q5k_batched" ||
+      kernel.Id() == "gemm_q6k_batched" ||
+      kernel.Id() == "gemm_iq4xs_batched" ||
+      kernel.Id() == "gemm_q3k_batched" ||
+      kernel.Id() == "gemm_iq4nl_batched") {
     launch.grid_x = static_cast<std::uint32_t>(((m + 31) / 32) * ((n + 7) / 8));
   } else {
     launch.grid_x = static_cast<std::uint32_t>(

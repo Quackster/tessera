@@ -1,10 +1,13 @@
 #version 450
 
-// Tiled batched Q4_K GEMM: one workgroup handles 8 activation rows x one
-// weight column; the Q4_K block is dequantized once into shared memory
-// and reused across the 8 rows. The 8 dots accumulate in the gemm_q4k
-// element order so the batch matches the sequential forward.
-// Dispatch is ceil(m / 8) * n workgroups of 256.
+// Tiled batched Q4_K GEMM: one workgroup covers 32 activation rows x 8
+// weight columns with one thread per output, so every thread computes.
+// The earlier 8-row tile left 248 of 256 threads dequantizing only and
+// held the prefill back. Each thread decodes its own column's block, and
+// the per-output accumulation keeps the gemm_q4k element order (per
+// 64-element group, the low 32 then the high 32), so the batch matches
+// the sequential forward.
+// Dispatch is ceil(m / 32) * ceil(n / 8) workgroups of 256.
 layout(local_size_x = 256) in;
 
 // "gemm_q4k_batched" contract (tessera API): buffers and scalars match
@@ -66,50 +69,41 @@ void scale_min4(uint j, uint base, out uint scale, out uint min) {
   }
 }
 
-shared float wq[256];
-
 void main() {
-  uint wg = gl_WorkGroupID.x;
-  uint tid = gl_LocalInvocationID.x;
   uint m = pc.v[0];
   uint n = pc.v[2];
   uint k = pc.v[4];
-  uint tm = wg / n;
-  uint row_w = wg % n;
-  uint base_row = tm * 8u;
-  bool dot_valid = tid < 8u && base_row + tid < m;
-  uint row_a = base_row + tid;
+  uint tid = gl_LocalInvocationID.x;
+  uint col_tiles = (n + 7u) / 8u;
+  uint wg = gl_WorkGroupID.x;
+  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
+  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
+  if (row_a >= m || row_w >= n) {
+    return;
+  }
   uint blocks = k / 256u;
+  uint abase = row_a * k;
+  uint wbase = row_w * (blocks * 144u);
   float acc = 0.0;
   for (uint b = 0u; b < blocks; ++b) {
-    uint base = row_w * (blocks * 144u) + b * 144u;
+    uint base = wbase + b * 144u;
     float d = fp16_at(base);
     float dm = fp16_at(base + 2u);
-    uint e = tid;
-    uint grp = e / 64u;
-    uint hi = (e % 64u) / 32u;
-    uint l = e % 32u;
-    uint sc, mn;
-    scale_min4(grp * 2u + hi, base, sc, mn);
-    uint q = wbyte(base + 16u + grp * 32u + l);
-    uint nib = hi == 0u ? (q & 15u) : (q >> 4u);
-    wq[e] = d * float(sc) * float(nib) - dm * float(mn);
-    barrier();
-    if (dot_valid) {
-      for (uint g = 0u; g < 4u; ++g) {
-        for (uint ll = 0u; ll < 32u; ++ll) {
-          uint t0 = g * 64u + ll;
-          uint t1 = t0 + 32u;
-          uint i0 = row_a * k + b * 256u + t0;
-          uint i1 = row_a * k + b * 256u + t1;
-          acc += a[i0] * wq[t0];
-          acc += a[i1] * wq[t1];
+    // Element order (0..255), matching the host reference exactly.
+    for (uint g = 0u; g < 4u; ++g) {
+      for (uint hf = 0u; hf < 2u; ++hf) {
+        uint sc, mn;
+        scale_min4(g * 2u + hf, base, sc, mn);
+        float dsc = d * float(sc);
+        float dmm = dm * float(mn);
+        for (uint l = 0u; l < 32u; ++l) {
+          uint q = wbyte(base + 16u + g * 32u + l);
+          uint nib = hf == 0u ? (q & 15u) : (q >> 4u);
+          acc += a[abase + b * 256u + g * 64u + hf * 32u + l] *
+                 (dsc * float(nib) - dmm);
         }
       }
     }
-    barrier();
   }
-  if (dot_valid) {
-    c[row_a * n + row_w] = acc;
-  }
+  c[row_a * n + row_w] = acc;
 }

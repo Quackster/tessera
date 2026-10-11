@@ -3,7 +3,7 @@
 This file tracks tessera development. After each milestone, update
 "Current status" and "Next" so both match reality. See AGENTS.md.
 
-Latest suite: 208/208 `ctest` on vulkan. 208/208 `ctest` on ROCm.
+Latest suite: 219/219 `ctest` on vulkan. 219/219 `ctest` on ROCm.
 The suite is trimmed to the coverage that catches a decode break: the
 kernel correctness tests (vs host references), the decode/speculation
 tests, the model loaders, and the calibration device test. The serving,
@@ -160,6 +160,40 @@ through RADV GFX1100, rocm through the system ROCm).
   strategy) still load the head, so a later MTP attach cannot break.
   Covered by `EngineTest.WeightMapSkipsMtpHeadWhenNotWanted` and
   `SpecTest.OnlyMtpReadsTargetHead`.
+- Shared ROCm device primitives. `src/backends/rocm/rocm_device.hpp`
+  ports libr4d v0.5.0 `r4d_common.h`: the bf16 round-trip conversions
+  (moved out of `rocm_kernels_basic.cpp`, so one definition serves every
+  kernel translation unit), the lane^16 exchange, the byte gather, the
+  exp2 intrinsic, the scheduling barrier and the LDS-scoped barrier (a
+  workgroup fence scoped to the local address space, so it does not
+  invalidate the vector caches the way `__syncthreads` does). Covered by
+  `BackendTest.DevicePrimitivesMatchScalarRefs` through the ROCm-only
+  `device_probe` kernel; other backends skip. First card of
+  `docs/PERFORMANCE.md` (P0.1); the LDS barrier is adopted in P0.2.
+- LDS-scoped barriers in the ROCm kernels. The 46 `__syncthreads()`
+  calls in `rocm_kernels_basic.cpp`, `rocm_kernels_block.cpp` and
+  `rocm_kernels_iq.cpp` became `LdsBarrier()`. Every one orders shared
+  staging or a shared reduction, so the workgroup-scope fence over every
+  address space is unnecessary; on gfx12 the global invalidate it emits
+  is what evicts the KV cache lines the next tile would hit. Both suites
+  pass bit-identical (213 tests, 0 failures). On the 27B GGUF (ROCm,
+  7900 XTX, int8 KV) prefill read 14 prompt tok/s against the
+  same-session 13.2 baseline. Second card of `docs/PERFORMANCE.md`
+  (P0.2).
+- Tiled GGUF prefill GEMM. The four tiled GGUF Q-quant GEMMs
+  (`gemm_q4k_batched`, `gemm_q5k_batched`, `gemm_q6k_batched`,
+  `gemm_iq4xs_batched`) used an 8-row x 1-column tile in which only 8 of
+  256 threads ran the dot. They now tile 32 activation rows x 8 weight
+  columns with one output per thread, and each thread decodes its own
+  column's block and accumulates in element order, so the result matches
+  the host reference exactly. `gemm_q3k_batched` and
+  `gemm_iq4nl_batched` (7 tensors each) joined them the same way, which
+  left the prefill rate unchanged: those are a small share.
+  `ProjectTiledDevice` dispatches the new ceil(m/32)*ceil(n/8) grid on
+  both backends. 27B Q4_K_M GGUF prefill: 14 to 65 prompt tok/s on ROCm
+  (RX 7900 XTX), 47 on Vulkan; covered by `GemmQ4KBatchedMatchesRef` and
+  the Q5_K/Q6_K/IQ4_XS/Q3_K/IQ4_NL siblings; both suites 219 tests, 0
+  failures.
 - KV cache types: fp32 (default), fp16, symmetric int8, symmetric
   4-bit, FP8. Selected by option (`--kv-f16`, `--kv-q8`,
   `--kv-q4`, `--kv-fp8`). Caches are preallocated and grow

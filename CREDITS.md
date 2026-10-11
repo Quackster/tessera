@@ -84,3 +84,11 @@ project, the version, the license, and where it is used.
   last committed hidden seeds the next draft. Also the prefill KV fill
   that writes an MTP slot per prompt position. Design reference; no
   code copied.
+- libr4d v0.5.0 (codeberg.org/StillDeadcode/libr4d,
+  r4d_common.h): the shared gfx11/gfx12 device primitives.
+  src/backends/rocm/rocm_device.hpp ports the bf16 round-trip
+  conversions, the lane^16 exchange, the byte gather, the exp2
+  intrinsic, the scheduling barrier and the LDS-scoped barrier. Same
+  instructions; tessera naming and host fallbacks added. The
+  reference's permlanex16 path stays off: the shfl_xor baseline is
+  kept.
