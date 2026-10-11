@@ -232,6 +232,14 @@ std::expected<std::vector<std::uint32_t>, StatusCode> ContextParallel::Generate(
 
 std::size_t ContextParallel::RankCount() const { return impl_->ranks.size(); }
 
+Engine& ContextParallel::RankEngine(std::size_t i) {
+  return *impl_->ranks.at(i).engine;
+}
+
+Model& ContextParallel::RankModel(std::size_t i) {
+  return *impl_->ranks.at(i).model;
+}
+
 const Tokenizer* ContextParallel::GetTokenizer() const {
   return impl_->ranks.empty() ? nullptr
                               : impl_->ranks.front().model->GetTokenizer();

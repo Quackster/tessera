@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "tessera/types.hpp"
 
@@ -72,8 +74,8 @@ inline bool ApplyDiagnosticFlag(std::string_view arg, int& i, char** argv,
     return true;
   }
   if ((arg == "--tiled-min-rows" || arg == "--tiled-min-cols" ||
-       arg == "--prefill-attn-pairs") &&
-      i + 1 < argc) {
+        arg == "--prefill-attn-pairs") &&
+       i + 1 < argc) {
     const char* value = argv[++i];
     const char* name = arg == "--tiled-min-rows"   ? "TESSERA_TILED_MIN_ROWS"
                        : arg == "--tiled-min-cols" ? "TESSERA_TILED_MIN_COLS"
@@ -82,6 +84,28 @@ inline bool ApplyDiagnosticFlag(std::string_view arg, int& i, char** argv,
     return true;
   }
   return false;
+}
+
+// Parse a comma-separated `--gpus` device list ("0,1") into indices.
+// Empty items are skipped; `--gpu` selects one device instead.
+inline std::vector<int> ParseGpuList(std::string_view list) {
+  std::vector<int> gpus;
+  std::size_t pos = 0;
+  while (pos <= list.size()) {
+    const std::size_t comma = list.find(',', pos);
+    const std::string_view item =
+        list.substr(pos, comma == std::string_view::npos
+                             ? std::string_view::npos
+                             : comma - pos);
+    if (!item.empty()) {
+      gpus.push_back(std::stoi(std::string(item)));
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    pos = comma + 1;
+  }
+  return gpus;
 }
 
 }  // namespace tessera::cli

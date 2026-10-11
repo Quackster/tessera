@@ -145,8 +145,8 @@ struct SweepOutcome {
     const SweepOptions& options, const MeasureFn& measure);
 
 // Identity of a calibrated machine and model: backend, device name, model
-// name, context, KV type and strategy. A change to any field means an entry
-// does not apply.
+// name, context, KV type, strategy and parallel layout. A change to any
+// field means an entry does not apply.
 struct HardwareKey {
   std::string backend;
   std::string device;
@@ -154,6 +154,10 @@ struct HardwareKey {
   std::size_t context = 0;
   std::string kv_type;
   std::string strategy;
+  // Parallel layout the entry was measured for: "none" (one device) or
+  // "tp2", "cp2", "pipe2" (route plus world size). Old files without the
+  // field read as "none".
+  std::string parallel = "none";
 
   // The fields joined by '|', the file's lookup key.
   [[nodiscard]] std::string ToString() const;
@@ -201,11 +205,12 @@ class CalibrationFile {
 // Build a hardware key from the runtime facts. `model` is the model name
 // (the caller falls back to the path basename when the model is unnamed).
 [[nodiscard]] HardwareKey MakeHardwareKey(std::string_view backend,
-                                          std::string_view device,
-                                          std::string_view model,
-                                          std::size_t context,
-                                          std::string_view kv_type,
-                                          std::string_view strategy);
+                                           std::string_view device,
+                                           std::string_view model,
+                                           std::size_t context,
+                                           std::string_view kv_type,
+                                           std::string_view strategy,
+                                           std::string_view parallel = "none");
 
 // Merge a saved entry into a configuration: a field the caller set (nonzero)
 // always wins; a zero field takes the saved value. Returns the merged
@@ -228,6 +233,9 @@ struct CalibrationReport {
   std::string kv_type;     // display name, "int8"
   std::string kv_flag;     // run flag prefix, "--kv-q8 " (empty for fp32)
   std::string strategy;
+  std::string parallel;  // display name, "none", "tp2", "cp2", "pipe2"
+  // Flag suffix reproducing the parallel layout, "" when none.
+  std::string parallel_flags;
   std::size_t key_context = 0;
   std::size_t max_context = 0;  // memory-bound context for the KV type
   CalibrationConfig defaults;

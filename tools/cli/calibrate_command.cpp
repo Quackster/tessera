@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 
+#include "calibrate_parallel.hpp"
 #include "cli_common.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
@@ -43,11 +44,6 @@ constexpr std::size_t kDecodePromptTokens = 64;
 // (1024 keys) and the prefill chunk half of the candidate list, and the
 // sweep can tell the chunks apart.
 constexpr std::size_t kPromptRepeats = 72;
-// Headroom kept free for scratch and fragmentation when reporting the
-// maximum context length.
-constexpr std::uint64_t kMemoryReserveBytes = 2ull * 1024 * 1024 * 1024;
-// Below this the reported maximum context is not useful.
-constexpr std::size_t kMinReportedContext = 2048;
 // The attention split only applies at this many keys or more (mirrors
 // core::detail::kSplitMinKeys; the CLI cannot include that header).
 constexpr std::size_t kAttentionSplitMinKeys = 1024;
@@ -104,32 +100,6 @@ std::string FormatRate(double rate) {
   return buffer;
 }
 
-// The run flag that selects a KV cache type (empty for the fp32 default).
-std::string KvFlag(KvCacheType type) {
-  switch (type) {
-    case KvCacheType::F16:
-      return "--kv-f16 ";
-    case KvCacheType::Q8:
-      return "--kv-q8 ";
-    case KvCacheType::Q4:
-      return "--kv-q4 ";
-    case KvCacheType::FP8:
-      return "--kv-fp8 ";
-    case KvCacheType::F32:
-      return "";
-  }
-  return "";
-}
-
-std::string TodayIso() {
-  const std::time_t now = std::time(nullptr);
-  std::tm local{};
-  localtime_r(&now, &local);
-  char date[16];
-  std::strftime(date, sizeof(date), "%Y-%m-%d", &local);
-  return date;
-}
-
 void PrintCalibrateUsage() {
   std::fprintf(
       stderr,
@@ -145,9 +115,11 @@ void PrintCalibrateUsage() {
       "  --context <n>     maximum context length (default %zu)\n"
       "  --kv-f16|--kv-q8|--kv-q4|--kv-fp8   KV cache type (default int8, "
       "kv8)\n"
-      "  --calibration <file> calibration file to read and write (env "
-      "TESSERA_CALIBRATION)\n"
-      "  --gpu <n>         GPU index to use (default 0, the first)\n"
+       "  --calibration <file> calibration file to read and write (env "
+       "TESSERA_CALIBRATION)\n"
+       "  --gpu <n>         GPU index to use (default 0, the first)\n"
+       "  --gpus <a,b>      parallel max-context: measure every listed GPU\n"
+       "  --tp | --cp | --pipeline  parallel route for --gpus (exactly one)\n"
       "  --prompts <file>  fixed prompts, one per non-empty line\n"
       "  --wmma|--no-wmma  fp8 tensor-core MXFP4 GEMM (diagnostic)\n"
       "  --w4a8            MXFP4 W4A8 activation quant (diagnostic)\n"
@@ -183,8 +155,12 @@ int RunCalibrateCommand(int argc, char** argv) {
   // cache the maximum context is found for.
   KvCacheType kv_type = KvCacheType::Q8;
   int gpu = 0;
+  std::string gpus;
   bool quiet = false;
   bool speculate = false;
+  bool tp_mode = false;
+  bool cp_mode = false;
+  bool pipeline_mode = false;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "--model" && i + 1 < argc) {
@@ -201,6 +177,14 @@ int RunCalibrateCommand(int argc, char** argv) {
       context = std::stoul(argv[++i]);
     } else if (arg == "--gpu" && i + 1 < argc) {
       gpu = std::stoi(argv[++i]);
+    } else if (arg == "--gpus" && i + 1 < argc) {
+      gpus = argv[++i];
+    } else if (arg == "--tp") {
+      tp_mode = true;
+    } else if (arg == "--cp") {
+      cp_mode = true;
+    } else if (arg == "--pipeline") {
+      pipeline_mode = true;
     } else if (arg == "--quiet") {
       quiet = true;
     } else if (MatchKvType(arg, kv_type)) {
@@ -225,6 +209,21 @@ int RunCalibrateCommand(int argc, char** argv) {
                  "cli: calibrate needs --calibration <file> or "
                  "TESSERA_CALIBRATION\n");
     return kExitUsage;
+  }
+  if (!gpus.empty() || tp_mode || cp_mode || pipeline_mode) {
+    // Parallel max-context calibration: no speed sweep, one entry per
+    // layout carrying the largest KV-cache context it allows.
+    ParallelCalibrateOptions parallel_options;
+    parallel_options.model_path = model_path;
+    parallel_options.gpus = gpus;
+    parallel_options.tp = tp_mode;
+    parallel_options.cp = cp_mode;
+    parallel_options.pipeline = pipeline_mode;
+    parallel_options.context = context;
+    parallel_options.kv_type = kv_type;
+    parallel_options.calibration_file = calibration_file;
+    parallel_options.quiet = quiet;
+    return RunParallelCalibrate(parallel_options);
   }
   std::vector<std::string> prompts = DefaultPrompts();
   if (!prompts_path.empty()) {
@@ -471,18 +470,9 @@ int RunCalibrateCommand(int argc, char** argv) {
   // Keep the identity for the report: `entry` is moved into the file below.
   const std::string model_id = entry.key.model;
 
-  CalibrationFile file;
-  auto existing = CalibrationFile::Load(calibration_file);
-  if (existing) {
-    file = std::move(*existing);
-  } else if (existing.error() != StatusCode::FileNotFound) {
-    log.Warn("calibrate", std::string("ignoring malformed calibration file '") +
-                              calibration_file + "' (" +
-                              std::string(ToString(existing.error())) + ")");
-  }
-  file.Set(std::move(entry));
-  auto saved = file.Save(calibration_file);
-  if (!saved) {
+  if (auto saved =
+          SaveCalibrationEntry(log, calibration_file, std::move(entry));
+      !saved) {
     log.Error("calibrate", std::string("cannot write '") + calibration_file +
                                "' (" + std::string(ToString(saved.error())) +
                                ")");

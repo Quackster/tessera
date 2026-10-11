@@ -158,22 +158,7 @@ int main(int argc, char** argv) {
     } else if (arg == "--gpus" && i + 1 < argc) {
       // A comma-separated device list for data-parallel serve, for
       // example `--gpus 0,1`. `--gpu` selects one device.
-      const std::string_view list = argv[++i];
-      std::size_t pos = 0;
-      while (pos <= list.size()) {
-        const std::size_t comma = list.find(',', pos);
-        const std::string_view item =
-            list.substr(pos, comma == std::string_view::npos
-                                 ? std::string_view::npos
-                                 : comma - pos);
-        if (!item.empty()) {
-          gpus.push_back(std::stoi(std::string(item)));
-        }
-        if (comma == std::string_view::npos) {
-          break;
-        }
-        pos = comma + 1;
-      }
+      gpus = tessera::cli::ParseGpuList(argv[++i]);
     } else if (arg == "--calibration" && i + 1 < argc) {
       calibration_path = argv[++i];
     } else if (arg == "--draft-block" && i + 1 < argc) {

@@ -261,6 +261,7 @@ endif()
 
 add_executable(tessera-cli tools/cli/main.cpp
                             tools/cli/calibrate_command.cpp
+                            tools/cli/calibrate_parallel.cpp
                             tools/cli/cli_helpers.cpp)
 target_link_libraries(tessera-cli PRIVATE tessera)
 

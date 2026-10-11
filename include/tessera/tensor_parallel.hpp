@@ -13,6 +13,8 @@
 
 namespace tessera {
 
+class Engine;
+class Model;
 class Tokenizer;
 
 // Options for building a tensor-parallel engine: one rank per device. The
@@ -54,6 +56,10 @@ class TensorParallel {
       std::span<const std::uint32_t> prompt, std::size_t max_tokens);
 
   [[nodiscard]] std::size_t RankCount() const;
+  // Rank `i`'s engine and model for measurement (for example per-device
+  // weight bytes). The driver owns them; `i` must be below RankCount().
+  [[nodiscard]] Engine& RankEngine(std::size_t i);
+  [[nodiscard]] Model& RankModel(std::size_t i);
   [[nodiscard]] const Tokenizer* GetTokenizer() const;
   [[nodiscard]] std::expected<std::string, StatusCode> ChatPrompt(
       std::string_view user_text, bool enable_thinking = false) const;

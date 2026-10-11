@@ -180,6 +180,22 @@ bool ReadOptionalNumber(const core::Json& object, std::string_view key,
   return true;
 }
 
+// Optional string field: absent leaves `out` unchanged. Used for fields
+// added after the first calibration file version, so a file without them
+// still loads.
+bool ReadOptionalString(const core::Json& object, std::string_view key,
+                        std::string& out) {
+  const core::Json* field = object.Find(key);
+  if (field == nullptr) {
+    return true;
+  }
+  if (!field->isString()) {
+    return false;
+  }
+  out = field->AsString();
+  return true;
+}
+
 // Parse one entry object. Any missing or wrong-typed field is
 // MalformedFile, so a truncated file is rejected instead of half-applied.
 std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
@@ -201,6 +217,7 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
       !ReadNumber(item, "context", context) ||
       !ReadString(item, "kv_type", entry.key.kv_type) ||
       !ReadString(item, "strategy", entry.key.strategy) ||
+      !ReadOptionalString(item, "parallel", entry.key.parallel) ||
       !ReadNumber(item, "mxfp4_split_target", split) ||
       !ReadOptionalNumber(item, "mxfp4_split_cap", cap) ||
       !ReadNumber(item, "prefill_chunk_tokens", prefill) ||
@@ -432,7 +449,7 @@ std::expected<SweepOutcome, StatusCode> RunCalibrationSweep(
 
 std::string HardwareKey::ToString() const {
   return backend + "|" + device + "|" + model + "|" + std::to_string(context) +
-         "|" + kv_type + "|" + strategy;
+         "|" + kv_type + "|" + strategy + "|" + parallel;
 }
 
 std::expected<CalibrationFile, StatusCode> CalibrationFile::Load(
@@ -478,6 +495,7 @@ std::expected<void, StatusCode> CalibrationFile::Save(
              core::Json::Number(static_cast<double>(entry.max_context)));
     item.Set("kv_type", core::Json::String(entry.key.kv_type));
     item.Set("strategy", core::Json::String(entry.key.strategy));
+    item.Set("parallel", core::Json::String(entry.key.parallel));
     item.Set("mxfp4_split_target",
              core::Json::Number(
                  static_cast<double>(entry.config.mxfp4_split_target)));
@@ -533,7 +551,8 @@ std::span<const CalibrationEntry> CalibrationFile::Entries() const {
 HardwareKey MakeHardwareKey(std::string_view backend, std::string_view device,
                             std::string_view model, std::size_t context,
                             std::string_view kv_type,
-                            std::string_view strategy) {
+                            std::string_view strategy,
+                            std::string_view parallel) {
   HardwareKey key;
   key.backend = std::string(backend);
   key.device = std::string(device);
@@ -541,6 +560,7 @@ HardwareKey MakeHardwareKey(std::string_view backend, std::string_view device,
   key.context = context;
   key.kv_type = std::string(kv_type);
   key.strategy = std::string(strategy);
+  key.parallel = std::string(parallel);
   return key;
 }
 
@@ -630,6 +650,7 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += row("model", report.model, 14);
   out += row("kv cache", report.kv_type, 14);
   out += row("strategy", report.strategy, 14);
+  out += row("parallel", report.parallel, 14);
   out += row("key context", std::to_string(report.key_context), 14);
   out += row("max context", std::to_string(report.max_context) + " token(s), " +
                                 report.kv_type + " memory bound",
@@ -683,7 +704,8 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += row("prefill", format_rate(report.prefill_tps) + " tok/s", 21);
   out += "\nWrote " + report.file + "\n";
   std::string example = "  tessera-cli run --model " + report.model_path +
-                        " " + report.kv_flag + "\\\n      --context " +
+                        " " + report.kv_flag + report.parallel_flags +
+                        "\\\n      --context " +
                         std::to_string(report.key_context);
   example += " --prefill-chunk " +
              std::to_string(report.chosen.prefill_chunk_tokens);
@@ -712,7 +734,7 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += example + "\n";
   out += "  # or apply the saved entry directly:\n";
   out += "  tessera-cli run --model " + report.model_path + " " +
-         report.kv_flag + "\\\n      --context " +
+         report.kv_flag + report.parallel_flags + "\\\n      --context " +
          std::to_string(report.key_context) +
          (report.strategy == "mtp" ? " --speculate" : "") + " --calibration " +
          report.file + " --prompt-text \"Hello\"\n";

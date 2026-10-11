@@ -188,6 +188,23 @@ int8 (kv8) and reports the maximum context length the device allows for that
 cache type: free device memory minus a 2 GiB reserve, divided by the per-token
 KV bytes over the full-attention layers.
 
+A parallel run calibrates the memory bound only, with no speed sweep:
+
+```
+tessera-cli calibrate --model <path> --gpus 0,1 --tp
+    [--kv-*] [--calibration <file>]
+```
+
+Exactly one of `--tp`, `--cp` or `--pipeline` selects the route. The
+command builds the route, measures each rank's resident weight bytes and
+free memory, and combines the per-device budgets: tensor takes the
+minimum (the KV cache is replicated), context multiplies the minimum by
+the rank count (one key chunk each), pipeline scales each stage by its
+layer share. The entry is stored under a key carrying the layout
+(`tp2`, `cp2`, `pipe2`), so it never collides with a single-device
+entry, and the report's example command reproduces the flags. Old files
+without the field still load; their entries read as unparallelized.
+
 `run` and `serve` accept `--calibration <file>`. When the file has an entry for
 the current key, the engine uses the saved values unless an explicit flag
 overrides them. An explicit flag always wins.

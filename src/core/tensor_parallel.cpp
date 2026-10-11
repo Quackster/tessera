@@ -227,6 +227,14 @@ std::expected<std::vector<std::uint32_t>, StatusCode> TensorParallel::Generate(
 
 std::size_t TensorParallel::RankCount() const { return impl_->ranks.size(); }
 
+Engine& TensorParallel::RankEngine(std::size_t i) {
+  return *impl_->ranks.at(i).engine;
+}
+
+Model& TensorParallel::RankModel(std::size_t i) {
+  return *impl_->ranks.at(i).model;
+}
+
 const Tokenizer* TensorParallel::GetTokenizer() const {
   return impl_->ranks.empty() ? nullptr
                               : impl_->ranks.front().model->GetTokenizer();

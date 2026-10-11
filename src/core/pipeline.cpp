@@ -55,6 +55,9 @@ struct Pipeline::Impl {
     // The last trunk layer this stage owns; the boundary capture reads the
     // residual hidden after it.
     std::size_t boundary_layer = 0;
+    // Owned trunk layer range [first_layer, last_layer) for budgeting.
+    std::size_t first_layer = 0;
+    std::size_t last_layer = 0;
   };
 
   std::vector<Stage> stages;
@@ -169,6 +172,8 @@ std::expected<std::unique_ptr<Pipeline>, StatusCode> Pipeline::Create(
     stage.engine = std::move(*engine);
     stage.model = std::move(*model);
     stage.boundary_layer = last - 1;
+    stage.first_layer = first;
+    stage.last_layer = last;
     if (i > 0) {
       auto buffer = stage.engine->Owner().AllocateBuffer(impl->hidden_dim * 4,
                                                          MemoryKind::Device);
@@ -495,6 +500,24 @@ Pipeline::GenerateMany(std::span<const std::vector<std::uint32_t>> prompts,
 }
 
 std::size_t Pipeline::StageCount() const { return impl_->stages.size(); }
+
+Engine& Pipeline::StageEngine(std::size_t i) {
+  return *impl_->stages.at(i).engine;
+}
+
+Model& Pipeline::StageModel(std::size_t i) {
+  return *impl_->stages.at(i).model;
+}
+
+std::vector<std::pair<std::size_t, std::size_t>> Pipeline::StageRanges()
+    const {
+  std::vector<std::pair<std::size_t, std::size_t>> ranges;
+  ranges.reserve(impl_->stages.size());
+  for (const Impl::Stage& stage : impl_->stages) {
+    ranges.emplace_back(stage.first_layer, stage.last_layer);
+  }
+  return ranges;
+}
 
 const Tokenizer* Pipeline::GetTokenizer() const {
   return impl_->stages.empty() ? nullptr

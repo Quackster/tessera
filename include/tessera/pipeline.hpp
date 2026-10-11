@@ -7,12 +7,15 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "tessera/types.hpp"
 
 namespace tessera {
 
+class Engine;
+class Model;
 class Tokenizer;
 
 // Options for building a pipeline: one stage per device, the trunk layers
@@ -75,6 +78,14 @@ class Pipeline {
                std::size_t max_tokens);
 
   [[nodiscard]] std::size_t StageCount() const;
+  // Stage `i`'s engine and model for measurement (for example per-device
+  // weight bytes). The driver owns them; `i` must be below StageCount().
+  [[nodiscard]] Engine& StageEngine(std::size_t i);
+  [[nodiscard]] Model& StageModel(std::size_t i);
+  // Owned trunk layer ranges per stage ([first, last)), in stage order,
+  // for scaling per-stage budgets by layer count.
+  [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>> StageRanges()
+      const;
   // The model tokenizer (identical across stages); nullptr when none.
   [[nodiscard]] const Tokenizer* GetTokenizer() const;
   // Render one user message through the model chat template with the
