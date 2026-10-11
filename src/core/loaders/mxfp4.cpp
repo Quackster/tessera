@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/json.hpp"
+#include "core/loaders/shard.hpp"
 #include "core/numerics/quant.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
@@ -174,7 +175,8 @@ std::expected<std::unique_ptr<Buffer>, StatusCode> Upload(
 std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
     Backend& backend, std::span<const std::byte> file,
     std::span<const SafetensorsTensor> tensors, const Architecture& module,
-    const TransformerConfig& config, const WeightLoadOptions& options) {
+    const TransformerConfig& config, const WeightLoadOptions& options,
+    const ModelShard& shard) {
   std::unordered_map<std::string, const SafetensorsTensor*> by_name;
   for (const auto& tensor : tensors) {
     by_name.emplace(tensor.name, &tensor);
@@ -186,6 +188,9 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
     }
     auto internal = module.MapWeightName(tensor.name, config, options);
     if (!internal) {
+      continue;
+    }
+    if (!ShardKeepsTensor(*internal, shard, config.layers)) {
       continue;
     }
     auto conversion = module.ConvertWeight(*internal, config);

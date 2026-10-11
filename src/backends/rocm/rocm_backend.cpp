@@ -296,18 +296,28 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyH2D(Buffer& dst,
                                          std::span<const std::byte> src) override {
+    return CopyH2DAt(dst, 0, src);
+  }
+
+  std::expected<void, StatusCode> CopyH2DAt(
+      Buffer& dst, std::size_t offset,
+      std::span<const std::byte> src) override {
     if (auto device = SelectDevice(); device != StatusCode::Ok) {
       return std::unexpected(device);
     }
-    if (src.size() > dst.Size()) {
+    if (offset > dst.Size() || src.size() > dst.Size() - offset) {
       return std::unexpected(StatusCode::InvalidArgument);
+    }
+    if (src.empty()) {
+      return {};
     }
     auto staging = EnsureStaging(src.size());
     if (!staging) {
       return std::unexpected(staging.error());
     }
     std::memcpy(*staging, src.data(), src.size());
-    auto error = hipMemcpyAsync(dst.Handle(), *staging, src.size(),
+    auto* base = static_cast<std::byte*>(dst.Handle()) + offset;
+    auto error = hipMemcpyAsync(base, *staging, src.size(),
                                 hipMemcpyHostToDevice, stream_);
     if (error == hipSuccess) {
       error = hipStreamSynchronize(stream_);

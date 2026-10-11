@@ -24,6 +24,19 @@ enum class ModelFormat : int {
   MxFp4 = 1,  // a directory with config.json + one *.safetensors
 };
 
+// A layer shard for a model loaded across several devices. Disabled (the
+// default) loads every tensor, the single-device case. Enabled restricts
+// the trunk blocks to `[first_layer, last_layer)`; `first_stage` also
+// gets the token embedding and `last_stage` the output head and the MTP
+// block. `last_layer` 0 means the last trunk layer.
+struct ModelShard {
+  bool enabled = false;
+  std::size_t first_layer = 0;
+  std::size_t last_layer = 0;
+  bool first_stage = true;
+  bool last_stage = true;
+};
+
 // Options for loading a model.
 struct ModelOptions {
   // Path to a .gguf file, or to a model directory (MXFP4 layout).
@@ -35,6 +48,8 @@ struct ModelOptions {
   // does not read it is attached. The MXFP4 directory loader honors the
   // flag; the GGUF loader loads every tensor in the file. Default true.
   bool load_mtp_head = true;
+  // Layer shard for a multi-device load; disabled loads the whole model.
+  ModelShard shard;
 };
 
 // A loaded model: format + options + parsed tensor manifest.
@@ -57,6 +72,18 @@ class Model {
   // detected automatically: a regular file is GGUF, a directory MXFP4.
   static std::expected<std::unique_ptr<Model>, StatusCode> Load(
       Backend& backend, const ModelOptions& options);
+
+  // Parse only the model definition, with no backend and no weight
+  // upload, and return the transformer config. A pipeline uses it to
+  // learn the layer count before it assigns the shard ranges, so no
+  // device is touched. FileNotFound / MalformedFile / UnsupportedFeature
+  // on a bad path or an unknown architecture.
+  //
+  // Usage:
+  //   auto config = Model::ProbeConfig(path);
+  //   if (config) split config->layers over the devices;
+  [[nodiscard]] static std::expected<TransformerConfig, StatusCode> ProbeConfig(
+      const std::string& path);
 
   [[nodiscard]] ModelFormat Format() const;
   [[nodiscard]] std::span<const TensorEntry> Tensors() const;
@@ -138,6 +165,10 @@ class Model {
   // nullptr when no module is registered. Generic code dispatches through
   // it for architecture specific behavior.
   [[nodiscard]] const Architecture* Arch() const;
+  // The layer shard this model was loaded with (disabled for a whole
+  // model). A sharded architecture module limits its layer loop to
+  // Shard().first_layer .. last_layer.
+  [[nodiscard]] const ModelShard& Shard() const;
 
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,

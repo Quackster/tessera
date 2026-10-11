@@ -287,6 +287,17 @@ through RADV GFX1100, rocm through the system ROCm).
   (was 37; Vulkan 88), prefill 81 tok/s (see docs/ORNITH-1.5.md). New kernels are
   tested on both backends. The batch (prefill and verify) path is
   row-serial for now.
+- Multi-GPU request replicas (first slice). `docs/PARALLELISM.md` holds
+  the ordered plan for every parallel route. `Runner` and `RunnerPool`
+  (`include/tessera/runner.hpp`, `src/core/runner.cpp`) own one engine
+  and model per device; `RunnerPool::Acquire` is the single device queue
+  (idle runner first, disconnect abort) and replaced the one-mutex
+  `WaitForGpu`. Serve routes every endpoint through the pool; `serve`
+  accepts `--gpus 0,1` next to `--gpu n`. Calibration moved from
+  `ServeOptions` onto each `Runner`. The CLI loads devices one at a time
+  and refuses a device whose free memory cannot hold the weights
+  (`Backend::MemoryInfo` against the on-disk size). Both backends build;
+  a two-device serve smoke run is pending.
 - Single GoogleTest target. Device tests skip cleanly with no
   device. Numerical checks use per-backend tolerance.
 
@@ -564,9 +575,11 @@ through RADV GFX1100, rocm through the system ROCm).
 - R4D FP8 attention. The served target difference not yet matched.
   W4A8 activation quant and the FP8 KV cache were measured and left
   acceptance unchanged, so they stay off by default.
-- Multi-GPU (deferred). One `Backend` per engine today. Routes:
-  tensor parallelism or pipeline split. Both need sharded loaders
-  and cross-device copies. Not started.
+- Multi-GPU (next slices). The data-parallel pool landed (see Current
+  status). Next: a two-device serve smoke run, then the sharded routes
+  in `docs/PARALLELISM.md` order (continuous batching, cross-device
+  copy, sharded loader, pipeline, tensor, expert, context, speculative
+  split, hybrid).
 
 ## Notes and decisions
 

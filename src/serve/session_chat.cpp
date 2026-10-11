@@ -184,19 +184,15 @@ bool BodyFlag(const Json& body, std::string_view key, bool fallback) {
 
 }  // namespace
 
-SessionHandler::SessionHandler(Engine& engine, Model& model,
-                               const Tokenizer& tokenizer,
-                               SessionStore& sessions, std::mutex& generation,
+SessionHandler::SessionHandler(RunnerPool& pool, const Tokenizer& tokenizer,
+                               SessionStore& sessions,
                                std::size_t default_max_completion_tokens,
-                               bool auto_title, CalibrationConfig calibration)
-    : engine_(engine),
-      model_(model),
+                               bool auto_title)
+    : pool_(pool),
       tokenizer_(tokenizer),
       sessions_(sessions),
-      generation_(generation),
       default_max_completion_tokens_(default_max_completion_tokens),
-      auto_title_(auto_title),
-      calibration_(calibration) {}
+      auto_title_(auto_title) {}
 
 void SessionHandler::HandleList(ResponseWriter& writer) const {
   Json items = Json::Array();
@@ -259,12 +255,15 @@ void SessionHandler::HandleRename(ResponseWriter& writer, std::string_view id,
 // with live think/content deltas, persist the assistant message. The
 // stop flag aborts the decode loop (prefill has no token hook and runs
 // to completion); pause blocks it between tokens.
-void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
+void SessionHandler::RunTurn(const RunnerLease& lease,
+                             const std::shared_ptr<Session>& session,
                              ResponseWriter& writer, const Json& request,
                              std::size_t max_completion_tokens,
                              std::size_t max_thinking_tokens,
                              bool enable_thinking, bool stream,
                              std::string_view title) const {
+  Engine& engine = lease.engine();
+  Model& model = lease.model();
   auto view = sessions_.View(session->Id());
   Json prompt_body = Json::Object();
   prompt_body.Set("messages", SessionHistoryJson(*view));
@@ -277,7 +276,7 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     }
   }
   std::string error;
-  const std::string prompt = RenderPrompt(model_, prompt_body, &error);
+  const std::string prompt = RenderPrompt(model, prompt_body, &error);
   if (!error.empty()) {
     SendError(writer, 422, error);
     return;
@@ -288,14 +287,14 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     return;
   }
   if (RejectOversizePrompt(writer, ids->size(),
-                           model_.MaxContextLength())) {
+                           model.MaxContextLength())) {
     return;
   }
   GenerateOptions options;
   options.max_completion_tokens = max_completion_tokens;
   options.max_thinking_tokens = max_thinking_tokens;
   options.prompt_tokens = *ids;
-  ApplyToGenerateOptions(calibration_, options);
+  ApplyToGenerateOptions(lease.runner().calibration(), options);
   ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
   std::string reasoning_text;
   std::string content_text;
@@ -359,8 +358,8 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
       WriteSse(writer, "", SseDelta(std::move(delta), ""), false);
     };
     const auto gen_started = std::chrono::steady_clock::now();
-    auto streamed = engine_.GenerateStreaming(
-        model_, options,
+    auto streamed = engine.GenerateStreaming(
+        model, options,
         [&](std::uint32_t token) { return on_token(token, true); });
     stats.elapsed_ms = MillisBetween(gen_started,
                                      std::chrono::steady_clock::now());
@@ -391,8 +390,8 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
     (void)writer.Write("data: [DONE]\n\n");
   } else {
     const auto gen_started = std::chrono::steady_clock::now();
-    auto streamed = engine_.GenerateStreaming(
-        model_, options,
+    auto streamed = engine.GenerateStreaming(
+        model, options,
         [&](std::uint32_t token) { return on_token(token, false); });
     stats.elapsed_ms = MillisBetween(gen_started,
                                      std::chrono::steady_clock::now());
@@ -421,23 +420,22 @@ void SessionHandler::RunTurn(const std::shared_ptr<Session>& session,
                                    saw_stop, stats, /*created_ms=*/0});
 }
 
-// Acquire the session turn and queue for the device: 409 when the
-// session is busy, otherwise wait behind running generations (a closed
-// peer waiting gives up its place). The guard releases the turn.
+// Acquire the session turn and an idle device: 409 when the session is
+// busy, otherwise wait for a free runner (a closed peer waiting gives up
+// its place). The guard releases the turn; the lease releases the device.
 bool SessionHandler::BeginTurn(const std::shared_ptr<Session>& session,
-                               ResponseWriter& writer,
-                               std::unique_lock<std::mutex>& gpu,
+                               ResponseWriter& writer, RunnerLease& lease,
                                SessionTurn& guard) const {
   if (!session->TryBegin()) {
     SendError(writer, 409, "session is already generating");
     return false;
   }
-  auto slot = WaitForGpu(generation_, writer);
+  auto slot = pool_.Acquire([&writer] { return writer.IsPeerGone(); });
   if (!slot) {
     session->End();
     return false;
   }
-  gpu = std::move(*slot);
+  lease = std::move(*slot);
   guard.session = session;
   return true;
 }
@@ -459,15 +457,15 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
                                  /*tool_calls_json=*/{}, /*tool_call_id=*/{},
                                  false, /*stats=*/{}, /*created_ms=*/0});
   SessionTurn guard;
-  std::unique_lock<std::mutex> gpu;
-  if (!BeginTurn(session, writer, gpu, guard)) {
+  RunnerLease lease;
+  if (!BeginTurn(session, writer, lease, guard)) {
     return;
   }
   // Name a fresh chat before its first answer: the title turn runs on
   // the device slot first, so the reply streams under the final title.
-  MaybeAutoTitle(engine_, model_, tokenizer_, session, auto_title_);
+  MaybeAutoTitle(lease.engine(), lease.model(), tokenizer_, session, auto_title_);
   const std::string title = session->View().title;
-  RunTurn(session, writer, body,
+  RunTurn(lease, session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body), title);
@@ -486,12 +484,12 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
     return;
   }
   SessionTurn guard;
-  std::unique_lock<std::mutex> gpu;
-  if (!BeginTurn(session, writer, gpu, guard)) {
+  RunnerLease lease;
+  if (!BeginTurn(session, writer, lease, guard)) {
     return;
   }
   const std::string title = session->View().title;
-  RunTurn(session, writer, body,
+  RunTurn(lease, session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
           MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body), title);

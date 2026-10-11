@@ -863,6 +863,12 @@ class Backend {
   virtual std::expected<void, StatusCode> CopyH2D(
       Buffer& dst, std::span<const std::byte> src) = 0;
 
+  // Copy host bytes into `dst` starting at `offset` (bounds-checked
+  // against the buffer size). The slice entry of CopyH2D; the whole
+  // buffer case is CopyH2DAt(dst, 0, src).
+  virtual std::expected<void, StatusCode> CopyH2DAt(
+      Buffer& dst, std::size_t offset, std::span<const std::byte> src) = 0;
+
   // One host-to-device copy in a batch: `src` lands at the start of `dst`.
   struct HostCopy {
     Buffer* dst = nullptr;
@@ -937,6 +943,17 @@ class Backend {
   // GPU index chosen by SetDeviceIndex (default 0, the first GPU).
   int device_index_ = 0;
 };
+
+// Copy `bytes` from a buffer owned by one backend into a buffer owned by
+// another, at the given offsets (bounds-checked). When both buffers share
+// an owner this is the backend's CopyD2D; otherwise the bytes stage
+// through host memory, which is correct on any device pair. The source is
+// synchronized before the read and the destination is ready for the next
+// launch when the call returns. This is the transport the sharded routes
+// (pipeline, tensor, expert) build on.
+[[nodiscard]] std::expected<void, StatusCode> CopyAcrossDevices(
+    const Buffer& src, std::size_t src_offset, Buffer& dst,
+    std::size_t dst_offset, std::size_t bytes);
 
 // Construct the configured backend. Returns nullptr only when the build
 // has no backend (a misconfiguration the engine reports as an error).

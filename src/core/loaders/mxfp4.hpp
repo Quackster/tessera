@@ -27,13 +27,15 @@ namespace core {
 // F4E2M1 blob with its paired E8M0 scale (blob then scale). Plain
 // (BF16/F32) tensors become F32 except the embedding, which stays BF16.
 // Tensors the module ignores are skipped; `options` selects the optional
-// groups, so the MTP head is skipped when include_mtp_head is false. The
-// returned weights are in internal-name order.
+// groups, so the MTP head is skipped when include_mtp_head is false. `shard`
+// drops the tensors outside the stage when enabled. The returned weights
+// are in internal-name order.
 [[nodiscard]] std::expected<std::vector<DeviceTensor>, StatusCode>
 BuildMxFp4Weights(Backend& backend, std::span<const std::byte> file,
                   std::span<const SafetensorsTensor> tensors,
                   const Architecture& module, const TransformerConfig& config,
-                  const WeightLoadOptions& options);
+                  const WeightLoadOptions& options,
+                  const ModelShard& shard = {});
 
 }  // namespace core
 }  // namespace tessera

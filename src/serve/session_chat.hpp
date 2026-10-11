@@ -12,6 +12,7 @@
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
+#include "tessera/runner.hpp"
 #include "tessera/tokenizer.hpp"
 
 // Web UI session turns over the chat model. One instance is shared by
@@ -41,10 +42,9 @@ namespace tessera::serve {
 
 class SessionHandler {
  public:
-  SessionHandler(Engine& engine, Model& model, const Tokenizer& tokenizer,
-                 SessionStore& sessions, std::mutex& generation,
-                 std::size_t default_max_completion_tokens, bool auto_title,
-                 CalibrationConfig calibration = {});
+  SessionHandler(RunnerPool& pool, const Tokenizer& tokenizer,
+                 SessionStore& sessions,
+                 std::size_t default_max_completion_tokens, bool auto_title);
 
   // Session CRUD over JSON bodies; 404 for an unknown id.
   void HandleList(ResponseWriter& writer) const;
@@ -68,25 +68,22 @@ class SessionHandler {
 
   private:
   // Shared turn core for chat and retry (see the .cpp for the flow).
-  void RunTurn(const std::shared_ptr<Session>& session,
+  void RunTurn(const RunnerLease& lease, const std::shared_ptr<Session>& session,
                ResponseWriter& writer, const core::Json& request,
                std::size_t max_completion_tokens,
                std::size_t max_thinking_tokens, bool enable_thinking,
                bool stream, std::string_view title) const;
   // 409 when the session is busy; otherwise take the turn and queue
-  // for the device behind running generations. The guard releases it.
+  // for an idle device behind running generations. The guard releases it.
   bool BeginTurn(const std::shared_ptr<Session>& session,
-                 ResponseWriter& writer, std::unique_lock<std::mutex>& gpu,
+                 ResponseWriter& writer, RunnerLease& lease,
                  SessionTurn& guard) const;
 
-  Engine& engine_;
-  Model& model_;
+  RunnerPool& pool_;
   const Tokenizer& tokenizer_;
   SessionStore& sessions_;
-  std::mutex& generation_;
   std::size_t default_max_completion_tokens_;
   bool auto_title_;
-  CalibrationConfig calibration_;
 };
 
 }  // namespace tessera::serve

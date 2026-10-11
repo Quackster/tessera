@@ -15,6 +15,7 @@
 #include "core/loaders/hf_tokenizer.hpp"
 #include "core/loaders/mxfp4.hpp"
 #include "core/loaders/safetensors.hpp"
+#include "core/loaders/shard.hpp"
 #include "core/timing.hpp"
 
 namespace tessera {
@@ -433,6 +434,8 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
 
 const Architecture* Model::Arch() const { return module_.get(); }
 
+const ModelShard& Model::Shard() const { return options_.shard; }
+
 // Upload every manifest tensor to a device buffer. `bytes` is the
 // whole file; offsets come from the parsed manifest. `log` receives one
 // phase line per upload stage (allocation, transfer) so a slow load is
@@ -440,7 +443,8 @@ const Architecture* Model::Arch() const { return module_.get(); }
 std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
     Backend& backend, const std::vector<TensorEntry>& tensors,
     const std::vector<std::uint64_t>& offsets, std::uint64_t data_start,
-    std::span<const std::byte> bytes, const log::Diagnostics* log) {
+    std::span<const std::byte> bytes, const log::Diagnostics* log,
+    const ModelShard& shard, std::size_t trunk_layers) {
   std::vector<DeviceTensor> weights;
   weights.reserve(tensors.size());
   std::vector<Backend::HostCopy> copies;
@@ -450,6 +454,9 @@ std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
     core::PhaseTimer timer(log, "model", "allocate device buffers");
     for (std::size_t i = 0; i < tensors.size(); ++i) {
       const auto& entry = tensors[i];
+      if (!core::ShardKeepsTensor(entry.name, shard, trunk_layers)) {
+        continue;
+      }
       auto sized = TensorBytes(entry.dtype, entry.shape.Numel());
       if (!sized) {
         return std::unexpected(sized.error());
@@ -538,7 +545,8 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     }
     auto weights =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
-                      gguf->tensor_data_start, bytes, log);
+                      gguf->tensor_data_start, bytes, log, options.shard,
+                      config->has_value() ? (*config)->layers : 0);
     if (!weights) {
       return std::unexpected(weights.error());
     }
@@ -603,7 +611,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
           core::PhaseTimer build_timer(log, "model", "build mxfp4 weights");
           weights = core::BuildMxFp4Weights(
               backend, file_bytes, *parsed, *module, *config,
-              WeightLoadOptions{options.load_mtp_head});
+              WeightLoadOptions{options.load_mtp_head}, options.shard);
         }
         if (!weights) {
           return std::unexpected(weights.error());
@@ -638,8 +646,8 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       offsets.push_back(tensor.begin);
     }
     // Map offsets count from the file start, so the base is zero.
-    auto weights =
-        UploadWeights(backend, tensors, offsets, 0, file_bytes, log);
+    auto weights = UploadWeights(backend, tensors, offsets, 0, file_bytes, log,
+                                 options.shard, 0);
     if (!weights) {
       return std::unexpected(weights.error());
     }
@@ -648,6 +656,59 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         std::string{}, std::string{}, std::nullopt, std::nullopt,
         std::move(*weights), std::nullopt, std::string{},
         core::LoadHfStopTokens(path)));
+  }
+  return std::unexpected(StatusCode::InvalidArgument);
+}
+
+std::expected<TransformerConfig, StatusCode> Model::ProbeConfig(
+    const std::string& path) {
+  if (path.empty()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  std::error_code ec;
+  const std::filesystem::path file_path(path);
+  if (!std::filesystem::exists(file_path, ec) || ec) {
+    return std::unexpected(StatusCode::FileNotFound);
+  }
+  if (std::filesystem::is_regular_file(file_path, ec) && !ec) {
+    auto mapped = core::MappedFile::Open(file_path);
+    if (!mapped) {
+      return std::unexpected(mapped.error());
+    }
+    auto gguf = core::ParseGguf(mapped->bytes());
+    if (!gguf) {
+      return std::unexpected(gguf.error());
+    }
+    std::string architecture;
+    if (const auto* value = gguf->Find("general.architecture");
+        value != nullptr) {
+      if (const auto* arch_str = std::get_if<std::string>(value)) {
+        architecture = *arch_str;
+      }
+    }
+    auto config = ParseConfig(*gguf, architecture);
+    if (!config) {
+      return std::unexpected(config.error());
+    }
+    if (!*config) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    return **config;
+  }
+  if (std::filesystem::is_directory(file_path, ec) && !ec) {
+    auto config_bytes = core::ReadFile(file_path / "config.json");
+    if (!config_bytes) {
+      return std::unexpected(config_bytes.error());
+    }
+    const std::string_view text(
+        reinterpret_cast<const char*>(config_bytes->data()),
+        config_bytes->size());
+    const std::string architecture = core::MxFp4ArchitectureName(text);
+    auto module = CreateArchitecture(architecture);
+    if (module == nullptr) {
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
+    return module->ParseConfigJson(text);
   }
   return std::unexpected(StatusCode::InvalidArgument);
 }

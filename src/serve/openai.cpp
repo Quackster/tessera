@@ -120,11 +120,9 @@ bool BeginSession(SessionStore& sessions, const std::string& session_id,
 
 }  // namespace
 
-void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
-                    SessionStore& sessions, std::mutex& generation,
-                    ResponseWriter& writer, const Json& body,
-                    std::size_t default_max,
-                    const CalibrationConfig& calibration) {
+void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
+                    SessionStore& sessions, ResponseWriter& writer,
+                    const Json& body, std::size_t default_max) {
   const std::string session_id = SessionIdFrom(body);
   const Json* prompt = body.Find("prompt");
   if (prompt == nullptr || !prompt->isString()) {
@@ -137,10 +135,12 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
       !BeginSession(sessions, session_id, writer, &session, &turn)) {
     return;
   }
-  auto slot = WaitForGpu(generation, writer);
-  if (!slot) {
+  auto lease = pool.Acquire([&writer] { return writer.IsPeerGone(); });
+  if (!lease) {
     return;
   }
+  Engine& engine = lease->engine();
+  Model& model = lease->model();
   std::string prompt_text = prompt->AsString();
   if (session != nullptr) {
     const SessionView before = session->View();
@@ -168,7 +168,7 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
   options.max_completion_tokens = max_completion_tokens;
   options.max_thinking_tokens = MaxThinkingTokensFrom(body);
   options.prompt_tokens = *ids;
-  ApplyToGenerateOptions(calibration, options);
+  ApplyToGenerateOptions(lease->runner().calibration(), options);
   if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;
   }
@@ -280,11 +280,9 @@ void OpenAiComplete(Engine& engine, Model& model, const Tokenizer& tokenizer,
   (void)count;
 }
 
-void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
-                SessionStore& sessions, std::mutex& generation,
-                ResponseWriter& writer, const Json& body,
-                std::size_t default_max, bool anthropic,
-                const CalibrationConfig& calibration) {
+void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
+                SessionStore& sessions, ResponseWriter& writer,
+                const Json& body, std::size_t default_max, bool anthropic) {
   const std::string session_id = SessionIdFrom(body);
   std::shared_ptr<Session> session;
   SessionTurn turn;
@@ -294,10 +292,12 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
       return;
     }
   }
-  auto slot = WaitForGpu(generation, writer);
-  if (!slot) {
+  auto lease = pool.Acquire([&writer] { return writer.IsPeerGone(); });
+  if (!lease) {
     return;
   }
+  Engine& engine = lease->engine();
+  Model& model = lease->model();
   if (session != nullptr) {
     SessionView view{"", "", {}, false, false};
     if (!BeginChatTurn(session, writer, body, &view)) {
@@ -333,7 +333,7 @@ void OpenAiChat(Engine& engine, Model& model, const Tokenizer& tokenizer,
   options.max_completion_tokens = max_completion_tokens;
   options.max_thinking_tokens = MaxThinkingTokensFrom(prompt_body);
   options.prompt_tokens = *ids;
-  ApplyToGenerateOptions(calibration, options);
+  ApplyToGenerateOptions(lease->runner().calibration(), options);
   if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;
   }

@@ -27,6 +27,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | GGUF loader | Done | v2/v3 headers, bounds-checked, memory-mapped (not copied). |
 | MXFP4 loader | Done | Tensor map, weight upload. FP8 and MXFP4 GEMM verified. |
 | Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched H2D upload (`CopyH2DBatch`); ROCm drains a 256 MiB pinned window, one sync per chunk. ROCm re-selects the configured GPU on every thread that touches the device. |
+| Parallelism | Partial | Data-parallel request replicas: one engine and model per GPU behind a `RunnerPool` with least-loaded routing. Built on both backends; a two-device serve smoke is pending. Tensor and pipeline split not started. |
 | Kernel launch | Done | Vulkan records a whole decode step into one command buffer. ROCm runs one blocking stream with pinned staging. |
 | DFlash2 | Partial | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. Draft cost still high. |
 | CLI | Partial | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, calibrate. |
@@ -267,6 +268,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--draft <dir>` | both | none | DFlash2 draft checkpoint directory. |
 | `--context <n>` | both | 4096 | Maximum context length. |
 | `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
+| `--gpus <a,b>` | both | none | Serve one model replica per listed GPU for parallel requests (for example `--gpus 0,1`). Overrides `--gpu`. |
 | `--draft-block <n>` | both | 0 | Draft block tokens. 0 keeps the draft checkpoint's configured block. |
 | `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects the automatic default (512). |
 | `--split-target <n>` | both | 0 | fp8 MXFP4 split-K workgroup target (ROCm only). 0 uses the built-in default (320). |

@@ -52,10 +52,12 @@ inline std::expected<LinearGeometry, StatusCode> DeriveGeometry(
 }
 
 // Loads the hybrid kernels and allocates the per-step scratch on first
-// use; idempotent. Requires the derived linear geometry.
+// use; idempotent. Requires the derived linear geometry. `shard` limits
+// the per-layer recurrent state to the owned layers; a disabled shard
+// (the whole model) allocates every linear layer.
 [[nodiscard]] std::expected<void, StatusCode> EnsureHybridReady(
     Backend& backend, const TransformerConfig& cfg, core::DecodeCache& cache,
-    const LinearGeometry& g);
+    const LinearGeometry& g, const ModelShard& shard);
 
 // One projection C = A x W^T for `m` rows of `a` (m x k fp32). For an
 // MXFP4 weight (F4E2M1) the activation is first quantize-dequantized per

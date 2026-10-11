@@ -12,6 +12,7 @@
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
+#include "tessera/runner.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
@@ -41,64 +42,44 @@ struct ServeOptions {
   // Ask the model for a chat title after the first prompt of a new
   // session; off keeps the first user line as the title.
   bool auto_title = true;
-  // Saved calibration stamped onto every generated turn (see
-  // docs/CALIBRATE.md). A zero field uses the engine default. The server
-  // applies these to each request's tuning fields, so a calibrated serve
-  // reproduces `run` with --calibration.
-  CalibrationConfig calibration;
 };
 
 // Reports the loader's current step (for example "loading weights" or
 // "compiling kernels") so /health shows progress instead of silence.
 using ServeProgress = std::function<void(std::string_view)>;
 
-// Produces the model for the deferred Serve overload. Runs on a
-// background thread after the HTTP socket is bound, so the endpoints
-// answer while the model loads and its kernels warm. Call `report` with
-// the current step; return the loaded model, or an error that Serve
-// records and reports through /health. A model that is not warmed is
-// still accepted, but the first request then pays the kernel compile.
+// Produces the runner pool for the deferred Serve overload: one runner
+// per device. Runs on a background thread after the socket is bound, so
+// /health answers while the weights load. Return an error that Serve
+// records and reports through /health.
 //
 // Usage:
-//   ModelLoader loader = [&](const ServeProgress& report) {
+//   PoolLoader loader = [&](const ServeProgress& report) {
 //     report("loading weights");
-//     return engine.LoadModel(ModelOptions{path});
+//     return BuildPool(devices);
 //   };
-using ModelLoader = std::function<std::expected<std::unique_ptr<Model>,
-                                                StatusCode>(const ServeProgress&)>;
+using PoolLoader = std::function<std::expected<std::unique_ptr<RunnerPool>,
+                                               StatusCode>(const ServeProgress&)>;
 
-// Serve a blocking HTTP API on the engine: OpenAI-style POST
-// /v1/completions, POST /v1/chat/completions (with OpenAI-form tool
-// calls) and POST /v1/messages, plus GET /health, GET /metrics, GET
-// /v1/models, session management (/api/sessions and the /v1/sessions
-// aliases, GET /slots) and a web chat UI at `/`. Generations queue in
-// arrival order on the single device, so parallel chats wait their
-// turn; a peer that disconnects while queued gives up its place. A
-// request carrying `session_id` continues that stored session (404
-// unknown, 409 already generating); without it the request is
-// stateless. Responses keep the standard OpenAI shape either way.
-// Returns when the server socket fails or closes. The listening
-// endpoint and every socket failure (with the failing call, the
-// endpoint and the errno text) go to the engine diagnostics channel.
-//
-// The deferred overload binds the socket first, then runs `loader` on a
-// background thread, so a client can connect while the model loads.
-// Until the loader returns, GET /health answers 503 with a JSON body
-// `{"status":"loading"|"failed","detail":...}` and every other endpoint
-// answers 503; when it returns, /health answers 200 and serving is
-// enabled. A load failure keeps the server up so /health can report it.
+// Serve a data-parallel pool of runners (one per device). Takes
+// ownership of the pool. Generations route to an idle device and queue
+// in arrival order when every device is busy. The OpenAI and session
+// endpoints are unchanged; only the device routing differs from the
+// single-device overload.
 //
 // Usage:
-//   Serve(engine, options, loader);   // deferred
-//   Serve(*engine, *model, options);  // model already loaded
-[[nodiscard]] std::expected<void, StatusCode> Serve(Engine& engine,
-                                                    const ServeOptions& options,
-                                                    ModelLoader loader);
+//   auto pool = BuildPool({0, 1});
+//   if (!pool) return 1;
+//   Serve(std::move(*pool), options);
+[[nodiscard]] std::expected<void, StatusCode> Serve(
+    std::unique_ptr<RunnerPool> pool, const ServeOptions& options);
 
-// Serve an already-loaded `model`, ready immediately. `model` must
-// outlive the call.
-[[nodiscard]] std::expected<void, StatusCode> Serve(Engine& engine,
-                                                    Model& model,
-                                                    const ServeOptions& options);
+// Deferred overload: binds the socket first, then runs `loader` on a
+// background thread to build the pool, so a client can connect while the
+// weights load. Until the loader returns, /health answers 503 with a JSON
+// body `{"status":"loading"|"failed","detail":...}`. A load failure
+// keeps the server up so /health can report it.
+[[nodiscard]] std::expected<void, StatusCode> Serve(const ServeOptions& options,
+                                                    PoolLoader loader);
 
 }  // namespace tessera

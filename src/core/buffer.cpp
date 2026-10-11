@@ -1,5 +1,8 @@
 #include "tessera/backend.hpp"
 
+#include <span>
+#include <vector>
+
 namespace tessera {
 
 Buffer::Buffer(Backend& backend, void* handle, std::size_t size, MemoryKind kind,
@@ -149,6 +152,30 @@ void Backend::LogError(std::string_view message) const {
   if (diagnostics_ != nullptr) {
     diagnostics_->Error("backend", message);
   }
+}
+
+std::expected<void, StatusCode> CopyAcrossDevices(
+    const Buffer& src, std::size_t src_offset, Buffer& dst,
+    std::size_t dst_offset, std::size_t bytes) {
+  if (src_offset > src.Size() || bytes > src.Size() - src_offset ||
+      dst_offset > dst.Size() || bytes > dst.Size() - dst_offset) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (bytes == 0) {
+    return {};
+  }
+  // A same-device copy stays on the device; a cross-device copy stages
+  // through host memory, which is correct for any device pair.
+  if (&src.Owner() == &dst.Owner()) {
+    return src.Owner().CopyD2D(src, src_offset, dst, dst_offset, bytes);
+  }
+  std::vector<std::byte> stage(bytes);
+  auto down = src.Owner().CopyD2HAt(src, src_offset, stage.data(), bytes);
+  if (!down) {
+    return down;
+  }
+  return dst.Owner().CopyH2DAt(
+      dst, dst_offset, std::span<const std::byte>(stage.data(), bytes));
 }
 
 }  // namespace tessera

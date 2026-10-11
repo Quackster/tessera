@@ -35,12 +35,6 @@ void SendError(ResponseWriter& writer, int status, const std::string& message);
 // request is stateless. OpenAI clients ignore the unknown field, so
 // passing it is compatible with other servers.
 [[nodiscard]] std::string SessionIdFrom(const core::Json& body);
-// Queue for the single device behind running generations. Blocks in
-// arrival order instead of failing; nullopt when the peer goes away
-// while waiting (the waiter gives up its place). The single canonical
-// device queue for every endpoint.
-[[nodiscard]] std::optional<std::unique_lock<std::mutex>> WaitForGpu(
-    std::mutex& generation, const ResponseWriter& writer);
 // Wall milliseconds between two steady-clock readings, for turn stats.
 [[nodiscard]] long long MillisBetween(
     std::chrono::steady_clock::time_point start,

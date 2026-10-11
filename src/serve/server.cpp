@@ -50,18 +50,18 @@ void SendNotReady(ResponseWriter& writer,
 }
 
 // Shared serving core. `readiness` is already seeded (ready for a
-// pre-loaded model; loading otherwise). A non-null `loader` runs on a
-// background thread while the socket serves, publishing the model
+// pre-loaded pool; loading otherwise). A non-null `loader` runs on a
+// background thread while the socket serves, publishing the pool
 // through `readiness`.
 std::expected<void, StatusCode> ServeInternal(
-    Engine& engine, const ServeOptions& options, serve::Readiness& readiness,
-    ModelLoader loader) {
+    std::unique_ptr<RunnerPool> ready_pool, const ServeOptions& options,
+    serve::Readiness& readiness, PoolLoader loader) {
   serve::SessionStore sessions;
-  // One generation at a time on the device; connection threads queue
-  // on it in arrival order, so parallel chats wait their turn.
-  std::mutex generation;
-  std::unique_ptr<Model> owned_model;
-  const auto handler = [&engine, &options, &sessions, &generation,
+  std::unique_ptr<RunnerPool> pool = std::move(ready_pool);
+  // Diagnostics sink for the deferred case before the pool exists; the
+  // ready case logs through the first runner's engine.
+  log::Diagnostics local_log;
+  const auto handler = [&pool, &options, &sessions,
                         &readiness](const HttpRequest& request,
                                     ResponseWriter& writer) {
     ++g_requests;
@@ -182,7 +182,8 @@ std::expected<void, StatusCode> ServeInternal(
       props.Set("model_path", Json::String(std::string(model.Name())));
       props.Set("n_ctx", Json::Number(
                              static_cast<double>(model.MaxContextLength())));
-      props.Set("total_slots", Json::Number(1));
+      props.Set("total_slots", Json::Number(
+                                   static_cast<double>(pool->size())));
       // The reasoning levels the chat template offers, in template order;
       // absent when the template never reads reasoning_effort. The web UI
       // builds its difficulty selector from this list.
@@ -202,14 +203,16 @@ std::expected<void, StatusCode> ServeInternal(
       SendError(writer, 422, "this model has no tokenizer");
       return;
     }
-    // Generations queue in arrival order on the single device; a
-    // request behind a running generation waits instead of failing, so
-    // parallel windows and parallel API clients each get their turn.
-    serve::SessionHandler session_handler(engine, model, *tokenizer, sessions,
-                                          generation,
+    if (pool == nullptr) {
+      SendNotReady(writer, readiness.Get());
+      return;
+    }
+    // Generations route to an idle device; when every device is busy a
+    // request waits instead of failing, so parallel windows and parallel
+    // API clients each get their turn.
+    serve::SessionHandler session_handler(*pool, *tokenizer, sessions,
                                           options.default_max_completion_tokens,
-                                          options.auto_title,
-                                          options.calibration);
+                                          options.auto_title);
     if (path == "/api/sessions") {
       if (request.method == "GET") {
         session_handler.HandleList(writer);
@@ -362,10 +365,8 @@ std::expected<void, StatusCode> ServeInternal(
         SendError(writer, 400, "invalid JSON body");
         return;
       }
-      serve::OpenAiComplete(engine, model, *tokenizer, sessions, generation,
-                            writer, *body,
-                            options.default_max_completion_tokens,
-                            options.calibration);
+      serve::OpenAiComplete(*pool, *tokenizer, sessions, writer, *body,
+                            options.default_max_completion_tokens);
       return;
     }
     if (request.method == "POST" &&
@@ -375,9 +376,8 @@ std::expected<void, StatusCode> ServeInternal(
         SendError(writer, 400, "invalid JSON body");
         return;
       }
-      serve::OpenAiChat(engine, model, *tokenizer, sessions, generation,
-                        writer, *body, options.default_max_completion_tokens,
-                        false, options.calibration);
+      serve::OpenAiChat(*pool, *tokenizer, sessions, writer, *body,
+                        options.default_max_completion_tokens, false);
       return;
     }
     if (request.method == "POST" &&
@@ -407,9 +407,8 @@ std::expected<void, StatusCode> ServeInternal(
         SendError(writer, 400, "invalid JSON body");
         return;
       }
-      serve::OpenAiChat(engine, model, *tokenizer, sessions, generation,
-                        writer, *body, options.default_max_completion_tokens,
-                        true, options.calibration);
+      serve::OpenAiChat(*pool, *tokenizer, sessions, writer, *body,
+                        options.default_max_completion_tokens, true);
       return;
     }
     // Live session states: one entry per chat with its id, title,
@@ -431,7 +430,7 @@ std::expected<void, StatusCode> ServeInternal(
   if (loader) {
     // Bind and serve first, then load: a client reaches /health during
     // a slow load instead of finding the port closed.
-    loader_thread = std::thread([&engine, &readiness, &owned_model,
+    loader_thread = std::thread([&pool, &readiness, &local_log,
                                  loader = std::move(loader)] {
       const ServeProgress report = [&readiness](std::string_view detail) {
         readiness.Loading(std::string(detail));
@@ -440,18 +439,19 @@ std::expected<void, StatusCode> ServeInternal(
       if (!loaded) {
         const std::string detail = std::string(ToString(loaded.error()));
         readiness.Failed(detail);
-        engine.Diagnostics().Error(
+        local_log.Error(
             "serve", "model load failed (" + detail +
                          "); /health reports the failure and no request is served");
         return;
       }
-      owned_model = std::move(*loaded);
-      readiness.Ready(owned_model.get(), owned_model->GetTokenizer());
-      engine.Diagnostics().Info("serve", "model ready");
+      pool = std::move(*loaded);
+      readiness.Ready(&pool->At(0).model(), pool->At(0).tokenizer());
+      local_log.Info("serve", "model ready");
     });
   }
-  auto served = serve::RunHttpServer(options.host, options.port, handler, &stop,
-                                     engine.Diagnostics());
+  auto served = serve::RunHttpServer(
+      options.host, options.port, handler, &stop,
+      pool ? pool->At(0).engine().Diagnostics() : local_log);
   if (loader_thread.joinable()) {
     loader_thread.join();
   }
@@ -460,19 +460,21 @@ std::expected<void, StatusCode> ServeInternal(
 
 }  // namespace
 
-std::expected<void, StatusCode> Serve(Engine& engine,
-                                      const ServeOptions& options,
-                                      ModelLoader loader) {
+std::expected<void, StatusCode> Serve(std::unique_ptr<RunnerPool> pool,
+                                      const ServeOptions& options) {
+  if (pool == nullptr || pool->empty()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
   serve::Readiness readiness;
-  readiness.Loading("waiting for the model");
-  return ServeInternal(engine, options, readiness, std::move(loader));
+  readiness.Ready(&pool->At(0).model(), pool->At(0).tokenizer());
+  return ServeInternal(std::move(pool), options, readiness, nullptr);
 }
 
-std::expected<void, StatusCode> Serve(Engine& engine, Model& model,
-                                      const ServeOptions& options) {
+std::expected<void, StatusCode> Serve(const ServeOptions& options,
+                                      PoolLoader loader) {
   serve::Readiness readiness;
-  readiness.Ready(&model, model.GetTokenizer());
-  return ServeInternal(engine, options, readiness, nullptr);
+  readiness.Loading("waiting for the model");
+  return ServeInternal(nullptr, options, readiness, std::move(loader));
 }
 
 }  // namespace tessera

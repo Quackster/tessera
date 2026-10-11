@@ -3,10 +3,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
+#include <filesystem>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "calibrate_command.hpp"
@@ -15,6 +17,7 @@
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/image.hpp"
+#include "tessera/pipeline.hpp"
 #include "tessera/vision.hpp"
 #include "tessera/serve.hpp"
 #include "tessera/speculative.hpp"
@@ -34,6 +37,26 @@ using tessera::cli::ResolveCalibration;
 constexpr int kExitOk = 0;
 constexpr int kExitError = 1;
 constexpr int kExitUsage = 2;
+
+// On-disk bytes of a model path: the file size for a GGUF, the sum of
+// the regular files for an MXFP4 directory. Used to refuse a device that
+// cannot hold the weights before the load starts.
+std::uint64_t PathSizeBytes(const std::string& path) {
+  std::error_code ec;
+  const std::filesystem::path p(path);
+  if (std::filesystem::is_regular_file(p, ec)) {
+    return std::filesystem::file_size(p, ec);
+  }
+  std::uint64_t total = 0;
+  if (std::filesystem::is_directory(p, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(p, ec)) {
+      if (entry.is_regular_file(ec)) {
+        total += entry.file_size(ec);
+      }
+    }
+  }
+  return total;
+}
 
 }  // namespace
 
@@ -76,6 +99,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> api_keys;
   std::vector<std::string> allow_origins;
   bool speculate = false;
+  bool pipeline_mode = false;
   tessera::SamplingOptions sampling;
   bool sample = false;
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
@@ -91,6 +115,7 @@ int main(int argc, char** argv) {
   std::size_t attention_split = 0;
   std::size_t draft_context = 0;
   int gpu = 0;
+  std::vector<int> gpus;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "--model" && i + 1 < argc) {
@@ -121,6 +146,25 @@ int main(int argc, char** argv) {
       context = std::stoul(argv[++i]);
     } else if (arg == "--gpu" && i + 1 < argc) {
       gpu = std::stoi(argv[++i]);
+    } else if (arg == "--gpus" && i + 1 < argc) {
+      // A comma-separated device list for data-parallel serve, for
+      // example `--gpus 0,1`. `--gpu` selects one device.
+      const std::string_view list = argv[++i];
+      std::size_t pos = 0;
+      while (pos <= list.size()) {
+        const std::size_t comma = list.find(',', pos);
+        const std::string_view item =
+            list.substr(pos, comma == std::string_view::npos
+                                 ? std::string_view::npos
+                                 : comma - pos);
+        if (!item.empty()) {
+          gpus.push_back(std::stoi(std::string(item)));
+        }
+        if (comma == std::string_view::npos) {
+          break;
+        }
+        pos = comma + 1;
+      }
     } else if (arg == "--calibration" && i + 1 < argc) {
       calibration_path = argv[++i];
     } else if (arg == "--draft-block" && i + 1 < argc) {
@@ -137,6 +181,8 @@ int main(int argc, char** argv) {
       draft_context = std::stoul(argv[++i]);
     } else if (arg == "--speculate") {
       speculate = true;
+    } else if (arg == "--pipeline") {
+      pipeline_mode = true;
     } else if (arg == "--sample") {
       sample = true;
     } else if (MatchKvType(arg, kv_type)) {
@@ -186,23 +232,26 @@ int main(int argc, char** argv) {
     }
   }
 
-  tessera::EngineOptions options;  // default stderr diagnostics sink
-  options.device_index = gpu;
-  options.prefill_chunk_tokens = prefill_chunk;
-  auto created = tessera::Engine::Create(options);
-  if (!created) {
-    std::fprintf(stderr, "cli: engine create failed (%s)\n",
-                 tessera::ToString(created.error()).data());
-    return kExitError;
-  }
-  tessera::Engine& engine = **created;
-  auto& log = engine.Diagnostics();
+  // Device selection: `--gpus 0,1` (data-parallel serve) or `--gpu n`
+  // (one device). `--gpus` wins when both are given.
+  const std::vector<int> device_indices =
+      gpus.empty() ? std::vector<int>{gpu} : gpus;
 
+  auto make_engine = [&](int device)
+      -> std::expected<std::unique_ptr<tessera::Engine>, tessera::StatusCode> {
+    tessera::EngineOptions engine_options;  // default stderr diagnostics sink
+    engine_options.device_index = device;
+    engine_options.prefill_chunk_tokens = prefill_chunk;
+    return tessera::Engine::Create(engine_options);
+  };
   // Attach the speculative strategy before serving or generating. DFlash2
   // drafts from its checkpoint; MTP drafts from the target's own nextn
-  // head, so it needs no path. Both the serve path and the plain generate
-  // path read this one attachment, so --speculate serves as it runs.
-  if (!draft_path.empty() || speculate) {
+  // head, so it needs no path. One strategy instance per engine: a
+  // strategy is not shared across devices.
+  auto attach_strategy = [&](tessera::Engine& engine) {
+    if (draft_path.empty() && !speculate) {
+      return;
+    }
     std::unique_ptr<tessera::SpeculativeStrategy> strategy =
         draft_path.empty() ? tessera::CreateMtpStrategy()
                            : tessera::CreateDFlash2Strategy();
@@ -211,19 +260,20 @@ int main(int argc, char** argv) {
     auto attach =
         strategy->Attach(tessera::StrategyOptions{draft_path, draft_block});
     if (!attach) {
-      log.Warn("cli", label + " attach failed: " +
-                           std::string(tessera::ToString(attach.error())) +
-                           "; continuing without speculative decoding");
-    } else {
-      auto attached = engine.AttachSpeculative(std::move(strategy));
-      if (!attached) {
-        log.Warn("cli",
-                 label + " strategy attach failed: " +
+      engine.Diagnostics().Warn(
+          "cli", label + " attach failed: " +
+                     std::string(tessera::ToString(attach.error())) +
+                     "; continuing without speculative decoding");
+      return;
+    }
+    auto attached = engine.AttachSpeculative(std::move(strategy));
+    if (!attached) {
+      engine.Diagnostics().Warn(
+          "cli", label + " strategy attach failed: " +
                      std::string(tessera::ToString(attached.error())) +
                      "; continuing without speculative decoding");
-      }
     }
-  }
+  };
 
   if (command == "serve") {
     tessera::ServeOptions serve_options;
@@ -232,81 +282,144 @@ int main(int argc, char** argv) {
     serve_options.api_keys = api_keys;
     serve_options.allow_origins = allow_origins;
     serve_options.auto_title = auto_title;
-    if (!calibration_path.empty()) {
-      // The calibration key depends on the loaded model, so resolve the
-      // saved settings up front and serve the already-loaded model. Without
-      // --calibration the deferred loader below binds the socket first.
-      auto calibration_model =
-          engine.LoadModel(tessera::ModelOptions{model_path, context});
-      if (!calibration_model) {
-        log.Error("cli", std::string("model load failed (") +
-                             std::string(tessera::ToString(
-                                 calibration_model.error())) +
-                             ")");
-        return kExitError;
-      }
-      LogModelSummary(engine, **calibration_model);
-      const std::string strategy =
-          draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
-      tessera::CalibrationConfig explicit_config;
-      explicit_config.prefill_chunk_tokens = prefill_chunk;
-      explicit_config.draft_tokens = draft_block;
-      serve_options.calibration = ResolveCalibration(
-          engine, **calibration_model, context, kv_type, strategy,
-          calibration_path, explicit_config);
-      tessera::GenerateOptions warm;
-      warm.max_completion_tokens = 1;
-      warm.progress_every = 0;
-      tessera::ApplyToGenerateOptions(serve_options.calibration, warm);
-      auto warmed = engine.Generate(**calibration_model, warm);
-      if (!warmed) {
-        log.Error("cli", std::string("kernel warmup failed (") +
-                             std::string(tessera::ToString(warmed.error())) +
-                             "); the model cannot serve");
-        return kExitError;
-      }
-      auto served = tessera::Serve(engine, **calibration_model, serve_options);
-      if (!served) {
-        log.Warn("cli", std::string("serve failed (") +
-                            std::string(tessera::ToString(served.error())) +
-                            ")");
-        return kExitError;
-      }
-      return kExitOk;
-    }
-    // Load and warm on the serve thread: the server binds first, so a
-    // client can reach /health while the weights and kernels load.
-    auto loader = [&](const tessera::ServeProgress& report)
-        -> std::expected<std::unique_ptr<tessera::Model>,
+    // Build one runner per device on the loader thread. Devices load and
+    // warm one at a time, so only one model is in host memory at once.
+    // The server binds first, so a client reaches /health while loading.
+    auto build_pool = [&](const tessera::ServeProgress& report)
+        -> std::expected<std::unique_ptr<tessera::RunnerPool>,
                          tessera::StatusCode> {
-      report("loading weights");
-      auto loaded = engine.LoadModel(tessera::ModelOptions{model_path, context});
-      if (!loaded) {
-        return std::unexpected(loaded.error());
-      }
-      LogModelSummary(engine, **loaded);
-      report("warming up kernels");
-      tessera::GenerateOptions warm;
-      warm.max_completion_tokens = 1;
-      warm.progress_every = 0;
-      auto warmed = engine.Generate(**loaded, warm);
-      if (!warmed) {
-        log.Error("cli", std::string("kernel warmup failed (") +
-                             std::string(tessera::ToString(warmed.error())) +
-                             "); the model cannot serve");
-        return std::unexpected(warmed.error());
+      auto pool = std::make_unique<tessera::RunnerPool>();
+      tessera::CalibrationConfig calibration;
+      for (std::size_t i = 0; i < device_indices.size(); ++i) {
+        const int device = device_indices[i];
+        report("loading weights on gpu " + std::to_string(device));
+        auto created = make_engine(device);
+        if (!created) {
+          return std::unexpected(created.error());
+        }
+        std::unique_ptr<tessera::Engine> engine_ptr = std::move(*created);
+        // Refuse a device that cannot hold the weights before the load
+        // starts, so a two-device serve does not half-load.
+        const std::uint64_t needed = PathSizeBytes(model_path);
+        const tessera::DeviceMemoryInfo memory =
+            engine_ptr->Owner().MemoryInfo();
+        if (memory.total_bytes != 0 && needed != 0 &&
+            memory.free_bytes < needed) {
+          std::fprintf(stderr,
+                       "cli: gpu %d has %s MiB free but the model needs about "
+                       "%s MiB; use fewer devices or a smaller quantization\n",
+                       device,
+                       std::to_string(memory.free_bytes / (1024 * 1024)).c_str(),
+                       std::to_string(needed / (1024 * 1024)).c_str());
+          return std::unexpected(tessera::StatusCode::OutOfMemory);
+        }
+        auto model =
+            engine_ptr->LoadModel(tessera::ModelOptions{model_path, context});
+        if (!model) {
+          return std::unexpected(model.error());
+        }
+        LogModelSummary(*engine_ptr, **model);
+        attach_strategy(*engine_ptr);
+        if (!calibration_path.empty() && i == 0) {
+          // The calibration key depends on the model; resolve it on the
+          // first device. Homogeneous devices share the settings.
+          const std::string strategy =
+              draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
+          tessera::CalibrationConfig explicit_config;
+          explicit_config.prefill_chunk_tokens = prefill_chunk;
+          explicit_config.draft_tokens = draft_block;
+          calibration = ResolveCalibration(*engine_ptr, **model, context,
+                                           kv_type, strategy, calibration_path,
+                                           explicit_config);
+        }
+        report("warming up kernels");
+        tessera::GenerateOptions warm;
+        warm.max_completion_tokens = 1;
+        warm.progress_every = 0;
+        if (!calibration_path.empty()) {
+          tessera::ApplyToGenerateOptions(calibration, warm);
+        }
+        auto warmed = engine_ptr->Generate(**model, warm);
+        if (!warmed) {
+          std::fprintf(stderr, "cli: kernel warmup failed (%s)\n",
+                       tessera::ToString(warmed.error()).data());
+          return std::unexpected(warmed.error());
+        }
+        pool->Add(std::make_unique<tessera::Runner>(
+            std::move(engine_ptr), std::move(*model), device, calibration));
       }
       report("ready");
-      return std::move(*loaded);
+      return pool;
     };
-    auto served = tessera::Serve(engine, serve_options, std::move(loader));
+    auto served = tessera::Serve(serve_options, std::move(build_pool));
     if (!served) {
-      log.Warn("cli", std::string("serve failed (") +
-                          std::string(tessera::ToString(served.error())) + ")");
+      std::fprintf(stderr, "cli: serve failed (%s)\n",
+                   tessera::ToString(served.error()).data());
       return kExitError;
     }
     return kExitOk;
   }
+
+  if (pipeline_mode) {
+    // Layer-split the model across the selected devices and run greedy
+    // generation through the stages. The prompt needs --prompt-text.
+    if (prompt_text.empty()) {
+      std::fprintf(stderr, "cli: --pipeline needs --prompt-text\n");
+      return kExitUsage;
+    }
+    tessera::PipelineOptions pipeline_options;
+    pipeline_options.model_path = model_path;
+    pipeline_options.devices = device_indices;
+    pipeline_options.context = context;
+    pipeline_options.kv_type = kv_type;
+    auto pipeline = tessera::Pipeline::Create(pipeline_options);
+    if (!pipeline) {
+      std::fprintf(stderr, "cli: pipeline create failed (%s)\n",
+                   tessera::ToString(pipeline.error()).data());
+      return kExitError;
+    }
+    const tessera::Tokenizer* tokenizer = (*pipeline)->GetTokenizer();
+    if (tokenizer == nullptr) {
+      std::fprintf(stderr, "cli: this model has no tokenizer\n");
+      return kExitError;
+    }
+    std::string text = prompt_text;
+    if (!no_chat) {
+      auto chat = (*pipeline)->ChatPrompt(prompt_text);
+      if (chat) {
+        text = *chat;
+      }
+    }
+    auto ids = tokenizer->Encode(text);
+    if (!ids) {
+      std::fprintf(stderr, "cli: prompt encode failed (%s)\n",
+                   tessera::ToString(ids.error()).data());
+      return kExitError;
+    }
+    auto generated = (*pipeline)->Generate(*ids, max_completion_tokens);
+    if (!generated) {
+      std::fprintf(stderr, "cli: pipeline generation failed (%s)\n",
+                   tessera::ToString(generated.error()).data());
+      return kExitError;
+    }
+    auto output_text = tokenizer->Decode(*generated);
+    if (output_text) {
+      std::fwrite(output_text->data(), 1, output_text->size(), stdout);
+      std::fputc('\n', stdout);
+      std::fflush(stdout);
+    }
+    return kExitOk;
+  }
+
+  auto engine_result = make_engine(device_indices.front());
+  if (!engine_result) {
+    std::fprintf(stderr, "cli: engine create failed (%s)\n",
+                 tessera::ToString(engine_result.error()).data());
+    return kExitError;
+  }
+  tessera::Engine& engine = **engine_result;
+  auto& log = engine.Diagnostics();
+  attach_strategy(engine);
 
   auto model = engine.LoadModel(tessera::ModelOptions{model_path, context});
   if (!model) {

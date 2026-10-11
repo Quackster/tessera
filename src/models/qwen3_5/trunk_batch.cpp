@@ -519,7 +519,7 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     return std::unexpected(geometry.error());
   }
   const LinearGeometry& g = *geometry;
-  auto ready = EnsureHybridReady(backend, cfg, cache, g);
+  auto ready = EnsureHybridReady(backend, cfg, cache, g, model.Shard());
   if (!ready) {
     return std::unexpected(ready.error());
   }
@@ -577,7 +577,13 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     return StatusCode::Ok;
   };
   const std::uint64_t start = h.position;
-  for (std::size_t l = 0; l < cfg.layers; ++l) {
+  const ModelShard& shard = model.Shard();
+  const std::size_t layer_begin = shard.enabled ? shard.first_layer : 0;
+  std::size_t layer_end = cfg.layers;
+  if (shard.enabled && shard.last_layer != 0 && shard.last_layer < layer_end) {
+    layer_end = shard.last_layer;
+  }
+  for (std::size_t l = layer_begin; l < layer_end; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
       auto block = RunFullBlockBatch(backend, model, cfg, h, l, start,
                                      h.full[l], rows);

@@ -1,9 +1,7 @@
 #include "serve/respond.hpp"
 
 #include <chrono>
-#include <mutex>
 #include <string>
-#include <thread>
 
 #include "tessera/serve.hpp"
 #include "tessera/types.hpp"
@@ -11,10 +9,6 @@
 namespace tessera::serve {
 
 namespace {
-
-// Poll interval while queued for the device: short enough to start
-// promptly, long enough to stay out of the way.
-constexpr int kQueuePollMs = 10;
 
 // The positive number under `name`, else 0. A missing field, a
 // non-number, or a value at or below zero all read as absent.
@@ -79,22 +73,6 @@ std::string SessionIdFrom(const core::Json& body) {
     return value->AsString();
   }
   return {};
-}
-
-std::optional<std::unique_lock<std::mutex>> WaitForGpu(
-    std::mutex& generation, const ResponseWriter& writer) {
-  for (;;) {
-    std::unique_lock<std::mutex> slot(generation, std::try_to_lock);
-    if (slot.owns_lock()) {
-      return slot;
-    }
-    // A peer that disconnects while queued stops waiting instead of
-    // holding its place behind a generation it never reads.
-    if (writer.IsPeerGone()) {
-      return std::nullopt;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(kQueuePollMs));
-  }
 }
 
 long long MillisBetween(std::chrono::steady_clock::time_point start,

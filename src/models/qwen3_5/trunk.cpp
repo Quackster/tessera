@@ -46,7 +46,8 @@ using detail::UploadF32;
 std::expected<void, StatusCode> InitScratch(Backend& backend,
                                             const TransformerConfig& cfg,
                                             Qwen35State& h,
-                                            const LinearGeometry& g) {
+                                            const LinearGeometry& g,
+                                            const ModelShard& shard) {
   const std::size_t q_dim = cfg.attention.heads * cfg.attention.head_dim;
   const std::size_t kv_dim = cfg.attention.kv_heads * cfg.attention.head_dim;
   // The dense FFN scratch is present even for a mixture-of-experts model
@@ -92,7 +93,12 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
   const std::size_t state_len =
       g.num_v_heads * g.head_k_dim * g.head_v_dim;
   std::vector<float> zeros;
-  for (std::size_t l = 0; l < cfg.layers; ++l) {
+  const std::size_t layer_begin = shard.enabled ? shard.first_layer : 0;
+  std::size_t layer_end = cfg.layers;
+  if (shard.enabled && shard.last_layer != 0 && shard.last_layer < layer_end) {
+    layer_end = shard.last_layer;
+  }
+  for (std::size_t l = layer_begin; l < layer_end; ++l) {
     if (!cfg.IsFullAttentionLayer(l)) {
       // The conv history lives on the device; the kernel shifts it.
       auto conv = alloc(hist_len * 4);
@@ -334,7 +340,7 @@ std::expected<void, StatusCode> RunFullBlock(
 
 std::expected<void, StatusCode> EnsureHybridReady(
     Backend& backend, const TransformerConfig& cfg, DecodeCache& cache,
-    const LinearGeometry& g) {
+    const LinearGeometry& g, const ModelShard& shard) {
   Qwen35State& h = State(cache);
   h.profile = cache.profile;
   if (!h.ready) {
@@ -365,7 +371,7 @@ std::expected<void, StatusCode> EnsureHybridReady(
         !load(h.conv1d_state_kernel, "conv1d_state")) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    auto scratch = InitScratch(backend, cfg, h, g);
+    auto scratch = InitScratch(backend, cfg, h, g, shard);
     if (!scratch) {
       return std::unexpected(scratch.error());
     }
@@ -491,18 +497,35 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
     return std::unexpected(geometry.error());
   }
   const LinearGeometry& g = *geometry;
-  auto ready = EnsureHybridReady(backend, cfg, cache, g);
+  auto ready = EnsureHybridReady(backend, cfg, cache, g, model.Shard());
   if (!ready) {
     return std::unexpected(ready.error());
   }
   Qwen35State& h = State(cache);
   const std::size_t hidden = cfg.hidden_dim;
+  // A shard runs only its trunk layers. The first stage gathers the token
+  // embedding (or an image embedding); a later stage receives the previous
+  // stage's hidden through `embedding` (the cross-device handoff).
+  const ModelShard& shard = model.Shard();
+  const std::size_t layer_begin = shard.enabled ? shard.first_layer : 0;
+  std::size_t layer_end = cfg.layers;
+  if (shard.enabled && shard.last_layer != 0 && shard.last_layer < layer_end) {
+    layer_end = shard.last_layer;
+  }
+  if (layer_begin > layer_end || layer_end > cfg.layers) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
   if (embedding != nullptr) {
-    // A precomputed embedding (an image token) replaces the gathered row.
+    // A precomputed embedding (an image token, or a previous pipeline
+    // stage's hidden) replaces the gathered row.
     if (embedding->Size() < hidden * 4 ||
         !backend.CopyD2D(*embedding, 0, *h.x, 0, hidden * 4)) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
+  } else if (shard.enabled && !shard.first_stage) {
+    // A middle or last stage has no token embedding; the driver must pass
+    // the previous stage's hidden through `embedding`.
+    return std::unexpected(StatusCode::InvalidArgument);
   } else {
     const std::uint32_t id = token;
     auto gathered = GatherEmbeddingRows(
@@ -536,7 +559,7 @@ std::expected<void, StatusCode> Qwen35Architecture::Forward(
   };
   core::Profile* const deep_profile =
       h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
-  for (std::size_t l = 0; l < cfg.layers; ++l) {
+  for (std::size_t l = layer_begin; l < layer_end; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
       core::PhaseScope layer_scope(deep_profile, core::Phase::kFullLayer);
       if (auto block = RunFullBlock(backend, model, cfg, h, l, p, h.full[l]);
