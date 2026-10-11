@@ -210,6 +210,21 @@ class Engine {
       Model& model, const GenerateOptions& options,
       const std::function<bool(std::uint32_t)>& on_token);
 
+  // Greedy generation for several prompts at once. Each sequence owns its
+  // own cache; the loop admits every sequence and retires one at its stop
+  // token or budget, so the sequences share the decode loop. The produced
+  // tokens of each request equal a separate greedy Generate for it.
+  // `max_completion_tokens` applies per request. This is the scheduling
+  // half of continuous batching; the compute is still one sequence per
+  // step.
+  //
+  // Usage:
+  //   std::vector<GenerateOptions> requests = ...;
+  //   auto out = engine->GenerateBatch(*model, requests);
+  [[nodiscard]] std::expected<std::vector<std::vector<std::uint32_t>>,
+                              StatusCode>
+  GenerateBatch(Model& model, std::span<const GenerateOptions> requests);
+
   // One multi-token-prediction draft for the token after `token`: run a
   // decode step to get the backbone hidden state, then the MTP head.
   // UnsupportedFeature when the model has no MTP block.

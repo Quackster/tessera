@@ -17,6 +17,7 @@
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
 
+#include "core/decode.hpp"
 #include "core/numerics/quant.hpp"
 
 // Host-side decode helpers shared by the vanilla and hybrid paths
@@ -226,7 +227,7 @@ inline std::expected<void, StatusCode> AttentionQuantDevice(
     const Buffer& v, const Buffer& k_scale, const Buffer& v_scale,
     Buffer& out, std::size_t n, std::size_t heads, std::size_t kv_heads,
     std::size_t head_dim, std::uint64_t q_base, std::uint64_t window,
-    std::size_t rows) {
+    std::size_t rows, std::uint64_t row_base = 0) {
   const std::uint64_t kind = kernel.Id() == "attention_q4"   ? 1
                              : kernel.Id() == "attention_fp8" ? 2
                                                               : 0;
@@ -234,8 +235,8 @@ inline std::expected<void, StatusCode> AttentionQuantDevice(
   launch.grid_x = static_cast<std::uint32_t>(rows * heads);
   launch.block_x = 256;
   launch.buffers = {&q, &k, &v, &k_scale, &v_scale, &out};
-  launch.scalars = {rows,  n,     heads, kv_heads,
-                    head_dim, q_base, window, kind};
+  launch.scalars = {rows,  n,      heads,   kv_heads, head_dim,
+                    q_base, row_base, window, kind};
   return backend.LaunchKernel(kernel, launch);
 }
 
@@ -273,6 +274,22 @@ constexpr std::size_t kMaxAttentionSplitChunks = 64;
   return 0;
 }
 
+// Merge one partial set per (query row, head) into `out`. The partials
+// are `split` concatenated (pacc, pmax, psum) triples; a null partial
+// (pmax -1e30, psum 0) contributes nothing. The split-N path and context
+// parallelism across ranks share this one combine step.
+inline std::expected<void, StatusCode> AttentionCombineDevice(
+    Backend& backend, const Kernel& combine_kernel, const Buffer& pacc,
+    const Buffer& pmax, const Buffer& psum, Buffer& out, std::size_t rows,
+    std::size_t heads, std::size_t head_dim, std::size_t split) {
+  KernelLaunch combine;
+  combine.grid_x = static_cast<std::uint32_t>(rows * heads);
+  combine.block_x = 256;
+  combine.buffers = {&pacc, &pmax, &psum, &out};
+  combine.scalars = {rows, heads, head_dim, split};
+  return backend.LaunchKernel(combine_kernel, combine);
+}
+
 // Split-N attention over `n` keys: the split kernel writes one
 // unnormalized partial per (query row, head, chunk) into pacc/pmax/psum,
 // then the combine kernel merges them into `out`.
@@ -295,12 +312,8 @@ inline std::expected<void, StatusCode> AttentionSplitDevice(
   if (!backend.LaunchKernel(split_kernel, launch)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  KernelLaunch combine;
-  combine.grid_x = static_cast<std::uint32_t>(rows * heads);
-  combine.block_x = 256;
-  combine.buffers = {&pacc, &pmax, &psum, &out};
-  combine.scalars = {rows, heads, head_dim, split};
-  return backend.LaunchKernel(combine_kernel, combine);
+  return AttentionCombineDevice(backend, combine_kernel, pacc, pmax, psum, out,
+                                rows, heads, head_dim, split);
 }
 
 // Split-N variant of AttentionQuantDevice; `kind` comes from the split
@@ -327,12 +340,152 @@ inline std::expected<void, StatusCode> AttentionQuantSplitDevice(
   if (!backend.LaunchKernel(split_kernel, launch)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  KernelLaunch combine;
-  combine.grid_x = static_cast<std::uint32_t>(rows * heads);
-  combine.block_x = 256;
-  combine.buffers = {&pacc, &pmax, &psum, &out};
-  combine.scalars = {rows, heads, head_dim, split};
-  return backend.LaunchKernel(combine_kernel, combine);
+  return AttentionCombineDevice(backend, combine_kernel, pacc, pmax, psum, out,
+                                rows, heads, head_dim, split);
+}
+
+// Context-parallel attention over one rank's key chunk. Each rank runs
+// the split kernel with split=1 over its local keys at the local query
+// position (pos - k0; the kernel's causal window is relative, so the
+// chunk base needs no other adjustment), stages its partial, and rank 0
+// gathers the world partials and combines them into every rank's output.
+// A rank with no owned keys yet contributes a null partial. `pacc/pmax/
+// psum` need at least `world` slots; the caller sizes them.
+template <typename Kv>
+inline std::expected<void, StatusCode> CpAttentionDevice(
+    Backend& backend, const Kernel& split_kernel, const Kernel& combine_kernel,
+    const Buffer& q, const Kv& kv, Buffer& out, Buffer& pacc, Buffer& pmax,
+    Buffer& psum, std::size_t heads, std::size_t kv_heads,
+    std::size_t head_dim, std::uint64_t pos, const CpContext& cp,
+    bool quantized, bool kv_f16) {
+  const std::size_t rank = static_cast<std::size_t>(cp.rank);
+  const std::size_t world = static_cast<std::size_t>(cp.world);
+  if (world < 2 || rank >= world || cp.partial.size() != world ||
+      cp.attn.size() != world || cp.barrier == nullptr) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t acc_bytes = heads * head_dim * 4;
+  const std::size_t max_bytes = heads * 4;
+  Buffer& stage = *cp.partial[rank];
+  if (kv.rows == 0) {
+    std::vector<float> null_part(heads * (head_dim + 2), 0.0f);
+    for (std::size_t hh = 0; hh < heads; ++hh) {
+      null_part[heads * head_dim + hh] = -1e30f;
+    }
+    if (!backend.CopyH2D(
+            stage,
+            std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(null_part.data()),
+                null_part.size() * 4))) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  } else {
+    const std::uint64_t local_pos = pos - cp.k0;
+    bool split_ok = false;
+    if (quantized) {
+      split_ok =
+          AttentionQuantSplitDevice(backend, split_kernel, combine_kernel, q,
+                                    *kv.k, *kv.v, *kv.k_scale, *kv.v_scale, out,
+                                    pacc, pmax, psum, kv.rows, heads, kv_heads,
+                                    head_dim, local_pos, 0, 1, 1)
+              .has_value();
+    } else {
+      split_ok =
+          AttentionSplitDevice(backend, split_kernel, combine_kernel, q, *kv.k,
+                               *kv.v, out, pacc, pmax, psum, kv.rows, heads,
+                               kv_heads, head_dim, local_pos, 0, 1, 1, kv_f16)
+              .has_value();
+    }
+    if (!split_ok) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!backend.CopyD2D(pacc, 0, stage, 0, acc_bytes) ||
+        !backend.CopyD2D(pmax, 0, stage, acc_bytes, max_bytes) ||
+        !backend.CopyD2D(psum, 0, stage, acc_bytes + max_bytes, max_bytes)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  cp.barrier->Wait();
+  if (cp.rank == 0) {
+    // Gather every rank's contiguous partial into slot r, then interleave
+    // the slots on the host: the combine kernel reads one triple per
+    // (head, rank) at slot h * world + r, not one contiguous block per
+    // rank, and there is no device permute kernel to do it.
+    for (std::size_t r = 1; r < world; ++r) {
+      const bool gathered =
+          CopyAcrossDevices(*cp.partial[r], 0, pacc, r * acc_bytes,
+                            acc_bytes) &&
+          CopyAcrossDevices(*cp.partial[r], acc_bytes, pmax, r * max_bytes,
+                            max_bytes) &&
+          CopyAcrossDevices(*cp.partial[r], acc_bytes + max_bytes, psum,
+                            r * max_bytes, max_bytes);
+      if (!gathered) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+    if (!backend.CopyD2D(stage, 0, pacc, 0, acc_bytes) ||
+        !backend.CopyD2D(stage, acc_bytes, pmax, 0, max_bytes) ||
+        !backend.CopyD2D(stage, acc_bytes + max_bytes, psum, 0, max_bytes)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    const std::size_t slots = world * heads;
+    std::vector<float> got_acc(slots * head_dim, 0.0f);
+    std::vector<float> got_max(slots, -1e30f);
+    std::vector<float> got_sum(slots, 0.0f);
+    const auto download = [&](const Buffer& src, std::byte* dst,
+                              std::size_t bytes) {
+      return backend.CopyD2HAt(src, 0, dst, bytes).has_value();
+    };
+    if (!download(pacc, reinterpret_cast<std::byte*>(got_acc.data()),
+                  got_acc.size() * 4) ||
+        !download(pmax, reinterpret_cast<std::byte*>(got_max.data()),
+                  got_max.size() * 4) ||
+        !download(psum, reinterpret_cast<std::byte*>(got_sum.data()),
+                  got_sum.size() * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    std::vector<float> acc(slots * head_dim, 0.0f);
+    std::vector<float> gmax(slots, -1e30f);
+    std::vector<float> gsum(slots, 0.0f);
+    for (std::size_t h = 0; h < heads; ++h) {
+      for (std::size_t r = 0; r < world; ++r) {
+        const std::size_t src = r * heads + h;
+        const std::size_t dst = h * world + r;
+        for (std::size_t e = 0; e < head_dim; ++e) {
+          acc[dst * head_dim + e] = got_acc[src * head_dim + e];
+        }
+        gmax[dst] = got_max[src];
+        gsum[dst] = got_sum[src];
+      }
+    }
+    const auto upload = [&](Buffer& dst, const std::byte* src,
+                            std::size_t bytes) {
+      return backend.CopyH2DAt(dst, 0, std::span<const std::byte>(src, bytes))
+          .has_value();
+    };
+    if (!upload(pacc, reinterpret_cast<const std::byte*>(acc.data()),
+                acc.size() * 4) ||
+        !upload(pmax, reinterpret_cast<const std::byte*>(gmax.data()),
+                gmax.size() * 4) ||
+        !upload(psum, reinterpret_cast<const std::byte*>(gsum.data()),
+                gsum.size() * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!AttentionCombineDevice(backend, combine_kernel, pacc, pmax, psum,
+                                *cp.attn[0], 1, heads, head_dim, world)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    for (std::size_t r = 1; r < world; ++r) {
+      if (!CopyAcrossDevices(*cp.attn[0], 0, *cp.attn[r], 0, acc_bytes)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+  }
+  cp.barrier->Wait();
+  if (!backend.CopyD2D(*cp.attn[rank], 0, out, 0, acc_bytes)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return {};
 }
 
 // Append one key/value row. `kv.type` selects fp32, fp16 (via `cast` into
@@ -863,7 +1016,7 @@ inline std::expected<void, StatusCode> AttentionDevice(
     const Buffer& v, Buffer& out, std::size_t n, std::size_t heads,
     std::size_t kv_heads, std::size_t head_dim, std::uint64_t q_base,
     std::uint64_t window = 0, std::size_t rows = 1, bool kv_f16 = false,
-    bool causal = true) {
+    bool causal = true, std::uint64_t row_base = 0) {
   if (head_dim == 0 || head_dim > 256) {
     // The tiled kernel holds the per-head query in 256 shared floats.
     return std::unexpected(StatusCode::UnsupportedFeature);
@@ -878,6 +1031,7 @@ inline std::expected<void, StatusCode> AttentionDevice(
                     kv_heads,
                     head_dim,
                     q_base,
+                    row_base,
                     window,
                     kv_f16 ? 1u : 0u,
                     causal ? 1u : 0u};

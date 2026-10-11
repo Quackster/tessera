@@ -35,7 +35,8 @@ BuildMxFp4Weights(Backend& backend, std::span<const std::byte> file,
                   std::span<const SafetensorsTensor> tensors,
                   const Architecture& module, const TransformerConfig& config,
                   const WeightLoadOptions& options,
-                  const ModelShard& shard = {});
+                  const ModelShard& shard = {},
+                  const TensorShard& tensor = {});
 
 }  // namespace core
 }  // namespace tessera

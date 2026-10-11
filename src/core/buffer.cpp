@@ -136,6 +136,25 @@ void Backend::SetDeviceIndex(int index) {
   device_index_ = index;
 }
 
+int Backend::DeviceIndex() const { return device_index_; }
+
+std::expected<void, StatusCode> Backend::CopyPeerFrom(Buffer& dst,
+                                                      const Buffer& src,
+                                                      std::size_t bytes) {
+  if (bytes == 0) {
+    return {};
+  }
+  if (bytes > dst.Size() || bytes > src.Size()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  std::vector<std::byte> stage(bytes);
+  auto down = src.Owner().CopyD2HAt(src, 0, stage.data(), bytes);
+  if (!down) {
+    return down;
+  }
+  return CopyH2DAt(dst, 0, std::span<const std::byte>(stage.data(), bytes));
+}
+
 void Backend::LogInfo(std::string_view message) const {
   if (diagnostics_ != nullptr) {
     diagnostics_->Info("backend", message);
@@ -164,10 +183,14 @@ std::expected<void, StatusCode> CopyAcrossDevices(
   if (bytes == 0) {
     return {};
   }
-  // A same-device copy stays on the device; a cross-device copy stages
-  // through host memory, which is correct for any device pair.
+  // A same-device copy stays on the device; a cross-device copy uses a
+  // direct peer transfer when the buffers start at offset 0, else stages
+  // through host memory (correct for any device pair).
   if (&src.Owner() == &dst.Owner()) {
     return src.Owner().CopyD2D(src, src_offset, dst, dst_offset, bytes);
+  }
+  if (src_offset == 0 && dst_offset == 0) {
+    return dst.Owner().CopyPeerFrom(dst, src, bytes);
   }
   std::vector<std::byte> stage(bytes);
   auto down = src.Owner().CopyD2HAt(src, src_offset, stage.data(), bytes);
@@ -176,6 +199,43 @@ std::expected<void, StatusCode> CopyAcrossDevices(
   }
   return dst.Owner().CopyH2DAt(
       dst, dst_offset, std::span<const std::byte>(stage.data(), bytes));
+}
+
+std::expected<void, StatusCode> AllReduceSum(std::span<Buffer* const> buffers,
+                                             std::size_t bytes) {
+  if (buffers.empty() || (bytes % 4) != 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (const Buffer* buffer : buffers) {
+    if (buffer == nullptr || bytes > buffer->Size()) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+  }
+  if (bytes == 0 || buffers.size() == 1) {
+    return {};
+  }
+  const std::size_t count = bytes / 4;
+  std::vector<float> sum(count, 0.0f);
+  std::vector<float> part(count);
+  for (Buffer* buffer : buffers) {
+    auto down = buffer->Owner().CopyD2H(
+        *buffer, reinterpret_cast<std::byte*>(part.data()), bytes);
+    if (!down) {
+      return down;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+      sum[i] += part[i];
+    }
+  }
+  const std::span<const std::byte> packed(
+      reinterpret_cast<const std::byte*>(sum.data()), bytes);
+  for (Buffer* buffer : buffers) {
+    auto up = buffer->Owner().CopyH2D(*buffer, packed);
+    if (!up) {
+      return up;
+    }
+  }
+  return {};
 }
 
 }  // namespace tessera

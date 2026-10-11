@@ -18,6 +18,10 @@
 #include "tessera/engine.hpp"
 #include "tessera/image.hpp"
 #include "tessera/pipeline.hpp"
+#include "tessera/tensor_parallel.hpp"
+#include "tessera/context_parallel.hpp"
+#include "tessera/spec_split.hpp"
+#include "tessera/hybrid.hpp"
 #include "tessera/vision.hpp"
 #include "tessera/serve.hpp"
 #include "tessera/speculative.hpp"
@@ -88,6 +92,7 @@ int main(int argc, char** argv) {
   std::string model_path;
   std::string draft_path;
   std::string prompt_text;
+  std::vector<std::string> batch_prompts;
   std::string calibration_path;
   std::string mmproj_path;
   std::string image_path;
@@ -100,6 +105,11 @@ int main(int argc, char** argv) {
   std::vector<std::string> allow_origins;
   bool speculate = false;
   bool pipeline_mode = false;
+  bool tp_mode = false;
+  bool cp_mode = false;
+  bool spec_split_mode = false;
+  bool hybrid_mode = false;
+  std::size_t dp_groups = 1;
   tessera::SamplingOptions sampling;
   bool sample = false;
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
@@ -124,6 +134,9 @@ int main(int argc, char** argv) {
       draft_path = argv[++i];
     } else if (arg == "--prompt-text" && i + 1 < argc) {
       prompt_text = argv[++i];
+    } else if (arg == "--batch-prompt" && i + 1 < argc) {
+      // Repeatable: each occurrence is one sequence in a batched run.
+      batch_prompts.emplace_back(argv[++i]);
     } else if (arg == "--mmproj" && i + 1 < argc) {
       mmproj_path = argv[++i];
     } else if (arg == "--image" && i + 1 < argc) {
@@ -183,6 +196,16 @@ int main(int argc, char** argv) {
       speculate = true;
     } else if (arg == "--pipeline") {
       pipeline_mode = true;
+    } else if (arg == "--tp") {
+      tp_mode = true;
+    } else if (arg == "--spec-split") {
+      spec_split_mode = true;
+    } else if (arg == "--hybrid") {
+      hybrid_mode = true;
+    } else if (arg == "--dp" && i + 1 < argc) {
+      dp_groups = std::stoul(argv[++i]);
+    } else if (arg == "--cp") {
+      cp_mode = true;
     } else if (arg == "--sample") {
       sample = true;
     } else if (MatchKvType(arg, kv_type)) {
@@ -361,10 +384,12 @@ int main(int argc, char** argv) {
   }
 
   if (pipeline_mode) {
-    // Layer-split the model across the selected devices and run greedy
-    // generation through the stages. The prompt needs --prompt-text.
-    if (prompt_text.empty()) {
-      std::fprintf(stderr, "cli: --pipeline needs --prompt-text\n");
+    // Layer-split the model across the selected devices. One --prompt-text
+    // streams a single request; repeated --batch-prompt runs several
+    // requests overlapped across the stages.
+    if (prompt_text.empty() && batch_prompts.empty()) {
+      std::fprintf(stderr,
+                   "cli: --pipeline needs --prompt-text or --batch-prompt\n");
       return kExitUsage;
     }
     tessera::PipelineOptions pipeline_options;
@@ -383,20 +408,53 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "cli: this model has no tokenizer\n");
       return kExitError;
     }
-    std::string text = prompt_text;
-    if (!no_chat) {
-      auto chat = (*pipeline)->ChatPrompt(prompt_text);
-      if (chat) {
-        text = *chat;
+    const auto encode = [&](const std::string& source,
+                            std::vector<std::uint32_t>* ids) -> bool {
+      std::string text = source;
+      if (!no_chat) {
+        auto chat = (*pipeline)->ChatPrompt(source);
+        if (chat) {
+          text = *chat;
+        }
       }
+      auto encoded = tokenizer->Encode(text);
+      if (!encoded) {
+        return false;
+      }
+      *ids = std::move(*encoded);
+      return true;
+    };
+    if (!batch_prompts.empty()) {
+      std::vector<std::vector<std::uint32_t>> prompts;
+      prompts.reserve(batch_prompts.size());
+      for (const std::string& source : batch_prompts) {
+        std::vector<std::uint32_t> ids;
+        if (!encode(source, &ids)) {
+          std::fprintf(stderr, "cli: prompt encode failed\n");
+          return kExitError;
+        }
+        prompts.push_back(std::move(ids));
+      }
+      auto outputs =
+          (*pipeline)->GenerateMany(prompts, max_completion_tokens);
+      if (!outputs) {
+        std::fprintf(stderr, "cli: pipeline batch generation failed (%s)\n",
+                     tessera::ToString(outputs.error()).data());
+        return kExitError;
+      }
+      for (std::size_t i = 0; i < outputs->size(); ++i) {
+        auto text = tokenizer->Decode((*outputs)[i]);
+        std::fprintf(stdout, "batch %zu: %s\n", i, text ? text->c_str() : "");
+      }
+      std::fflush(stdout);
+      return kExitOk;
     }
-    auto ids = tokenizer->Encode(text);
-    if (!ids) {
-      std::fprintf(stderr, "cli: prompt encode failed (%s)\n",
-                   tessera::ToString(ids.error()).data());
+    std::vector<std::uint32_t> ids;
+    if (!encode(prompt_text, &ids)) {
+      std::fprintf(stderr, "cli: prompt encode failed\n");
       return kExitError;
     }
-    auto generated = (*pipeline)->Generate(*ids, max_completion_tokens);
+    auto generated = (*pipeline)->Generate(ids, max_completion_tokens);
     if (!generated) {
       std::fprintf(stderr, "cli: pipeline generation failed (%s)\n",
                    tessera::ToString(generated.error()).data());
@@ -408,6 +466,230 @@ int main(int argc, char** argv) {
       std::fputc('\n', stdout);
       std::fflush(stdout);
     }
+    return kExitOk;
+  }
+
+  if (tp_mode && !hybrid_mode) {
+    // Tensor-parallel: split the attention and FFN across the selected
+    // devices and run greedy generation with a per-rank thread and the
+    // rank reduce. MoE routed experts split by expert dim on the same
+    // ranks; each rank runs its local experts and reduces the sum.
+    if (prompt_text.empty()) {
+      std::fprintf(stderr, "cli: --tp needs --prompt-text\n");
+      return kExitUsage;
+    }
+    tessera::TensorParallelOptions tp_options;
+    tp_options.model_path = model_path;
+    tp_options.devices = device_indices;
+    tp_options.context = context;
+    tp_options.kv_type = kv_type;
+    auto tp = tessera::TensorParallel::Create(tp_options);
+    if (!tp) {
+      std::fprintf(stderr, "cli: tensor-parallel create failed (%s)\n",
+                   tessera::ToString(tp.error()).data());
+      return kExitError;
+    }
+    const tessera::Tokenizer* tokenizer = (*tp)->GetTokenizer();
+    if (tokenizer == nullptr) {
+      std::fprintf(stderr, "cli: this model has no tokenizer\n");
+      return kExitError;
+    }
+    std::string text = prompt_text;
+    if (!no_chat) {
+      auto chat = (*tp)->ChatPrompt(prompt_text);
+      if (chat) {
+        text = *chat;
+      }
+    }
+    auto ids = tokenizer->Encode(text);
+    if (!ids) {
+      std::fprintf(stderr, "cli: prompt encode failed\n");
+      return kExitError;
+    }
+    auto generated = (*tp)->Generate(*ids, max_completion_tokens);
+    if (!generated) {
+      std::fprintf(stderr, "cli: tensor-parallel generation failed (%s)\n",
+                   tessera::ToString(generated.error()).data());
+      return kExitError;
+    }
+    auto output_text = tokenizer->Decode(*generated);
+    if (output_text) {
+      std::fwrite(output_text->data(), 1, output_text->size(), stdout);
+      std::fputc('\n', stdout);
+      std::fflush(stdout);
+    }
+    return kExitOk;
+  }
+
+  if (cp_mode && !hybrid_mode) {
+    // Context-parallel: split the key range across the selected devices
+    // and run greedy generation with a per-rank thread and a per-layer
+    // partial combine.
+    if (prompt_text.empty()) {
+      std::fprintf(stderr, "cli: --cp needs --prompt-text\n");
+      return kExitUsage;
+    }
+    tessera::ContextParallelOptions cp_options;
+    cp_options.model_path = model_path;
+    cp_options.devices = device_indices;
+    cp_options.context = context;
+    cp_options.kv_type = kv_type;
+    auto cp = tessera::ContextParallel::Create(cp_options);
+    if (!cp) {
+      std::fprintf(stderr, "cli: context-parallel create failed (%s)\n",
+                   tessera::ToString(cp.error()).data());
+      return kExitError;
+    }
+    const tessera::Tokenizer* tokenizer = (*cp)->GetTokenizer();
+    if (tokenizer == nullptr) {
+      std::fprintf(stderr, "cli: this model has no tokenizer\n");
+      return kExitError;
+    }
+    std::string text = prompt_text;
+    if (!no_chat) {
+      auto chat = (*cp)->ChatPrompt(prompt_text);
+      if (chat) {
+        text = *chat;
+      }
+    }
+    auto ids = tokenizer->Encode(text);
+    if (!ids) {
+      std::fprintf(stderr, "cli: prompt encode failed\n");
+      return kExitError;
+    }
+    auto generated = (*cp)->Generate(*ids, max_completion_tokens);
+    if (!generated) {
+      std::fprintf(stderr, "cli: context-parallel generation failed (%s)\n",
+                   tessera::ToString(generated.error()).data());
+      return kExitError;
+    }
+    auto output_text = tokenizer->Decode(*generated);
+    if (output_text) {
+      std::fwrite(output_text->data(), 1, output_text->size(), stdout);
+      std::fputc('\n', stdout);
+      std::fflush(stdout);
+    }
+    return kExitOk;
+  }
+
+  if (spec_split_mode) {
+    // Speculative split: the target runs on the first --gpus device and
+    // the MTP draft head on the second. Needs --speculate (MTP); other
+    // strategies stay on one device.
+    if (!speculate) {
+      std::fprintf(stderr, "cli: --spec-split needs --speculate\n");
+      return kExitUsage;
+    }
+    if (prompt_text.empty()) {
+      std::fprintf(stderr, "cli: --spec-split needs --prompt-text\n");
+      return kExitUsage;
+    }
+    tessera::SpecSplitOptions split_options;
+    split_options.model_path = model_path;
+    split_options.devices = device_indices;
+    split_options.context = context;
+    split_options.kv_type = kv_type;
+    split_options.draft_block = draft_block;
+    split_options.prefill_chunk = prefill_chunk;
+    auto split = tessera::SpecSplit::Create(split_options);
+    if (!split) {
+      std::fprintf(stderr, "cli: speculative-split create failed (%s)\n",
+                   tessera::ToString(split.error()).data());
+      return kExitError;
+    }
+    const tessera::Tokenizer* tokenizer = (*split)->GetTokenizer();
+    if (tokenizer == nullptr) {
+      std::fprintf(stderr, "cli: this model has no tokenizer\n");
+      return kExitError;
+    }
+    std::string text = prompt_text;
+    if (!no_chat) {
+      auto chat = (*split)->ChatPrompt(prompt_text);
+      if (chat) {
+        text = *chat;
+      }
+    }
+    auto ids = tokenizer->Encode(text);
+    if (!ids) {
+      std::fprintf(stderr, "cli: prompt encode failed\n");
+      return kExitError;
+    }
+    auto generated = (*split)->Generate(*ids, max_completion_tokens);
+    if (!generated) {
+      std::fprintf(stderr, "cli: speculative-split generation failed (%s)\n",
+                   tessera::ToString(generated.error()).data());
+      return kExitError;
+    }
+    auto output_text = tokenizer->Decode(*generated);
+    if (output_text) {
+      std::fwrite(output_text->data(), 1, output_text->size(), stdout);
+      std::fputc('\n', stdout);
+      std::fflush(stdout);
+    }
+    return kExitOk;
+  }
+
+  if (hybrid_mode) {
+    // Hybrid: data-parallel groups of model-parallel teams behind one
+    // device mesh. One --batch-prompt per group; --tp/--cp selects the
+    // model-parallel route inside each multi-rank group.
+    if (batch_prompts.empty()) {
+      std::fprintf(stderr, "cli: --hybrid needs --batch-prompt\n");
+      return kExitUsage;
+    }
+    if (batch_prompts.size() != dp_groups) {
+      std::fprintf(stderr, "cli: --hybrid needs one --batch-prompt per group");
+      std::fprintf(stderr, " (%zu groups, %zu prompts)\n", dp_groups,
+                   batch_prompts.size());
+      return kExitUsage;
+    }
+    tessera::HybridOptions hybrid_options;
+    hybrid_options.model_path = model_path;
+    hybrid_options.devices = device_indices;
+    hybrid_options.dp_groups = dp_groups;
+    hybrid_options.mp_kind = cp_mode ? tessera::HybridMpKind::Context
+                                     : tessera::HybridMpKind::Tensor;
+    hybrid_options.context = context;
+    hybrid_options.kv_type = kv_type;
+    auto hybrid = tessera::Hybrid::Create(hybrid_options);
+    if (!hybrid) {
+      std::fprintf(stderr, "cli: hybrid create failed (%s)\n",
+                   tessera::ToString(hybrid.error()).data());
+      return kExitError;
+    }
+    const tessera::Tokenizer* tokenizer = (*hybrid)->GetTokenizer();
+    if (tokenizer == nullptr) {
+      std::fprintf(stderr, "cli: this model has no tokenizer\n");
+      return kExitError;
+    }
+    std::vector<std::vector<std::uint32_t>> prompts;
+    prompts.reserve(batch_prompts.size());
+    for (const std::string& source : batch_prompts) {
+      std::string text = source;
+      if (!no_chat) {
+        auto chat = (*hybrid)->ChatPrompt(source);
+        if (chat) {
+          text = *chat;
+        }
+      }
+      auto encoded = tokenizer->Encode(text);
+      if (!encoded) {
+        std::fprintf(stderr, "cli: prompt encode failed\n");
+        return kExitError;
+      }
+      prompts.push_back(std::move(*encoded));
+    }
+    auto outputs = (*hybrid)->GenerateMany(prompts, max_completion_tokens);
+    if (!outputs) {
+      std::fprintf(stderr, "cli: hybrid generation failed (%s)\n",
+                   tessera::ToString(outputs.error()).data());
+      return kExitError;
+    }
+    for (std::size_t i = 0; i < outputs->size(); ++i) {
+      auto text = tokenizer->Decode((*outputs)[i]);
+      std::fprintf(stdout, "batch %zu: %s\n", i, text ? text->c_str() : "");
+    }
+    std::fflush(stdout);
     return kExitOk;
   }
 
@@ -429,6 +711,50 @@ int main(int argc, char** argv) {
   }
   tessera::Model& loaded = **model;
   LogModelSummary(engine, loaded);
+  if (!batch_prompts.empty()) {
+    // Batched greedy: one sequence per --batch-prompt, decoded together.
+    const tessera::Tokenizer* tokenizer = loaded.GetTokenizer();
+    if (tokenizer == nullptr) {
+      log.Warn("cli", "this model has no tokenizer; batch prompts unavailable");
+      return kExitError;
+    }
+    std::vector<tessera::GenerateOptions> requests;
+    requests.reserve(batch_prompts.size());
+    for (const std::string& text : batch_prompts) {
+      std::string prompt = text;
+      if (!no_chat) {
+        auto chat = loaded.ChatPrompt(text);
+        if (chat) {
+          prompt = *chat;
+        }
+      }
+      auto ids = tokenizer->Encode(prompt);
+      if (!ids) {
+        log.Warn("cli", std::string("prompt encode failed (") +
+                            std::string(tessera::ToString(ids.error())) + ")");
+        return kExitError;
+      }
+      tessera::GenerateOptions gen;
+      gen.prompt_tokens = *ids;
+      gen.max_completion_tokens = max_completion_tokens;
+      gen.kv_type = kv_type;
+      gen.progress_every = 0;
+      requests.push_back(std::move(gen));
+    }
+    auto outputs = engine.GenerateBatch(loaded, requests);
+    if (!outputs) {
+      log.Warn("cli", std::string("batch generation failed (") +
+                          std::string(tessera::ToString(outputs.error())) + ")");
+      return kExitError;
+    }
+    for (std::size_t i = 0; i < outputs->size(); ++i) {
+      auto text = tokenizer->Decode((*outputs)[i]);
+      std::fprintf(stdout, "batch %zu: %s\n", i,
+                   text ? text->c_str() : "");
+    }
+    std::fflush(stdout);
+    return kExitOk;
+  }
   // Resolve any saved calibration (explicit CLI values win) before building
   // the request options.
   tessera::CalibrationConfig applied;

@@ -65,6 +65,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
                                 unsigned long long kv_heads,
                                 unsigned long long head_dim,
                                 unsigned long long q_base,
+                                unsigned long long row_base,
                                 unsigned long long window,
                                  unsigned long long kv_f16,
                                  unsigned long long causal) {
@@ -103,7 +104,7 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     }
   }
   const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-  const unsigned long long qb = (i * heads + h) * head_dim;
+  const unsigned long long qb = ((row_base + i) * heads + h) * head_dim;
   if (e < head_dim) {
     q_s[e] = q[qb + e];
   }
@@ -1841,6 +1842,7 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
                                     unsigned long long kv_heads,
                                     unsigned long long head_dim,
                                     unsigned long long q_base,
+                                    unsigned long long row_base,
                                     unsigned long long window) {
   constexpr unsigned long long kTile = 256;
   __shared__ float q_s[256];
@@ -1864,7 +1866,7 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
     start = last;
   }
   const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-  const unsigned long long qb = (i * heads + h) * head_dim;
+  const unsigned long long qb = ((row_base + i) * heads + h) * head_dim;
   if (e < head_dim) {
     q_s[e] = q[qb + e];
   }
@@ -1980,11 +1982,12 @@ __global__ void AttentionQ8Kernel(const float* q, const unsigned char* k,
                                   unsigned long long kv_heads,
                                   unsigned long long head_dim,
                                   unsigned long long q_base,
+                                  unsigned long long row_base,
                                   unsigned long long window,
                                   unsigned long long kind) {
   (void)kind;
   AttentionQuantTiled<kQuantKvQ8>(q, k, v, ks, vs, out, m, n, heads, kv_heads,
-                                  head_dim, q_base, window);
+                                  head_dim, q_base, row_base, window);
 }
 
 // Split-N variant of AttentionQuantTiled: one workgroup per (query row,
@@ -2172,11 +2175,12 @@ __global__ void AttentionFp8Kernel(const float* q, const unsigned char* k,
                                    unsigned long long kv_heads,
                                    unsigned long long head_dim,
                                    unsigned long long q_base,
+                                   unsigned long long row_base,
                                    unsigned long long window,
                                    unsigned long long kind) {
   (void)kind;
   AttentionQuantTiled<kQuantKvFp8>(q, k, v, ks, vs, out, m, n, heads, kv_heads,
-                                   head_dim, q_base, window);
+                                   head_dim, q_base, row_base, window);
 }
 
 __global__ void AttentionFp8SplitKernel(
@@ -2315,12 +2319,13 @@ __global__ void AttentionQ4Kernel(const float* q, const unsigned char* k,
                                   unsigned long long heads,
                                   unsigned long long kv_heads,
                                   unsigned long long head_dim,
-                                  unsigned long long q_base,
-                                  unsigned long long window,
-                                  unsigned long long kind) {
+                                   unsigned long long q_base,
+                                   unsigned long long row_base,
+                                   unsigned long long window,
+                                   unsigned long long kind) {
   (void)kind;
   AttentionQuantTiled<kQuantKvQ4>(q, k, v, ks, vs, out, m, n, heads, kv_heads,
-                                  head_dim, q_base, window);
+                                   head_dim, q_base, row_base, window);
 }
 
 __global__ void AttentionQ4SplitKernel(

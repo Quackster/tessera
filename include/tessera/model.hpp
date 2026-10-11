@@ -37,6 +37,16 @@ struct ModelShard {
   bool last_stage = true;
 };
 
+// Tensor-parallel shard: `rank` of `world` ranks. The architecture module
+// answers the ParallelKind of each internal tensor; the loader slices the
+// bytes at block boundaries, and the forward all-reduces a row-parallel
+// projection. Disabled (world 1) loads the whole model.
+struct TensorShard {
+  bool enabled = false;
+  int rank = 0;
+  int world = 1;
+};
+
 // Options for loading a model.
 struct ModelOptions {
   // Path to a .gguf file, or to a model directory (MXFP4 layout).
@@ -50,6 +60,8 @@ struct ModelOptions {
   bool load_mtp_head = true;
   // Layer shard for a multi-device load; disabled loads the whole model.
   ModelShard shard;
+  // Tensor-parallel shard; disabled loads the whole model.
+  TensorShard tensor;
 };
 
 // A loaded model: format + options + parsed tensor manifest.
@@ -169,6 +181,9 @@ class Model {
   // model). A sharded architecture module limits its layer loop to
   // Shard().first_layer .. last_layer.
   [[nodiscard]] const ModelShard& Shard() const;
+  // The tensor-parallel shard this model was loaded with (disabled for a
+  // whole model). A row-parallel projection all-reduces over the ranks.
+  [[nodiscard]] const TensorShard& Tensor() const;
 
  private:
   Model(Backend& backend, ModelOptions options, ModelFormat format,

@@ -16,6 +16,7 @@
 #include "core/loaders/mxfp4.hpp"
 #include "core/loaders/safetensors.hpp"
 #include "core/loaders/shard.hpp"
+#include "core/loaders/tensor_slice.hpp"
 #include "core/timing.hpp"
 
 namespace tessera {
@@ -436,6 +437,8 @@ const Architecture* Model::Arch() const { return module_.get(); }
 
 const ModelShard& Model::Shard() const { return options_.shard; }
 
+const TensorShard& Model::Tensor() const { return options_.tensor; }
+
 // Upload every manifest tensor to a device buffer. `bytes` is the
 // whole file; offsets come from the parsed manifest. `log` receives one
 // phase line per upload stage (allocation, transfer) so a slow load is
@@ -444,16 +447,20 @@ std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
     Backend& backend, const std::vector<TensorEntry>& tensors,
     const std::vector<std::uint64_t>& offsets, std::uint64_t data_start,
     std::span<const std::byte> bytes, const log::Diagnostics* log,
-    const ModelShard& shard, std::size_t trunk_layers) {
+    const ModelShard& shard, std::size_t trunk_layers,
+    const TensorShard& tensor, const Architecture* module) {
   std::vector<DeviceTensor> weights;
   weights.reserve(tensors.size());
   std::vector<Backend::HostCopy> copies;
   copies.reserve(tensors.size());
+  // Sliced tensor bytes must outlive the batched upload below, so keep them
+  // in one stable vector (moving the inner vectors preserves their data).
+  std::vector<std::vector<std::byte>> sliced_storage;
   std::uint64_t total_bytes = 0;
   {
     core::PhaseTimer timer(log, "model", "allocate device buffers");
     for (std::size_t i = 0; i < tensors.size(); ++i) {
-      const auto& entry = tensors[i];
+      TensorEntry entry = tensors[i];
       if (!core::ShardKeepsTensor(entry.name, shard, trunk_layers)) {
         continue;
       }
@@ -467,15 +474,49 @@ std::expected<std::vector<DeviceTensor>, StatusCode> UploadWeights(
           static_cast<std::uint64_t>(count) > bytes.size() - begin) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      auto buffer = backend.AllocateBuffer(count, MemoryKind::Device);
+      std::span<const std::byte> payload =
+          bytes.subspan(static_cast<std::size_t>(begin), count);
+      if (tensor.enabled && module != nullptr &&
+          (entry.shape.rank == 2 || entry.shape.rank == 3)) {
+        const ParallelKind kind = module->TensorParallelKind(entry.name);
+        if (kind == ParallelKind::Expert && entry.shape.rank == 3) {
+          // The outer dim is the expert count; slice it for this rank.
+          const std::size_t num_experts = entry.shape.dims[2];
+          if (num_experts == 0) {
+            return std::unexpected(StatusCode::MalformedFile);
+          }
+          const std::size_t per = entry.shape.Numel() / num_experts;
+          auto sliced = core::SliceExperts(entry.dtype, num_experts, per,
+                                           tensor.rank, tensor.world, payload);
+          if (!sliced) {
+            return std::unexpected(sliced.error());
+          }
+          entry.shape.dims[2] = sliced->experts;
+          sliced_storage.push_back(std::move(sliced->bytes));
+          payload = sliced_storage.back();
+        } else if (kind != ParallelKind::Replicated &&
+                   entry.shape.rank == 2) {
+          // GGUF dims are [row_length, rows] (ne[0] fastest); the slicer
+          // takes (rows, row_length).
+          auto sliced = core::SliceTensor2D(
+              entry.dtype, entry.shape.dims[1], entry.shape.dims[0], kind,
+              tensor.rank, tensor.world, payload);
+          if (!sliced) {
+            return std::unexpected(sliced.error());
+          }
+          entry.shape.dims[1] = sliced->rows;
+          entry.shape.dims[0] = sliced->cols;
+          sliced_storage.push_back(std::move(sliced->bytes));
+          payload = sliced_storage.back();
+        }
+      }
+      auto buffer = backend.AllocateBuffer(payload.size(), MemoryKind::Device);
       if (!buffer) {
         return std::unexpected(buffer.error());
       }
-      total_bytes += count;
-      weights.push_back(DeviceTensor{entry, std::move(*buffer)});
-      copies.push_back(Backend::HostCopy{
-          weights.back().device.get(),
-          bytes.subspan(static_cast<std::size_t>(begin), count)});
+      total_bytes += payload.size();
+      weights.push_back(DeviceTensor{std::move(entry), std::move(*buffer)});
+      copies.push_back(Backend::HostCopy{weights.back().device.get(), payload});
     }
     timer.Stop(std::to_string(tensors.size()) + " tensors");
   }
@@ -543,10 +584,14 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     if (!config) {
       return std::unexpected(config.error());
     }
+    // The module answers the tensor-parallel role of each internal tensor
+    // so the loader can slice it; a null module loads every tensor whole.
+    std::unique_ptr<Architecture> module = CreateArchitecture(architecture);
     auto weights =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
                       gguf->tensor_data_start, bytes, log, options.shard,
-                      config->has_value() ? (*config)->layers : 0);
+                      config->has_value() ? (*config)->layers : 0,
+                      options.tensor, module.get());
     if (!weights) {
       return std::unexpected(weights.error());
     }
@@ -611,7 +656,8 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
           core::PhaseTimer build_timer(log, "model", "build mxfp4 weights");
           weights = core::BuildMxFp4Weights(
               backend, file_bytes, *parsed, *module, *config,
-              WeightLoadOptions{options.load_mtp_head}, options.shard);
+              WeightLoadOptions{options.load_mtp_head}, options.shard,
+              options.tensor);
         }
         if (!weights) {
           return std::unexpected(weights.error());
@@ -647,7 +693,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     }
     // Map offsets count from the file start, so the base is zero.
     auto weights = UploadWeights(backend, tensors, offsets, 0, file_bytes, log,
-                                 options.shard, 0);
+                                 options.shard, 0, options.tensor, nullptr);
     if (!weights) {
       return std::unexpected(weights.error());
     }

@@ -471,6 +471,38 @@ class RocmBackend final : public Backend {
     return {};
   }
 
+  // Direct peer copy when the source lives on another ROCm device this
+  // device can reach (hipMemcpyPeer); otherwise host-staged.
+  std::expected<void, StatusCode> CopyPeerFrom(Buffer& dst, const Buffer& src,
+                                               std::size_t bytes) override {
+    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+      return std::unexpected(device);
+    }
+    if (bytes == 0) {
+      return {};
+    }
+    if (bytes > dst.Size() || bytes > src.Size()) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    const int peer_device = src.Owner().DeviceIndex();
+    if (src.Owner().Name() == "rocm" && peer_device != device_index_) {
+      int can_access = 0;
+      if (hipDeviceCanAccessPeer(&can_access, device_index_, peer_device) ==
+              hipSuccess &&
+          can_access != 0) {
+        // Idempotent: a repeated enable returns AlreadyEnabled, which is
+        // fine. The first call creates the peer mapping.
+        hipDeviceEnablePeerAccess(peer_device, 0);
+        auto error = hipMemcpyPeer(dst.Handle(), device_index_, src.Handle(),
+                                   peer_device, bytes);
+        if (error == hipSuccess) {
+          return {};
+        }
+      }
+    }
+    return Backend::CopyPeerFrom(dst, src, bytes);
+  }
+
   std::expected<std::unique_ptr<Kernel>, StatusCode> LoadKernel(
       std::string_view name, std::span<const std::byte> code) override {
     if (!code.empty()) {

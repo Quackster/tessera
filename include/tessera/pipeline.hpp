@@ -61,6 +61,19 @@ class Pipeline {
   std::expected<std::vector<std::uint32_t>, StatusCode> Generate(
       std::span<const std::uint32_t> prompt, std::size_t max_tokens);
 
+  // Greedy generation for several prompts at once, overlapped across the
+  // stages: each stage runs on its own thread, so while one stage
+  // processes one sequence the next stage processes another. Each
+  // sequence's tokens equal a separate Generate. `max_tokens` applies per
+  // prompt (0 fills the remaining context).
+  //
+  // Usage:
+  //   std::vector<std::vector<std::uint32_t>> prompts = ...;
+  //   auto out = pipeline->GenerateMany(prompts, 32);
+  std::expected<std::vector<std::vector<std::uint32_t>>, StatusCode>
+  GenerateMany(std::span<const std::vector<std::uint32_t>> prompts,
+               std::size_t max_tokens);
+
   [[nodiscard]] std::size_t StageCount() const;
   // The model tokenizer (identical across stages); nullptr when none.
   [[nodiscard]] const Tokenizer* GetTokenizer() const;

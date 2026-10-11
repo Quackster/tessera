@@ -176,7 +176,12 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
     Backend& backend, std::span<const std::byte> file,
     std::span<const SafetensorsTensor> tensors, const Architecture& module,
     const TransformerConfig& config, const WeightLoadOptions& options,
-    const ModelShard& shard) {
+    const ModelShard& shard, const TensorShard& tensor) {
+  if (tensor.enabled) {
+    // Tensor-parallel slicing is implemented for the GGUF loader first; the
+    // MXFP4 blob||scale layout follows.
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
   std::unordered_map<std::string, const SafetensorsTensor*> by_name;
   for (const auto& tensor : tensors) {
     by_name.emplace(tensor.name, &tensor);

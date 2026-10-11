@@ -46,9 +46,12 @@ bool ShardKeepsTensor(std::string_view name, const ModelShard& shard,
   }
   std::size_t layer = 0;
   if (BlockIndex(name, &layer)) {
-    // The MTP block (blk.<trunk>.nextn.*) runs after every trunk layer, so
-    // it belongs to the last stage.
-    if (name.find(".nextn.") != std::string_view::npos) {
+    // The MTP block (blk.<trunk>.*: the nextn weights and the block's own
+    // attention/FFN tensors) runs after every trunk layer, so the whole
+    // group belongs to the last stage. A head-only draft shard (an empty
+    // trunk range with both stage flags) keeps exactly this group plus
+    // the embedding and the head.
+    if (trunk_layers > 0 && layer == trunk_layers) {
       return shard.last_stage;
     }
     const std::size_t end =

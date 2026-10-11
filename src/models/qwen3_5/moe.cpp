@@ -180,8 +180,8 @@ std::expected<void, StatusCode> ScaleAdd(Backend& backend, Qwen35State& h,
 }
 
 // One row of the MoE feed-forward: norm `x_row` into h.xn, route, run the
-// experts and the shared expert, and write the summed feed-forward output
-// (without the residual) to `out_row`.
+// experts and the shared expert, and write the feed-forward output to
+// `out_row`, adding the residual when `accumulate_residual` is set.
 std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
                                           const Model& model,
                                           const TransformerConfig& cfg,
@@ -194,6 +194,10 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
   const std::size_t inter = cfg.moe_intermediate;
   const std::size_t shared = cfg.shared_expert_intermediate;
   const std::string base = "blk." + std::to_string(layer) + ".";
+  // Expert parallelism: each rank owns experts [base, base + ne/world) and
+  // sums only its owned experts; the per-rank contribution is all-reduced.
+  const bool ep = h.tp != nullptr && h.tp->enabled;
+  const int world = ep ? h.tp->world : 1;
 
   auto mlp_norm =
       NeedWeight(model, base + "post_attention_norm.weight", DType::F32);
@@ -232,9 +236,44 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
       return std::unexpected(StatusCode::DeviceError);
     }
   }
-  auto gate_bytes = ExpertSliceBytes(**gate_exps, ne);
-  auto up_bytes = ExpertSliceBytes(**up_exps, ne);
-  auto down_bytes = ExpertSliceBytes(**down_exps, ne);
+  if (ep) {
+    // Remap the top-k global expert ids to this rank's local range; an
+    // expert this rank does not own contributes zero (its weight is
+    // cleared, and the id points at local expert 0).
+    std::vector<std::uint32_t> ids(top_k, 0);
+    std::vector<float> wts(top_k, 0.0f);
+    if (!backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
+                         top_k * 4) ||
+        !backend.CopyD2H(*h.moe_wts, reinterpret_cast<std::byte*>(wts.data()),
+                         top_k * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    const std::size_t first = ne * static_cast<std::size_t>(h.tp->rank) /
+                              static_cast<std::size_t>(world);
+    const std::size_t count = ne / static_cast<std::size_t>(world);
+    for (std::size_t k = 0; k < top_k; ++k) {
+      const std::uint32_t expert = ids[k];
+      if (expert >= first && expert < first + count) {
+        ids[k] = static_cast<std::uint32_t>(expert - first);
+      } else {
+        ids[k] = 0;
+        wts[k] = 0.0f;
+      }
+    }
+    if (!backend.CopyH2D(*h.moe_ids,
+                         std::span<const std::byte>(
+                             reinterpret_cast<const std::byte*>(ids.data()),
+                             top_k * 4)) ||
+        !backend.CopyH2D(*h.moe_wts,
+                         std::span<const std::byte>(
+                             reinterpret_cast<const std::byte*>(wts.data()),
+                             top_k * 4))) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  auto gate_bytes = ExpertSliceBytes(**gate_exps, ep ? ne / world : ne);
+  auto up_bytes = ExpertSliceBytes(**up_exps, ep ? ne / world : ne);
+  auto down_bytes = ExpertSliceBytes(**down_exps, ep ? ne / world : ne);
   if (!gate_bytes || !up_bytes || !down_bytes) {
     return std::unexpected(StatusCode::MalformedFile);
   }
@@ -247,6 +286,19 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
       gate_dt == DType::Q4K && up_dt == DType::Q4K &&
       (down_dt == DType::Q4K || down_dt == DType::Q6K) &&
       hidden % kQ4KBlockElements == 0 && inter % kQ4KBlockElements == 0;
+  if (ep && !fused) {
+    // Expert parallelism needs the fused packed-expert kernel; the scalar
+    // fallback does not shard experts yet.
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  if (ep && accumulate_residual) {
+    // Stash the residual before the routed partial overwrites `out_row`
+    // (the decode path aliases `x_row` and `out_row`); it is added back
+    // after the shared expert. The fused path does not use `moe_acc`.
+    if (!backend.CopyD2D(x_row, 0, *h.moe_acc, 0, hidden * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
   if (fused) {
     KernelLaunch gate_up;
     gate_up.grid_x = static_cast<std::uint32_t>((inter * top_k + 7) / 8);
@@ -260,15 +312,31 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
     }
     const Kernel& down_kernel = down_dt == DType::Q6K ? *h.moe_down_q6k_kernel
                                                       : *h.moe_down_q4k_kernel;
+    // Expert-parallel: the rank's routed contribution goes to its partial
+    // buffer and is reduced across ranks; the residual is added later.
+    Buffer& routed_out =
+        ep ? *h.tp->ffn_partial[static_cast<std::size_t>(h.tp->rank)]
+           : out_row;
     KernelLaunch down;
     down.grid_x = static_cast<std::uint32_t>((hidden + 7) / 8);
     down.block_x = kMoeThreads;
     down.buffers = {h.moe_phi.get(), (*down_exps)->device.get(),
-                    h.moe_ids.get(), h.moe_wts.get(), &out_row};
+                    h.moe_ids.get(), h.moe_wts.get(), &routed_out};
     down.scalars = {hidden, inter, top_k, *down_bytes,
-                    accumulate_residual ? 1ull : 0ull};
+                    ep ? 0ull : (accumulate_residual ? 1ull : 0ull)};
     if (!backend.LaunchKernel(down_kernel, down)) {
       return std::unexpected(StatusCode::DeviceError);
+    }
+    if (ep) {
+      auto reduced = TpReduce(backend, h, hidden * 4);
+      if (!reduced) {
+        return std::unexpected(reduced.error());
+      }
+      if (!backend.CopyD2D(
+              *h.tp->ffn_partial[static_cast<std::size_t>(h.tp->rank)], 0,
+              out_row, 0, hidden * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
     }
   } else {
     std::vector<std::uint32_t> ids(top_k, 0);
@@ -365,9 +433,17 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
       return std::unexpected(StatusCode::DeviceError);
     }
     if (auto r = ScaleAdd(backend, h, out_row, *h.moe_shared, *h.moe_sig,
-                          out_row, hidden, 0);
+                           out_row, hidden, 0);
         !r) {
       return r;
+    }
+  }
+  if (ep && accumulate_residual) {
+    // The routed partial was reduced without the residual so it is summed
+    // once; add the stashed input now that the shared expert is included.
+    if (!AddDevice(backend, *h.add_kernel, *h.moe_acc, out_row, out_row,
+                   hidden)) {
+      return std::unexpected(StatusCode::DeviceError);
     }
   }
   return {};

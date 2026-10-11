@@ -188,12 +188,26 @@ struct Qwen35State final : core::ArchState {
   std::vector<LinearState> linear;
   // Batched-forward scratch, created on the first batched step.
   std::unique_ptr<Qwen35BatchScratch> batch;
+  // Shared activation scratch for a multi-sequence batched step, owned by
+  // the driver state (the first sequence). Sized to the number of
+  // sequences; the per-sequence KV and recurrent state stay in each
+  // sequence's own state.
+  std::unique_ptr<Qwen35BatchScratch> multi;
   FullKv mtp_kv;
   // Host-side cache of constant weights (conv kernels) and the sequence
   // position (full-layer KV rows equal the position).
   std::unordered_map<std::string, std::vector<float>> host_weights;
   // Opt-in decode phase profiler, mirrored from the cache on first use.
   core::Profile* profile = nullptr;
+  // Tensor-parallel context, mirrored from the cache on first use. Non-null
+  // only when the model is tensor-sharded; the FFN down projection writes
+  // its partial into tp->ffn_partial[rank] and all-reduces across ranks.
+  core::TpContext* tp = nullptr;
+  // Context-parallel context, mirrored from the cache on first use.
+  // Non-null only when the key range is split across ranks; the
+  // full-attention layers attend only the owned key chunk and combine
+  // the per-rank partials through it.
+  core::CpContext* cp = nullptr;
   std::size_t position = 0;  // full-layer KV rows equal the position
   bool ready = false;
 };
@@ -208,6 +222,8 @@ inline Qwen35State& State(core::DecodeCache& cache) {
     state->mxfp4_split_target = cache.tuning.mxfp4_split_target;
     state->mxfp4_split_cap = cache.tuning.mxfp4_split_cap;
     state->attention_split = cache.tuning.attention_split;
+    state->tp = cache.tp;
+    state->cp = cache.cp;
     cache.arch = std::move(state);
   }
   return *static_cast<Qwen35State*>(cache.arch.get());

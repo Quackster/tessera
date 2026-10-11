@@ -1,10 +1,12 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -18,6 +20,61 @@
 namespace tessera::core {
 
 class Profile;
+
+// Tensor-parallel context shared by every rank. Each rank writes its FFN
+// down-projection partial into `ffn_partial[rank]`, rendezvous at the
+// barrier, then all-reduces the vector and adds the sum to the residual.
+// Owned by the driver; every rank's DecodeCache points at its own context
+// (its rank) and the ranks share one barrier.
+struct TpBarrier {
+  int world = 1;
+  // Arrive and wait until every rank has arrived.
+  void Wait();
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  int arrived_ = 0;
+  int phase_ = 0;
+};
+
+struct TpContext {
+  bool enabled = false;
+  int rank = 0;
+  int world = 1;
+  // One FFN down-projection partial output per rank (hidden_dim floats).
+  std::vector<Buffer*> ffn_partial;
+  // Staging buffer on rank 0's device for the peer reduce (null on the
+  // other ranks and when the reduce is host-staged).
+  Buffer* reduce_scratch = nullptr;
+  // Shared by every rank.
+  TpBarrier* barrier = nullptr;
+};
+
+// Context-parallel context shared by every rank. Each rank owns the
+// contiguous key chunk [k0, k1) of the configured context: it appends
+// only the KV rows it owns, runs the split kernel over its local keys,
+// and stages its one partial in `partial[rank]`. Rank 0 gathers the
+// partials, combines them with the attention combine kernel, and
+// broadcasts the output through `attn`. Owned by the driver; every
+// rank's DecodeCache points at its own context (its rank) and the ranks
+// share one barrier (the tensor-parallel barrier type, reused as a
+// generic rank rendezvous).
+struct CpContext {
+  bool enabled = false;
+  int rank = 0;
+  int world = 1;
+  // Owned key chunk [k0, k1) over the configured context.
+  std::size_t k0 = 0;
+  std::size_t k1 = 0;
+  // One partial staging buffer per rank (heads * (head_dim + 2) floats:
+  // pacc, pmax, psum) plus one attention output staging buffer per rank
+  // (heads * head_dim floats).
+  std::vector<Buffer*> partial;
+  std::vector<Buffer*> attn;
+  // Shared by every rank.
+  TpBarrier* barrier = nullptr;
+};
 
 // Base for the architecture-specific decode state. Each architecture
 // module defines its own subclass (in src/models/<arch>/) and stores it in
@@ -60,6 +117,12 @@ struct DecodeCache {
   // Architecture-specific state (built by the model's Architecture
   // module); null until the first step, and null for the generic path.
   std::unique_ptr<ArchState> arch;
+  // Tensor-parallel context (null unless the model is tensor-sharded). The
+  // architecture module all-reduces its row-parallel FFN output through it.
+  TpContext* tp = nullptr;
+  // Context-parallel context (null unless the key range is split). The
+  // architecture module attends only the owned key chunk through it.
+  CpContext* cp = nullptr;
   // Device-resident vanilla state, created on the first vanilla step.
   std::unique_ptr<struct DeviceDecodeState> device;
   // Opt-in decode phase profiler (TESSERA_PROFILE). Null disables timing.

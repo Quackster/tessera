@@ -128,4 +128,40 @@ std::optional<std::string> Qwen35Architecture::MapWeightName(
   return LayerName(index, *mapped);
 }
 
+ParallelKind Qwen35Architecture::TensorParallelKind(
+    std::string_view internal_name) const {
+  // The FFN and the attention projections are the tensor-parallel slice:
+  // gate/up and attn_q/k/v split the output rows (column-parallel), down
+  // and attn_output split the input columns (row-parallel) and their
+  // partial output is all-reduced across ranks. attn_q is the fused
+  // query+gate projection, stored head-major, so an even row split keeps
+  // whole heads per rank.
+  const auto ends_with = [](std::string_view text, std::string_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.substr(text.size() - suffix.size()) == suffix;
+  };
+  for (const std::string_view suffix :
+       {".ffn_gate.weight", ".ffn_up.weight", ".attn_q.weight",
+        ".attn_k.weight", ".attn_v.weight"}) {
+    if (ends_with(internal_name, suffix)) {
+      return ParallelKind::Column;
+    }
+  }
+  for (const std::string_view suffix :
+       {".ffn_down.weight", ".attn_output.weight"}) {
+    if (ends_with(internal_name, suffix)) {
+      return ParallelKind::Row;
+    }
+  }
+  // Expert parallelism: the routed expert tensors split by the expert dim.
+  for (const std::string_view suffix :
+       {".ffn_gate_exps.weight", ".ffn_up_exps.weight",
+        ".ffn_down_exps.weight"}) {
+    if (ends_with(internal_name, suffix)) {
+      return ParallelKind::Expert;
+    }
+  }
+  return ParallelKind::Replicated;
+}
+
 }  // namespace tessera::models::qwen3_5

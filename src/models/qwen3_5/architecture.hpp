@@ -46,6 +46,10 @@ class Qwen35Architecture final : public Architecture {
       std::uint32_t token, std::vector<float>* hidden_out,
       const std::vector<std::size_t>* capture_layers,
       std::vector<Buffer*>* capture, const Buffer* embedding) const override;
+  [[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
+  GreedyBatchMulti(Backend& backend, const Model& model,
+                   std::span<core::DecodeCache* const> caches,
+                   std::span<const std::uint32_t> tokens) const override;
   [[nodiscard]] std::expected<void, StatusCode> ForwardBatch(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
@@ -72,6 +76,10 @@ class Qwen35Architecture final : public Architecture {
   void DraftTruncate(core::DecodeCache& cache,
                      std::size_t rows) const override;
 
+  [[nodiscard]] std::expected<void, StatusCode> EnsureReady(
+      Backend& backend, const Model& model,
+      core::DecodeCache& cache) const override;
+
   [[nodiscard]] std::expected<TransformerConfig, StatusCode> ParseConfigJson(
       std::string_view json) const override;
 
@@ -82,6 +90,9 @@ class Qwen35Architecture final : public Architecture {
   [[nodiscard]] std::optional<WeightConversion> ConvertWeight(
       std::string_view internal_name,
       const TransformerConfig& config) const override;
+
+  [[nodiscard]] ParallelKind TensorParallelKind(
+      std::string_view internal_name) const override;
 };
 
 // Build the module (registered for general.architecture "qwen35").

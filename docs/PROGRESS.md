@@ -344,8 +344,16 @@ through RADV GFX1100, rocm through the system ROCm).
   accepts `--gpus 0,1` next to `--gpu n`. Calibration moved from
   `ServeOptions` onto each `Runner`. The CLI loads devices one at a time
   and refuses a device whose free memory cannot hold the weights
-  (`Backend::MemoryInfo` against the on-disk size). Both backends build;
-  a two-device serve smoke run is pending.
+  (`Backend::MemoryInfo` against the on-disk size). Continuous batching,
+  layer pipeline with micro-batching, tensor parallelism and expert
+  parallelism also landed and match single-device output. Context
+  parallelism splits the key range across two devices with a per-layer
+  partial combine and also matches. Speculative split runs the MTP
+  draft head on a second device against a head-only shard and matches
+  the single-device speculate run. Hybrid combinations run
+  data-parallel groups of tensor- or context-parallel teams behind one
+  device mesh and match the single-route runs. Both backends
+  build; a two-device serve smoke run is pending.
 - Single GoogleTest target. Device tests skip cleanly with no
   device. Numerical checks use per-backend tolerance.
 
@@ -623,11 +631,8 @@ through RADV GFX1100, rocm through the system ROCm).
 - R4D FP8 attention. The served target difference not yet matched.
   W4A8 activation quant and the FP8 KV cache were measured and left
   acceptance unchanged, so they stay off by default.
-- Multi-GPU (next slices). The data-parallel pool landed (see Current
-  status). Next: a two-device serve smoke run, then the sharded routes
-  in `docs/PARALLELISM.md` order (continuous batching, cross-device
-  copy, sharded loader, pipeline, tensor, expert, context, speculative
-  split, hybrid).
+- Multi-GPU (next slices). Every route in `docs/PARALLELISM.md` landed
+  (see Current status). Remaining: a two-device serve smoke run.
 
 ## Notes and decisions
 

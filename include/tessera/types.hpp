@@ -21,6 +21,16 @@ enum class KvCacheType : int {
   FP8 = 4,
 };
 
+// How a projection is split across tensor-parallel ranks. The architecture
+// module answers this per internal tensor; the loader slices a Column or Row
+// tensor at block boundaries and the forward all-reduces a Row projection.
+enum class ParallelKind : int {
+  Replicated = 0,  // every rank holds the full tensor
+  Column = 1,      // split the output rows across ranks
+  Row = 2,         // split the input columns (the row-parallel reduce)
+  Expert = 3,      // split the outer (expert) dim of a packed expert tensor
+};
+
 // Status codes for result-style returns (runtime I/O, parsing, device errors).
 // See AGENTS.md rule 6: exceptions are for programmer errors only.
 enum class StatusCode : int {

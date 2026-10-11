@@ -59,6 +59,14 @@ inline std::expected<LinearGeometry, StatusCode> DeriveGeometry(
     Backend& backend, const TransformerConfig& cfg, core::DecodeCache& cache,
     const LinearGeometry& g, const ModelShard& shard);
 
+// All-reduce the tensor-parallel rank partials (hidden-sized, one buffer per
+// rank) and leave the sum in every rank's buffer. Every rank must call it
+// with the same byte count, at the same point in the forward. A no-op when
+// the model is not tensor-parallel.
+[[nodiscard]] std::expected<void, StatusCode> TpReduce(Backend& backend,
+                                                       Qwen35State& h,
+                                                       std::size_t bytes);
+
 // One projection C = A x W^T for `m` rows of `a` (m x k fp32). For an
 // MXFP4 weight (F4E2M1) the activation is first quantize-dequantized per
 // token to FP8 E4M3 in place, the W4A8 contract the served Qwen3.8 target

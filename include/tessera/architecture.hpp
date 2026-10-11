@@ -104,6 +104,24 @@ class Architecture {
       const std::vector<std::size_t>* capture_layers,
       std::vector<Buffer*>* capture, const Buffer* embedding) const;
 
+  // Batched greedy decode of several independent sequences on one device:
+  // each cache holds one sequence's state and `tokens[i]` is its next
+  // token. The projections and FFN run over all sequences at once and the
+  // attention runs per sequence (row_base). Returns the greedy token per
+  // sequence, or the fallback status when the architecture cannot batch
+  // (the caller then advances the sequences one by one). The default
+  // returns UnsupportedFeature.
+  [[nodiscard]] virtual std::expected<std::vector<std::uint32_t>, StatusCode>
+  GreedyBatchMulti(Backend& backend, const Model& model,
+                   std::span<core::DecodeCache* const> caches,
+                   std::span<const std::uint32_t> tokens) const {
+    (void)backend;
+    (void)model;
+    (void)caches;
+    (void)tokens;
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+
   // Several tokens in one batched forward, advancing the cache by all of
   // them. `logits_out` receives one vocab row per token when all_logits is
   // true, otherwise only the last row; `embedding` supplies one embedding
@@ -155,6 +173,19 @@ class Architecture {
   virtual void DraftTruncate(core::DecodeCache& cache,
                              std::size_t rows) const = 0;
 
+  // Allocate the decode state (kernels, scratch) for `cache` without
+  // running a forward, so a device that only drafts (never runs the
+  // trunk) can still use the draft head. The default returns
+  // UnsupportedFeature; a module with a draft head overrides it.
+  [[nodiscard]] virtual std::expected<void, StatusCode> EnsureReady(
+      Backend& backend, const Model& model,
+      core::DecodeCache& cache) const {
+    (void)backend;
+    (void)model;
+    (void)cache;
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+
   // Parse a JSON model definition (an MXFP4 directory's config.json) into
   // the transformer hyper-parameters. The GGUF path parses GGUF metadata
   // instead and never calls this. The default returns UnsupportedFeature;
@@ -190,6 +221,17 @@ class Architecture {
     (void)internal_name;
     (void)config;
     return std::nullopt;
+  }
+
+  // How this internal tensor is split across tensor-parallel ranks. The
+  // loader slices a Column tensor's output rows or a Row tensor's input
+  // columns at block boundaries; the forward all-reduces a Row projection
+  // across the ranks. The default is Replicated, so a model with no
+  // tensor shard and an architecture without the override load unsharded.
+  [[nodiscard]] virtual ParallelKind TensorParallelKind(
+      std::string_view internal_name) const {
+    (void)internal_name;
+    return ParallelKind::Replicated;
   }
 };
 

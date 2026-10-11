@@ -177,6 +177,22 @@ void Qwen35Architecture::DraftTruncate(core::DecodeCache& cache,
   }
 }
 
+// Allocate the decode state without running the trunk forward, so the
+// speculative-split draft device (which holds only the MTP block group,
+// the embedding and the head) can run the draft head.
+std::expected<void, StatusCode> Qwen35Architecture::EnsureReady(
+    Backend& backend, const Model& model, core::DecodeCache& cache) const {
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  auto geometry = DeriveGeometry(*config);
+  if (!geometry) {
+    return std::unexpected(geometry.error());
+  }
+  return EnsureHybridReady(backend, *config, cache, *geometry, model.Shard());
+}
+
 std::unique_ptr<Architecture> MakeQwen35Architecture() {
   return std::make_unique<Qwen35Architecture>();
 }

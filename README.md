@@ -27,7 +27,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | GGUF loader | Done | v2/v3 headers, bounds-checked, memory-mapped (not copied). |
 | MXFP4 loader | Done | Tensor map, weight upload. FP8 and MXFP4 GEMM verified. |
 | Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched H2D upload (`CopyH2DBatch`); ROCm drains a 256 MiB pinned window, one sync per chunk. ROCm re-selects the configured GPU on every thread that touches the device. Shared gfx11/gfx12 device primitives (`rocm_device.hpp`, ported from libr4d v0.5.0); the ROCm kernels barrier on LDS scope (`LdsBarrier`). |
-| Parallelism | Partial | Data-parallel request replicas: one engine and model per GPU behind a `RunnerPool` with least-loaded routing. Built on both backends; a two-device serve smoke is pending. Tensor and pipeline split not started. |
+| Parallelism | Partial | Data-parallel request replicas: one engine and model per GPU behind a `RunnerPool` with least-loaded routing. Continuous batching, layer pipeline with micro-batching, tensor parallelism, expert parallelism, context parallelism, speculative split and hybrid combinations match single-device output. Built on both backends; a two-device serve smoke is pending. |
 | Kernel launch | Done | Vulkan records a whole decode step into one command buffer. ROCm runs one blocking stream with pinned staging. |
 | DFlash2 | Partial | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. Draft cost still high. |
 | CLI | Partial | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, calibrate. |
@@ -271,6 +271,9 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--context <n>` | both | 4096 | Maximum context length. |
 | `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
 | `--gpus <a,b>` | both | none | Serve one model replica per listed GPU for parallel requests (for example `--gpus 0,1`). Overrides `--gpu`. |
+| `--pipeline` | run | off | Split the model layers across the `--gpus` devices. |
+| `--tp` | run | off | Split attention, FFN and MoE experts across the `--gpus` devices with a rank reduce. |
+| `--cp` | run | off | Split the key range across the `--gpus` devices with a per-layer partial combine. |
 | `--draft-block <n>` | both | 0 | Draft block tokens. 0 keeps the draft checkpoint's configured block. |
 | `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects the automatic default (512). |
 | `--split-target <n>` | both | 0 | fp8 MXFP4 split-K workgroup target (ROCm only). 0 uses the built-in default (320). |
@@ -285,6 +288,9 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--max-completion-tokens <n>` | run | 0 | Completion tokens. 0 fills the remaining context. |
 | `--max-thinking-tokens <n>` | run | 0 | Think-block budget per turn. 0 leaves thinking unlimited. |
 | `--speculate` | both | off | MTP speculative decode. It drafts from the target's own nextn head, so it needs no checkpoint path and drives both `run` and served turns. |
+| `--spec-split` | run | off | Run the MTP draft head on the second `--gpus` device; needs `--speculate`. |
+| `--hybrid` | run | off | Data-parallel groups of model-parallel teams; needs `--batch-prompt` (one per group). |
+| `--dp <n>` | run | 1 | Data-parallel group count for `--hybrid`. |
 | `--sample` | run | off | Sample instead of greedy decode. |
 | `--temperature <f>` | run | 0.6 | Sampling temperature. |
 | `--top-p <f>` | run | 0.95 | Nucleus probability. |

@@ -1,5 +1,7 @@
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -38,17 +40,17 @@ using detail::SigmoidGateDevice;
 using detail::SiluMulDevice;
 using detail::SsmGateDevice;
 
-// Allocates (or reallocates) the batched scratch for `rows` tokens. Two
-// scratches are sized by need, not `rows`, because a long prompt must not
-// allocate their full rows: the logits scratch (prefill scores only the last
-// token) and the per-layer linear state snapshots (only a verification reads
-// them to roll back, and it ever scores at most the draft block).
-std::expected<void, StatusCode> AllocBatch(Backend& backend,
-                                           const TransformerConfig& cfg,
-                                           const LinearGeometry& g,
-                                           Qwen35State& h, std::size_t rows,
-                                           std::size_t logits_rows,
-                                           bool need_state_hist) {
+// Sizes (or resizes) a batched scratch for `rows` tokens. Two scratches are
+// sized by need, not `rows`, because a long prompt must not allocate their
+// full rows: the logits scratch (prefill scores only the last token) and the
+// per-layer linear state snapshots (only a verification reads them).
+std::expected<void, StatusCode> EnsureScratch(Backend& backend,
+                                              const TransformerConfig& cfg,
+                                              const LinearGeometry& g,
+                                              Qwen35BatchScratch& s,
+                                              std::size_t rows,
+                                              std::size_t logits_rows,
+                                              bool need_state_hist) {
   auto alloc = [&backend](std::unique_ptr<Buffer>& slot,
                           std::size_t elements) -> bool {
     auto buf = backend.AllocateBuffer(elements * 4, MemoryKind::Device);
@@ -60,84 +62,96 @@ std::expected<void, StatusCode> AllocBatch(Backend& backend,
   };
   const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
   const std::size_t hist_len = g.conv_dim * (g.width - 1);
-  const auto alloc_hist = [&](Qwen35BatchScratch& s, std::size_t hist_rows) {
-    s.state_hist.resize(cfg.layers);
-    s.conv_hist_hist.resize(cfg.layers);
+  const auto alloc_hist = [&](Qwen35BatchScratch& t, std::size_t hist_rows) {
+    t.state_hist.resize(cfg.layers);
+    t.conv_hist_hist.resize(cfg.layers);
     for (std::size_t l = 0; l < cfg.layers; ++l) {
       if (!cfg.IsFullAttentionLayer(l)) {
-        if (!alloc(s.state_hist[l], (hist_rows + 1) * state_len) ||
-            !alloc(s.conv_hist_hist[l], (hist_rows + 1) * hist_len)) {
+        if (!alloc(t.state_hist[l], (hist_rows + 1) * state_len) ||
+            !alloc(t.conv_hist_hist[l], (hist_rows + 1) * hist_len)) {
           return false;
         }
       }
     }
-    s.hist_rows = hist_rows;
+    t.hist_rows = hist_rows;
     return true;
   };
-  if (h.batch && h.batch->capacity >= rows) {
-    h.batch->snapshot_states = need_state_hist;
-    if (h.batch->logits_capacity < logits_rows) {
-      if (!alloc(h.batch->logits, logits_rows * cfg.vocab_size)) {
+  if (s.capacity >= rows) {
+    s.snapshot_states = need_state_hist;
+    if (s.logits_capacity < logits_rows) {
+      if (!alloc(s.logits, logits_rows * cfg.vocab_size)) {
         return std::unexpected(StatusCode::OutOfMemory);
       }
-      h.batch->logits_capacity = logits_rows;
+      s.logits_capacity = logits_rows;
     }
-    if (need_state_hist && h.batch->hist_rows < rows &&
-        !alloc_hist(*h.batch, rows)) {
+    if (need_state_hist && s.hist_rows < rows && !alloc_hist(s, rows)) {
       return std::unexpected(StatusCode::OutOfMemory);
     }
     return {};
   }
-  auto b = std::make_unique<Qwen35BatchScratch>();
-  b->capacity = rows;
-  b->logits_capacity = logits_rows;
-  b->snapshot_states = need_state_hist;
+  s = Qwen35BatchScratch{};
+  s.capacity = rows;
+  s.logits_capacity = logits_rows;
+  s.snapshot_states = need_state_hist;
   const std::size_t q_dim = cfg.attention.heads * cfg.attention.head_dim;
   const std::size_t kv_dim = cfg.attention.kv_heads * cfg.attention.head_dim;
   const std::size_t ffn = cfg.ffn_dim != 0 ? cfg.ffn_dim : 1;
-  if (!alloc(b->x, rows * cfg.hidden_dim) ||
-      !alloc(b->xn, rows * cfg.hidden_dim) ||
-      !alloc(b->proj, rows * cfg.hidden_dim) ||
-      !alloc(b->logits, logits_rows * cfg.vocab_size) ||
-      !alloc(b->fused, rows * q_dim * 2) || !alloc(b->q, rows * q_dim) ||
-      !alloc(b->gate, rows * q_dim) || !alloc(b->kf, rows * kv_dim) ||
-      !alloc(b->vf, rows * kv_dim) || !alloc(b->attn, rows * q_dim) ||
-      !alloc(b->fgate, rows * ffn) ||
-      !alloc(b->fup, rows * ffn) ||
-      !alloc(b->fmlp, rows * ffn) ||
-      !alloc(b->qkv, rows * g.conv_dim) ||
-      !alloc(b->z, rows * g.value_dim) ||
-      !alloc(b->alpha_raw, rows * g.num_v_heads) ||
-      !alloc(b->beta_raw, rows * g.num_v_heads) ||
-      !alloc(b->alpha, rows * g.num_v_heads) ||
-      !alloc(b->beta, rows * g.num_v_heads) ||
-      !alloc(b->out, rows * g.value_dim) ||
-      !alloc(b->q_all, rows * g.key_dim) ||
-      !alloc(b->k_all, rows * g.key_dim) ||
-      !alloc(b->v_all, rows * g.value_dim) ||
-      !alloc(b->q_exp_all, rows * g.num_v_heads * g.head_k_dim) ||
-      !alloc(b->k_exp_all, rows * g.num_v_heads * g.head_k_dim) ||
-      !alloc(b->core_all, rows * g.value_dim) ||
-      (cfg.IsMoe() && !alloc(b->moe_out, rows * cfg.hidden_dim))) {
+  if (!alloc(s.x, rows * cfg.hidden_dim) ||
+      !alloc(s.xn, rows * cfg.hidden_dim) ||
+      !alloc(s.proj, rows * cfg.hidden_dim) ||
+      !alloc(s.logits, logits_rows * cfg.vocab_size) ||
+      !alloc(s.fused, rows * q_dim * 2) || !alloc(s.q, rows * q_dim) ||
+      !alloc(s.gate, rows * q_dim) || !alloc(s.kf, rows * kv_dim) ||
+      !alloc(s.vf, rows * kv_dim) || !alloc(s.attn, rows * q_dim) ||
+      !alloc(s.fgate, rows * ffn) || !alloc(s.fup, rows * ffn) ||
+      !alloc(s.fmlp, rows * ffn) || !alloc(s.qkv, rows * g.conv_dim) ||
+      !alloc(s.z, rows * g.value_dim) ||
+      !alloc(s.alpha_raw, rows * g.num_v_heads) ||
+      !alloc(s.beta_raw, rows * g.num_v_heads) ||
+      !alloc(s.alpha, rows * g.num_v_heads) ||
+      !alloc(s.beta, rows * g.num_v_heads) || !alloc(s.out, rows * g.value_dim) ||
+      !alloc(s.q_all, rows * g.key_dim) ||
+      !alloc(s.k_all, rows * g.key_dim) ||
+      !alloc(s.v_all, rows * g.value_dim) ||
+      !alloc(s.q_exp_all, rows * g.num_v_heads * g.head_k_dim) ||
+      !alloc(s.k_exp_all, rows * g.num_v_heads * g.head_k_dim) ||
+      !alloc(s.core_all, rows * g.value_dim) ||
+      (cfg.IsMoe() && !alloc(s.moe_out, rows * cfg.hidden_dim))) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   auto pos = backend.AllocateBuffer(rows * 3 * 8, MemoryKind::Device);
   if (!pos) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
-  b->pos = std::move(*pos);
-  if (need_state_hist && !alloc_hist(*b, rows)) {
+  s.pos = std::move(*pos);
+  if (need_state_hist && !alloc_hist(s, rows)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
-  h.batch = std::move(b);
   return {};
 }
 
-// Batched gated MLP over `rows` rows of h.batch->x in place.
+// Sizes the per-cache batch scratch, creating it on first use.
+std::expected<void, StatusCode> AllocBatch(Backend& backend,
+                                           const TransformerConfig& cfg,
+                                           const LinearGeometry& g,
+                                           Qwen35State& h, std::size_t rows,
+                                           std::size_t logits_rows,
+                                           bool need_state_hist) {
+  if (!h.batch) {
+    h.batch = std::make_unique<Qwen35BatchScratch>();
+  }
+  return EnsureScratch(backend, cfg, g, *h.batch, rows, logits_rows,
+                       need_state_hist);
+}
+
+// Batched gated MLP over `rows` rows of `b.x` in place. The scratch is
+// passed explicitly so the multi-sequence path can share one scratch across
+// sequences while the single-sequence path uses its own.
 std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
                                             const Model& model,
                                             const TransformerConfig& cfg,
                                             Qwen35State& h,
+                                            Qwen35BatchScratch& b,
                                             std::size_t layer,
                                             std::size_t rows) {
   if (cfg.IsMoe()) {
@@ -155,7 +169,6 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
   if (!mlp_norm || !fg || !fu || !fd) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*mlp_norm)->device,
                      *b.xn, rows, cfg.hidden_dim, cfg.norm_eps)) {
     return std::unexpected(StatusCode::DeviceError);
@@ -182,7 +195,7 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
 // Batched full-attention block over `rows` rows ending in h.batch->x.
 std::expected<void, StatusCode> RunFullBlockBatch(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
-    Qwen35State& h, std::size_t layer, std::uint64_t pos,
+    Qwen35State& h, Qwen35BatchScratch& b, std::size_t layer, std::uint64_t pos,
     Qwen35State::FullKv& kv, std::size_t rows) {
   core::Profile* const deep =
       h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
@@ -207,7 +220,6 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   if (!norm || !wq || !wk || !wv || !wo || !q_norm || !k_norm) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*norm)->device, *b.xn,
                      rows, hidden, cfg.norm_eps)) {
     return std::unexpected(StatusCode::DeviceError);
@@ -285,15 +297,15 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   if (deep != nullptr) {
     backend.Synchronize();  // profile attribution only
   }
-  return RunFfnBatch(backend, model, cfg, h, layer, rows);
+  return RunFfnBatch(backend, model, cfg, h, b, layer, rows);
 }
 
 // Batched linear-attention block. The projections run batched; the causal
 // conv and the gated-delta scan run token by token with the shared state.
 std::expected<void, StatusCode> RunLinearBlockBatch(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
-    Qwen35State& h, std::size_t layer, const LinearGeometry& g,
-    std::size_t rows) {
+    Qwen35State& h, Qwen35BatchScratch& b, std::size_t layer,
+    const LinearGeometry& g, std::size_t rows) {
   core::Profile* const deep =
       h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
   core::PhaseScope layer_scope(deep, core::Phase::kLinearLayer);
@@ -313,7 +325,6 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
       !w_dt || !w_norm || !w_out) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  Qwen35BatchScratch& b = *h.batch;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*norm)->device, *b.xn,
                      rows, hidden, cfg.norm_eps)) {
     return std::unexpected(StatusCode::DeviceError);
@@ -387,7 +398,7 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
     if (deep != nullptr) {
       backend.Synchronize();  // profile attribution only
     }
-    return RunFfnBatch(backend, model, cfg, h, layer, rows);
+    return RunFfnBatch(backend, model, cfg, h, b, layer, rows);
   }
   for (std::size_t t = 0; t < rows; ++t) {
     // The causal conv, SiLU and q/k/v split run on the device; the
@@ -436,7 +447,7 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
   if (deep != nullptr) {
     backend.Synchronize();  // profile attribution only
   }
-  return RunFfnBatch(backend, model, cfg, h, layer, rows);
+  return RunFfnBatch(backend, model, cfg, h, b, layer, rows);
 }
 
 // Runs the vocab head over the batch. `all_rows` projects every row (the
@@ -446,7 +457,7 @@ std::expected<void, StatusCode> RunLinearBlockBatch(
 // for a device-side argmax.
 std::expected<void, StatusCode> RunBatchHead(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
-    Qwen35State& h, std::size_t rows, bool all_rows,
+    Qwen35State& h, Qwen35BatchScratch& b, std::size_t rows, bool all_rows,
     std::vector<float>* download) {
   auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
   auto output = NeedWeightAny(model, "output.weight");
@@ -455,25 +466,23 @@ std::expected<void, StatusCode> RunBatchHead(
   }
   const std::size_t hidden = cfg.hidden_dim;
   if (all_rows && rows > 1) {
-    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.batch->x,
-                       *(*out_norm)->device, *h.batch->xn, rows, hidden,
-                       cfg.norm_eps) ||
-        !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.batch->xn,
-                      *(*output)->device, *h.batch->logits, rows,
-                      cfg.vocab_size, hidden)) {
+    if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *b.x, *(*out_norm)->device,
+                       *b.xn, rows, hidden, cfg.norm_eps) ||
+        !ProjectBatch(backend, h, (*output)->manifest.dtype, *b.xn,
+                      *(*output)->device, *b.logits, rows, cfg.vocab_size,
+                      hidden)) {
       return std::unexpected(StatusCode::DeviceError);
     }
     if (download != nullptr) {
       download->resize(rows * cfg.vocab_size);
-      if (!backend.CopyD2H(*h.batch->logits,
+      if (!backend.CopyD2H(*b.logits,
                            reinterpret_cast<std::byte*>(download->data()),
                            rows * cfg.vocab_size * 4)) {
         return std::unexpected(StatusCode::DeviceError);
       }
     }
   } else {
-    if (!backend.CopyD2D(*h.batch->x, (rows - 1) * hidden * 4, *h.x, 0,
-                         hidden * 4) ||
+    if (!backend.CopyD2D(*b.x, (rows - 1) * hidden * 4, *h.x, 0, hidden * 4) ||
         !RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
                        *h.xn, 1, hidden, cfg.norm_eps) ||
         !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
@@ -491,6 +500,122 @@ std::expected<void, StatusCode> RunBatchHead(
     }
   }
   return {};
+}
+
+// Full-attention block for a multi-sequence batch: `rows` sequences each
+// contribute one token. The projections, norms and RoPE run over all rows in
+// `b`; the attention runs per sequence over that sequence's own KV, with
+// `row_base = t` selecting row t of the shared q/attn buffers and `pos[t]`
+// the sequence's position.
+std::expected<void, StatusCode> RunFullBlockBatchMulti(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen35State& driver, Qwen35BatchScratch& b, std::size_t layer,
+    std::span<Qwen35State* const> seqs, std::span<const std::uint64_t> pos,
+    std::size_t rows) {
+  const std::size_t hidden = cfg.hidden_dim;
+  const std::size_t heads = cfg.attention.heads;
+  const std::size_t kv_heads = cfg.attention.kv_heads;
+  const std::size_t head_dim = cfg.attention.head_dim;
+  const std::size_t kv_dim = kv_heads * head_dim;
+  const std::size_t rope_dim = cfg.attention.rope_dim;
+  const std::size_t sec_t = static_cast<std::size_t>(cfg.rope_sections[0]);
+  const std::size_t sec_h = static_cast<std::size_t>(cfg.rope_sections[1]);
+  const std::size_t sec_w = static_cast<std::size_t>(cfg.rope_sections[2]);
+  const std::string base = "blk." + std::to_string(layer) + ".";
+  auto norm = NeedWeight(model, base + "attn_norm.weight", DType::F32);
+  auto wq = NeedWeightAny(model, base + "attn_q.weight");
+  auto wk = NeedWeightAny(model, base + "attn_k.weight");
+  auto wv = NeedWeightAny(model, base + "attn_v.weight");
+  auto wo = NeedWeightAny(model, base + "attn_output.weight");
+  auto q_norm = NeedWeight(model, base + "attn_q_norm.weight", DType::F32);
+  auto k_norm = NeedWeight(model, base + "attn_k_norm.weight", DType::F32);
+  if (!norm || !wq || !wk || !wv || !wo || !q_norm || !k_norm) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (!RmsNormDevice(backend, *driver.rmsnorm_kernel, *b.x, *(*norm)->device,
+                     *b.xn, rows, hidden, cfg.norm_eps)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  InvalidateActivationPack(driver);
+  if (!ProjectBatch(backend, driver, (*wq)->manifest.dtype, *b.xn,
+                    *(*wq)->device, *b.fused, rows, heads * head_dim * 2,
+                    hidden) ||
+      !QGateSplitDevice(backend, *driver.qgate_split_kernel, *b.fused, *b.q,
+                        *b.gate, heads, head_dim, rows) ||
+      !ProjectBatch(backend, driver, (*wk)->manifest.dtype, *b.xn,
+                    *(*wk)->device, *b.kf, rows, kv_dim, hidden) ||
+      !ProjectBatch(backend, driver, (*wv)->manifest.dtype, *b.xn,
+                    *(*wv)->device, *b.vf, rows, kv_dim, hidden) ||
+      !RmsNormDevice(backend, *driver.rmsnorm_kernel, *b.q, *(*q_norm)->device,
+                     *b.q, rows * heads, head_dim, cfg.norm_eps) ||
+      !RmsNormDevice(backend, *driver.rmsnorm_kernel, *b.kf, *(*k_norm)->device,
+                     *b.kf, rows * kv_heads, head_dim, cfg.norm_eps) ||
+      !detail::MropeDevice(backend, *driver.mrope_kernel, *b.q, *b.pos, rows,
+                           heads, head_dim, rope_dim, sec_t, sec_h, sec_w,
+                           cfg.attention.rope_theta) ||
+      !detail::MropeDevice(backend, *driver.mrope_kernel, *b.kf, *b.pos, rows,
+                           kv_heads, head_dim, rope_dim, sec_t, sec_h, sec_w,
+                           cfg.attention.rope_theta)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  // Append each sequence's key/value row to its own cache.
+  for (std::size_t t = 0; t < rows; ++t) {
+    Qwen35State& s = *seqs[t];
+    Qwen35State::FullKv& kv = s.full[layer];
+    const Buffer* ksrc = b.kf.get();
+    const Buffer* vsrc = b.vf.get();
+    std::size_t row_offset = 0;
+    if (kv.type == KvCacheType::F32) {
+      row_offset = t * kv_dim * 4;
+    } else {
+      if (!backend.CopyD2D(*b.kf, t * kv_dim * 4, *s.kf, 0, kv_dim * 4) ||
+          !backend.CopyD2D(*b.vf, t * kv_dim * 4, *s.vf, 0, kv_dim * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      ksrc = s.kf.get();
+      vsrc = s.vf.get();
+    }
+    if (auto appended =
+            detail::AppendKv(backend, s.cast_kernel.get(), s.quant_kernel.get(),
+                             s.kv_scratch.get(), s.kv_scratch.get(),
+                             s.scale_scratch.get(), kv, *ksrc, *vsrc, kv_dim,
+                             row_offset);
+        !appended) {
+      return std::unexpected(appended.error());
+    }
+  }
+  // Attention per sequence over its own KV, one row via row_base.
+  for (std::size_t t = 0; t < rows; ++t) {
+    Qwen35State& s = *seqs[t];
+    Qwen35State::FullKv& kv = s.full[layer];
+    const bool quantized = kv.type == KvCacheType::Q8 ||
+                           kv.type == KvCacheType::Q4 ||
+                           kv.type == KvCacheType::FP8;
+    const bool ok =
+        quantized
+            ? detail::AttentionQuantDevice(
+                  backend, *driver.attention_kernel, *b.q, *kv.k, *kv.v,
+                  *kv.k_scale, *kv.v_scale, *b.attn, kv.rows, heads, kv_heads,
+                  head_dim, pos[t], 0, 1, t)
+                  .has_value()
+            : AttentionDevice(backend, *driver.attention_kernel, *b.q, *kv.k,
+                              *kv.v, *b.attn, kv.rows, heads, kv_heads,
+                              head_dim, pos[t], 0, 1,
+                              kv.type == KvCacheType::F16, true, t)
+                  .has_value();
+    if (!ok) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  if (!SigmoidGateDevice(backend, *driver.sigmoid_gate_kernel, *b.attn,
+                         *b.gate, *b.attn, rows * heads * head_dim) ||
+      !ProjectBatch(backend, driver, (*wo)->manifest.dtype, *b.attn,
+                    *(*wo)->device, *b.proj, rows, hidden, heads * head_dim) ||
+      !AddDevice(backend, *driver.add_kernel, *b.x, *b.proj, *b.x,
+                 rows * hidden)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return RunFfnBatch(backend, model, cfg, driver, b, layer, rows);
 }
 
 }  // namespace
@@ -585,13 +710,14 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
   }
   for (std::size_t l = layer_begin; l < layer_end; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
-      auto block = RunFullBlockBatch(backend, model, cfg, h, l, start,
+      auto block = RunFullBlockBatch(backend, model, cfg, h, *h.batch, l, start,
                                      h.full[l], rows);
       if (!block) {
         return std::unexpected(block.error());
       }
     } else {
-      auto block = RunLinearBlockBatch(backend, model, cfg, h, l, g, rows);
+      auto block =
+          RunLinearBlockBatch(backend, model, cfg, h, *h.batch, l, g, rows);
       if (!block) {
         return std::unexpected(block.error());
       }
@@ -617,8 +743,8 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     std::copy(last->begin(), last->end(), hidden_out->begin());
   }
   if (logits_out != nullptr) {
-    auto head =
-        RunBatchHead(backend, model, cfg, h, rows, all_logits, logits_out);
+    auto head = RunBatchHead(backend, model, cfg, h, *h.batch, rows, all_logits,
+                             logits_out);
     if (!head) {
       return std::unexpected(head.error());
     }
@@ -674,8 +800,8 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     if (!status) {
       return std::unexpected(status.error());
     }
-    auto head =
-        RunBatchHead(backend, model, *config, h, tokens.size(), true, nullptr);
+    auto head = RunBatchHead(backend, model, *config, h, *h.batch,
+                             tokens.size(), true, nullptr);
     if (!head) {
       return std::unexpected(head.error());
     }
@@ -752,6 +878,141 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
                 xh->begin() + (row + 1) * config->hidden_dim,
                 hidden_out->begin());
     }
+  }
+  return result;
+}
+
+// Batched greedy decode of several independent sequences. The dense
+// projections and FFN run over all sequences in one shared scratch; the
+// full-attention layers run the attention per sequence over that
+// sequence's own KV with `row_base`; the hybrid linear layers run per
+// sequence because their conv/delta state is per sequence. Returns the
+// greedy token per sequence.
+std::expected<std::vector<std::uint32_t>, StatusCode>
+Qwen35Architecture::GreedyBatchMulti(
+    Backend& backend, const Model& model,
+    std::span<core::DecodeCache* const> caches,
+    std::span<const std::uint32_t> tokens) const {
+  const std::size_t rows = caches.size();
+  if (rows == 0 || tokens.size() != rows) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const TransformerConfig& cfg = *config;
+  if (!cfg.hybrid || cfg.full_attention_interval == 0 ||
+      cfg.rope_sections.size() != 3) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (cfg.IsMoe()) {
+    // The MoE FFN batch path is not multi-sequence yet.
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  auto geometry = DeriveGeometry(cfg);
+  if (!geometry) {
+    return std::unexpected(geometry.error());
+  }
+  const LinearGeometry& g = *geometry;
+  for (std::size_t t = 0; t < rows; ++t) {
+    if (caches[t] == nullptr) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    auto ready = EnsureHybridReady(backend, cfg, *caches[t], g, model.Shard());
+    if (!ready) {
+      return std::unexpected(ready.error());
+    }
+  }
+  Qwen35State& driver = State(*caches[0]);
+  const std::size_t hidden = cfg.hidden_dim;
+  if (!driver.multi) {
+    driver.multi = std::make_unique<Qwen35BatchScratch>();
+  }
+  auto scratch = EnsureScratch(backend, cfg, g, *driver.multi, rows, 1, false);
+  if (!scratch) {
+    return std::unexpected(scratch.error());
+  }
+  Qwen35BatchScratch& b = *driver.multi;
+  auto gathered =
+      GatherEmbeddingRows(backend, model, driver, tokens, hidden, *b.x);
+  if (!gathered) {
+    return std::unexpected(gathered.error());
+  }
+  std::vector<Qwen35State*> seqs(rows);
+  std::vector<std::uint64_t> pos(rows);
+  std::vector<std::uint64_t> triples(rows * 3);
+  for (std::size_t t = 0; t < rows; ++t) {
+    Qwen35State& s = State(*caches[t]);
+    seqs[t] = &s;
+    if (!s.batch) {
+      auto sized = AllocBatch(backend, cfg, g, s, 1, 1, false);
+      if (!sized) {
+        return std::unexpected(sized.error());
+      }
+    }
+    pos[t] = s.position;
+    triples[3 * t] = pos[t];
+    triples[3 * t + 1] = pos[t];
+    triples[3 * t + 2] = pos[t];
+  }
+  if (!backend.CopyH2D(*b.pos,
+                       std::span<const std::byte>(
+                           reinterpret_cast<const std::byte*>(triples.data()),
+                           triples.size() * sizeof(std::uint64_t)))) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  const ModelShard& shard = model.Shard();
+  const std::size_t layer_begin = shard.enabled ? shard.first_layer : 0;
+  std::size_t layer_end = cfg.layers;
+  if (shard.enabled && shard.last_layer != 0 && shard.last_layer < layer_end) {
+    layer_end = shard.last_layer;
+  }
+  for (std::size_t l = layer_begin; l < layer_end; ++l) {
+    if (cfg.IsFullAttentionLayer(l)) {
+      auto block = RunFullBlockBatchMulti(backend, model, cfg, driver, b, l,
+                                          seqs, pos, rows);
+      if (!block) {
+        return std::unexpected(block.error());
+      }
+      continue;
+    }
+    for (std::size_t t = 0; t < rows; ++t) {
+      Qwen35State& s = *seqs[t];
+      if (!backend.CopyD2D(*b.x, t * hidden * 4, *s.batch->x, 0, hidden * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      auto lin = RunLinearBlockBatch(backend, model, cfg, s, *s.batch, l, g, 1);
+      if (!lin) {
+        return std::unexpected(lin.error());
+      }
+      if (!backend.CopyD2D(*s.batch->x, 0, *b.x, t * hidden * 4, hidden * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+  }
+  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
+  auto output = NeedWeightAny(model, "output.weight");
+  if (!out_norm || !output) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  std::vector<std::uint32_t> result(rows);
+  for (std::size_t t = 0; t < rows; ++t) {
+    Qwen35State& s = *seqs[t];
+    if (!backend.CopyD2D(*b.x, t * hidden * 4, *s.x, 0, hidden * 4) ||
+        !RmsNormDevice(backend, *driver.rmsnorm_kernel, *s.x,
+                       *(*out_norm)->device, *s.xn, 1, hidden, cfg.norm_eps) ||
+        !ProjectBatch(backend, driver, (*output)->manifest.dtype, *s.xn,
+                      *(*output)->device, *s.logits, 1, cfg.vocab_size,
+                      hidden)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    auto best = DeviceRowArgMax(backend, s, *s.logits, 1, cfg.vocab_size);
+    if (!best) {
+      return std::unexpected(best.error());
+    }
+    result[t] = (*best)[0];
+    s.position += 1;
   }
   return result;
 }

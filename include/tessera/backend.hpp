@@ -156,10 +156,12 @@ class Kernel {
 // ceil(rows * heads * (rope_dim / 2) / 256) workgroups of 256.
 // "attention": buffers are q (m x heads*head_dim fp32), k and v
 // (n x kv_heads*head_dim each), out (m x heads*head_dim); scalars are
-// m, n, heads, kv_heads, head_dim, q_base, window (0 = full causal;
-// a nonzero window keeps only the recent window keys), kv_f16 (0 fp32
-// keys/values, 1 fp16) and causal (0 attends all n keys, 1 the causal
-// prefix; the CLIP vision encoder is non-causal). Detail:
+// m, n, heads, kv_heads, head_dim, q_base, row_base, window (0 = full
+// causal; a nonzero window keeps only the recent window keys), kv_f16
+// (0 fp32 keys/values, 1 fp16) and causal (0 attends all n keys, 1 the
+// causal prefix; the CLIP vision encoder is non-causal). row_base
+// offsets the q/out row index (usually 0), so one launch can serve the
+// rows of one sequence inside a shared batch. Detail:
 // m, n, heads, kv_heads, head_dim, q_base. Query row i sits at
 // position q_base + i and attends keys 0..pos (clamped to n - 1) with
 // scale 1/sqrt(head_dim); head h reads kv head h / (heads/kv_heads).
@@ -405,7 +407,7 @@ class Kernel {
     }
   }
   if (kernel.Id() == "attention") {
-    if (launch.buffers.size() != 4 || launch.scalars.size() != 9) {
+    if (launch.buffers.size() != 4 || launch.scalars.size() != 10) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t heads = launch.scalars[2];
@@ -642,14 +644,14 @@ class Kernel {
   }
   if (kernel.Id() == "attention_q8" || kernel.Id() == "attention_q4" ||
       kernel.Id() == "attention_fp8") {
-    if (launch.buffers.size() != 6 || launch.scalars.size() != 8) {
+    if (launch.buffers.size() != 6 || launch.scalars.size() != 9) {
       return StatusCode::InvalidArgument;
     }
     const std::uint64_t heads = launch.scalars[2];
     const std::uint64_t kv_heads = launch.scalars[3];
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
         kv_heads == 0 || launch.scalars[4] == 0 || heads % kv_heads != 0 ||
-        launch.scalars[7] > 2) {
+        launch.scalars[8] > 2) {
       return StatusCode::InvalidArgument;
     }
   }
@@ -835,6 +837,9 @@ class Backend {
   // out of range. The selected index and device name are logged.
   virtual void SetDeviceIndex(int index);
 
+  // The GPU index selected by SetDeviceIndex (default 0).
+  [[nodiscard]] int DeviceIndex() const;
+
   // One-time device initialization. Returns Ok when already done.
   virtual std::expected<void, StatusCode> Init() = 0;
 
@@ -912,6 +917,15 @@ class Backend {
       const Buffer& src, std::size_t src_offset, Buffer& dst,
       std::size_t dst_offset, std::size_t bytes) = 0;
 
+  // Copy `bytes` from `src` (owned by another backend) into `dst` on this
+  // backend. A direct peer transfer when the two devices can reach each
+  // other; the default host-stages through CopyD2HAt and CopyH2DAt, which
+  // is correct on any device pair. Used by CopyAcrossDevices and the
+  // tensor-parallel reduce.
+  virtual std::expected<void, StatusCode> CopyPeerFrom(Buffer& dst,
+                                                       const Buffer& src,
+                                                       std::size_t bytes);
+
   // Load a compiled kernel. Vulkan: `code` is a SPIR-V module and `name`
   // its entry point; an empty code resolves a built-in (today "fill" and
   // "gemm_q4k"). ROCm: built-ins only; a non-empty code is
@@ -954,6 +968,18 @@ class Backend {
 [[nodiscard]] std::expected<void, StatusCode> CopyAcrossDevices(
     const Buffer& src, std::size_t src_offset, Buffer& dst,
     std::size_t dst_offset, std::size_t bytes);
+
+// Elementwise sum `bytes` of fp32 across `buffers`, one per rank, leaving
+// every buffer with the sum. This is the tensor-parallel reduce: a
+// row-parallel projection writes one partial per rank, and the reduce
+// combines them before the residual add. `bytes` is a multiple of 4; every
+// buffer must hold at least `bytes`. Host-staged first (correct on any
+// device set); a single buffer or a shared owner is a no-op.
+//
+// Usage:
+//   AllReduceSum({&rank0_out, &rank1_out}, hidden * 4);
+[[nodiscard]] std::expected<void, StatusCode> AllReduceSum(
+    std::span<Buffer* const> buffers, std::size_t bytes);
 
 // Construct the configured backend. Returns nullptr only when the build
 // has no backend (a misconfiguration the engine reports as an error).

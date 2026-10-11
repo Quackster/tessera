@@ -2122,7 +2122,7 @@ TEST(BackendTest, AttentionDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 1};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 0, 1};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -3569,7 +3569,7 @@ TEST(BackendTest, AttentionBatchedMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*o_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 1};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 0, 1};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
@@ -3839,7 +3839,7 @@ TEST(BackendTest, AttentionWindowDeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, kWindow, 0, 1};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, kWindow, 0, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(kM * kHeads * kDim * 4);
@@ -5137,7 +5137,7 @@ TEST(BackendTest, AttentionF16DeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {(*q_buf).get(), (*k_buf).get(), (*v_buf).get(),
                     (*out_buf).get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 1, 1};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 1, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(kM * kHeads * kDim * 4);
@@ -5373,7 +5373,7 @@ TEST(BackendTest, AttentionQ8DeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), ks_buf.get(),
                     vs_buf.get(), out_buf->get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(q.size() * 4);
@@ -5566,7 +5566,7 @@ TEST(BackendTest, AttentionFp8DeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), ks_buf.get(),
                     vs_buf.get(), out_buf->get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 2};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 2};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(q.size() * 4);
@@ -5620,7 +5620,7 @@ TEST(BackendTest, AttentionMultiTileMatchesRef) {
   launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), out_buf->get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 1};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 0, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(q.size() * 4);
@@ -5797,7 +5797,7 @@ TEST(BackendTest, AttentionQ4DeviceMatchesRef) {
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), ks_buf.get(),
                     vs_buf.get(), out_buf->get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 1};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, kQBase, 0, 0, 1};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(q.size() * 4);
@@ -5940,7 +5940,7 @@ TEST(BackendTest, AttentionNonCausalDeviceMatchesRef) {
   launch.grid_x = kM * kHeads;
   launch.block_x = 256;
   launch.buffers = {q_buf.get(), k_buf.get(), v_buf.get(), out_buf->get()};
-  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, 0, 0, 0, 0};
+  launch.scalars = {kM, kN, kHeads, kKvHeads, kDim, 0, 0, 0, 0, 0};
   ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
   backend->Synchronize();
   std::vector<std::byte> readback(q.size() * 4);

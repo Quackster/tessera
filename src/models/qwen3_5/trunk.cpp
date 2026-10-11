@@ -133,7 +133,12 @@ std::expected<void, StatusCode> EnsureSplitReady(Backend& backend,
                                                  KvCacheType type) {
   const std::size_t heads = cfg.attention.heads;
   const std::size_t head_dim = cfg.attention.head_dim;
-  const std::size_t chunks = detail::ResolveAttentionSplit(h.attention_split);
+  std::size_t chunks = detail::ResolveAttentionSplit(h.attention_split);
+  if (h.cp != nullptr && h.cp->enabled &&
+      static_cast<std::size_t>(h.cp->world) > chunks) {
+    // Context parallelism gathers one partial per rank into these slots.
+    chunks = static_cast<std::size_t>(h.cp->world);
+  }
   if (h.split_acc == nullptr || h.split_heads != heads ||
       h.split_dim != head_dim || h.split_chunks != chunks) {
     const std::size_t part = heads * chunks;
@@ -194,6 +199,54 @@ std::expected<void, StatusCode> RunOutputHead(Backend& backend,
 
 }  // namespace
 
+// All-reduce the rank partials across the tensor-parallel ranks: every rank
+// writes its partial, then rank 0 pulls each peer's partial (a direct peer
+// copy when the devices can reach each other), accumulates it with the add
+// kernel, and broadcasts the sum back. Both reduce sites (attention output
+// and FFN down) and the MoE routed experts reuse the same hidden-sized
+// buffers. Every rank must call it with the same byte count.
+std::expected<void, StatusCode> TpReduce(Backend& backend, Qwen35State& h,
+                                         std::size_t bytes) {
+  core::TpContext& tp = *h.tp;
+  if (tp.reduce_scratch == nullptr) {
+    // No device staging buffer: host-staged reduce.
+    tp.barrier->Wait();
+    if (tp.rank == 0) {
+      auto reduced = AllReduceSum(tp.ffn_partial, bytes);
+      if (!reduced) {
+        return reduced;
+      }
+    }
+    tp.barrier->Wait();
+    return {};
+  }
+  tp.barrier->Wait();
+  if (tp.rank == 0) {
+    for (int r = 1; r < tp.world; ++r) {
+      auto down = CopyAcrossDevices(*tp.ffn_partial[static_cast<std::size_t>(r)],
+                                    0, *tp.reduce_scratch, 0, bytes);
+      if (!down) {
+        return down;
+      }
+      auto add = AddDevice(backend, *h.add_kernel, *tp.ffn_partial[0],
+                           *tp.reduce_scratch, *tp.ffn_partial[0], bytes / 4);
+      if (!add) {
+        return add;
+      }
+    }
+    for (int r = 1; r < tp.world; ++r) {
+      auto up = CopyAcrossDevices(*tp.ffn_partial[0], 0,
+                                  *tp.ffn_partial[static_cast<std::size_t>(r)],
+                                  0, bytes);
+      if (!up) {
+        return up;
+      }
+    }
+  }
+  tp.barrier->Wait();
+  return {};
+}
+
 std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
                                        const TransformerConfig& cfg,
                                        Qwen35State& h,
@@ -213,17 +266,35 @@ std::expected<void, StatusCode> RunFfn(Backend& backend, const Model& model,
   if (!mlp_norm || !fg || !fu || !fd) {
     return std::unexpected(StatusCode::MalformedFile);
   }
+  // Tensor-parallel FFN: gate and up are column-parallel (each rank holds
+  // ffn_dim/world output rows), down is row-parallel (each rank sums its
+  // ffn slice) and its partial output is all-reduced across the ranks.
+  const bool tp = h.tp != nullptr && h.tp->enabled;
+  const std::size_t world = tp ? static_cast<std::size_t>(h.tp->world) : 1;
+  const std::size_t ffn = cfg.ffn_dim / world;
+  Buffer& down_out =
+      tp ? *h.tp->ffn_partial[static_cast<std::size_t>(h.tp->rank)] : *h.proj;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*mlp_norm)->device,
                      *h.xn, 1, cfg.hidden_dim, cfg.norm_eps) ||
       !ProjectBatch(backend, h, (*fg)->manifest.dtype, *h.xn, *(*fg)->device,
-                    *h.fgate, 1, cfg.ffn_dim, cfg.hidden_dim) ||
+                    *h.fgate, 1, ffn, cfg.hidden_dim) ||
       !ProjectBatch(backend, h, (*fu)->manifest.dtype, *h.xn, *(*fu)->device,
-                    *h.fup, 1, cfg.ffn_dim, cfg.hidden_dim) ||
+                    *h.fup, 1, ffn, cfg.hidden_dim) ||
       !SiluMulDevice(backend, *h.silu_mul_kernel, *h.fgate, *h.fup, *h.fmlp,
-                     cfg.ffn_dim) ||
+                     ffn) ||
       !ProjectBatch(backend, h, (*fd)->manifest.dtype, *h.fmlp, *(*fd)->device,
-                    *h.proj, 1, cfg.hidden_dim, cfg.ffn_dim) ||
-      !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, cfg.hidden_dim)) {
+                    down_out, 1, cfg.hidden_dim, ffn)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (tp) {
+    // Reduce the FFN down partial across the ranks (device-side).
+    auto reduced = TpReduce(backend, h, cfg.hidden_dim * 4);
+    if (!reduced) {
+      return std::unexpected(reduced.error());
+    }
+  }
+  if (!AddDevice(backend, *h.add_kernel, *h.x, down_out, *h.x,
+                 cfg.hidden_dim)) {
     return std::unexpected(StatusCode::DeviceError);
   }
   if (deep != nullptr) {
@@ -237,9 +308,21 @@ std::expected<void, StatusCode> RunFullBlock(
     Qwen35State& h, std::size_t layer, std::uint64_t pos,
     Qwen35State::FullKv& kv) {
   const std::size_t hidden = cfg.hidden_dim;
-  const std::size_t heads = cfg.attention.heads;
-  const std::size_t kv_heads = cfg.attention.kv_heads;
+  // Tensor-parallel attention: each rank owns heads/world query heads and
+  // kv_heads/world key/value heads; the output projection is row-parallel
+  // and its partial is all-reduced across the ranks.
+  const bool tp = h.tp != nullptr && h.tp->enabled;
+  // Context-parallel attention: each rank owns the key chunk [k0, k1) and
+  // attends only its local keys; the per-rank partials are combined.
+  const bool cp = h.cp != nullptr && h.cp->enabled;
+  if (tp && cp) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  const std::size_t world = tp ? static_cast<std::size_t>(h.tp->world) : 1;
+  const std::size_t heads = cfg.attention.heads / world;
+  const std::size_t kv_heads = cfg.attention.kv_heads / world;
   const std::size_t head_dim = cfg.attention.head_dim;
+  const std::size_t q_dim = heads * head_dim;
   const std::size_t kv_dim = kv_heads * head_dim;
   const std::size_t rope_dim = cfg.attention.rope_dim;
   const std::size_t sec_t = static_cast<std::size_t>(cfg.rope_sections[0]);
@@ -256,10 +339,12 @@ std::expected<void, StatusCode> RunFullBlock(
   if (!norm || !wq || !wk || !wv || !wo || !q_norm || !k_norm) {
     return std::unexpected(StatusCode::MalformedFile);
   }
+  Buffer& out_partial =
+      tp ? *h.tp->ffn_partial[static_cast<std::size_t>(h.tp->rank)] : *h.proj;
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*norm)->device, *h.xn,
                      1, hidden, cfg.norm_eps) ||
       !ProjectBatch(backend, h, (*wq)->manifest.dtype, *h.xn, *(*wq)->device,
-                    *h.fused, 1, heads * head_dim * 2, hidden) ||
+                    *h.fused, 1, q_dim * 2, hidden) ||
       !QGateSplitDevice(backend, *h.qgate_split_kernel, *h.fused, *h.q, *h.gate,
                         heads, head_dim) ||
       !ProjectBatch(backend, h, (*wk)->manifest.dtype, *h.xn, *(*wk)->device,
@@ -277,12 +362,14 @@ std::expected<void, StatusCode> RunFullBlock(
                    cfg.attention.rope_theta)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  if (auto appended =
-          AppendKv(backend, h.cast_kernel.get(), h.quant_kernel.get(),
-                   h.kv_scratch.get(), h.kv_scratch.get(),
-                   h.scale_scratch.get(), kv, *h.kf, *h.vf, kv_dim);
-      !appended) {
-    return std::unexpected(appended.error());
+  if (!cp || (pos >= h.cp->k0 && pos < h.cp->k1)) {
+    if (auto appended =
+            AppendKv(backend, h.cast_kernel.get(), h.quant_kernel.get(),
+                     h.kv_scratch.get(), h.kv_scratch.get(),
+                     h.scale_scratch.get(), kv, *h.kf, *h.vf, kv_dim);
+        !appended) {
+      return std::unexpected(appended.error());
+    }
   }
   const bool quantized = kv.type == KvCacheType::Q8 ||
                          kv.type == KvCacheType::Q4 ||
@@ -291,9 +378,23 @@ std::expected<void, StatusCode> RunFullBlock(
   // range is one serial 128-tile dependency chain per workgroup, so a long
   // context is latency-bound. Batches (prefill, verify) keep the tiled
   // kernel, which is faster at their row counts.
-  const std::size_t split = detail::SplitFor(1, kv.rows, h.attention_split);
+  const std::size_t split =
+      (tp || cp) ? 0 : detail::SplitFor(1, kv.rows, h.attention_split);
   bool attention_ok = false;
-  if (split > 0) {
+  if (cp) {
+    auto ready = EnsureSplitReady(backend, cfg, h, kv.type);
+    if (!ready) {
+      return std::unexpected(ready.error());
+    }
+    auto cp_ok = detail::CpAttentionDevice(
+        backend, *h.attention_split_kernel, *h.attention_combine_kernel, *h.q,
+        kv, *h.attn, *h.split_acc, *h.split_max, *h.split_sum, heads, kv_heads,
+        head_dim, pos, *h.cp, quantized, kv.type == KvCacheType::F16);
+    attention_ok = cp_ok.has_value();
+    if (!cp_ok) {
+      return std::unexpected(cp_ok.error());
+    }
+  } else if (split > 0) {
     auto ready = EnsureSplitReady(backend, cfg, h, kv.type);
     if (!ready) {
       return std::unexpected(ready.error());
@@ -331,8 +432,17 @@ std::expected<void, StatusCode> RunFullBlock(
       !SigmoidGateDevice(backend, *h.sigmoid_gate_kernel, *h.attn, *h.gate,
                          *h.attn, heads * head_dim) ||
       !ProjectBatch(backend, h, (*wo)->manifest.dtype, *h.attn, *(*wo)->device,
-                    *h.proj, 1, hidden, heads * head_dim) ||
-      !AddDevice(backend, *h.add_kernel, *h.x, *h.proj, *h.x, hidden)) {
+                    out_partial, 1, hidden, q_dim)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (tp) {
+    // Reduce the attention output partial across the ranks (device-side).
+    auto reduced = TpReduce(backend, h, hidden * 4);
+    if (!reduced) {
+      return std::unexpected(reduced.error());
+    }
+  }
+  if (!AddDevice(backend, *h.add_kernel, *h.x, out_partial, *h.x, hidden)) {
     return std::unexpected(StatusCode::DeviceError);
   }
   return RunFfn(backend, model, cfg, h, layer);

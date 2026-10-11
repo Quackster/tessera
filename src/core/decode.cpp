@@ -8,6 +8,18 @@
 
 namespace tessera::core {
 
+void TpBarrier::Wait() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  const int phase = phase_;
+  if (++arrived_ == world) {
+    arrived_ = 0;
+    ++phase_;
+    cv_.notify_all();
+    return;
+  }
+  cv_.wait(lock, [this, phase] { return phase_ != phase; });
+}
+
 std::expected<std::uint32_t, StatusCode> DecodeStep(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden) {
