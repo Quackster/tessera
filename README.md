@@ -270,7 +270,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--draft <dir>` | both | none | DFlash2 draft checkpoint directory. |
 | `--context <n>` | both | 4096 | Maximum context length. |
 | `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
-| `--gpu-layers <n\|all>` | both | 0 | Layers kept in VRAM. The rest page from system RAM per token. 0 uploads everything. `help` prints the offloadable layer count and the fitting count for the current `--context` and KV cache without loading. |
+| `--gpu-layers <n\|all>` | both | 0 | Layers kept in VRAM. The rest page from system RAM per token. 0 uploads everything. `help` prints the offloadable layer count and the fitting count for the current `--context` and KV cache without loading. A paged load that cannot fit is refused before it starts. |
 | `--draft-block <n>` | both | 0 | Draft block tokens. 0 keeps the draft checkpoint's configured block. |
 | `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects the automatic default (512). |
 | `--split-target <n>` | both | 0 | fp8 MXFP4 split-K workgroup target (ROCm only). 0 uses the built-in default (320). |

@@ -1135,3 +1135,34 @@ TEST(EngineTest, RecommendGpuLayersRanksResidentSets) {
                                  "none")
                   .error() == tessera::StatusCode::FileNotFound);
 }
+
+// The fit check judges the requested value: it fits at ample memory, it
+// refuses below resident plus cache plus headroom, and larger N costs
+// more resident bytes.
+TEST(EngineTest, FitGpuLayersJudgesRequestedValue) {
+  using tessera::core::FitGpuLayers;
+  auto path = WriteTinyModelFixture("fit.gguf", 2);
+  auto full = FitGpuLayers(path.string(), 1024, tessera::KvCacheType::F32,
+                           1ull << 60, "none", 2);
+  ASSERT_TRUE(full.has_value()) << tessera::ToString(full.error());
+  EXPECT_EQ(full->total_layers, 3u);
+  EXPECT_TRUE(full->fits);
+  EXPECT_FALSE(full->budget_is_total);
+  EXPECT_GT(full->resident_bytes, 0u);
+  EXPECT_GT(full->kv_bytes, 0u);
+  auto one = FitGpuLayers(path.string(), 1024, tessera::KvCacheType::F32,
+                          1ull << 60, "none", 1);
+  ASSERT_TRUE(one.has_value()) << tessera::ToString(one.error());
+  EXPECT_TRUE(one->fits);
+  EXPECT_LT(one->resident_bytes, full->resident_bytes);
+  // One byte below resident plus cache plus the 1024 MiB reserve refuses.
+  const std::uint64_t tight =
+      one->resident_bytes + one->kv_bytes + (1024ull << 20) - 1;
+  auto refused = FitGpuLayers(path.string(), 1024, tessera::KvCacheType::F32,
+                              tight, "none", 1);
+  ASSERT_TRUE(refused.has_value()) << tessera::ToString(refused.error());
+  EXPECT_FALSE(refused->fits);
+  EXPECT_TRUE(FitGpuLayers("/nonexistent.gguf", 1024,
+                           tessera::KvCacheType::F32, 1ull << 60, "none", 1)
+                  .error() == tessera::StatusCode::FileNotFound);
+}

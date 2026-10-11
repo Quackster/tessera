@@ -341,10 +341,9 @@ int main(int argc, char** argv) {
         }
         std::unique_ptr<tessera::Engine> engine_ptr = std::move(*created);
         // Refuse a device that cannot hold the weights before the load
-        // starts, so a two-device serve does not half-load. Skipped under
-        // paging: only the resident set lands in VRAM, so the file size
-        // is not the resident size; the load itself still fails cleanly
-        // when the resident set does not fit.
+        // starts, so a two-device serve does not half-load. Under paging
+        // the file size is not the resident size, so the resident set
+        // plus the KV cache is judged instead.
         const std::uint64_t needed = PathSizeBytes(model_path);
         const tessera::DeviceMemoryInfo memory =
             engine_ptr->Owner().MemoryInfo();
@@ -357,6 +356,15 @@ int main(int argc, char** argv) {
                        std::to_string(memory.free_bytes / (1024 * 1024)).c_str(),
                        std::to_string(needed / (1024 * 1024)).c_str());
           return std::unexpected(tessera::StatusCode::OutOfMemory);
+        }
+        if (gpu_layers != 0) {
+          const std::string strategy =
+              draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
+          if (!tessera::cli::CheckGpuLayersFit(*engine_ptr, model_path,
+                                               context, kv_type, strategy,
+                                               gpu_layers, device)) {
+            return std::unexpected(tessera::StatusCode::OutOfMemory);
+          }
         }
         tessera::ModelOptions model_options{model_path, context};
         model_options.gpu_layers = gpu_layers;
@@ -692,6 +700,17 @@ int main(int argc, char** argv) {
   auto& log = engine.Diagnostics();
   attach_strategy(engine);
 
+  if (gpu_layers != 0) {
+    // Refuse a paged load whose resident set plus KV cache cannot fit,
+    // before the weights start moving.
+    const std::string strategy =
+        draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
+    if (!tessera::cli::CheckGpuLayersFit(engine, model_path, context,
+                                         kv_type, strategy, gpu_layers,
+                                         device_indices.front())) {
+      return kExitError;
+    }
+  }
   tessera::ModelOptions model_options{model_path, context};
   model_options.gpu_layers = gpu_layers;
   auto model = engine.LoadModel(model_options);

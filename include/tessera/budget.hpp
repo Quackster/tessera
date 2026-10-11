@@ -87,4 +87,34 @@ struct GpuLayersAdvice {
     const std::string& path, std::size_t context, KvCacheType kv_type,
     std::uint64_t free_bytes, const std::string& strategy);
 
+// Fit of one requested `--gpu-layers` value against device memory.
+struct GpuLayersFit {
+  // Trunk blocks plus the output head: the largest useful layer count.
+  std::size_t total_layers = 0;
+  // Resident weight bytes at the requested value.
+  std::uint64_t resident_bytes = 0;
+  // Cache bytes at context, with one MTP layer when strategy is "mtp".
+  std::uint64_t kv_bytes = 0;
+  // Device budget in bytes (free memory or the device total).
+  std::uint64_t budget_bytes = 0;
+  // True when budget_bytes is the device total, not current free memory.
+  bool budget_is_total = false;
+  // Resident plus cache plus the headroom reserve fits the budget.
+  bool fits = false;
+};
+
+// Check a requested `--gpu-layers` value for `path` at `context` with
+// `kv_type` against `budget_bytes` of device memory. `budget_bytes`
+// must be nonzero: pass free memory when the backend reports it, else
+// the device total (then budget_is_total is set). `strategy` is "mtp",
+// "dflash2" or "none". Same errors as MeasureWeights.
+//
+// Usage:
+//   auto fit = FitGpuLayers(path, 4096, kv, free, "none", 20);
+//   if (fit && !fit->fits) refuse the load before it starts;
+[[nodiscard]] std::expected<GpuLayersFit, StatusCode> FitGpuLayers(
+    const std::string& path, std::size_t context, KvCacheType kv_type,
+    std::uint64_t budget_bytes, const std::string& strategy,
+    std::size_t gpu_layers);
+
 }  // namespace tessera::core

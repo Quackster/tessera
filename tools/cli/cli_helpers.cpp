@@ -251,4 +251,44 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
   return 0;
 }
 
+bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
+                       std::size_t context, KvCacheType kv_type,
+                       std::string_view strategy, std::size_t gpu_layers,
+                       int device) {
+  auto& log = engine.Diagnostics();
+  const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
+  // Vulkan reports the device total but no free figure; judge against
+  // the total then (a load that fails it can never fit).
+  const bool budget_is_total = memory.free_bytes == 0;
+  const std::uint64_t budget =
+      budget_is_total ? memory.total_bytes : memory.free_bytes;
+  if (budget == 0) {
+    return true;
+  }
+  auto fit = core::FitGpuLayers(model_path, context, kv_type, budget,
+                                std::string(strategy), gpu_layers);
+  if (!fit) {
+    log.Warn("cli", std::string("cannot size --gpu-layers for '") +
+                        model_path + "' (" +
+                        std::string(ToString(fit.error())) +
+                        "); check the path and file format");
+    return false;
+  }
+  fit->budget_is_total = budget_is_total;
+  if (fit->fits) {
+    return true;
+  }
+  const std::string budget_label =
+      std::to_string(ToMiB(fit->budget_bytes)) +
+      (fit->budget_is_total ? " MiB device total" : " MiB free");
+  log.Warn("cli",
+           "gpu " + std::to_string(device) + " cannot hold --gpu-layers " +
+               std::to_string(gpu_layers) + ": resident about " +
+               std::to_string(ToMiB(fit->resident_bytes)) + " MiB plus " +
+               std::to_string(ToMiB(fit->kv_bytes)) + " MiB KV cache exceeds " +
+               budget_label + "; lower --gpu-layers (try --gpu-layers help), "
+                              "lower --context, or quantize the KV cache");
+  return false;
+}
+
 }  // namespace tessera::cli

@@ -43,5 +43,15 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
                        std::size_t context, KvCacheType kv_type,
                        std::string_view strategy);
 
+// Refuse a paged load whose resident set plus KV cache cannot fit the
+// engine's device before the load starts, logging what is needed and
+// what fits. True when the load may proceed (or when the backend
+// reports no memory size, so nothing can be judged). `device` names
+// the GPU in the refusal message.
+bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
+                       std::size_t context, KvCacheType kv_type,
+                       std::string_view strategy, std::size_t gpu_layers,
+                       int device);
+
 }  // namespace cli
 }  // namespace tessera

@@ -225,6 +225,42 @@ std::uint64_t ResidentWeightBytes(const WeightBudget& budget,
   return total;
 }
 
+// Cache bytes at context: one geometrically grown full-attention layer
+// each, the context-independent linear state each, plus one MTP layer
+// for the "mtp" strategy. Shared with RecommendGpuLayers so the help
+// text and the fit check judge the same cost.
+std::uint64_t CacheBytes(const TransformerConfig& config,
+                         std::size_t trunk_layers, std::size_t context,
+                         KvCacheType kv_type, const std::string& strategy) {
+  std::size_t full_layers = 0;
+  for (std::size_t l = 0; l < trunk_layers; ++l) {
+    if (config.IsFullAttentionLayer(l)) {
+      ++full_layers;
+    }
+  }
+  const std::size_t linear_layers =
+      config.hybrid ? trunk_layers - full_layers : 0;
+  std::uint64_t kv_bytes = static_cast<std::uint64_t>(full_layers) *
+                           FullKvLayerBytes(config, kv_type, context);
+  kv_bytes += static_cast<std::uint64_t>(linear_layers) *
+              LinearStateLayerBytes(config);
+  if (strategy == "mtp") {
+    kv_bytes += FullKvLayerBytes(config, kv_type, context);
+  }
+  return kv_bytes;
+}
+
+// Overflow-safe fit: resident plus cache plus the headroom reserve stays
+// within the budget.
+bool FitsBudget(std::uint64_t resident, std::uint64_t kv_bytes,
+                std::uint64_t budget) {
+  if (resident > budget) {
+    return false;
+  }
+  const std::uint64_t rest = budget - resident;
+  return kv_bytes <= rest && kRecommendHeadroomBytes <= rest - kv_bytes;
+}
+
 std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
     const std::string& path, std::size_t context, KvCacheType kv_type,
     std::uint64_t free_bytes, const std::string& strategy) {
@@ -246,14 +282,8 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
   const std::size_t linear_layers = config->hybrid
                                         ? budget->trunk_layers - full_layers
                                         : 0;
-  std::uint64_t kv_bytes =
-      static_cast<std::uint64_t>(full_layers) *
-      FullKvLayerBytes(*config, kv_type, context);
-  kv_bytes += static_cast<std::uint64_t>(linear_layers) *
-              LinearStateLayerBytes(*config);
-  if (strategy == "mtp") {
-    kv_bytes += FullKvLayerBytes(*config, kv_type, context);
-  }
+  const std::uint64_t kv_bytes =
+      CacheBytes(*config, budget->trunk_layers, context, kv_type, strategy);
   GpuLayersAdvice advice;
   advice.trunk_layers = budget->trunk_layers;
   advice.total_layers = budget->trunk_layers + 1;
@@ -265,14 +295,7 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
   if (free_bytes == 0) {
     return advice;
   }
-  const auto fits = [&](std::uint64_t resident) {
-    if (resident > free_bytes) {
-      return false;
-    }
-    const std::uint64_t rest = free_bytes - resident;
-    return kv_bytes <= rest && kRecommendHeadroomBytes <= rest - kv_bytes;
-  };
-  if (fits(advice.full_bytes)) {
+  if (FitsBudget(advice.full_bytes, kv_bytes, free_bytes)) {
     advice.has_best = true;
     advice.best = 0;
     advice.best_bytes = advice.full_bytes;
@@ -280,7 +303,7 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
   }
   for (std::size_t layers = budget->trunk_layers; layers > 0; --layers) {
     const std::uint64_t resident = ResidentWeightBytes(*budget, layers);
-    if (fits(resident)) {
+    if (FitsBudget(resident, kv_bytes, free_bytes)) {
       advice.has_best = true;
       advice.best = layers;
       advice.best_bytes = resident;
@@ -288,6 +311,29 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
     }
   }
   return advice;
+}
+
+std::expected<GpuLayersFit, StatusCode> FitGpuLayers(
+    const std::string& path, std::size_t context, KvCacheType kv_type,
+    std::uint64_t budget_bytes, const std::string& strategy,
+    std::size_t gpu_layers) {
+  auto config = Model::ProbeConfig(path);
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const bool include_mtp_head = strategy != "dflash2";
+  auto budget = MeasureWeights(path, include_mtp_head);
+  if (!budget) {
+    return std::unexpected(budget.error());
+  }
+  GpuLayersFit fit;
+  fit.total_layers = budget->trunk_layers + 1;
+  fit.resident_bytes = ResidentWeightBytes(*budget, gpu_layers);
+  fit.kv_bytes =
+      CacheBytes(*config, budget->trunk_layers, context, kv_type, strategy);
+  fit.budget_bytes = budget_bytes;
+  fit.fits = FitsBudget(fit.resident_bytes, fit.kv_bytes, budget_bytes);
+  return fit;
 }
 
 }  // namespace tessera::core
