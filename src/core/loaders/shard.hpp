@@ -19,6 +19,19 @@ namespace tessera::core {
 [[nodiscard]] bool SplitBlockName(std::string_view name, std::size_t* layer,
                                   std::string_view* kind);
 
+// True when a tensor kind (the name after "blk.<layer>.") is a packed
+// routed-expert weight of the llama/Qwen MoE convention
+// ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"). Dense shared experts
+// ("ffn_*_shexp") are not routed experts: every token uses them whole.
+//
+// Usage:
+//   if (IsRoutedExpertKind(kind)) page slices, not the whole tensor;
+[[nodiscard]] inline bool IsRoutedExpertKind(std::string_view kind) {
+  constexpr std::string_view kSuffix = "_exps.weight";
+  return kind.size() >= kSuffix.size() &&
+         kind.substr(kind.size() - kSuffix.size()) == kSuffix;
+}
+
 // True when a sharded load keeps the internal tensor `name`. `trunk_layers`
 // is the model's trunk block count; the MTP block sits at that index and
 // belongs to the last stage. A disabled shard keeps every tensor, so the

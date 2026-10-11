@@ -1039,3 +1039,17 @@ TEST(EngineTest, GpuLayerResidentSplitsLastLayers) {
   // Non-block globals stay resident at any setting.
   EXPECT_TRUE(GpuLayerResident("position_embd.weight", 1, kTrunk));
 }
+
+TEST(EngineTest, RoutedExpertKindMatchesSuffix) {
+  using tessera::core::IsRoutedExpertKind;
+  EXPECT_TRUE(IsRoutedExpertKind("ffn_gate_exps.weight"));
+  EXPECT_TRUE(IsRoutedExpertKind("ffn_up_exps.weight"));
+  EXPECT_TRUE(IsRoutedExpertKind("ffn_down_exps.weight"));
+  EXPECT_TRUE(IsRoutedExpertKind("blk.0.ffn_gate_exps.weight"));
+  // Dense weights never match: shared experts, router, attention, head.
+  EXPECT_FALSE(IsRoutedExpertKind("ffn_gate_shexp.weight"));
+  EXPECT_FALSE(IsRoutedExpertKind("ffn_gate_inp.weight"));
+  EXPECT_FALSE(IsRoutedExpertKind("attn_q.weight"));
+  EXPECT_FALSE(IsRoutedExpertKind("output.weight"));
+  EXPECT_FALSE(IsRoutedExpertKind(""));
+}

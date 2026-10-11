@@ -1001,13 +1001,19 @@ const DeviceTensor* Model::FindDeviceTensor(std::string_view name) const {
   }
   // A paged name resolves only while its layer is staged; otherwise the
   // caller missed its EnsureLayerResident and gets a miss, which the
-  // NeedWeight helpers report as MalformedFile.
+  // NeedWeight helpers report as MalformedFile. Routed experts resolve
+  // through the expert staging instead (see EnsureLayerExperts): the
+  // whole-layer ensure skips them.
   const auto paged = paged_index_.find(name);
   if (paged == paged_index_.end()) {
     return nullptr;
   }
   const PagedTensor& entry = paged_[paged->second];
-  if (!ensured_layer_.has_value() || *ensured_layer_ != entry.layer) {
+  if (core::IsRoutedExpertKind(entry.kind)) {
+    if (!experts_layer_.has_value() || *experts_layer_ != entry.layer) {
+      return nullptr;
+    }
+  } else if (!ensured_layer_.has_value() || *ensured_layer_ != entry.layer) {
     return nullptr;
   }
   const auto staged = stage_index_.find(entry.kind);
@@ -1034,10 +1040,15 @@ std::expected<void, StatusCode> Model::EnsureLayerResident(
   }
   // One batched upload for the layer's paged tensors, then point the
   // kind views at this layer's manifests. Resident layers stage nothing
-  // but still mark the layer ensured.
+  // but still mark the layer ensured. Routed experts are skipped: the
+  // MoE path stages only the selected experts (see EnsureLayerExperts),
+  // which moves top_k slices instead of every expert.
   std::vector<Backend::HostCopy> copies;
   for (const PagedTensor& entry : paged_) {
     if (entry.layer != layer) {
+      continue;
+    }
+    if (core::IsRoutedExpertKind(entry.kind)) {
       continue;
     }
     const auto staged = stage_index_.find(entry.kind);
@@ -1056,6 +1067,9 @@ std::expected<void, StatusCode> Model::EnsureLayerResident(
     if (entry.layer != layer) {
       continue;
     }
+    if (core::IsRoutedExpertKind(entry.kind)) {
+      continue;
+    }
     const auto staged = stage_index_.find(entry.kind);
     if (staged == stage_index_.end()) {
       return std::unexpected(StatusCode::MalformedFile);
@@ -1063,6 +1077,134 @@ std::expected<void, StatusCode> Model::EnsureLayerResident(
     stage_views_[staged->second].manifest = entry.manifest;
   }
   ensured_layer_ = layer;
+  return {};
+}
+
+bool Model::ExpertsPaged(std::size_t layer) const {
+  for (const PagedTensor& entry : paged_) {
+    if (entry.layer == layer && core::IsRoutedExpertKind(entry.kind)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// One expert's byte size and count from a rank-3 packed expert manifest.
+// MalformedFile when the shape cannot hold experts.
+std::expected<std::pair<std::size_t, std::size_t>, StatusCode> ExpertSpan(
+    const TensorEntry& manifest) {
+  if (manifest.shape.rank != 3 || manifest.shape.dims[2] == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const std::size_t count = manifest.shape.dims[2];
+  auto per = TensorBytes(manifest.dtype, manifest.shape.Numel() / count);
+  if (!per || *per == 0) {
+    return std::unexpected(per ? StatusCode::MalformedFile : per.error());
+  }
+  return std::make_pair(*per, count);
+}
+
+std::expected<void, StatusCode> Model::EnsureLayerExperts(
+    std::size_t layer) const {
+  if (paged_.empty()) {
+    return {};
+  }
+  if (experts_layer_.has_value() && *experts_layer_ == layer) {
+    return {};
+  }
+  // Whole upload for the batched case: every expert tensor lands fully.
+  std::vector<Backend::HostCopy> copies;
+  for (const PagedTensor& entry : paged_) {
+    if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
+      continue;
+    }
+    const auto staged = stage_index_.find(entry.kind);
+    if (staged == stage_index_.end()) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    copies.push_back(Backend::HostCopy{stage_views_[staged->second].device.get(),
+                                       entry.host});
+  }
+  if (!copies.empty()) {
+    if (auto uploaded = backend_.CopyH2DBatch(copies); !uploaded) {
+      return std::unexpected(uploaded.error());
+    }
+  }
+  for (const PagedTensor& entry : paged_) {
+    if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
+      continue;
+    }
+    const auto staged = stage_index_.find(entry.kind);
+    if (staged == stage_index_.end()) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    stage_views_[staged->second].manifest = entry.manifest;
+  }
+  experts_layer_ = layer;
+  return {};
+}
+
+std::expected<void, StatusCode> Model::EnsureLayerExperts(
+    std::size_t layer, std::span<const std::uint32_t> experts) const {
+  if (paged_.empty()) {
+    return {};
+  }
+  // Selective upload for the single-row case: only the routed experts
+  // land, at their expert offsets, so kernels keep the unchanged ids. No
+  // short-circuit here: every call carries a new selection, and
+  // re-uploading the same bytes is idempotent anyway.
+  struct SliceCopy {
+    Buffer* dst = nullptr;
+    std::size_t offset = 0;
+    std::span<const std::byte> src;
+  };
+  std::vector<SliceCopy> slices;
+  for (const PagedTensor& entry : paged_) {
+    if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
+      continue;
+    }
+    auto span = ExpertSpan(entry.manifest);
+    if (!span) {
+      return std::unexpected(span.error());
+    }
+    const auto [per, count] = *span;
+    const auto staged = stage_index_.find(entry.kind);
+    if (staged == stage_index_.end()) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    Buffer* slot = stage_views_[staged->second].device.get();
+    if (slot == nullptr) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    for (const std::uint32_t expert : experts) {
+      const std::size_t id = expert;
+      if (id >= count || per > entry.host.size() ||
+          id > (entry.host.size() - per) / per) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      const std::size_t begin = id * per;
+      slices.push_back(SliceCopy{slot, begin,
+                                 entry.host.subspan(begin, per)});
+    }
+  }
+  for (const SliceCopy& slice : slices) {
+    if (auto copied =
+            backend_.CopyH2DAt(*slice.dst, slice.offset, slice.src);
+        !copied) {
+      return std::unexpected(copied.error());
+    }
+  }
+  for (const PagedTensor& entry : paged_) {
+    if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
+      continue;
+    }
+    const auto staged = stage_index_.find(entry.kind);
+    if (staged == stage_index_.end()) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    stage_views_[staged->second].manifest = entry.manifest;
+  }
+  experts_layer_ = layer;
   return {};
 }
 

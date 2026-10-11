@@ -154,6 +154,32 @@ class Model {
   //   if (auto ensured = model.EnsureLayerResident(l); !ensured) return ensured.error();
   [[nodiscard]] std::expected<void, StatusCode> EnsureLayerResident(
       std::size_t layer) const;
+  // True when trunk layer `layer` keeps routed-expert weights RAM-backed
+  // (see IsRoutedExpertKind): the MoE path stages only the selected
+  // experts instead of the whole expert tensors. False for resident
+  // layers and for models without paging.
+  //
+  // Usage:
+  //   if (model.ExpertsPaged(layer)) stage the selected experts;
+  [[nodiscard]] bool ExpertsPaged(std::size_t layer) const;
+  // Upload every paged expert tensor of trunk layer `layer` into the
+  // staging buffers (the batched-prefill case: rows times top_k reaches
+  // the expert count, so whole upload beats per-expert slices). A no-op
+  // without paging. Like EnsureLayerResident, confined to one thread.
+  //
+  // Usage:
+  //   if (auto staged = model.EnsureLayerExperts(l); !staged) return staged.error();
+  [[nodiscard]] std::expected<void, StatusCode> EnsureLayerExperts(
+      std::size_t layer) const;
+  // Upload only the experts in `experts` of trunk layer `layer` into the
+  // staging buffers at their expert offsets, so the fused and unfused
+  // MoE kernels read them with the unchanged ids. Ids outside the
+  // tensor's expert count are MalformedFile. A no-op without paging.
+  //
+  // Usage:
+  //   if (auto staged = model.EnsureLayerExperts(l, ids); !staged) return staged.error();
+  [[nodiscard]] std::expected<void, StatusCode> EnsureLayerExperts(
+      std::size_t layer, std::span<const std::uint32_t> experts) const;
   [[nodiscard]] const std::string& Path() const;
   [[nodiscard]] std::size_t MaxContextLength() const;
   // New tokens to generate for `requested` after a prompt of
@@ -266,6 +292,9 @@ class Model {
   // Trunk layer whose paged tensors are staged; nullopt before the first
   // EnsureLayerResident. Mutable for the same reason as stage_views_.
   mutable std::optional<std::size_t> ensured_layer_;
+  // Trunk layer whose paged experts are staged by EnsureLayerExperts;
+  // nullopt when no expert staging covers the layer. Mutable likewise.
+  mutable std::optional<std::size_t> experts_layer_;
   // Lifetime holders for the RAM backing the paged host spans point into:
   // the mapped weight file and any retained owned copies (tensor-parallel
   // slices, converted MXFP4 blobs). The shared_ptr<const void> type erases

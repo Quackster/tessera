@@ -182,12 +182,15 @@ std::expected<void, StatusCode> ScaleAdd(Backend& backend, Qwen35State& h,
 // One row of the MoE feed-forward: norm `x_row` into h.xn, route, run the
 // experts and the shared expert, and write the feed-forward output to
 // `out_row`, adding the residual when `accumulate_residual` is set.
+// `experts_staged` skips the selective expert staging below (the batched
+// caller stages the whole expert set up front when that wins).
 std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
                                           const Model& model,
                                           const TransformerConfig& cfg,
                                           Qwen35State& h, std::size_t layer,
                                           const Buffer& x_row, Buffer& out_row,
-                                          bool accumulate_residual) {
+                                          bool accumulate_residual,
+                                          bool experts_staged) {
   const std::size_t hidden = cfg.hidden_dim;
   const std::size_t ne = cfg.num_experts;
   const std::size_t top_k = cfg.experts_per_tok;
@@ -204,14 +207,10 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
   auto router = NeedWeight(model, base + "ffn_gate_inp.weight", DType::F32);
   auto shexp_gate =
       NeedWeight(model, base + "ffn_gate_inp_shexp.weight", DType::F32);
-  auto gate_exps = NeedWeightAny(model, base + "ffn_gate_exps.weight");
-  auto up_exps = NeedWeightAny(model, base + "ffn_up_exps.weight");
-  auto down_exps = NeedWeightAny(model, base + "ffn_down_exps.weight");
   auto gate_sh = NeedWeightAny(model, base + "ffn_gate_shexp.weight");
   auto up_sh = NeedWeightAny(model, base + "ffn_up_shexp.weight");
   auto down_sh = NeedWeightAny(model, base + "ffn_down_shexp.weight");
-  if (!mlp_norm || !router || !shexp_gate || !gate_exps || !up_exps ||
-      !down_exps || !gate_sh || !up_sh || !down_sh) {
+  if (!mlp_norm || !router || !shexp_gate || !gate_sh || !up_sh || !down_sh) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   if (!RmsNormDevice(backend, *h.rmsnorm_kernel, x_row, *(*mlp_norm)->device,
@@ -271,15 +270,41 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
       return std::unexpected(StatusCode::DeviceError);
     }
   }
-  auto gate_bytes = ExpertSliceBytes(**gate_exps, ep ? ne / world : ne);
-  auto up_bytes = ExpertSliceBytes(**up_exps, ep ? ne / world : ne);
-  auto down_bytes = ExpertSliceBytes(**down_exps, ep ? ne / world : ne);
+  // Routed experts resolve from the device when resident (or batched whole
+  // staged); paged experts stage only the routed selection here, at their
+  // expert offsets, so both MoE kernels keep the unchanged ids.
+  std::vector<std::uint32_t> staged_ids;
+  if (!experts_staged && model.ExpertsPaged(layer)) {
+    staged_ids.assign(top_k, 0);
+    if (!backend.CopyD2H(*h.moe_ids,
+                         reinterpret_cast<std::byte*>(staged_ids.data()),
+                         top_k * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (auto staged = model.EnsureLayerExperts(layer, staged_ids);
+        !staged) {
+      return std::unexpected(staged.error());
+    }
+  }
+  const DeviceTensor* gate_exps =
+      model.FindDeviceTensor(base + "ffn_gate_exps.weight");
+  const DeviceTensor* up_exps =
+      model.FindDeviceTensor(base + "ffn_up_exps.weight");
+  const DeviceTensor* down_exps =
+      model.FindDeviceTensor(base + "ffn_down_exps.weight");
+  if (gate_exps == nullptr || up_exps == nullptr || down_exps == nullptr) {
+    // Residency is all-or-nothing per layer; a partial set is corrupt.
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  auto gate_bytes = ExpertSliceBytes(*gate_exps, ep ? ne / world : ne);
+  auto up_bytes = ExpertSliceBytes(*up_exps, ep ? ne / world : ne);
+  auto down_bytes = ExpertSliceBytes(*down_exps, ep ? ne / world : ne);
   if (!gate_bytes || !up_bytes || !down_bytes) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  const DType gate_dt = (*gate_exps)->manifest.dtype;
-  const DType up_dt = (*up_exps)->manifest.dtype;
-  const DType down_dt = (*down_exps)->manifest.dtype;
+  const DType gate_dt = gate_exps->manifest.dtype;
+  const DType up_dt = up_exps->manifest.dtype;
+  const DType down_dt = down_exps->manifest.dtype;
   // The fused path covers the packed expert formats this model family uses
   // (Q4_K gate/up, Q4_K or Q6_K down) on a block-aligned intermediate width.
   const bool fused =
@@ -303,8 +328,8 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
     KernelLaunch gate_up;
     gate_up.grid_x = static_cast<std::uint32_t>((inter * top_k + 7) / 8);
     gate_up.block_x = kMoeThreads;
-    gate_up.buffers = {h.xn.get(), (*gate_exps)->device.get(),
-                       (*up_exps)->device.get(), h.moe_ids.get(),
+    gate_up.buffers = {h.xn.get(), gate_exps->device.get(),
+                       up_exps->device.get(), h.moe_ids.get(),
                        h.moe_phi.get()};
     gate_up.scalars = {hidden, inter, top_k, *gate_bytes, *up_bytes};
     if (!backend.LaunchKernel(*h.moe_gate_up_kernel, gate_up)) {
@@ -320,7 +345,7 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
     KernelLaunch down;
     down.grid_x = static_cast<std::uint32_t>((hidden + 7) / 8);
     down.block_x = kMoeThreads;
-    down.buffers = {h.moe_phi.get(), (*down_exps)->device.get(),
+    down.buffers = {h.moe_phi.get(), down_exps->device.get(),
                     h.moe_ids.get(), h.moe_wts.get(), &routed_out};
     down.scalars = {hidden, inter, top_k, *down_bytes,
                     ep ? 0ull : (accumulate_residual ? 1ull : 0ull)};
@@ -339,10 +364,16 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
       }
     }
   } else {
-    std::vector<std::uint32_t> ids(top_k, 0);
-    if (!backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
-                         top_k * 4)) {
-      return std::unexpected(StatusCode::DeviceError);
+    // The selective path above already downloaded the ids; otherwise fetch
+    // them now for the per-expert gather.
+    std::vector<std::uint32_t> ids = std::move(staged_ids);
+    if (ids.empty()) {
+      ids.assign(top_k, 0);
+      if (!backend.CopyD2H(*h.moe_ids,
+                           reinterpret_cast<std::byte*>(ids.data()),
+                           top_k * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
     }
     if (auto r = ZeroBuffer(backend, h, *h.moe_acc, hidden); !r) {
       return r;
@@ -355,9 +386,9 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
       if (expert >= ne) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      if (!backend.CopyD2D(*(*gate_exps)->device, expert * *gate_bytes,
+      if (!backend.CopyD2D(*gate_exps->device, expert * *gate_bytes,
                            *h.moe_gate_w, 0, *gate_bytes) ||
-          !backend.CopyD2D(*(*up_exps)->device, expert * *up_bytes,
+          !backend.CopyD2D(*up_exps->device, expert * *up_bytes,
                            *h.moe_up_w, 0, *up_bytes) ||
           !ProjectBatch(backend, h, gate_dt, *h.xn, *h.moe_gate_w,
                         *h.moe_gate_out, 1, inter, hidden) ||
@@ -365,7 +396,7 @@ std::expected<void, StatusCode> MoeFfnRow(Backend& backend,
                         inter, hidden) ||
           !SiluMulDevice(backend, *h.silu_mul_kernel, *h.moe_gate_out,
                          *h.moe_up_out, *h.moe_inter, inter) ||
-          !backend.CopyD2D(*(*down_exps)->device, expert * *down_bytes,
+          !backend.CopyD2D(*down_exps->device, expert * *down_bytes,
                            *h.moe_down_w, 0, *down_bytes) ||
           !ProjectBatch(backend, h, down_dt, *h.moe_inter, *h.moe_down_w,
                         *h.moe_down_out, 1, hidden, inter)) {
@@ -461,7 +492,8 @@ std::expected<void, StatusCode> RunMoeFfn(Backend& backend,
   if (auto ready = EnsureMoeReady(backend, cfg, h); !ready) {
     return ready;
   }
-  auto row = MoeFfnRow(backend, model, cfg, h, layer, *h.x, *h.x, true);
+  auto row = MoeFfnRow(backend, model, cfg, h, layer, *h.x, *h.x, true,
+                       false);
   if (!row) {
     return row;
   }
@@ -479,12 +511,23 @@ std::expected<void, StatusCode> RunMoeFfnBatch(
   }
   Qwen35BatchScratch& b = *h.batch;
   const std::size_t hidden = cfg.hidden_dim;
+  // Whole expert upload wins once the rows times top_k reaches the expert
+  // count; otherwise each row stages only its own selection. Division
+  // form keeps tiny rows exact with no overflow.
+  const bool stage_whole =
+      rows >= (cfg.num_experts + cfg.experts_per_tok - 1) /
+                  cfg.experts_per_tok;
+  if (stage_whole) {
+    if (auto staged = model.EnsureLayerExperts(layer); !staged) {
+      return std::unexpected(staged.error());
+    }
+  }
   for (std::size_t t = 0; t < rows; ++t) {
     if (!backend.CopyD2D(*b.x, t * hidden * 4, *h.moe_row_in, 0, hidden * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }
     if (auto row = MoeFfnRow(backend, model, cfg, h, layer, *h.moe_row_in,
-                             *h.moe_row_out, false);
+                             *h.moe_row_out, false, stage_whole);
         !row) {
       return row;
     }

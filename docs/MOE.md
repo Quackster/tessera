@@ -76,7 +76,8 @@ It works with the current fused expert kernels as is.
 Phase 2 pages only active experts.
 It moves about `top_k / num_experts` of the expert bytes.
 For Ornith that is 8 of 256.
-Phase 2 needs a staged slice kernel variant.
+It needs no new kernels: slices land at their expert offsets in the
+existing staging slots, so both MoE kernels keep the unchanged ids.
 Phase 1 comes first.
 
 ## Agreed scope
@@ -134,6 +135,11 @@ paged layers reach the device per token through
 `--gpu-layers N|all` on `run` and `serve`.
 `EngineTest.GpuLayerResidentSplitsLastLayers` and
 `EngineTest.PagedModelMatchesFullUpload` cover it.
+Phase 2 pages only the routed experts: the whole-layer ensure skips
+`ffn_*_exps` tensors, each decode token uploads its top-k slices at
+their expert offsets, and batched rows above rows times top-k reaches
+expert count stage the whole expert set instead. Both MoE kernels keep
+the unchanged ids, so paged output is bit-identical to full upload.
 Full suite passes on Vulkan and ROCm (221 tests, 0 failures each).
 
 ## What is done
@@ -163,7 +169,7 @@ Full suite passes on Vulkan and ROCm (221 tests, 0 failures each).
 - [x] Measure decode rate at full VRAM versus paged N on Ornith Q4_K_M.
 - [x] Update `README.md` flags table. There is no `docs/PROGRESS.md`
   in the tree, so nothing else tracks this.
-- [ ] Phase 2: active expert paging for `ffn_*_exps` tensors.
+- [x] Phase 2: active expert paging for `ffn_*_exps` tensors.
 
 ## Measurement
 
@@ -181,6 +187,13 @@ Qwen3.8 27B MXFP4, `--gpu-layers 8` (110 tensors resident, 8.2 GB on
 device; 756 tensors paged, 10.9 GB in RAM): one completion token
 decodes to `Hello` on Vulkan and on ROCm, identical to the full
 upload.
+
+Phase 2 (Ornith Q4_K_M GGUF, `--gpu-layers 20`, Vulkan on the R9700):
+8 tokens in 3.2 s (about 2.5 tok/s) with the correct `**Paris**`
+output, against about 0.4 tok/s for whole-layer paging. Each paged
+layer moves 8 expert slices instead of 256 experts. The slice uploads
+still go one `CopyH2DAt` at a time; a batched offset-copy variant
+would cut the per-layer round trips further.
 
 ## Risks
 

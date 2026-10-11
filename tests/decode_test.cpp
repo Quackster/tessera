@@ -463,6 +463,78 @@ TEST(MoeDecodeTest, TinyMoeBatchedMatchesSequential) {
   }
 }
 
+// A paged MoE load stages only the routed experts per token and decodes
+// exactly like the full upload on the tiny fixture.
+TEST(MoeDecodeTest, PagedMatchesFullUpload) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteMoeHybridFixture("moe-paged.gguf").string();
+  auto full = engine->LoadModel(ModelOptions{path, 1024});
+  ASSERT_TRUE(full.has_value()) << tessera::ToString(full.error());
+  ModelOptions paged_options{path, 1024};
+  paged_options.gpu_layers = 1;
+  auto paged = engine->LoadModel(paged_options);
+  ASSERT_TRUE(paged.has_value()) << tessera::ToString(paged.error());
+  // One trunk layer, paged: attention stages whole, experts stage slices.
+  EXPECT_TRUE((*paged)->ExpertsPaged(0));
+  EXPECT_EQ((*paged)->FindDeviceTensor("blk.0.ffn_gate_exps.weight"), nullptr);
+  EXPECT_EQ((*paged)->FindDeviceTensor("blk.0.attn_q.weight"), nullptr);
+  tessera::core::DecodeCache full_cache;
+  auto full_first =
+      tessera::core::DecodeStep(engine->Owner(), **full, full_cache, 0);
+  ASSERT_TRUE(full_first.has_value())
+      << tessera::ToString(full_first.error());
+  auto full_second = tessera::core::DecodeStep(engine->Owner(), **full,
+                                               full_cache, *full_first);
+  ASSERT_TRUE(full_second.has_value())
+      << tessera::ToString(full_second.error());
+  tessera::core::DecodeCache paged_cache;
+  auto paged_first =
+      tessera::core::DecodeStep(engine->Owner(), **paged, paged_cache, 0);
+  ASSERT_TRUE(paged_first.has_value())
+      << tessera::ToString(paged_first.error());
+  EXPECT_EQ(*paged_first, *full_first);
+  auto paged_second = tessera::core::DecodeStep(engine->Owner(), **paged,
+                                                paged_cache, *paged_first);
+  ASSERT_TRUE(paged_second.has_value())
+      << tessera::ToString(paged_second.error());
+  EXPECT_EQ(*paged_second, *full_second);
+  // The selective staging ran: expert views resolve after generation.
+  EXPECT_NE((*paged)->FindDeviceTensor("blk.0.ffn_gate_exps.weight"), nullptr);
+}
+
+// The paged MoE batch path matches the full-upload sequential logits,
+// covering the whole-expert staging above the row breakeven.
+TEST(MoeDecodeTest, PagedBatchedMatchesFullSequential) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteMoeHybridFixture("moe-paged-batch.gguf").string();
+  auto full = engine->LoadModel(ModelOptions{path, 1024});
+  ASSERT_TRUE(full.has_value()) << tessera::ToString(full.error());
+  ModelOptions paged_options{path, 1024};
+  paged_options.gpu_layers = 1;
+  auto paged = engine->LoadModel(paged_options);
+  ASSERT_TRUE(paged.has_value()) << tessera::ToString(paged.error());
+  const std::vector<std::uint32_t> tokens = {0, 1, 0, 26};
+  tessera::core::DecodeCache batched_cache;
+  auto batched = tessera::core::DecodeLogitsBatch(engine->Owner(), **paged,
+                                                  batched_cache, tokens);
+  ASSERT_TRUE(batched.has_value()) << tessera::ToString(batched.error());
+  ASSERT_EQ(batched->size(), tokens.size());
+  tessera::core::DecodeCache seq_cache;
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    auto one = tessera::core::DecodeLogits(engine->Owner(), **full, seq_cache,
+                                           tokens[i]);
+    ASSERT_TRUE(one.has_value()) << tessera::ToString(one.error());
+    ASSERT_EQ((*batched)[i].size(), one->size());
+    float max_abs = 0.0f;
+    for (std::size_t j = 0; j < one->size(); ++j) {
+      max_abs = std::max(max_abs, std::abs((*batched)[i][j] - (*one)[j]));
+    }
+    EXPECT_LE(max_abs, 1e-3f) << "row " << i << " max_abs " << max_abs;
+  }
+}
+
 namespace {
 
 // Greedy tokens from token 0 for `n` steps (fixed-seed fixtures).
