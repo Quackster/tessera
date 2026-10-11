@@ -51,6 +51,7 @@ add_library(tessera STATIC
     src/core/loaders/hf_tokenizer.cpp
     src/core/loaders/mxfp4.cpp
     src/core/loaders/shard.cpp
+    src/core/loaders/budget.cpp
     src/core/loaders/tensor_slice.cpp
     src/core/json.cpp
     src/core/sampling.cpp

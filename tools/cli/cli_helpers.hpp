@@ -35,5 +35,13 @@ void PrintUsage();
     std::string_view strategy, const std::string& path,
     const CalibrationConfig& explicit_config);
 
+// Print the `--gpu-layers help` sizing advice for a model path without
+// loading it: the offloadable layer count, the KV cache cost at
+// `context`, and the largest fitting layer count on this engine's
+// device. Returns the process exit code (0 on advice, 1 on error).
+int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
+                       std::size_t context, KvCacheType kv_type,
+                       std::string_view strategy);
+
 }  // namespace cli
 }  // namespace tessera

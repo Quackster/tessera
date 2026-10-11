@@ -124,6 +124,7 @@ int main(int argc, char** argv) {
   std::size_t attention_split = 0;
   std::size_t draft_context = 0;
   std::size_t gpu_layers = 0;
+  bool gpu_layers_help = false;
   int gpu = 0;
   std::vector<int> gpus;
   for (int i = 2; i < argc; ++i) {
@@ -177,11 +178,16 @@ int main(int argc, char** argv) {
     } else if (arg == "--gpu-layers" && i + 1 < argc) {
       // How many layers stay in VRAM; the rest page from system RAM per
       // token. 0 (the default) uploads everything; `all` also keeps
-      // everything resident. Larger than the layer count caps cleanly.
+      // everything resident; `help` sizes the model without loading it.
+      // Larger than the layer count caps cleanly.
       const std::string_view layers_value = argv[++i];
-      gpu_layers = layers_value == "all"
-                       ? 0
-                       : std::stoul(std::string(layers_value));
+      if (layers_value == "help") {
+        gpu_layers_help = true;
+      } else {
+        gpu_layers = layers_value == "all"
+                         ? 0
+                         : std::stoul(std::string(layers_value));
+      }
     } else if (arg == "--speculate") {
       speculate = true;
     } else if (arg == "--pipeline") {
@@ -287,6 +293,29 @@ int main(int argc, char** argv) {
                      "; continuing without speculative decoding");
     }
   };
+
+  if (gpu_layers_help) {
+    // Size the model without loading it: needs --model, one device for
+    // the free-memory query, and the calibration strategy label.
+    if (model_path.empty()) {
+      std::fprintf(stderr, "cli: --gpu-layers help needs --model\n");
+      PrintUsage();
+      return kExitUsage;
+    }
+    auto engine_result = make_engine(device_indices.front());
+    if (!engine_result) {
+      std::fprintf(stderr, "cli: engine create failed (%s)\n",
+                   tessera::ToString(engine_result.error()).data());
+      return kExitError;
+    }
+    tessera::Engine& engine = **engine_result;
+    const std::string strategy =
+        draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
+    return tessera::cli::LogGpuLayersAdvice(engine, model_path, context,
+                                            kv_type, strategy) == 0
+               ? kExitOk
+               : kExitError;
+  }
 
   if (command == "serve") {
     tessera::ServeOptions serve_options;

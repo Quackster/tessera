@@ -122,6 +122,26 @@ Examples:
   --max-completion-tokens 64
 ```
 
+`--gpu-layers help` sizes the model without loading it. It prints
+the offloadable layer count, the KV cache cost at the current
+`--context` and KV cache type, and the largest fitting layer count
+on the selected GPU:
+
+```sh
+./cmake-build-vulkan/tessera-cli run \
+  --model ~/models/Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-Q4_K_M.gguf \
+  --gpu-layers help --kv-q8 --context 262144
+# 40 trunk blocks plus the output head (41 offloadable layers, ...)
+# context 262144, kv int8: cache about 2642 MiB (10 full, 30 linear)
+# weights: full upload 20697 MiB
+# best --gpu-layers 0: ...
+```
+
+The weights are exact per tensor. The cache follows the loader's
+growth. A 1024 MiB reserve covers the driver, the scratch and the
+draft. ROCm sizes against current free memory. Vulkan reports no
+free figure, so it sizes against the device total and says so.
+
 ## Current status
 
 Date 2026-10-11: paging works end to end on Vulkan and ROCm.

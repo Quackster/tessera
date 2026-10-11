@@ -16,6 +16,7 @@
 #include "core/decode_internal.hpp"
 #include "core/loaders/shard.hpp"
 #include "core/sampling.hpp"
+#include "tessera/budget.hpp"
 #include "core/timing.hpp"
 #include "test_helpers.hpp"
 #include "tessera/architecture.hpp"
@@ -1052,4 +1053,85 @@ TEST(EngineTest, RoutedExpertKindMatchesSuffix) {
   EXPECT_FALSE(IsRoutedExpertKind("attn_q.weight"));
   EXPECT_FALSE(IsRoutedExpertKind("output.weight"));
   EXPECT_FALSE(IsRoutedExpertKind(""));
+}
+
+// KV cache math pins the AppendKv growth: one F32 row per key and value,
+// geometric capacity, per-row scales only for quantized types.
+TEST(EngineTest, FullKvLayerBytesFollowsAppendKv) {
+  tessera::TransformerConfig config;
+  config.attention.kv_heads = 2;
+  config.attention.head_dim = 64;
+  // kv_dim 128, capacity 1024 at context 1024.
+  EXPECT_EQ(tessera::core::FullKvLayerBytes(config, tessera::KvCacheType::F32,
+                                            1024),
+            2u * 1024u * 128u * 4u);
+  EXPECT_EQ(tessera::core::FullKvLayerBytes(config, tessera::KvCacheType::Q8,
+                                            1024),
+            2u * 1024u * 128u + 2u * 1024u * 4u);
+  EXPECT_EQ(
+      tessera::core::FullKvLayerBytes(config, tessera::KvCacheType::F32, 0),
+      0u);
+}
+
+// Linear state is context independent; dense configs carry none.
+TEST(EngineTest, LinearStateLayerBytesNeedsHybrid) {
+  tessera::TransformerConfig dense;
+  EXPECT_EQ(tessera::core::LinearStateLayerBytes(dense), 0u);
+  tessera::TransformerConfig hybrid;
+  hybrid.hybrid = true;
+  hybrid.ssm.conv_kernel = 4;
+  hybrid.ssm.state_size = 128;
+  hybrid.ssm.group_count = 16;
+  hybrid.ssm.time_step_rank = 32;
+  hybrid.ssm.inner_size = 4096;
+  // hist 8192 x 3 x 4 plus state 32 x 128 x 128 x 4.
+  EXPECT_EQ(tessera::core::LinearStateLayerBytes(hybrid),
+            8192u * 3u * 4u + 32u * 128u * 128u * 4u);
+}
+
+// The layer advisor on the 2-layer tiny fixture: total layers, full fit
+// at ample memory, paging below it, and no advice without free bytes.
+TEST(EngineTest, RecommendGpuLayersRanksResidentSets) {
+  using tessera::core::RecommendGpuLayers;
+  using tessera::core::ResidentWeightBytes;
+  auto path = WriteTinyModelFixture("budget.gguf", 2);
+  auto full = RecommendGpuLayers(path.string(), 1024, tessera::KvCacheType::F32,
+                                 1ull << 60, "none");
+  ASSERT_TRUE(full.has_value()) << tessera::ToString(full.error());
+  EXPECT_EQ(full->trunk_layers, 2u);
+  EXPECT_EQ(full->total_layers, 3u);
+  EXPECT_EQ(full->full_layers, 2u);
+  EXPECT_EQ(full->linear_layers, 0u);
+  EXPECT_GT(full->full_bytes, 0u);
+  EXPECT_GT(full->kv_bytes, 0u);
+  EXPECT_TRUE(full->has_best);
+  EXPECT_EQ(full->best, 0u);
+  EXPECT_EQ(full->best_bytes, full->full_bytes);
+  auto budget = tessera::core::MeasureWeights(path.string(), true);
+  ASSERT_TRUE(budget.has_value()) << tessera::ToString(budget.error());
+  const std::uint64_t all = ResidentWeightBytes(*budget, 0);
+  const std::uint64_t two = ResidentWeightBytes(*budget, 2);
+  const std::uint64_t one = ResidentWeightBytes(*budget, 1);
+  EXPECT_EQ(all, full->full_bytes);
+  EXPECT_LT(one, two);
+  EXPECT_LE(two, all);
+  // Just below the full fit: paging becomes the advice.
+  auto paged = RecommendGpuLayers(path.string(), 1024,
+                                  tessera::KvCacheType::F32,
+                                  full->full_bytes + full->kv_bytes +
+                                      (1024ull << 20) - 1,
+                                  "none");
+  ASSERT_TRUE(paged.has_value()) << tessera::ToString(paged.error());
+  EXPECT_TRUE(paged->has_best);
+  EXPECT_GE(paged->best, 1u);
+  EXPECT_LT(paged->best_bytes, full->full_bytes);
+  // Without reported memory there is no recommendation.
+  auto unknown = RecommendGpuLayers(path.string(), 1024,
+                                    tessera::KvCacheType::F32, 0, "none");
+  ASSERT_TRUE(unknown.has_value()) << tessera::ToString(unknown.error());
+  EXPECT_FALSE(unknown->has_best);
+  EXPECT_TRUE(RecommendGpuLayers("/nonexistent.gguf", 1024,
+                                 tessera::KvCacheType::F32, 1ull << 60,
+                                 "none")
+                  .error() == tessera::StatusCode::FileNotFound);
 }

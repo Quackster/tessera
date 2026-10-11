@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "cli_common.hpp"
+#include "tessera/budget.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
@@ -81,6 +82,8 @@ void PrintUsage() {
                 "  --gpu <n>         GPU index to use (default 0, the first)\n"
                 "  --gpu-layers <n|all> layers kept in VRAM (0 uploads all, "
                 "default 0)\n"
+                "  --gpu-layers help   size the model for --gpu-layers "
+                "without loading it\n"
                "  --gpus <a,b>      serve one model replica per GPU for "
                "parallel requests\n"
                "  --pipeline        run the model split across --gpus devices "
@@ -178,6 +181,74 @@ CalibrationConfig ResolveCalibration(Engine& engine, Model& model,
                       std::to_string(merged.prefill_chunk_tokens) +
                       " draft_tokens=" + std::to_string(merged.draft_tokens));
   return merged;
+}
+
+namespace {
+
+// Whole MiB, the unit the serve pre-check reports free memory in.
+std::uint64_t ToMiB(std::uint64_t bytes) { return bytes / (1024 * 1024); }
+
+}  // namespace
+
+int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
+                       std::size_t context, KvCacheType kv_type,
+                       std::string_view strategy) {
+  auto& log = engine.Diagnostics();
+  const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
+  // Vulkan reports the device total but no free figure; size against the
+  // total then (an upper bound), and say so below.
+  const bool budget_is_total = memory.free_bytes == 0;
+  const std::uint64_t budget =
+      budget_is_total ? memory.total_bytes : memory.free_bytes;
+  auto advice = core::RecommendGpuLayers(model_path, context, kv_type, budget,
+                                         std::string(strategy));
+  if (!advice) {
+    log.Warn("cli", std::string("cannot size --gpu-layers for '") + model_path +
+                        "' (" + std::string(ToString(advice.error())) +
+                        "); check the path and file format");
+    return 1;
+  }
+  advice->budget_is_total = budget_is_total;
+  const std::string model_id =
+      std::filesystem::path(model_path).filename().string();
+  log.Info("cli", model_id + ": " + std::to_string(advice->trunk_layers) +
+                      " trunk blocks plus the output head (" +
+                      std::to_string(advice->total_layers) +
+                      " offloadable layers, 0 keeps every layer)");
+  log.Info("cli",
+           "context " + std::to_string(context) + ", kv " +
+               std::string(ToString(kv_type)) + ": cache about " +
+               std::to_string(ToMiB(advice->kv_bytes)) + " MiB (" +
+               std::to_string(advice->full_layers) + " full, " +
+               std::to_string(advice->linear_layers) + " linear layers)");
+  log.Info("cli", "weights: full upload " +
+                      std::to_string(ToMiB(advice->full_bytes)) + " MiB");
+  const std::string budget_label =
+      std::to_string(ToMiB(advice->free_bytes)) +
+      (advice->budget_is_total ? " MiB device total (free unknown on this "
+                                 "backend; other processes may hold memory)"
+                               : " MiB free");
+  if (!advice->has_best) {
+    if (advice->free_bytes == 0) {
+      log.Info("cli", "the backend reports no memory size; size "
+                      "--gpu-layers by hand");
+    } else {
+      log.Info("cli", "no layer count fits " + budget_label +
+                          "; lower --context, quantize the KV "
+                          "cache, or use a smaller model");
+    }
+    return 0;
+  }
+  if (advice->best == 0) {
+    log.Info("cli", "best --gpu-layers 0: the full upload fits " +
+                        budget_label + "; no paging needed");
+  } else {
+    log.Info("cli", "best --gpu-layers " + std::to_string(advice->best) +
+                        ": resident " +
+                        std::to_string(ToMiB(advice->best_bytes)) +
+                        " MiB of " + budget_label);
+  }
+  return 0;
 }
 
 }  // namespace tessera::cli
