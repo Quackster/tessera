@@ -76,6 +76,7 @@ std::expected<WeightBudget, StatusCode> MeasureWeights(
   }
   WeightBudget budget;
   budget.trunk_layers = config->layers;
+  budget.has_moe = config->IsMoe();
   if (IsGgufPath(path)) {
     auto mapped = MappedFile::Open(std::filesystem::path(path));
     if (!mapped) {
@@ -218,7 +219,9 @@ std::uint64_t ResidentWeightBytes(const WeightBudget& budget,
                                   std::size_t gpu_layers) {
   std::uint64_t total = 0;
   for (const auto& [name, bytes] : budget.tensors) {
-    if (GpuLayerResident(name, gpu_layers, budget.trunk_layers)) {
+    if (GpuLayerResident(name, gpu_layers, budget.trunk_layers) ||
+        PagedMoeDenseResident(name, gpu_layers, budget.trunk_layers,
+                              budget.has_moe)) {
       total += bytes;
     }
   }

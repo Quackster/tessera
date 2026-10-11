@@ -91,6 +91,12 @@ class VulkanCompute {
       VkBuffer dst, std::size_t dst_offset, std::span<const std::byte> data);
   // Flush the pending command buffer (submit) and wait for it. Idempotent.
   [[nodiscard]] std::expected<void, StatusCode> Synchronize();
+  // Submit pending work without waiting, so a transfer can queue behind
+  // it on the same queue and one fence wait covers both. Idempotent.
+  // Call Wait() once the queued work must be complete.
+  [[nodiscard]] std::expected<void, StatusCode> Flush();
+  // Wait for a prior Flush and release its descriptor sets. Idempotent.
+  [[nodiscard]] std::expected<void, StatusCode> Wait();
 
  private:
   void DestroyResources();
@@ -119,6 +125,9 @@ class VulkanCompute {
   VkCommandBuffer cmd_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;
   bool recording_ = false;
+  // A Flush() submission is still unwaited: the next Wait() drains it
+  // and releases its descriptor sets.
+  bool submitted_ = false;
   // Descriptor sets are allocated on demand from one pool and released in
   // bulk by vkResetDescriptorPool after each flush.
   static constexpr std::uint32_t kDescriptorSetBudget = 8192;

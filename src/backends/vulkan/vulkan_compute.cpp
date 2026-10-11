@@ -390,21 +390,21 @@ std::expected<void, StatusCode> VulkanCompute::EnsureRecording() {
   return {};
 }
 
-std::expected<void, StatusCode> VulkanCompute::FlushAndWait() {
+std::expected<void, StatusCode> VulkanCompute::Flush() {
   if (!recording_) {
     return {};
   }
   auto result = vkEndCommandBuffer(cmd_);
   if (result != VK_SUCCESS) {
     LogError(std::string("vkEndCommandBuffer failed (") +
-             std::to_string(static_cast<int>(result)) + ")");
+              std::to_string(static_cast<int>(result)) + ")");
     recording_ = false;
     return std::unexpected(FromVkResult(result));
   }
   result = vkResetFences(device_, 1, &fence_);
   if (result != VK_SUCCESS) {
     LogError(std::string("vkResetFences failed (") +
-             std::to_string(static_cast<int>(result)) + ")");
+              std::to_string(static_cast<int>(result)) + ")");
     recording_ = false;
     return std::unexpected(FromVkResult(result));
   }
@@ -415,12 +415,21 @@ std::expected<void, StatusCode> VulkanCompute::FlushAndWait() {
   result = vkQueueSubmit(queue_, 1, &submit_info, fence_);
   if (result != VK_SUCCESS) {
     LogError(std::string("vkQueueSubmit failed (") +
-             std::to_string(static_cast<int>(result)) + ")");
+              std::to_string(static_cast<int>(result)) + ")");
     recording_ = false;
     return std::unexpected(FromVkResult(result));
   }
-  result = vkWaitForFences(device_, 1, &fence_, VK_TRUE, kFenceTimeoutNs);
   recording_ = false;
+  submitted_ = true;
+  return {};
+}
+
+std::expected<void, StatusCode> VulkanCompute::Wait() {
+  if (!submitted_) {
+    return {};
+  }
+  auto result = vkWaitForFences(device_, 1, &fence_, VK_TRUE, kFenceTimeoutNs);
+  submitted_ = false;
   if (result == VK_TIMEOUT) {
     LogError("fence wait timed out after 30 s; the device is hung or the "
              "ICD is unresponsive");
@@ -428,17 +437,24 @@ std::expected<void, StatusCode> VulkanCompute::FlushAndWait() {
   }
   if (result != VK_SUCCESS) {
     LogError(std::string("vkWaitForFences failed (") +
-             std::to_string(static_cast<int>(result)) + ")");
+              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
   // The submission is done, so every descriptor set it used can be released.
   result = vkResetDescriptorPool(device_, descriptor_pool_, 0);
   if (result != VK_SUCCESS) {
     LogError(std::string("vkResetDescriptorPool failed (") +
-             std::to_string(static_cast<int>(result)) + ")");
+              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
   return {};
+}
+
+std::expected<void, StatusCode> VulkanCompute::FlushAndWait() {
+  if (auto flushed = Flush(); !flushed) {
+    return flushed;
+  }
+  return Wait();
 }
 
 std::expected<void, StatusCode> VulkanCompute::Synchronize() {

@@ -162,6 +162,18 @@ expert count stage the whole expert set instead. Both MoE kernels keep
 the unchanged ids, so paged output is bit-identical to full upload.
 Full suite passes on Vulkan and ROCm (221 tests, 0 failures each).
 
+Date 2026-10-11: the transfer path no longer allocates per batch.
+Both backends keep a persistent staging window. Vulkan reuses its
+copy command buffer and fence and flushes pending compute without
+draining it, so one fence wait covers compute plus copy. `Model`
+indexes paged tensors per layer and skips empty layers, and selective
+expert staging uploads each shared expert once per prefill layer.
+The MoE dense refinement from the Decision section above is
+implemented now (`PagedMoeDenseResident`): dense block tensors stay
+resident and only routed experts page, in dense and MXFP4 loads and
+in the fit check alike. Full suite passes on Vulkan and ROCm
+(230 tests, 0 failures each).
+
 ## What is done
 
 - [x] Record Ornith MoE architecture in `docs/ORNITH-1.5.md`.
@@ -181,9 +193,16 @@ Full suite passes on Vulkan and ROCm (221 tests, 0 failures each).
 - [ ] Add prefetch of next layer where the backend allows overlap.
   Assessed 2026-10-11: neither backend allows it today. Vulkan
   flushes and fence-waits every transfer; ROCm synchronizes the
-  stream per call. Overlap needs an async transfer extension to the
-  `Backend` interface on both backends, a larger interface change.
-  Deferred until profiling shows upload/compute overlap headroom.
+  stream per call. Profiled 2026-10-11 (`TESSERA_PROFILE=2`, Ornith
+  `--gpu-layers 20`): each paged layer stages about 16 MB of expert
+  slices in about 5 ms and about 27 MB of dense tensors in about
+  8 ms, both at the measured bus rate of about 3.1 GiB/s, so the
+  transfers are bandwidth-bound, not round-trip-bound. Decode moves
+  about 0.9 GB per token at the same rate, which fully accounts for
+  the 4 tok/s rate. Overlap could at best hide the smaller side
+  (layer compute, about 0.3 ms at full-VRAM rates), so an async
+  transfer extension to the `Backend` interface on both backends
+  would buy little for a large interface change. Stays deferred.
 - [x] Wire `--gpu-layers` through `run` and `serve` plus usage text.
 - [x] Extend `LogModelSummary` with resident and RAM byte counts.
 - [x] Add VRAM fit check before load starts. `FitGpuLayers` judges
@@ -226,6 +245,16 @@ layer moves 8 expert slices instead of 256 experts. Batching the
 slice uploads into one `CopyH2DBatch` per layer (16 MB in 24 offset
 copies, about 5 ms) brings the same run to 2.0 s (about 4 tok/s):
 one staging round trip per layer instead of one per expert.
+
+Round 3 (same model, N and prompt, R9700, greedy, byte-identical
+output across backends and runs): persistent staging plus flush without
+draining raises the effective staging rate to about 7 GB/s, and the
+MoE dense refinement cuts the paged set from 384 tensors to 63
+expert tensors (resident 11.0 GB to 11.5 GB). N=20 decodes at
+14 tok/s on Vulkan and on ROCm with 25 tok/s prefill. N=30
+decodes at 22 tok/s. N=40 decodes at 61 tok/s with 92 tok/s
+prefill. Cost per token is linear from here: about 8 ms per paged
+layer plus about 13 ms fixed, all PCIe bytes at the bus rate.
 
 ## Risks
 

@@ -1055,6 +1055,39 @@ TEST(EngineTest, RoutedExpertKindMatchesSuffix) {
   EXPECT_FALSE(IsRoutedExpertKind(""));
 }
 
+// The MoE dense refinement keeps every non-expert tensor of a paged
+// trunk block resident, so only routed experts page per token. Dense
+// models, full uploads, and already-resident names never match.
+TEST(EngineTest, PagedMoeDenseResidentKeepsMoeDense) {
+  using tessera::core::PagedMoeDenseResident;
+  constexpr std::size_t kTrunk = 40;
+  // A paged MoE block keeps its dense tensors: attention, norms, router
+  // and shared experts.
+  EXPECT_TRUE(PagedMoeDenseResident("blk.0.attn_q.weight", 20, kTrunk, true));
+  EXPECT_TRUE(PagedMoeDenseResident("blk.0.post_attention_norm.weight", 20,
+                                    kTrunk, true));
+  EXPECT_TRUE(
+      PagedMoeDenseResident("blk.0.ffn_gate_inp.weight", 20, kTrunk, true));
+  EXPECT_TRUE(
+      PagedMoeDenseResident("blk.0.ffn_gate_shexp.weight", 20, kTrunk, true));
+  // Routed experts still page.
+  EXPECT_FALSE(
+      PagedMoeDenseResident("blk.0.ffn_gate_exps.weight", 20, kTrunk, true));
+  EXPECT_FALSE(
+      PagedMoeDenseResident("blk.0.ffn_down_exps.weight", 20, kTrunk, true));
+  // Already-resident names are not double counted: resident blocks, the
+  // MTP block, the head and non-block globals.
+  EXPECT_FALSE(PagedMoeDenseResident("blk.39.attn_q.weight", 20, kTrunk, true));
+  EXPECT_FALSE(PagedMoeDenseResident("blk.40.attn_q.weight", 20, kTrunk, true));
+  EXPECT_FALSE(PagedMoeDenseResident("output.weight", 20, kTrunk, true));
+  EXPECT_FALSE(PagedMoeDenseResident("position_embd.weight", 20, kTrunk, true));
+  // Dense models never match, so their paging is unchanged.
+  EXPECT_FALSE(PagedMoeDenseResident("blk.0.attn_q.weight", 20, kTrunk, false));
+  // Full uploads and unknown trunk counts never match.
+  EXPECT_FALSE(PagedMoeDenseResident("blk.0.attn_q.weight", 0, kTrunk, true));
+  EXPECT_FALSE(PagedMoeDenseResident("blk.0.attn_q.weight", 20, 0, true));
+}
+
 // KV cache math pins the AppendKv growth: one F32 row per key and value,
 // geometric capacity, per-row scales only for quantized types.
 TEST(EngineTest, FullKvLayerBytesFollowsAppendKv) {

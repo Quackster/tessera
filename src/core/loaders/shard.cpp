@@ -102,4 +102,20 @@ bool GpuLayerResident(std::string_view name, std::size_t gpu_layers,
   return layer >= first_resident && layer < trunk_layers;
 }
 
+bool PagedMoeDenseResident(std::string_view name, std::size_t gpu_layers,
+                           std::size_t trunk_layers, bool has_moe) {
+  if (!has_moe || gpu_layers == 0 || trunk_layers == 0) {
+    return false;
+  }
+  if (GpuLayerResident(name, gpu_layers, trunk_layers)) {
+    return false;
+  }
+  std::size_t layer = 0;
+  std::string_view kind;
+  if (!SplitBlockName(name, &layer, &kind) || layer >= trunk_layers) {
+    return false;
+  }
+  return !IsRoutedExpertKind(kind);
+}
+
 }  // namespace tessera::core

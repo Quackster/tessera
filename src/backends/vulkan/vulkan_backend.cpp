@@ -152,6 +152,9 @@ class VulkanBackend final : public Backend {
   ~VulkanBackend() override {
     compute_.Shutdown();
     FreeAllMemory();
+    // The queue is idle after Shutdown, so the reusable upload command
+    // buffer and fence are safe to destroy before the device goes away.
+    ReleaseUpload();
     DestroyState(state_);
   }
 
@@ -303,6 +306,9 @@ class VulkanBackend final : public Backend {
     vkGetDeviceQueue(state_.device, queue_family, 0, &state_.queue);
     VkCommandPoolCreateInfo pool_info{};
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    // Resettable, so the reusable upload command buffer below resets
+    // without freeing.
+    pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool_info.queueFamilyIndex = queue_family;
     result = vkCreateCommandPool(state_.device, &pool_info, nullptr,
                                 &state_.pool);
@@ -441,19 +447,23 @@ class VulkanBackend final : public Backend {
     if (src.empty()) {
       return {};
     }
-    // Drain any pending compute work first: the copy is submitted on its
-    // own command buffer and must not overtake the dispatches before it.
-    auto flushed = compute_.Synchronize();
+    // Queue pending compute behind without draining it: the copy below
+    // submits on the same queue, so its fence wait covers both.
+    auto flushed = compute_.Flush();
     if (!flushed) {
       return flushed;
     }
-    auto staging = AllocateStaging(src.size());
-    if (!staging) {
-      return std::unexpected(staging.error());
+    if (auto staged = EnsureUploadStaging(src.size()); !staged) {
+      (void)compute_.Wait();
+      return std::unexpected(staged.error());
     }
-    std::memcpy(staging->mapped, src.data(), src.size());
-    auto copy = SubmitCopy(*staging, *record, 0, offset, src.size());
-    ReleaseStaging(*staging);
+    std::memcpy(upload_staging_.mapped, src.data(), src.size());
+    auto copy = SubmitCopy(upload_staging_, *record, 0, offset, src.size());
+    // The copy fence already covers the flushed compute; this only
+    // releases its descriptor sets (and drains on the error path).
+    if (auto waited = compute_.Wait(); !waited && copy) {
+      return waited;
+    }
     return copy;
   }
 
@@ -468,24 +478,28 @@ class VulkanBackend final : public Backend {
     if (offset > src.Size() || bytes > src.Size() - offset) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
-    // Flush the pending dispatches so the readback sees their result.
-    auto flushed = compute_.Synchronize();
+    // Queue the pending dispatches without draining them, so the
+    // readback below waits once for both instead of twice.
+    auto flushed = compute_.Flush();
     if (!flushed) {
       return flushed;
     }
-    auto staging = AllocateStaging(bytes);
-    if (!staging) {
-      return std::unexpected(staging.error());
+    if (auto staged = EnsureUploadStaging(bytes); !staged) {
+      (void)compute_.Wait();
+      return std::unexpected(staged.error());
     }
     auto record = LookupRecord(src.Handle());
     if (!record) {
+      (void)compute_.Wait();
       return std::unexpected(StatusCode::DeviceError);
     }
-    auto copy = SubmitCopy(*record, *staging, offset, 0, bytes);
+    auto copy = SubmitCopy(*record, upload_staging_, offset, 0, bytes);
     if (copy) {
-      std::memcpy(dst, staging->mapped, bytes);
+      std::memcpy(dst, upload_staging_.mapped, bytes);
     }
-    ReleaseStaging(*staging);
+    if (auto waited = compute_.Wait(); !waited && copy) {
+      return waited;
+    }
     return copy;
   }
 
@@ -509,6 +523,9 @@ class VulkanBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyH2DBatch(
       std::span<const Backend::HostCopy> copies) override {
+    if (copies.empty()) {
+      return {};
+    }
     for (const Backend::HostCopy& copy : copies) {
       if (copy.dst == nullptr ||
           copy.dst_offset > copy.dst->Size() ||
@@ -516,8 +533,11 @@ class VulkanBackend final : public Backend {
         return std::unexpected(StatusCode::InvalidArgument);
       }
     }
-    auto flushed = compute_.Synchronize();
-    if (!flushed) {
+    // Queue pending compute behind without draining it: the copies below
+    // submit on the same queue, so one fence wait covers both. Draining
+    // here would stall the device once per batch (forty times per paged
+    // token) for no ordering benefit.
+    if (auto flushed = compute_.Flush(); !flushed) {
       return flushed;
     }
     // Drain the batch through one bounded staging buffer at a time. Every
@@ -539,34 +559,42 @@ class VulkanBackend final : public Backend {
         staging_size = copies[index].src.size();
         end = index + 1;
       }
-      auto staging = AllocateStaging(staging_size);
-      if (!staging) {
-        return std::unexpected(staging.error());
+      // The staging window persists across batches; the drain below
+      // leaves the backend clean even on the error paths.
+      if (auto staged = EnsureUploadStaging(staging_size); !staged) {
+        (void)compute_.Wait();
+        return std::unexpected(staged.error());
       }
       std::vector<CopyRegion> regions;
       regions.reserve(end - index);
       std::size_t offset = 0;
       for (std::size_t i = index; i < end; ++i) {
-        std::memcpy(static_cast<std::byte*>(staging->mapped) + offset,
+        std::memcpy(static_cast<std::byte*>(upload_staging_.mapped) + offset,
                     copies[i].src.data(), copies[i].src.size());
         const auto* record = LookupRecord(copies[i].dst->Handle());
         if (record == nullptr) {
-          ReleaseStaging(*staging);
+          (void)compute_.Wait();
           return std::unexpected(StatusCode::DeviceError);
         }
         regions.push_back(CopyRegion{record->buffer, copies[i].dst_offset,
                                      offset, copies[i].src.size()});
         offset += copies[i].src.size();
       }
-      auto submitted = SubmitCopyRegions(staging->buffer, regions);
-      ReleaseStaging(*staging);
-      if (!submitted) {
+      if (auto submitted =
+              SubmitCopyRegions(upload_staging_.buffer, regions);
+          !submitted) {
+        (void)compute_.Wait();
         return submitted;
       }
       for (std::size_t i = index; i < end; ++i) {
         total_bytes += copies[i].src.size();
       }
       index = end;
+    }
+    // The copy fence above already covers the flushed compute on the
+    // same queue; this only releases its descriptor sets.
+    if (auto waited = compute_.Wait(); !waited) {
+      return waited;
     }
     if (diagnostics_ != nullptr) {
       LogInfo(core::FormatTransferSummary(
@@ -741,6 +769,75 @@ class VulkanBackend final : public Backend {
     }
   }
 
+  // Grow the reusable upload staging window on demand, so a batched
+  // upload pays no per-batch allocation. Confined to the calling
+  // thread like the rest of the transfer path.
+  std::expected<void, StatusCode> EnsureUploadStaging(std::size_t bytes) {
+    if (upload_staging_bytes_ >= bytes && upload_staging_.mapped != nullptr) {
+      return {};
+    }
+    ReleaseUploadStaging();
+    auto staging = AllocateStaging(bytes);
+    if (!staging) {
+      return std::unexpected(staging.error());
+    }
+    upload_staging_ = *staging;
+    upload_staging_bytes_ = bytes;
+    return {};
+  }
+
+  void ReleaseUploadStaging() {
+    ReleaseStaging(upload_staging_);
+    upload_staging_ = Staging{};
+    upload_staging_bytes_ = 0;
+  }
+
+  // Lazily create the reusable upload command buffer and fence, so a
+  // batched upload pays no per-submit allocation.
+  std::expected<void, StatusCode> EnsureUploadSubmit() {
+    if (upload_cmd_ != VK_NULL_HANDLE && upload_fence_ != VK_NULL_HANDLE) {
+      return {};
+    }
+    VkCommandBufferAllocateInfo alloc_info{};
+    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    alloc_info.commandPool = state_.pool;
+    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc_info.commandBufferCount = 1;
+    auto result =
+        vkAllocateCommandBuffers(state_.device, &alloc_info, &upload_cmd_);
+    if (result != VK_SUCCESS) {
+      upload_cmd_ = VK_NULL_HANDLE;
+      return std::unexpected(FromVkResult(result));
+    }
+    VkFenceCreateInfo fence_info{};
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    result = vkCreateFence(state_.device, &fence_info, nullptr, &upload_fence_);
+    if (result != VK_SUCCESS) {
+      vkFreeCommandBuffers(state_.device, state_.pool, 1, &upload_cmd_);
+      upload_cmd_ = VK_NULL_HANDLE;
+      return std::unexpected(FromVkResult(result));
+    }
+    return {};
+  }
+
+  // Free the reusable upload staging, command buffer and fence. The
+  // queue is idle (the destructor runs this after Shutdown), so no
+  // submitted work can still reference them.
+  void ReleaseUpload() {
+    if (state_.device == VK_NULL_HANDLE) {
+      return;
+    }
+    if (upload_fence_ != VK_NULL_HANDLE) {
+      vkDestroyFence(state_.device, upload_fence_, nullptr);
+      upload_fence_ = VK_NULL_HANDLE;
+    }
+    if (upload_cmd_ != VK_NULL_HANDLE) {
+      vkFreeCommandBuffers(state_.device, state_.pool, 1, &upload_cmd_);
+      upload_cmd_ = VK_NULL_HANDLE;
+    }
+    ReleaseUploadStaging();
+  }
+
   // One destination region of a batched copy from a single source.
   struct CopyRegion {
     VkBuffer dst = VK_NULL_HANDLE;
@@ -757,29 +854,26 @@ class VulkanBackend final : public Backend {
     return SubmitCopyRegions(source, std::span<const CopyRegion>(&region, 1));
   }
 
-  // Record every region as one command buffer and submit it once, so a
-  // batch of copies pays one fence wait rather than one per copy.
+  // Record every region into the reusable command buffer and submit it
+  // once, so a batch of copies pays one fence wait rather than one per
+  // copy, with no per-submit allocation.
   std::expected<void, StatusCode> SubmitCopyRegions(
       const VkBuffer source, std::span<const CopyRegion> regions) {
     if (regions.empty()) {
       return {};
     }
-    VkCommandBufferAllocateInfo alloc_info{};
-    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.commandPool = state_.pool;
-    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc_info.commandBufferCount = 1;
-    VkCommandBuffer command = VK_NULL_HANDLE;
-    auto result =
-        vkAllocateCommandBuffers(state_.device, &alloc_info, &command);
+    if (auto ready = EnsureUploadSubmit(); !ready) {
+      return std::unexpected(ready.error());
+    }
+    auto result = vkResetCommandBuffer(upload_cmd_, 0);
     if (result != VK_SUCCESS) {
       return std::unexpected(FromVkResult(result));
     }
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    result = vkBeginCommandBuffer(command, &begin_info);
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(upload_cmd_, &begin_info);
     if (result != VK_SUCCESS) {
-      vkFreeCommandBuffers(state_.device, state_.pool, 1, &command);
       return std::unexpected(FromVkResult(result));
     }
     for (const CopyRegion& region : regions) {
@@ -788,34 +882,25 @@ class VulkanBackend final : public Backend {
       copy.srcOffset = region.src_offset;
       copy.dstOffset = region.dst_offset;
       copy.size = region.size;
-      vkCmdCopyBuffer(command, source, region.dst, 1, &copy);
+      vkCmdCopyBuffer(upload_cmd_, source, region.dst, 1, &copy);
     }
-    result = vkEndCommandBuffer(command);
+    result = vkEndCommandBuffer(upload_cmd_);
     if (result != VK_SUCCESS) {
-      vkFreeCommandBuffers(state_.device, state_.pool, 1, &command);
       return std::unexpected(FromVkResult(result));
     }
-    VkFence fence = VK_NULL_HANDLE;
-    VkFenceCreateInfo fence_info{};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    result = vkCreateFence(state_.device, &fence_info, nullptr, &fence);
+    result = vkResetFences(state_.device, 1, &upload_fence_);
     if (result != VK_SUCCESS) {
-      vkFreeCommandBuffers(state_.device, state_.pool, 1, &command);
       return std::unexpected(FromVkResult(result));
     }
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &command;
-    result = vkQueueSubmit(state_.queue, 1, &submit_info, fence);
+    submit_info.pCommandBuffers = &upload_cmd_;
+    result = vkQueueSubmit(state_.queue, 1, &submit_info, upload_fence_);
     if (result == VK_SUCCESS) {
-      result = vkWaitForFences(state_.device, 1, &fence, VK_TRUE,
-                              kFenceTimeoutNs);
+      result = vkWaitForFences(state_.device, 1, &upload_fence_, VK_TRUE,
+                               kFenceTimeoutNs);
     }
-    if (fence != VK_NULL_HANDLE) {
-      vkDestroyFence(state_.device, fence, nullptr);
-    }
-    vkFreeCommandBuffers(state_.device, state_.pool, 1, &command);
     if (result == VK_TIMEOUT) {
       LogError("fence wait timed out after 30 s; the device is hung or the "
                "ICD is unresponsive");
@@ -823,7 +908,7 @@ class VulkanBackend final : public Backend {
     }
     if (result != VK_SUCCESS) {
       LogError(std::string("device transfer failed (") +
-               std::to_string(static_cast<int>(result)) + ")");
+                std::to_string(static_cast<int>(result)) + ")");
       return std::unexpected(FromVkResult(result));
     }
     return {};
@@ -853,6 +938,13 @@ class VulkanBackend final : public Backend {
   std::size_t next_id_ = 0;
   std::string device_name_;
   bool initialized_ = false;
+  // Reusable upload staging window (grown on demand) with its command
+  // buffer and fence, so batched transfers pay no per-batch allocation.
+  // Used by one call at a time, like the rest of the transfer path.
+  Staging upload_staging_;
+  std::size_t upload_staging_bytes_ = 0;
+  VkCommandBuffer upload_cmd_ = VK_NULL_HANDLE;
+  VkFence upload_fence_ = VK_NULL_HANDLE;
 };
 
 }  // namespace tessera::backends::vulkan

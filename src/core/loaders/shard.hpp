@@ -53,7 +53,24 @@ namespace tessera::core {
 // Usage:
 //   if (!GpuLayerResident(entry.name, options.gpu_layers, layers)) page it;
 [[nodiscard]] bool GpuLayerResident(std::string_view name,
-                                    std::size_t gpu_layers,
-                                    std::size_t trunk_layers);
+                                     std::size_t gpu_layers,
+                                     std::size_t trunk_layers);
+
+// True when the `--gpu-layers` resident set keeps the tensor `name` on the
+// device through the MoE dense refinement: in a model with routed experts
+// (`has_moe`), every non-expert tensor of a trunk block stays resident and
+// only the routed-expert weights page per token, because every token uses
+// the dense weights whole while touching top_k of num_experts. In a dense
+// model (or when paging is off) this is always false, so the plain block
+// rule above decides alone. Values past the layer count keep everything
+// resident through that rule.
+//
+// Usage:
+//   const bool resident = GpuLayerResident(name, layers, trunk) ||
+//                         PagedMoeDenseResident(name, layers, trunk, moe);
+[[nodiscard]] bool PagedMoeDenseResident(std::string_view name,
+                                         std::size_t gpu_layers,
+                                         std::size_t trunk_layers,
+                                         bool has_moe);
 
 }  // namespace tessera::core

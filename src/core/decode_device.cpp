@@ -12,19 +12,134 @@ namespace {
 
 using detail::AppendKv;
 using detail::AttentionQuantDevice;
+using detail::CachedKernel;
 using detail::DownloadF32;
+using detail::EmbeddingKernelName;
 using detail::GatherEmbedding;
+using detail::GatherEmbeddingDevice;
 using detail::AttentionDevice;
 using detail::GemmFor;
 using detail::RopeDevice;
 using detail::NeedWeight;
 using detail::NeedWeightAny;
+using detail::TopKRowsDevice;
 using detail::UploadF32;
 
 std::uint32_t FloatBits(float value) {
   std::uint32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
+}
+
+// Gather one embedding row into st.x on the device. True when a device
+// kernel covers the dtype (mirrors GatherEmbeddingRows for Qwen35State);
+// false means the caller falls back to the host gather. Hard failures
+// surface as DeviceError or OutOfMemory.
+std::expected<bool, StatusCode> EmbedTokenDevice(Backend& backend,
+                                                 DeviceDecodeState& st,
+                                                 const DeviceTensor& embed,
+                                                 std::uint32_t token,
+                                                 std::size_t hidden) {
+  const DType dtype = embed.manifest.dtype;
+  const std::string_view name = EmbeddingKernelName(dtype);
+  // A Q4_K table is quantized in 256-element blocks, so the width must
+  // align with the block (same rule as GatherEmbeddingRows).
+  const bool aligned = dtype != DType::Q4K || hidden % 256 == 0;
+  if (name.empty() || !aligned) {
+    return false;
+  }
+  auto kernel = CachedKernel(backend, st.embed_kernels,
+                             static_cast<int>(dtype), name);
+  if (!kernel) {
+    return std::unexpected(kernel.error());
+  }
+  if (st.embed_ids == nullptr || st.embed_ids->Size() < 4) {
+    auto allocated = backend.AllocateBuffer(4, MemoryKind::Device);
+    if (!allocated) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    st.embed_ids = std::move(*allocated);
+  }
+  const std::size_t vocab = embed.manifest.shape.Numel() / hidden;
+  if (token >= vocab) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (!backend.CopyH2D(*st.embed_ids, std::span<const std::byte>(
+                                          reinterpret_cast<const std::byte*>(
+                                              &token),
+                                          4))) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (!GatherEmbeddingDevice(backend, **kernel, *st.embed_ids, *embed.device,
+                             *st.x, 1, hidden, vocab)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return true;
+}
+
+// Top-1 of the logits buffer on the device, so greedy decode reads back
+// one id instead of the whole vocabulary. Loads the kernel and grows
+// the scratch on demand (mirrors DeviceRowArgMax for Qwen35State).
+std::expected<std::uint32_t, StatusCode> ArgMaxDevice(
+    Backend& backend, DeviceDecodeState& st, std::size_t vocab) {
+  if (st.topk_kernel == nullptr) {
+    auto kernel = backend.LoadKernel("top_k_rows", {});
+    if (!kernel) {
+      return std::unexpected(kernel.error());
+    }
+    st.topk_kernel = std::move(*kernel);
+  }
+  if (st.argmax_ids == nullptr || st.argmax_ids->Size() < 4) {
+    auto ids = backend.AllocateBuffer(4, MemoryKind::Device);
+    if (!ids) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    st.argmax_ids = std::move(*ids);
+  }
+  if (st.argmax_vals == nullptr || st.argmax_vals->Size() < 4) {
+    auto vals = backend.AllocateBuffer(4, MemoryKind::Device);
+    if (!vals) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    st.argmax_vals = std::move(*vals);
+  }
+  if (!TopKRowsDevice(backend, *st.topk_kernel, *st.logits, *st.argmax_ids,
+                      *st.argmax_vals, 1, vocab, 1)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  std::uint32_t best = 0;
+  if (!backend.CopyD2H(*st.argmax_ids, reinterpret_cast<std::byte*>(&best),
+                       4)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return best;
+}
+
+// The vocab-sized output head of one device step: norm plus projection
+// into st.logits. Shared by the logits download and the device argmax
+// below, so the head has one implementation.
+std::expected<void, StatusCode> ProjectLogits(Backend& backend,
+                                              const Model& model,
+                                              DeviceDecodeState& st,
+                                              const TransformerConfig& cfg) {
+  const std::size_t hidden = cfg.hidden_dim;
+  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
+  auto output = NeedWeightAny(model, "output.weight");
+  if (!out_norm || !output) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  auto gemm_out = GemmFor(backend, st.gemms, (*output)->manifest.dtype);
+  if (!gemm_out) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  if (!detail::RmsNormDevice(backend, *st.rmsnorm_kernel, *st.x,
+                             *(*out_norm)->device, *st.xn, 1, hidden,
+                             cfg.norm_eps) ||
+      !detail::ProjectDevice(backend, *(*gemm_out), *st.xn, *(*output)->device,
+                             *st.logits, 1, cfg.vocab_size, hidden)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return {};
 }
 
 }  // namespace
@@ -148,7 +263,11 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
     if (!copy) {
       return std::unexpected(copy.error());
     }
-  } else {
+  } else if (auto device =
+                 EmbedTokenDevice(backend, st, **embed, token, hidden);
+             !device) {
+    return std::unexpected(device.error());
+  } else if (!*device) {
     std::vector<float> row(hidden);
     auto gathered = GatherEmbedding(backend, **embed, token, hidden, row);
     if (!gathered) {
@@ -281,23 +400,8 @@ std::expected<std::vector<float>, StatusCode> DecodeStepDeviceLogits(
   }
   const TransformerConfig& cfg = *config;
   DeviceDecodeState& st = *cache.device;
-  const std::size_t hidden = cfg.hidden_dim;
-  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
-  auto output = NeedWeightAny(model, "output.weight");
-  if (!out_norm || !output) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  auto gemm_out = GemmFor(backend, st.gemms, (*output)->manifest.dtype);
-  if (!gemm_out) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
-  if (!detail::RmsNormDevice(backend, *st.rmsnorm_kernel, *st.x,
-                             *(*out_norm)->device, *st.xn, 1, hidden,
-                             cfg.norm_eps) ||
-      !detail::ProjectDevice(backend, *(*gemm_out), *st.xn,
-                             *(*output)->device, *st.logits, 1, cfg.vocab_size,
-                             hidden)) {
-    return std::unexpected(StatusCode::DeviceError);
+  if (auto head = ProjectLogits(backend, model, st, cfg); !head) {
+    return std::unexpected(head.error());
   }
   backend.Synchronize();
   return DownloadF32(backend, *st.logits);
@@ -306,8 +410,28 @@ std::expected<std::vector<float>, StatusCode> DecodeStepDeviceLogits(
 std::expected<std::uint32_t, StatusCode> DecodeStepDevice(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::uint32_t token, std::vector<float>* hidden_out) {
-  auto logits =
-      DecodeStepDeviceLogits(backend, model, cache, token, hidden_out);
+  auto forward =
+      DecodeStepDeviceForward(backend, model, cache, token, hidden_out);
+  if (!forward) {
+    return std::unexpected(forward.error());
+  }
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  const TransformerConfig& cfg = *config;
+  DeviceDecodeState& st = *cache.device;
+  if (auto head = ProjectLogits(backend, model, st, cfg); !head) {
+    return std::unexpected(head.error());
+  }
+  // Top-1 on the device: read back one id instead of the whole
+  // vocabulary. Falls back to the full download when the kernel is
+  // missing, so the token stays identical either way.
+  if (auto best = ArgMaxDevice(backend, st, cfg.vocab_size); best) {
+    return *best;
+  }
+  backend.Synchronize();
+  auto logits = DownloadF32(backend, *st.logits);
   if (!logits) {
     return std::unexpected(logits.error());
   }

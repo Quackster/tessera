@@ -1,5 +1,6 @@
 #include "tessera/model.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -444,6 +445,18 @@ Model::Model(Backend& backend, ModelOptions options, ModelFormat format,
   for (std::size_t i = 0; i < paged_.size(); ++i) {
     paged_index_.emplace(paged_[i].manifest.name, i);
   }
+  // Group the paged indices by trunk layer once, so the per-token
+  // ensures walk only the layer they stage (about ten tensors, not
+  // every paged tensor of the model).
+  for (std::size_t i = 0; i < paged_.size(); ++i) {
+    auto& table = core::IsRoutedExpertKind(paged_[i].kind)
+                      ? paged_expert_by_layer_
+                      : paged_dense_by_layer_;
+    if (table.size() <= paged_[i].layer) {
+      table.resize(paged_[i].layer + 1);
+    }
+    table[paged_[i].layer].push_back(i);
+  }
   // One staging view per paged kind; the manifest is filled when a layer
   // is ensured and the device buffer is the kind's staging slot.
   stage_views_.reserve(staged.size());
@@ -480,7 +493,7 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
     std::span<const std::byte> bytes, const log::Diagnostics* log,
     const ModelShard& shard, std::size_t trunk_layers,
     const TensorShard& tensor, const Architecture* module,
-    std::size_t gpu_layers) {
+    std::size_t gpu_layers, bool has_moe) {
   SplitUpload out;
   out.resident.reserve(tensors.size());
   std::vector<Backend::HostCopy> copies;
@@ -546,9 +559,13 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
       // Under paging the early trunk blocks stay RAM-backed: no device
       // buffer is allocated now; the decode loop stages them per layer.
       // Anything outside `blk.<layer>.` (or past the trunk) stays
-      // resident, as does everything when paging is off.
+      // resident, as does everything when paging is off. In a model with
+      // routed experts the dense block tensors stay resident too and only
+      // the routed experts page (see PagedMoeDenseResident).
       bool resident =
-          core::GpuLayerResident(entry.name, gpu_layers, trunk_layers);
+          core::GpuLayerResident(entry.name, gpu_layers, trunk_layers) ||
+          core::PagedMoeDenseResident(entry.name, gpu_layers, trunk_layers,
+                                      has_moe);
       std::size_t layer = 0;
       std::string block_kind;
       if (!resident) {
@@ -635,14 +652,17 @@ struct EvictedWeights {
 // that never fits cannot load paged either.
 std::expected<EvictedWeights, StatusCode> EvictPagedLayers(
     Backend& backend, std::vector<DeviceTensor> uploaded,
-    std::size_t trunk_layers, std::size_t gpu_layers) {
+    std::size_t trunk_layers, std::size_t gpu_layers, bool has_moe) {
   EvictedWeights out;
   out.resident.reserve(uploaded.size());
   std::unordered_map<std::string, std::size_t> stage_max;
   for (auto& weight : uploaded) {
-    bool resident = weight.device == nullptr ||
-                    core::GpuLayerResident(weight.manifest.name, gpu_layers,
-                                           trunk_layers);
+    bool resident =
+        weight.device == nullptr ||
+        core::GpuLayerResident(weight.manifest.name, gpu_layers,
+                               trunk_layers) ||
+        core::PagedMoeDenseResident(weight.manifest.name, gpu_layers,
+                                    trunk_layers, has_moe);
     std::size_t layer = 0;
     std::string block_kind;
     if (!resident) {
@@ -737,11 +757,13 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     // The module answers the tensor-parallel role of each internal tensor
     // so the loader can slice it; a null module loads every tensor whole.
     std::unique_ptr<Architecture> module = CreateArchitecture(architecture);
+    const bool has_moe = config->has_value() && (*config)->IsMoe();
     auto uploaded =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
                       gguf->tensor_data_start, bytes, log, options.shard,
                       config->has_value() ? (*config)->layers : 0,
-                      options.tensor, module.get(), options.gpu_layers);
+                      options.tensor, module.get(), options.gpu_layers,
+                      has_moe);
     if (!uploaded) {
       return std::unexpected(uploaded.error());
     }
@@ -842,7 +864,8 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         std::vector<std::pair<std::string, std::size_t>> stage_sizes;
         if (options.gpu_layers != 0) {
           auto evicted = EvictPagedLayers(backend, std::move(resident),
-                                          config->layers, options.gpu_layers);
+                                          config->layers, options.gpu_layers,
+                                          config->IsMoe());
           if (!evicted) {
             return std::unexpected(evicted.error());
           }
@@ -901,7 +924,8 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     // the backing is still retained for uniformity.
     auto uploaded = UploadWeights(backend, tensors, offsets, 0, file_bytes,
                                   log, options.shard, 0, options.tensor,
-                                  nullptr, options.gpu_layers);
+                                  nullptr, options.gpu_layers,
+                                  /*has_moe=*/false);
     if (!uploaded) {
       return std::unexpected(uploaded.error());
     }
@@ -1042,51 +1066,41 @@ std::expected<void, StatusCode> Model::EnsureLayerResident(
   // kind views at this layer's manifests. Resident layers stage nothing
   // but still mark the layer ensured. Routed experts are skipped: the
   // MoE path stages only the selected experts (see EnsureLayerExperts),
-  // which moves top_k slices instead of every expert.
-  std::vector<Backend::HostCopy> copies;
-  for (const PagedTensor& entry : paged_) {
-    if (entry.layer != layer) {
-      continue;
+  // which moves top_k slices instead of every expert. The per-layer
+  // index keeps this to the layer's own entries; an empty layer skips
+  // the upload round trip entirely.
+  const std::vector<std::size_t>* rows =
+      layer < paged_dense_by_layer_.size() ? &paged_dense_by_layer_[layer]
+                                           : nullptr;
+  if (rows != nullptr && !rows->empty()) {
+    std::vector<Backend::HostCopy> copies;
+    std::vector<std::size_t> slots;
+    copies.reserve(rows->size());
+    slots.reserve(rows->size());
+    for (const std::size_t i : *rows) {
+      const PagedTensor& entry = paged_[i];
+      const auto staged = stage_index_.find(entry.kind);
+      if (staged == stage_index_.end()) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      copies.push_back(Backend::HostCopy{stage_views_[staged->second].device.get(),
+                                         entry.host});
+      slots.push_back(staged->second);
     }
-    if (core::IsRoutedExpertKind(entry.kind)) {
-      continue;
-    }
-    const auto staged = stage_index_.find(entry.kind);
-    if (staged == stage_index_.end()) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    copies.push_back(Backend::HostCopy{stage_views_[staged->second].device.get(),
-                                       entry.host});
-  }
-  if (!copies.empty()) {
     if (auto uploaded = backend_.CopyH2DBatch(copies); !uploaded) {
       return std::unexpected(uploaded.error());
     }
-  }
-  for (const PagedTensor& entry : paged_) {
-    if (entry.layer != layer) {
-      continue;
+    for (std::size_t k = 0; k < rows->size(); ++k) {
+      stage_views_[slots[k]].manifest = paged_[(*rows)[k]].manifest;
     }
-    if (core::IsRoutedExpertKind(entry.kind)) {
-      continue;
-    }
-    const auto staged = stage_index_.find(entry.kind);
-    if (staged == stage_index_.end()) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    stage_views_[staged->second].manifest = entry.manifest;
   }
   ensured_layer_ = layer;
   return {};
 }
 
 bool Model::ExpertsPaged(std::size_t layer) const {
-  for (const PagedTensor& entry : paged_) {
-    if (entry.layer == layer && core::IsRoutedExpertKind(entry.kind)) {
-      return true;
-    }
-  }
-  return false;
+  return layer < paged_expert_by_layer_.size() &&
+         !paged_expert_by_layer_[layer].empty();
 }
 
 // One expert's byte size and count from a rank-3 packed expert manifest.
@@ -1113,33 +1127,35 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
     return {};
   }
   // Whole upload for the batched case: every expert tensor lands fully.
-  std::vector<Backend::HostCopy> copies;
-  for (const PagedTensor& entry : paged_) {
-    if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
-      continue;
+  const std::vector<std::size_t>* rows =
+      layer < paged_expert_by_layer_.size() ? &paged_expert_by_layer_[layer]
+                                            : nullptr;
+  if (rows != nullptr && !rows->empty()) {
+    std::vector<Backend::HostCopy> copies;
+    std::vector<std::size_t> slots;
+    copies.reserve(rows->size());
+    slots.reserve(rows->size());
+    for (const std::size_t i : *rows) {
+      const PagedTensor& entry = paged_[i];
+      const auto staged = stage_index_.find(entry.kind);
+      if (staged == stage_index_.end()) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      copies.push_back(Backend::HostCopy{stage_views_[staged->second].device.get(),
+                                         entry.host});
+      slots.push_back(staged->second);
     }
-    const auto staged = stage_index_.find(entry.kind);
-    if (staged == stage_index_.end()) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    copies.push_back(Backend::HostCopy{stage_views_[staged->second].device.get(),
-                                       entry.host});
-  }
-  if (!copies.empty()) {
     if (auto uploaded = backend_.CopyH2DBatch(copies); !uploaded) {
       return std::unexpected(uploaded.error());
     }
-  }
-  for (const PagedTensor& entry : paged_) {
-    if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
-      continue;
+    for (std::size_t k = 0; k < rows->size(); ++k) {
+      stage_views_[slots[k]].manifest = paged_[(*rows)[k]].manifest;
     }
-    const auto staged = stage_index_.find(entry.kind);
-    if (staged == stage_index_.end()) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    stage_views_[staged->second].manifest = entry.manifest;
   }
+  // A whole upload covers every expert id, so later selective calls for
+  // this layer stage nothing.
+  experts_staged_.clear();
+  experts_staged_all_ = true;
   experts_layer_ = layer;
   return {};
 }
@@ -1150,16 +1166,54 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
     return {};
   }
   // Selective upload for the single-row case: only the routed experts
-  // land, at their expert offsets, so kernels keep the unchanged ids. No
-  // short-circuit here: every call carries a new selection, and
-  // re-uploading the same bytes is idempotent anyway. One batched upload
-  // covers every slice, so a token pays one staging round trip per layer
-  // instead of one per expert.
-  std::vector<Backend::HostCopy> slices;
-  for (const PagedTensor& entry : paged_) {
-    if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
-      continue;
+  // land, at their expert offsets, so kernels keep the unchanged ids.
+  // One batched upload covers every slice, so a token pays one staging
+  // round trip per layer instead of one per expert. The per-layer index
+  // keeps this to the layer's own expert entries, and the staged set
+  // below stages only ids missing from an earlier call for the same
+  // layer: a prefill batch whose rows share experts uploads each one
+  // once instead of once per row. The staged bytes are identical either
+  // way, so the kernels read the same weights.
+  const std::vector<std::size_t>* rows =
+      layer < paged_expert_by_layer_.size() ? &paged_expert_by_layer_[layer]
+                                            : nullptr;
+  const bool same_layer =
+      experts_layer_.has_value() && *experts_layer_ == layer;
+  if (rows == nullptr || rows->empty()) {
+    experts_layer_ = layer;
+    experts_staged_.clear();
+    experts_staged_all_ = false;
+    return {};
+  }
+  if (same_layer && experts_staged_all_) {
+    return {};
+  }
+  // Sorted unique ids for the set difference below. An id outside the
+  // tensor's expert count is MalformedFile, reported before any upload.
+  std::vector<std::uint32_t> wanted(experts.begin(), experts.end());
+  std::sort(wanted.begin(), wanted.end());
+  wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+  std::vector<std::uint32_t> missing;
+  if (same_layer && !experts_staged_all_) {
+    missing.reserve(wanted.size());
+    for (const std::uint32_t id : wanted) {
+      if (!std::binary_search(experts_staged_.begin(), experts_staged_.end(),
+                              id)) {
+        missing.push_back(id);
+      }
     }
+    if (missing.empty()) {
+      return {};
+    }
+  } else {
+    missing = wanted;
+  }
+  std::vector<Backend::HostCopy> slices;
+  std::vector<std::size_t> slots;
+  slices.reserve(rows->size() * missing.size());
+  slots.reserve(rows->size());
+  for (const std::size_t i : *rows) {
+    const PagedTensor& entry = paged_[i];
     auto span = ExpertSpan(entry.manifest);
     if (!span) {
       return std::unexpected(span.error());
@@ -1173,7 +1227,8 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
     if (slot == nullptr) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    for (const std::uint32_t expert : experts) {
+    slots.push_back(staged->second);
+    for (const std::uint32_t expert : missing) {
       const std::size_t id = expert;
       if (id >= count || per > entry.host.size() ||
           id > (entry.host.size() - per) / per) {
@@ -1187,15 +1242,15 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   if (auto uploaded = backend_.CopyH2DBatch(slices); !uploaded) {
     return std::unexpected(uploaded.error());
   }
-  for (const PagedTensor& entry : paged_) {
-    if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
-      continue;
-    }
-    const auto staged = stage_index_.find(entry.kind);
-    if (staged == stage_index_.end()) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    stage_views_[staged->second].manifest = entry.manifest;
+  for (std::size_t k = 0; k < rows->size(); ++k) {
+    stage_views_[slots[k]].manifest = paged_[(*rows)[k]].manifest;
+  }
+  if (!same_layer) {
+    experts_staged_ = wanted;
+  } else {
+    experts_staged_.insert(experts_staged_.end(), missing.begin(),
+                           missing.end());
+    std::sort(experts_staged_.begin(), experts_staged_.end());
   }
   experts_layer_ = layer;
   return {};

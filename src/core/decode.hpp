@@ -155,6 +155,16 @@ struct DeviceDecodeState {
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
   std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
+  // Device embedding-gather kernel keyed by the embedding weight dtype,
+  // plus one token-id slot: quantized embeddings gather on the device
+  // instead of downloading one row for a host dequantize per token.
+  std::unordered_map<int, std::unique_ptr<Kernel>> embed_kernels;
+  std::unique_ptr<Buffer> embed_ids;
+  // On-device top-1 over the logits, so greedy decode reads back one id
+  // instead of the whole vocabulary.
+  std::unique_ptr<Kernel> topk_kernel;
+  std::unique_ptr<Buffer> argmax_ids;
+  std::unique_ptr<Buffer> argmax_vals;
   std::unique_ptr<Buffer> x;
   std::unique_ptr<Buffer> xn;
   std::unique_ptr<Buffer> proj;

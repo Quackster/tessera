@@ -475,10 +475,11 @@ TEST(MoeDecodeTest, PagedMatchesFullUpload) {
   paged_options.gpu_layers = 1;
   auto paged = engine->LoadModel(paged_options);
   ASSERT_TRUE(paged.has_value()) << tessera::ToString(paged.error());
-  // One trunk layer, paged: attention stages whole, experts stage slices.
+  // One trunk layer, paged: dense block tensors stay resident under the
+  // MoE refinement while routed experts stage slices per token.
   EXPECT_TRUE((*paged)->ExpertsPaged(0));
   EXPECT_EQ((*paged)->FindDeviceTensor("blk.0.ffn_gate_exps.weight"), nullptr);
-  EXPECT_EQ((*paged)->FindDeviceTensor("blk.0.attn_q.weight"), nullptr);
+  EXPECT_NE((*paged)->FindDeviceTensor("blk.0.attn_q.weight"), nullptr);
   tessera::core::DecodeCache full_cache;
   auto full_first =
       tessera::core::DecodeStep(engine->Owner(), **full, full_cache, 0);

@@ -282,6 +282,13 @@ class Model {
   // RAM-backed tensors and their name index; empty without paging.
   std::vector<PagedTensor> paged_;
   std::unordered_map<std::string_view, std::size_t> paged_index_;
+  // Per-layer paged indices into paged_: dense holds the non-expert
+  // entries of each trunk layer, expert the routed-expert entries.
+  // Empty without paging; the outer size covers the highest paged
+  // layer. Built once at load so the per-token ensures touch only
+  // one layer instead of scanning every paged tensor per layer.
+  std::vector<std::vector<std::size_t>> paged_dense_by_layer_;
+  std::vector<std::vector<std::size_t>> paged_expert_by_layer_;
   // Staging views keyed by tensor kind, one per paged kind, each sized
   // to the largest paged tensor of that kind. FindDeviceTensor answers
   // paged names from the matching view once the layer is ensured.
@@ -295,6 +302,13 @@ class Model {
   // Trunk layer whose paged experts are staged by EnsureLayerExperts;
   // nullopt when no expert staging covers the layer. Mutable likewise.
   mutable std::optional<std::size_t> experts_layer_;
+  // Expert ids already staged for experts_layer_ by selective uploads;
+  // sorted and unique. A later call for the same layer uploads only the
+  // missing ids, so a prefill batch whose rows share experts stages each
+  // one once instead of once per row. Reset on a layer change; a whole
+  // upload covers every id (see experts_staged_all_). Mutable likewise.
+  mutable std::vector<std::uint32_t> experts_staged_;
+  mutable bool experts_staged_all_ = false;
   // Lifetime holders for the RAM backing the paged host spans point into:
   // the mapped weight file and any retained owned copies (tensor-parallel
   // slices, converted MXFP4 blobs). The shared_ptr<const void> type erases

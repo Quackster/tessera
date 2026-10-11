@@ -150,13 +150,14 @@ inline void SiluMulInto(const std::vector<float>& gate,
 
 inline std::expected<std::vector<float>, StatusCode> DownloadF32(
     Backend& backend, const Buffer& buf) {
-  std::vector<std::byte> raw(buf.Size());
-  auto down = backend.CopyD2H(buf, raw.data(), raw.size());
+  // One allocation: the floats land directly instead of staging through
+  // a byte buffer plus a copy.
+  std::vector<float> out(buf.Size() / 4);
+  auto down = backend.CopyD2H(buf, reinterpret_cast<std::byte*>(out.data()),
+                              out.size() * 4);
   if (!down) {
     return std::unexpected(down.error());
   }
-  std::vector<float> out(buf.Size() / 4);
-  std::memcpy(out.data(), raw.data(), raw.size());
   return out;
 }
 

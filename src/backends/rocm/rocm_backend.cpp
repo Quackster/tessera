@@ -336,6 +336,9 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyH2DBatch(
       std::span<const Backend::HostCopy> copies) override {
+    if (copies.empty()) {
+      return {};
+    }
     if (auto device = SelectDevice(); device != StatusCode::Ok) {
       return std::unexpected(device);
     }
@@ -400,7 +403,8 @@ class RocmBackend final : public Backend {
       }
       index = end;
     }
-    ReleaseStaging();
+    // The staging window persists for the next batch (the destructor
+    // frees it), so a paged token pays no per-batch pinned allocation.
     if (diagnostics_ != nullptr) {
       LogInfo(core::FormatTransferSummary(
           total_bytes, copies.size(),
@@ -644,8 +648,10 @@ class RocmBackend final : public Backend {
     return staging_;
   }
 
-  // Free the reusable staging buffer. A batched upload releases it when
-  // done, so a loaded model does not hold a large pinned block.
+  // Free the reusable staging buffer. The window persists across
+  // batches for the backend lifetime now (a paged token stages dozens
+  // of batches); the destructor frees it, so a loaded model holds at
+  // most one window of pinned memory.
   void ReleaseStaging() {
     if (staging_ == nullptr) {
       return;

@@ -19,6 +19,10 @@ namespace tessera::core {
 struct WeightBudget {
   // Trunk block count from the model definition.
   std::size_t trunk_layers = 0;
+  // True when the definition carries routed experts: under paging the
+  // dense block tensors stay resident and only experts page (see
+  // PagedMoeDenseResident), so the resident bytes include them.
+  bool has_moe = false;
   // (internal tensor name, device bytes) in manifest order.
   std::vector<std::pair<std::string, std::uint64_t>> tensors;
 };
