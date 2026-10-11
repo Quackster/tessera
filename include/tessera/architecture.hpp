@@ -59,6 +59,14 @@ struct WeightConversion {
   bool add_one = false;
 };
 
+// The optional weight groups a load materializes. The MTP
+// (next-token-prediction) head is the only group today: only MTP
+// speculation reads it, so a run with another strategy can skip it and
+// the device memory it would hold. A 27B head is about 1.6 GiB.
+struct WeightLoadOptions {
+  bool include_mtp_head = true;
+};
+
 class Architecture {
  public:
   virtual ~Architecture() = default;
@@ -160,12 +168,16 @@ class Architecture {
   // Map a checkpoint tensor name to the internal name this module looks
   // up (for example a HuggingFace safetensors name to a "blk.N.*" name),
   // or nullopt to ignore the tensor. `config` is the parsed model config,
-  // so the module can place draft blocks after the trunk layers. The
-  // default returns the name unchanged, for formats that already use the
-  // internal names (GGUF).
+  // so the module can place draft blocks after the trunk layers. `options`
+  // selects the optional weight groups to materialize: with
+  // include_mtp_head false the module ignores the next-token-prediction
+  // head, which only MTP speculation reads. The default returns the name
+  // unchanged, for formats that already use the internal names (GGUF).
   [[nodiscard]] virtual std::optional<std::string> MapWeightName(
-      std::string_view name, const TransformerConfig& config) const {
+      std::string_view name, const TransformerConfig& config,
+      const WeightLoadOptions& options) const {
     (void)config;
+    (void)options;
     return std::string(name);
   }
 

@@ -71,6 +71,13 @@ TEST(SpecTest, DraftDefaultsToAuto) {
   EXPECT_EQ(tessera::CreateMtpStrategy()->DraftBlock(), 2u);
 }
 
+// Only the MTP drafter reads the target's own nextn head; the engine
+// skips those weights for every other strategy.
+TEST(SpecTest, OnlyMtpReadsTargetHead) {
+  EXPECT_TRUE(tessera::CreateMtpStrategy()->ReadsTargetMtpHead());
+  EXPECT_FALSE(CreateDFlash2Strategy()->ReadsTargetMtpHead());
+}
+
 // The MTP override flows through Attach (GenerateSpeculative attaches
 // the request value): 0 keeps the default, a nonzero value wins.
 TEST(SpecTest, MtpAttachOverridesBlock) {

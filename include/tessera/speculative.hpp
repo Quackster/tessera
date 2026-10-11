@@ -56,6 +56,11 @@ class SpeculativeStrategy {
   // Maximum draft tokens proposed per window (0 = strategy default).
   [[nodiscard]] virtual std::size_t DraftBlock() const = 0;
 
+  // True when the drafter reads the target's MTP (next-token-prediction)
+  // head and therefore needs its weights loaded. The engine skips the
+  // head on load when the attached strategy returns false.
+  [[nodiscard]] virtual bool ReadsTargetMtpHead() const { return false; }
+
   // Override the draft context window in rows for the next generation
   // (0 keeps the checkpoint's configured window). Called once before a
   // generation; a strategy without a bounded draft context ignores it. Safe

@@ -30,6 +30,11 @@ struct ModelOptions {
   std::string path;
   // Maximum context length to prepare for; a tunable.
   std::size_t max_context_length = 4096;
+  // Materialize the MTP (next-token-prediction) head. Only MTP
+  // speculation reads it, so the engine clears this when a strategy that
+  // does not read it is attached. The MXFP4 directory loader honors the
+  // flag; the GGUF loader loads every tensor in the file. Default true.
+  bool load_mtp_head = true;
 };
 
 // A loaded model: format + options + parsed tensor manifest.

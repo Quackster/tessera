@@ -146,6 +146,20 @@ through RADV GFX1100, rocm through the system ROCm).
   with an 11.8 GiB peak (mostly reclaimable mapped pages), the
   DFlash2 draft loads in 16.6 s with a 3.1 GiB peak, and the ROCm
   suite passes 192 tests.
+- The MTP head loads only when a strategy reads it. `Engine::LoadModel`
+  clears `ModelOptions::load_mtp_head` when the attached strategy's
+  `ReadsTargetMtpHead()` is false (DFlash2 returns false, MTP true), and
+  the Qwen3.5 weight map then skips `mtp.*`. The 27B head is 1.58 GiB of
+  device memory as f32 (0.4 GiB of fp8 widened). With it loaded, the
+  27B MXFP4 target, the DFlash2 draft and the verify's recurrent-state
+  history (48 linear layers x 9 rows x 27 MiB) did not fit the 24 GiB RX
+  7900 XTX: the first speculative decode died on a 27 MiB `hipMalloc`.
+  Without it the MXFP4 + DFlash2 calibration completes on the 7900 XTX
+  (19m14s, peak host 10.0 GiB) and DFlash2 runs (prefill 80.6 tok/s,
+  decode 9.6 to 23 tok/s over the sweep prompts). Plain runs (no
+  strategy) still load the head, so a later MTP attach cannot break.
+  Covered by `EngineTest.WeightMapSkipsMtpHeadWhenNotWanted` and
+  `SpecTest.OnlyMtpReadsTargetHead`.
 - KV cache types: fp32 (default), fp16, symmetric int8, symmetric
   4-bit, FP8. Selected by option (`--kv-f16`, `--kv-q8`,
   `--kv-q4`, `--kv-fp8`). Caches are preallocated and grow

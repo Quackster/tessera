@@ -601,8 +601,9 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
         std::expected<std::vector<DeviceTensor>, StatusCode> weights;
         {
           core::PhaseTimer build_timer(log, "model", "build mxfp4 weights");
-          weights = core::BuildMxFp4Weights(backend, file_bytes, *parsed,
-                                            *module, *config);
+          weights = core::BuildMxFp4Weights(
+              backend, file_bytes, *parsed, *module, *config,
+              WeightLoadOptions{options.load_mtp_head});
         }
         if (!weights) {
           return std::unexpected(weights.error());

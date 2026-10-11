@@ -174,7 +174,7 @@ std::expected<std::unique_ptr<Buffer>, StatusCode> Upload(
 std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
     Backend& backend, std::span<const std::byte> file,
     std::span<const SafetensorsTensor> tensors, const Architecture& module,
-    const TransformerConfig& config) {
+    const TransformerConfig& config, const WeightLoadOptions& options) {
   std::unordered_map<std::string, const SafetensorsTensor*> by_name;
   for (const auto& tensor : tensors) {
     by_name.emplace(tensor.name, &tensor);
@@ -184,7 +184,7 @@ std::expected<std::vector<DeviceTensor>, StatusCode> BuildMxFp4Weights(
     if (tensor.entry.dtype == DType::F8E8M0) {
       continue;  // E8M0 scales pair with their F4E2M1 blob
     }
-    auto internal = module.MapWeightName(tensor.name, config);
+    auto internal = module.MapWeightName(tensor.name, config, options);
     if (!internal) {
       continue;
     }

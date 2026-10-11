@@ -57,7 +57,8 @@ std::string LayerName(std::string_view index, std::string_view suffix) {
 }  // namespace
 
 std::optional<std::string> Qwen35Architecture::MapWeightName(
-    std::string_view name, const TransformerConfig& config) const {
+    std::string_view name, const TransformerConfig& config,
+    const WeightLoadOptions& options) const {
   if (name == "lm_head.weight") {
     return std::string("output.weight");
   }
@@ -65,6 +66,9 @@ std::optional<std::string> Qwen35Architecture::MapWeightName(
     return std::nullopt;  // vision tower; the text model does not use it
   }
   if (name.rfind("mtp.", 0) == 0) {
+    if (!options.include_mtp_head) {
+      return std::nullopt;  // no attached strategy reads the MTP head
+    }
     const std::string base = std::to_string(config.layers);
     std::string_view rest = name.substr(4);
     if (rest == "fc.weight") {

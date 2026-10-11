@@ -531,6 +531,31 @@ TEST(EngineTest, ParsesMoeTextConfigJson) {
   EXPECT_TRUE(config->hybrid);
 }
 
+// The MXFP4 weight map honors the MTP head selection, so the loader can
+// skip the nextn tensors when no attached strategy reads them.
+TEST(EngineTest, WeightMapSkipsMtpHeadWhenNotWanted) {
+  auto arch = tessera::CreateArchitecture("qwen35");
+  ASSERT_NE(arch, nullptr);
+  tessera::TransformerConfig config;
+  config.layers = 64;
+  tessera::WeightLoadOptions with_head;
+  tessera::WeightLoadOptions without_head;
+  without_head.include_mtp_head = false;
+  auto mapped = arch->MapWeightName("mtp.fc.weight", config, with_head);
+  ASSERT_TRUE(mapped.has_value());
+  EXPECT_EQ(*mapped, "blk.64.nextn.eh_proj.weight");
+  EXPECT_FALSE(
+      arch->MapWeightName("mtp.fc.weight", config, without_head).has_value());
+  const char* trunk =
+      "model.language_model.layers.3.self_attn.q_proj.weight";
+  auto trunk_with = arch->MapWeightName(trunk, config, with_head);
+  auto trunk_without = arch->MapWeightName(trunk, config, without_head);
+  ASSERT_TRUE(trunk_with.has_value());
+  ASSERT_TRUE(trunk_without.has_value());
+  EXPECT_EQ(*trunk_with, "blk.3.attn_q.weight");
+  EXPECT_EQ(*trunk_without, "blk.3.attn_q.weight");
+}
+
 TEST(EngineTest, LoadGgufModelMoeConfig) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);

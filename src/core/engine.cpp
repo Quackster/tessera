@@ -49,7 +49,14 @@ std::expected<std::unique_ptr<Engine>, StatusCode> Engine::Create(
 
 std::expected<std::unique_ptr<Model>, StatusCode> Engine::LoadModel(
     const ModelOptions& options) {
-  auto model = Model::Load(*backend_, options);
+  // A drafter that does not read the target's MTP head lets the loader
+  // skip it (about 1.6 GiB on the 27B target). With no strategy attached
+  // the head stays, so a later MTP attach still finds it.
+  ModelOptions effective = options;
+  if (speculative_ != nullptr && !speculative_->ReadsTargetMtpHead()) {
+    effective.load_mtp_head = false;
+  }
+  auto model = Model::Load(*backend_, effective);
   if (!model) {
     diagnostics_.Warn(
         "model", std::string("load failed for '") + options.path + "': " +

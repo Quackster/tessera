@@ -76,7 +76,8 @@ class Qwen35Architecture final : public Architecture {
       std::string_view json) const override;
 
   [[nodiscard]] std::optional<std::string> MapWeightName(
-      std::string_view name, const TransformerConfig& config) const override;
+      std::string_view name, const TransformerConfig& config,
+      const WeightLoadOptions& options) const override;
 
   [[nodiscard]] std::optional<WeightConversion> ConvertWeight(
       std::string_view internal_name,

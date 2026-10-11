@@ -51,6 +51,8 @@ class MtpStrategy final : public SpeculativeStrategy {
   }
 
   std::size_t DraftBlock() const override { return block_; }
+
+  [[nodiscard]] bool ReadsTargetMtpHead() const override { return true; }
   // The anchor rides the verify batch (the reference MTP cycle): the draft
   // runs before the target sees the anchor, pairing the anchor token with
   // the hidden one position before, and the verify scores
