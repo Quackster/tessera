@@ -83,11 +83,14 @@ std::expected<DraftWeightStore, StatusCode> DraftWeightStore::Load(
   if (!layout) {
     return std::unexpected(layout.error());
   }
-  auto file = core::ReadFile(layout->weights_path);
+  // Map the 2 GiB checkpoint. The fp8-to-f32 conversion copies each tensor
+  // it needs; a whole-file read would hold the container in host memory
+  // for the whole load next to those transients.
+  auto file = core::MappedFile::Open(layout->weights_path);
   if (!file) {
     return std::unexpected(file.error());
   }
-  std::span<const std::byte> bytes(*file);
+  std::span<const std::byte> bytes = file->bytes();
   auto parsed = core::ParseSafetensorsMap(bytes);
   if (!parsed) {
     return std::unexpected(parsed.error());

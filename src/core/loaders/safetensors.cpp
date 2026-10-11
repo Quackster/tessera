@@ -389,25 +389,30 @@ bool EndsWith(std::string_view text, std::string_view suffix) {
 
 std::expected<SafetensorsFileCheck, StatusCode> InspectSafetensorsFile(
     const std::filesystem::path& path) {
-  auto data = ReadFile(path);
-  if (!data) {
-    return std::unexpected(data.error());
+  // Map the file. Reading it whole would allocate the full container in
+  // host memory: a 27B checkpoint is about 19 GiB and the process is
+  // killed before the first weight is uploaded. Inspection touches only
+  // the prefix and the header byte.
+  auto mapped = MappedFile::Open(path);
+  if (!mapped) {
+    return std::unexpected(mapped.error());
   }
-  if (data->size() < kSafetensorsMinSize) {
+  const std::span<const std::byte> data = mapped->bytes();
+  if (data.size() < kSafetensorsMinSize) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   std::uint64_t header_len = 0;
-  std::memcpy(&header_len, data->data(), 8);  // little-endian on all targets
+  std::memcpy(&header_len, data.data(), 8);  // little-endian on all targets
   if (header_len == 0 || header_len > kMaxSafetensorsHeaderLen) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  if (data->size() < 8 + static_cast<std::size_t>(header_len)) {
+  if (data.size() < 8 + static_cast<std::size_t>(header_len)) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  if (data->at(8) != static_cast<std::byte>('{')) {
+  if (data[8] != static_cast<std::byte>('{')) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  return SafetensorsFileCheck{data->size(), header_len};
+  return SafetensorsFileCheck{data.size(), header_len};
 }
 
 std::expected<MxFp4Layout, StatusCode> InspectMxFp4Directory(
