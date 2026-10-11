@@ -704,14 +704,18 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
     example +=
         " --draft-context " + std::to_string(report.chosen.draft_context);
   }
+  if (report.strategy == "mtp") {
+    example += " --speculate";
+  }
   example += " --prompt-text \"Hello\"";
   out += "\nExample\n-------\n";
   out += example + "\n";
   out += "  # or apply the saved entry directly:\n";
   out += "  tessera-cli run --model " + report.model_path + " " +
          report.kv_flag + "\\\n      --context " +
-         std::to_string(report.key_context) + " --calibration " + report.file +
-         " --prompt-text \"Hello\"\n";
+         std::to_string(report.key_context) +
+         (report.strategy == "mtp" ? " --speculate" : "") + " --calibration " +
+         report.file + " --prompt-text \"Hello\"\n";
   return out;
 }
 

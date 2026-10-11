@@ -194,6 +194,20 @@ through RADV GFX1100, rocm through the system ROCm).
   (RX 7900 XTX), 47 on Vulkan; covered by `GemmQ4KBatchedMatchesRef` and
   the Q5_K/Q6_K/IQ4_XS/Q3_K/IQ4_NL siblings; both suites 219 tests, 0
   failures.
+- MTP calibration and the MTP quantized-KV fix. `calibrate --speculate`
+  attaches the MTP strategy, so the sweep measures the speculative decode
+  path, the hardware key carries strategy `mtp`, the `draft_tokens` sweep
+  tunes the MTP chain, and the report's example command passes
+  `--speculate`. Measured on the 27B Q4_K_M GGUF (ROCm, RX 7900 XTX,
+  int8 KV, the default three-prompt set): 30.56 decode tok/s against
+  19.43 greedy, 60.10 prefill tok/s; every default was kept. The first
+  run failed with a device error and exposed a real defect:
+  `EnsureHybridReady` set the cache KV type on the trunk's full-attention
+  caches but not on `mtp_kv`, so MTP with a quantized KV cache picked the
+  F32 append/attention path while the attention kernel was loaded for the
+  quantized type and the first step failed. It now sets `mtp_kv.type`;
+  `EngineTest.MtpDecodeOnModel` covers the quantized case when
+  `TESSERA_TEST_MODEL` is set.
 - KV cache types: fp32 (default), fp16, symmetric int8, symmetric
   4-bit, FP8. Selected by option (`--kv-f16`, `--kv-q8`,
   `--kv-q4`, `--kv-fp8`). Caches are preallocated and grow

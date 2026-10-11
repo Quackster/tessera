@@ -415,6 +415,10 @@ std::expected<void, StatusCode> EnsureHybridReady(
       for (auto& kv : h.full) {
         kv.type = cache.kv_type;
       }
+      // The MTP head's KV cache shares the cache type. Without this it
+      // stays F32 while the attention kernel is loaded for the quantized
+      // type, and the first MTP step fails.
+      h.mtp_kv.type = cache.kv_type;
     }
     h.ready = true;
   }

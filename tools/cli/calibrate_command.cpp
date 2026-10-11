@@ -134,11 +134,14 @@ void PrintCalibrateUsage() {
   std::fprintf(
       stderr,
       "usage: tessera-cli calibrate --model <path> [--draft <dir>]\n"
-      "       [--context <n>] [--kv-f16|--kv-q8|--kv-q4|--kv-fp8]\n"
+      "       [--speculate] [--context <n>]\n"
+      "       [--kv-f16|--kv-q8|--kv-q4|--kv-fp8]\n"
       "       [--calibration <file>] [--gpu <n>] [--prompts <file>]\n"
       "  --model <path>    a .gguf file or an MXFP4 model directory\n"
       "  --draft <dir>     DFlash2 draft checkpoint (enables the draft "
       "block sweep)\n"
+      "  --speculate       MTP speculation from the target's own nextn head\n"
+      "                    (enables the draft block sweep)\n"
       "  --context <n>     maximum context length (default %zu)\n"
       "  --kv-f16|--kv-q8|--kv-q4|--kv-fp8   KV cache type (default int8, "
       "kv8)\n"
@@ -181,12 +184,15 @@ int RunCalibrateCommand(int argc, char** argv) {
   KvCacheType kv_type = KvCacheType::Q8;
   int gpu = 0;
   bool quiet = false;
+  bool speculate = false;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "--model" && i + 1 < argc) {
       model_path = argv[++i];
     } else if (arg == "--draft" && i + 1 < argc) {
       draft_path = argv[++i];
+    } else if (arg == "--speculate") {
+      speculate = true;
     } else if (arg == "--calibration" && i + 1 < argc) {
       calibration_path = argv[++i];
     } else if (arg == "--prompts" && i + 1 < argc) {
@@ -242,12 +248,17 @@ int RunCalibrateCommand(int argc, char** argv) {
   Engine& engine = **created;
   auto& log = engine.Diagnostics();
 
+  // DFlash2 attaches from its checkpoint; MTP drafts from the target's own
+  // nextn head, so it needs no path. Either enables the draft sweeps.
   bool draft_attached = false;
-  if (!draft_path.empty()) {
-    auto strategy = CreateDFlash2Strategy();
+  bool dflash2_attached = false;
+  if (!draft_path.empty() || speculate) {
+    std::unique_ptr<SpeculativeStrategy> strategy =
+        draft_path.empty() ? CreateMtpStrategy() : CreateDFlash2Strategy();
+    const std::string label = draft_path.empty() ? "MTP" : "DFlash2";
     auto attach = strategy->Attach(StrategyOptions{draft_path, 0});
     if (!attach) {
-      log.Error("calibrate", std::string("draft attach failed (") +
+      log.Error("calibrate", label + " attach failed (" +
                                  std::string(ToString(attach.error())) + ")");
       return kExitError;
     }
@@ -259,6 +270,7 @@ int RunCalibrateCommand(int argc, char** argv) {
       return kExitError;
     }
     draft_attached = true;
+    dflash2_attached = !draft_path.empty();
   }
 
   auto model = engine.LoadModel(ModelOptions{model_path, context});
@@ -292,7 +304,8 @@ int RunCalibrateCommand(int argc, char** argv) {
     decode_ids.push_back(std::move(short_ids));
   }
   const std::string backend(engine.Owner().Name());
-  const std::string strategy_label = draft_attached ? "dflash2" : "none";
+  const std::string strategy_label =
+      dflash2_attached ? "dflash2" : (draft_attached ? "mtp" : "none");
 
   // Report the maximum context length the device allows for this KV cache
   // type: free memory (or total memory minus the weights) minus a reserve,
@@ -395,7 +408,8 @@ int RunCalibrateCommand(int argc, char** argv) {
   }
   sweep.sweep_attention_split = longest_prompt >= kAttentionSplitMinKeys;
   sweep.sweep_draft_tokens = draft_attached && defaults.draft_tokens > 0;
-  sweep.sweep_draft_context = draft_attached;
+  // MTP has no draft context window; only DFlash2 sweeps that knob.
+  sweep.sweep_draft_context = dflash2_attached;
 
   if (!quiet) {
     log.Info("calibrate", std::string("sweeping on ") + backend + " (" +

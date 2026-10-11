@@ -917,6 +917,18 @@ TEST(EngineTest, MtpDecodeOnModel) {
   auto served = engine->Generate(**model, options);
   ASSERT_TRUE(served.has_value()) << tessera::ToString(served.error());
   EXPECT_EQ(*served, *greedy);
+  // A quantized KV cache must take the same MTP path. The MTP head's KV
+  // cache shares the cache type; before that was set the first MTP step
+  // failed with a device error. The quantized cache is lossy by design,
+  // so compare the speculative output with its own greedy baseline.
+  options.kv_type = tessera::KvCacheType::Q8;
+  auto quantized_greedy = engine->Generate(**model, options);
+  ASSERT_TRUE(quantized_greedy.has_value())
+      << tessera::ToString(quantized_greedy.error());
+  auto quantized_spec = engine->GenerateSpeculative(**model, options);
+  ASSERT_TRUE(quantized_spec.has_value())
+      << tessera::ToString(quantized_spec.error());
+  EXPECT_EQ(*quantized_spec, *quantized_greedy);
 }
 
 // The vision config parser rejects a non-CLIP GGUF.
