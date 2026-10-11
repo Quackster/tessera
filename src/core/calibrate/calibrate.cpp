@@ -194,6 +194,7 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
   double attention = 0.0;
   double draft = 0.0;
   double draft_context = 0.0;
+  double max_context = 0.0;
   if (!ReadString(item, "backend", entry.key.backend) ||
       !ReadString(item, "device", entry.key.device) ||
       !ReadString(item, "model", entry.key.model) ||
@@ -206,13 +207,15 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
       !ReadOptionalNumber(item, "attention_split", attention) ||
       !ReadNumber(item, "draft_tokens", draft) ||
       !ReadOptionalNumber(item, "draft_context", draft_context) ||
+      !ReadOptionalNumber(item, "max_context", max_context) ||
       !ReadNumber(item, "decode_tps", entry.decode_tps) ||
       !ReadNumber(item, "prefill_tps", entry.prefill_tps) ||
       !ReadString(item, "date", entry.date)) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   if (context < 0.0 || split < 0.0 || cap < 0.0 || prefill < 0.0 ||
-      attention < 0.0 || draft < 0.0 || draft_context < 0.0) {
+      attention < 0.0 || draft < 0.0 || draft_context < 0.0 ||
+      max_context < 0.0) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   entry.key.context = static_cast<std::size_t>(context);
@@ -222,6 +225,7 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
   entry.config.attention_split = static_cast<std::size_t>(attention);
   entry.config.draft_tokens = static_cast<std::size_t>(draft);
   entry.config.draft_context = static_cast<std::size_t>(draft_context);
+  entry.max_context = static_cast<std::size_t>(max_context);
   return entry;
 }
 
@@ -470,6 +474,8 @@ std::expected<void, StatusCode> CalibrationFile::Save(
     item.Set("model", core::Json::String(entry.key.model));
     item.Set("context", core::Json::Number(
                             static_cast<double>(entry.key.context)));
+    item.Set("max_context",
+             core::Json::Number(static_cast<double>(entry.max_context)));
     item.Set("kv_type", core::Json::String(entry.key.kv_type));
     item.Set("strategy", core::Json::String(entry.key.strategy));
     item.Set("mxfp4_split_target",
@@ -676,9 +682,10 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += row("decode", format_rate(report.decode_tps) + " tok/s", 21);
   out += row("prefill", format_rate(report.prefill_tps) + " tok/s", 21);
   out += "\nWrote " + report.file + "\n";
-  std::string example =
-      "  tessera-cli run --model " + report.model_path + " " + report.kv_flag;
-  example += "\\\n      --prefill-chunk " +
+  std::string example = "  tessera-cli run --model " + report.model_path +
+                        " " + report.kv_flag + "\\\n      --context " +
+                        std::to_string(report.key_context);
+  example += " --prefill-chunk " +
              std::to_string(report.chosen.prefill_chunk_tokens);
   if (report.split_applicable) {
     example +=
@@ -702,7 +709,8 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += example + "\n";
   out += "  # or apply the saved entry directly:\n";
   out += "  tessera-cli run --model " + report.model_path + " " +
-         report.kv_flag + "\\\n      --calibration " + report.file +
+         report.kv_flag + "\\\n      --context " +
+         std::to_string(report.key_context) + " --calibration " + report.file +
          " --prompt-text \"Hello\"\n";
   return out;
 }

@@ -452,6 +452,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   entry.config = outcome->config;
   entry.decode_tps = MedianOf(decode_rates);
   entry.prefill_tps = MedianOf(prefill_rates);
+  entry.max_context = max_context;
   entry.date = TodayIso();
   // Keep the identity for the report: `entry` is moved into the file below.
   const std::string model_id = entry.key.model;

@@ -48,7 +48,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
 | MoE, MLP, norms | Partial | Norms and MLP kernels done. Sparse mixture-of-experts (Ornith-1.5) decodes on Vulkan and ROCm with fused routed-expert kernels (84 tok/s ROCm, 88 Vulkan). Grouped-expert batch GEMM is the follow-up. |
-| Calibration | Done | `calibrate` sweeps the split-K target and cap (ROCm), the prefill chunk (multiples of 256 from 512), the single-token attention split and (with a draft) the draft block and draft context, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8 and reports the memory-bound max context. Prints a report with an example `run` command; writes JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
+| Calibration | Done | `calibrate` sweeps the split-K target and cap (ROCm), the prefill chunk (multiples of 256 from 512), the single-token attention split and (with a draft) the draft block and draft context, keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8, and reports and stores the memory-bound max context in the entry. Prints a report with an example `run` command; writes JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 
@@ -136,9 +136,10 @@ tokens. Run it once on each machine and model, before the first `run` or
 `serve`.
 
 The `calibrate` subcommand loads the model one time, warms it, and sweeps the
-candidate values for each setting. The whole sweep stays inside a 15 minute
-cap. It writes a JSON file and prints a report with the identity, the sweep
-points, the chosen settings, and an example `run` command.
+candidate values for each setting. The sweep has no time cap; it runs to
+completion, so the prompt set sizes the run. It writes a JSON file and prints
+a report with the identity, the sweep points, the chosen settings, and an
+example `run` command.
 
 ```sh
 # Sweep on ROCm with the DFlash2 draft and write the result.
@@ -188,9 +189,10 @@ and model unless an explicit flag overrides it. An explicit flag always wins.
 The file is JSON. It holds one entry per hardware key. The key joins the
 backend, the device name, the model name, the context, the KV type, and the
 strategy. Each entry stores the chosen settings, the measured decode and
-prefill rates, and the date. A machine, model, context, KV type, or strategy
-that differs from the key does not match the entry. The path is runtime
-configuration and is never hard-coded.
+prefill rates, the memory-bound context for the KV type, and the date. A
+machine, model, context, KV type, or strategy that differs from the key does
+not match the entry. The path is runtime configuration and is never
+hard-coded.
 
 ## Usage
 

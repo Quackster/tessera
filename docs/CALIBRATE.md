@@ -150,7 +150,8 @@ the model and the strategy. The context and the KV type change the cache and
 the shapes. A change to any part of the key means the entry does not apply.
 
 The file holds one entry per key, each with the chosen settings, the measured
-tok/s, and the date. A later run with the same key reuses the entry only when
+tok/s, the memory-bound context for the KV type, and the date. A later run
+with the same key reuses the entry only when
 the caller passes `--calibration`. There is no implicit global lookup, so state
 flows through the command line (`AGENTS.md`, engineering principles).
 

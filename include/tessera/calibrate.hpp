@@ -167,6 +167,10 @@ struct CalibrationEntry {
   CalibrationConfig config;
   double decode_tps = 0.0;
   double prefill_tps = 0.0;
+  // Largest full-attention context the device's free memory allows for the
+  // key's KV type when the entry was written. Informational; 0 when the
+  // entry predates the field.
+  std::size_t max_context = 0;
   std::string date;
 };
 

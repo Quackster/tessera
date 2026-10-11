@@ -106,19 +106,22 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   config.prefill_chunk_tokens = 1024;
   config.draft_tokens = 4;
   CalibrationFile file;
-  file.Set(MakeEntry(key, config, 61.5, 1234.0));
+  CalibrationEntry entry = MakeEntry(key, config, 61.5, 1234.0);
+  entry.max_context = 197632;
+  file.Set(std::move(entry));
 
   ASSERT_TRUE(file.Save(path).has_value());
   auto loaded = CalibrationFile::Load(path);
   ASSERT_TRUE(loaded.has_value()) << tessera::ToString(loaded.error());
-  const CalibrationEntry* entry = loaded->Find(key);
-  ASSERT_NE(entry, nullptr);
-  EXPECT_EQ(entry->config.mxfp4_split_target, 640u);
-  EXPECT_EQ(entry->config.prefill_chunk_tokens, 1024u);
-  EXPECT_EQ(entry->config.draft_tokens, 4u);
-  EXPECT_DOUBLE_EQ(entry->decode_tps, 61.5);
-  EXPECT_DOUBLE_EQ(entry->prefill_tps, 1234.0);
-  EXPECT_EQ(entry->date, "2026-10-10");
+  const CalibrationEntry* found = loaded->Find(key);
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->config.mxfp4_split_target, 640u);
+  EXPECT_EQ(found->config.prefill_chunk_tokens, 1024u);
+  EXPECT_EQ(found->config.draft_tokens, 4u);
+  EXPECT_DOUBLE_EQ(found->decode_tps, 61.5);
+  EXPECT_DOUBLE_EQ(found->prefill_tps, 1234.0);
+  EXPECT_EQ(found->max_context, 197632u);
+  EXPECT_EQ(found->date, "2026-10-10");
 
   // An unknown key has no entry.
   const HardwareKey other =
@@ -131,6 +134,46 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   loaded->Set(MakeEntry(key, config, 99.0, 100.0));
   EXPECT_EQ(loaded->Entries().size(), 2u);
   EXPECT_DOUBLE_EQ(loaded->Find(key)->decode_tps, 99.0);
+}
+
+// An entry written before max_context existed still loads; the missing
+// field reads as 0.
+TEST(CalibrateTest, FileWithoutMaxContextStillLoads) {
+  const auto dir = FreshTempDir("tessera_tests_calibration");
+  const std::string path = (dir / "legacy.json").string();
+  WriteString(path,
+              R"({"version":1,"entries":[{"backend":"rocm",)"
+              R"("device":"R9700","model":"Qwen3.8-27B","context":4096,)"
+              R"("kv_type":"int8","strategy":"none",)"
+              R"("mxfp4_split_target":320,"mxfp4_split_cap":4,)"
+              R"("prefill_chunk_tokens":512,"attention_split":16,)"
+              R"("draft_tokens":0,"draft_context":0,)"
+              R"("decode_tps":23.9,"prefill_tps":73.7,)"
+              R"("date":"2026-01-01"}]})");
+  auto loaded = CalibrationFile::Load(path);
+  ASSERT_TRUE(loaded.has_value()) << tessera::ToString(loaded.error());
+  ASSERT_EQ(loaded->Entries().size(), 1u);
+  EXPECT_EQ(loaded->Entries()[0].max_context, 0u);
+}
+
+// The report prints the memory-bound max context and its example commands
+// carry the key context, so a saved entry applies on a copy-paste run.
+TEST(CalibrateTest, ReportNamesMaxContextAndKeyContext) {
+  CalibrationReport report;
+  report.backend = "rocm";
+  report.device = "AMD Radeon RX 7900 XTX";
+  report.model = "Qwen3.8-27B";
+  report.model_path = "/models/Qwen3.8-27B-MXFP4-MTPFP8";
+  report.kv_type = "int8";
+  report.kv_flag = "--kv-q8 ";
+  report.strategy = "none";
+  report.key_context = 4096;
+  report.max_context = 197632;
+  report.file = "/tmp/calibration.json";
+  const std::string text = FormatCalibrationReport(report);
+  EXPECT_NE(text.find("197632 token(s), int8 memory bound"),
+            std::string::npos);
+  EXPECT_NE(text.find("--context 4096"), std::string::npos);
 }
 
 

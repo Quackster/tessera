@@ -133,6 +133,19 @@ through RADV GFX1100, rocm through the system ROCm).
   alone was 7 s of memset), and a batched `CopyH2DBatch` upload
   drains all tensors with one synchronization per backend chunk
   instead of one per tensor.
+- Safetensors inspect and the DFlash2 draft load now map, not read.
+  `InspectSafetensorsFile` read the whole container into a zero-filled
+  host vector to check the 8-byte prefix and the header, and
+  `DraftWeightStore::Load` did the same for the 2 GiB DFlash2
+  checkpoint. On the 27B MXFP4 target the inspect tried to allocate
+  19.4 GiB and the host OOM killer killed the process during load, so
+  calibration with `--draft` could not start. Both now open the file
+  with `MappedFile`: the inspect touches the prefix and the header
+  only and the draft loader faults only the tensors it converts.
+  Measured on the RX 7900 XTX: the MXFP4 target loads and generates
+  with an 11.8 GiB peak (mostly reclaimable mapped pages), the
+  DFlash2 draft loads in 16.6 s with a 3.1 GiB peak, and the ROCm
+  suite passes 192 tests.
 - KV cache types: fp32 (default), fp16, symmetric int8, symmetric
   4-bit, FP8. Selected by option (`--kv-f16`, `--kv-q8`,
   `--kv-q4`, `--kv-fp8`). Caches are preallocated and grow
@@ -218,7 +231,8 @@ through RADV GFX1100, rocm through the system ROCm).
   (free memory minus a 2 GiB reserve, divided by the per-token KV
   bytes over the full-attention layers). It writes a JSON calibration
   file keyed by backend, device, model, context, KV type and
-  strategy, and reports the backend used. It prints a formatted
+  strategy, and stores the memory-bound context in the entry. It
+  reports the backend used. It prints a formatted
   report (the identity, the sweep, the chosen settings and an example
   `run` command that reproduces them). `run` and `serve` accept
   `--calibration <file>` (or `TESSERA_CALIBRATION`): a saved entry is
