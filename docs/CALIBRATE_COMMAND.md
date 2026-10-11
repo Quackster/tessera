@@ -48,7 +48,8 @@ Check GPU memory before each run with `rocm-smi`.
 If GPU 0 is busy, run single GPU work on the free GPU with `--gpu 1`.
 Parallel work needs both GPUs free. If one GPU is busy, stop and ask.
 Never background a run. Never loop runs in one shell command.
-Cap each command at 5 minutes. A longer run signals a defect.
+A calibrate run has no time cap. It runs to completion in one process.
+Never kill a run that shows steady progress in its log.
 The 79 GB Flash Next split is excluded. It does not fit in 2x32 GB.
 
 ## Single GPU matrix
