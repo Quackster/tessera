@@ -1152,13 +1152,10 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   // Selective upload for the single-row case: only the routed experts
   // land, at their expert offsets, so kernels keep the unchanged ids. No
   // short-circuit here: every call carries a new selection, and
-  // re-uploading the same bytes is idempotent anyway.
-  struct SliceCopy {
-    Buffer* dst = nullptr;
-    std::size_t offset = 0;
-    std::span<const std::byte> src;
-  };
-  std::vector<SliceCopy> slices;
+  // re-uploading the same bytes is idempotent anyway. One batched upload
+  // covers every slice, so a token pays one staging round trip per layer
+  // instead of one per expert.
+  std::vector<Backend::HostCopy> slices;
   for (const PagedTensor& entry : paged_) {
     if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {
       continue;
@@ -1183,16 +1180,12 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
         return std::unexpected(StatusCode::MalformedFile);
       }
       const std::size_t begin = id * per;
-      slices.push_back(SliceCopy{slot, begin,
-                                 entry.host.subspan(begin, per)});
+      slices.push_back(Backend::HostCopy{slot, entry.host.subspan(begin, per),
+                                         begin});
     }
   }
-  for (const SliceCopy& slice : slices) {
-    if (auto copied =
-            backend_.CopyH2DAt(*slice.dst, slice.offset, slice.src);
-        !copied) {
-      return std::unexpected(copied.error());
-    }
+  if (auto uploaded = backend_.CopyH2DBatch(slices); !uploaded) {
+    return std::unexpected(uploaded.error());
   }
   for (const PagedTensor& entry : paged_) {
     if (entry.layer != layer || !core::IsRoutedExpertKind(entry.kind)) {

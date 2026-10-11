@@ -179,17 +179,28 @@ Full suite passes on Vulkan and ROCm (221 tests, 0 failures each).
 - [x] Page whole `blk.L.*` tensors per token in the decode path.
 - [x] Page converted MXFP4 weights by post-build eviction to RAM.
 - [ ] Add prefetch of next layer where the backend allows overlap.
+  Assessed 2026-10-11: neither backend allows it today. Vulkan
+  flushes and fence-waits every transfer; ROCm synchronizes the
+  stream per call. Overlap needs an async transfer extension to the
+  `Backend` interface on both backends, a larger interface change.
+  Deferred until profiling shows upload/compute overlap headroom.
 - [x] Wire `--gpu-layers` through `run` and `serve` plus usage text.
 - [x] Extend `LogModelSummary` with resident and RAM byte counts.
-- [ ] Add VRAM fit check before load starts. The serve pre-check is
-  skipped under paging for now; the load still fails cleanly when the
-  resident set does not fit.
+- [x] Add VRAM fit check before load starts. `FitGpuLayers` judges
+  the requested value (resident plus cache plus the 1024 MiB reserve)
+  on `run` and `serve`; an impossible load is refused with the needed
+  and fitting sizes instead of dying mid-load. It covers the KV cache
+  too, so a small N with a large context is caught up front.
 - [x] Add unit tests for layer split and paging order.
 - [x] Verify paged runs on Vulkan and ROCm for GGUF and MXFP4.
 - [x] Measure decode rate at full VRAM versus paged N on Ornith Q4_K_M.
 - [x] Update `README.md` flags table. There is no `docs/PROGRESS.md`
   in the tree, so nothing else tracks this.
 - [x] Phase 2: active expert paging for `ffn_*_exps` tensors.
+- [x] Batch the expert slice uploads: `HostCopy` carries a
+  destination offset and `CopyH2DBatch` honors it on both backends,
+  so one token stages a layer's slices in one round trip instead of
+  one per expert.
 
 ## Measurement
 
@@ -211,9 +222,10 @@ upload.
 Phase 2 (Ornith Q4_K_M GGUF, `--gpu-layers 20`, Vulkan on the R9700):
 8 tokens in 3.2 s (about 2.5 tok/s) with the correct `**Paris**`
 output, against about 0.4 tok/s for whole-layer paging. Each paged
-layer moves 8 expert slices instead of 256 experts. The slice uploads
-still go one `CopyH2DAt` at a time; a batched offset-copy variant
-would cut the per-layer round trips further.
+layer moves 8 expert slices instead of 256 experts. Batching the
+slice uploads into one `CopyH2DBatch` per layer (16 MB in 24 offset
+copies, about 5 ms) brings the same run to 2.0 s (about 4 tok/s):
+one staging round trip per layer instead of one per expert.
 
 ## Risks
 

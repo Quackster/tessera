@@ -152,6 +152,67 @@ TEST(BackendTest, WorkerThreadLaunchTargetsConfiguredDevice) {
 // Batched upload: several buffers land in one call, each with its own
 // bytes, and an oversized source is rejected. This is the weight-upload
 // path, so it must match CopyH2D exactly.
+TEST(BackendTest, BatchedUploadMatchesSingleCopies) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kFirst = 64;
+  constexpr std::size_t kSecond = 96;
+  auto first = backend->AllocateBuffer(kFirst, MemoryKind::Device);
+  auto second = backend->AllocateBuffer(kSecond, MemoryKind::Device);
+  ASSERT_TRUE(first.has_value()) << tessera::ToString(first.error());
+  ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
+  std::vector<std::byte> first_bytes(kFirst);
+  std::vector<std::byte> second_bytes(kSecond);
+  for (std::size_t i = 0; i < kFirst; ++i) {
+    first_bytes[i] = static_cast<std::byte>(i + 1);
+  }
+  for (std::size_t i = 0; i < kSecond; ++i) {
+    second_bytes[i] = static_cast<std::byte>(i + 101);
+  }
+  // Slices land at their destination offsets, so one batch covers the
+  // paged expert staging: two disjoint writes into one buffer plus one
+  // whole write into another. The target is pre-filled with a pattern
+  // first (fresh device memory has no guaranteed contents).
+  const std::vector<std::byte> fill(kFirst, std::byte{0xAA});
+  const std::vector<Backend::HostCopy> prefill = {
+      {first->get(), std::span<const std::byte>(fill)},
+  };
+  ASSERT_TRUE(backend->CopyH2DBatch(prefill).has_value());
+  const std::vector<Backend::HostCopy> copies = {
+      {first->get(), std::span<const std::byte>(first_bytes.data(), 16), 0},
+      {first->get(), std::span<const std::byte>(first_bytes.data() + 16, 16),
+       48},
+      {second->get(), std::span<const std::byte>(second_bytes)},
+  };
+  auto uploaded = backend->CopyH2DBatch(copies);
+  ASSERT_TRUE(uploaded.has_value()) << tessera::ToString(uploaded.error());
+  std::vector<std::byte> first_back(kFirst, std::byte{0});
+  std::vector<std::byte> second_back(kSecond, std::byte{0});
+  ASSERT_TRUE(backend
+                  ->CopyD2H(**first, first_back.data(), first_back.size())
+                  .has_value());
+  ASSERT_TRUE(backend
+                  ->CopyD2H(**second, second_back.data(), second_back.size())
+                  .has_value());
+  for (std::size_t i = 0; i < 16; ++i) {
+    EXPECT_EQ(first_back[i], first_bytes[i]) << "offset 0 slice byte " << i;
+    EXPECT_EQ(first_back[48 + i], first_bytes[16 + i])
+        << "offset 48 slice byte " << i;
+  }
+  for (std::size_t i = 16; i < 48; ++i) {
+    EXPECT_EQ(first_back[i], std::byte{0xAA}) << "gap byte " << i;
+  }
+  EXPECT_EQ(second_back, second_bytes);
+  // An overrun at a nonzero offset is rejected like a whole-buffer one.
+  const std::vector<Backend::HostCopy> overrun = {
+      {first->get(), std::span<const std::byte>(first_bytes.data(), 17), 48},
+  };
+  EXPECT_FALSE(backend->CopyH2DBatch(overrun).has_value());
+  const std::vector<Backend::HostCopy> null_dst = {
+      {nullptr, std::span<const std::byte>(first_bytes)},
+  };
+  EXPECT_FALSE(backend->CopyH2DBatch(null_dst).has_value());
+}
 
 
 // Per backend tolerance for the fp GEMM kernels.

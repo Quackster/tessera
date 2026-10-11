@@ -510,7 +510,9 @@ class VulkanBackend final : public Backend {
   std::expected<void, StatusCode> CopyH2DBatch(
       std::span<const Backend::HostCopy> copies) override {
     for (const Backend::HostCopy& copy : copies) {
-      if (copy.dst == nullptr || copy.src.size() > copy.dst->Size()) {
+      if (copy.dst == nullptr ||
+          copy.dst_offset > copy.dst->Size() ||
+          copy.src.size() > copy.dst->Size() - copy.dst_offset) {
         return std::unexpected(StatusCode::InvalidArgument);
       }
     }
@@ -552,8 +554,8 @@ class VulkanBackend final : public Backend {
           ReleaseStaging(*staging);
           return std::unexpected(StatusCode::DeviceError);
         }
-        regions.push_back(CopyRegion{record->buffer, 0, offset,
-                                     copies[i].src.size()});
+        regions.push_back(CopyRegion{record->buffer, copies[i].dst_offset,
+                                     offset, copies[i].src.size()});
         offset += copies[i].src.size();
       }
       auto submitted = SubmitCopyRegions(staging->buffer, regions);

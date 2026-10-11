@@ -340,7 +340,8 @@ class RocmBackend final : public Backend {
       return std::unexpected(device);
     }
     for (const Backend::HostCopy& copy : copies) {
-      if (copy.dst == nullptr || copy.src.size() > copy.dst->Size()) {
+      if (copy.dst == nullptr || copy.dst_offset > copy.dst->Size() ||
+          copy.src.size() > copy.dst->Size() - copy.dst_offset) {
         return std::unexpected(StatusCode::InvalidArgument);
       }
     }
@@ -376,7 +377,9 @@ class RocmBackend final : public Backend {
       }
       offset = 0;
       for (std::size_t i = index; i < end; ++i) {
-        auto error = hipMemcpyAsync(copies[i].dst->Handle(), *staging + offset,
+        auto* dst = static_cast<std::byte*>(copies[i].dst->Handle()) +
+                    copies[i].dst_offset;
+        auto error = hipMemcpyAsync(dst, *staging + offset,
                                     copies[i].src.size(),
                                     hipMemcpyHostToDevice, stream_);
         if (error != hipSuccess) {
