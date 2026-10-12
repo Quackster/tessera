@@ -1,15 +1,18 @@
 #include <gtest/gtest.h>
 #include <cstdio>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include <optional>
 #include <random>
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "core/decode.hpp"
@@ -21,6 +24,8 @@
 #include "test_helpers.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/engine.hpp"
+#include "tessera/runner.hpp"
+#include "tessera/scheduler.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/image.hpp"
 #include "tessera/vision.hpp"
@@ -38,6 +43,7 @@ using tessera::testing::DrawValue;
 using tessera::testing::FreshTempDir;
 using tessera::testing::GgufBuilder;
 using tessera::testing::MakeEngineOrSkip;
+using tessera::testing::TestDeviceIndex;
 using tessera::testing::MakeSafetensorsContainer;
 using tessera::testing::MakeValidGguf;
 using tessera::testing::QuantizeRows;
@@ -486,6 +492,194 @@ TEST(EngineTest, GenerateBatchInterleavesChunkedPrefill) {
       {2, 2}};
   EXPECT_EQ(first_progress, expect_first_progress);
   EXPECT_EQ(second_progress, expect_second_progress);
+}
+
+// The scheduler time-slices one device across sessions: a long turn
+// prefills chunk by chunk while two short turns decode beside it, and
+// every turn equals a separate Generate with the same prompt.
+TEST(EngineTest, SchedulerSharesOneDeviceAcrossSessions) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("scheduler_share.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  std::vector<std::uint32_t> long_prompt(200);
+  for (std::size_t i = 0; i < long_prompt.size(); ++i) {
+    long_prompt[i] = static_cast<std::uint32_t>(i % 32);
+  }
+  std::vector<GenerateOptions> requests(3);
+  // TEMPORARY bisect (revert): one token plus three completions each,
+  // so no KV growth ever happens (4 rows fit the initial capacity).
+  requests[0].prompt_tokens = {10};
+  requests[0].max_completion_tokens = 3;
+  requests[1].prompt_tokens = {1};
+  requests[1].max_completion_tokens = 3;
+  requests[2].prompt_tokens = {3};
+  requests[2].max_completion_tokens = 3;
+  std::vector<std::vector<std::uint32_t>> expected;
+  for (const auto& request : requests) {
+    auto solo = engine->Generate(**model, request);
+    ASSERT_TRUE(solo.has_value()) << tessera::ToString(solo.error());
+    expected.push_back(*solo);
+  }
+  tessera::RunnerPool pool;
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(engine), std::move(*model), TestDeviceIndex()));
+  std::atomic<int> entered{0};
+  std::atomic<std::size_t> max_active{0};
+  struct Turn {
+    std::vector<std::uint32_t> tokens;
+    std::size_t produced = 0;
+    bool ok = false;
+  };
+  std::vector<Turn> turns(3);
+  std::vector<std::thread> workers;
+  for (int t = 0; t < 3; ++t) {
+    workers.emplace_back([&, t] {
+      entered.fetch_add(1);
+      while (entered.load() < 3) {
+        std::this_thread::yield();
+      }
+      auto outcome = pool.SubmitLeastLoaded(
+          requests[t], [&](std::uint32_t token) {
+            turns[t].tokens.push_back(token);
+            std::size_t active = pool.Active()[0];
+            std::size_t seen = max_active.load();
+            while (seen < active &&
+                   !max_active.compare_exchange_weak(seen, active)) {
+            }
+            return true;
+          });
+      turns[t].ok = outcome.has_value();
+      if (outcome) {
+        turns[t].produced = outcome->produced;
+      }
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  for (int t = 0; t < 3; ++t) {
+    EXPECT_TRUE(turns[t].ok) << "session " << t << " failed";
+    EXPECT_EQ(turns[t].tokens, expected[t]) << "session " << t << " drifted";
+    EXPECT_EQ(turns[t].produced, expected[t].size());
+  }
+  // All three turns decoded together at some point; a serial device
+  // would never admit more than one.
+  EXPECT_EQ(max_active.load(), 3u);
+}
+
+
+
+
+// The scheduler queues past its bound: with one slot a long turn
+// admits first while a short turn waits, then both read back equal
+// to separate Generates.
+TEST(EngineTest, SchedulerQueuesBeyondMaxConcurrent) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("scheduler_queue.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  std::vector<std::uint32_t> long_prompt(400);
+  for (std::size_t i = 0; i < long_prompt.size(); ++i) {
+    long_prompt[i] = static_cast<std::uint32_t>(i % 32);
+  }
+  GenerateOptions first;
+  first.prompt_tokens = long_prompt;
+  first.max_completion_tokens = 4;
+  first.prefill_chunk_tokens = 2;
+  GenerateOptions second;
+  second.prompt_tokens = {7};
+  second.max_completion_tokens = 4;
+  auto expect_first = engine->Generate(**model, first);
+  ASSERT_TRUE(expect_first.has_value())
+      << tessera::ToString(expect_first.error());
+  auto expect_second = engine->Generate(**model, second);
+  ASSERT_TRUE(expect_second.has_value())
+      << tessera::ToString(expect_second.error());
+  std::mutex device;
+  tessera::SchedulerOptions bound;
+  bound.max_concurrent = 1;
+  tessera::Scheduler shared(*engine, **model, device, bound);
+  std::vector<std::uint32_t> first_tokens;
+  std::vector<std::uint32_t> second_tokens;
+  bool first_ok = false;
+  bool second_ok = false;
+  std::thread head([&] {
+    auto outcome = shared.Submit(first, [&](std::uint32_t token) {
+      first_tokens.push_back(token);
+      return true;
+    });
+    first_ok = outcome.has_value();
+  });
+  while (shared.Active() == 0) {
+    std::this_thread::yield();
+  }
+  std::thread tail([&] {
+    auto outcome = shared.Submit(second, [&](std::uint32_t token) {
+      second_tokens.push_back(token);
+      return true;
+    });
+    second_ok = outcome.has_value();
+  });
+  bool saw_queued = false;
+  for (int i = 0; i < 1000 && !saw_queued; ++i) {
+    saw_queued = shared.Pending() > 0;
+    if (!saw_queued) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+  head.join();
+  tail.join();
+  EXPECT_TRUE(first_ok);
+  EXPECT_TRUE(second_ok);
+  EXPECT_EQ(first_tokens, *expect_first);
+  EXPECT_EQ(second_tokens, *expect_second);
+  EXPECT_TRUE(saw_queued);
+}
+
+// The scheduler rejects bad turns without touching the device: an
+// oversize prompt, a thinking budget and bad sampling fail fast, and
+// an empty pool has no device to route to.
+TEST(EngineTest, SchedulerRejectsBadRequests) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("scheduler_reject.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 8});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  tessera::RunnerPool pool;
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(engine), std::move(*model), TestDeviceIndex()));
+  const auto sink = [](std::uint32_t) { return true; };
+  GenerateOptions too_long;
+  too_long.prompt_tokens = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+  too_long.max_completion_tokens = 1;
+  auto rejected = pool.SubmitLeastLoaded(too_long, sink);
+  ASSERT_FALSE(rejected.has_value());
+  EXPECT_EQ(rejected.error(), StatusCode::InvalidArgument);
+  GenerateOptions thinking;
+  thinking.prompt_tokens = {0};
+  thinking.max_completion_tokens = 1;
+  thinking.max_thinking_tokens = 1;
+  auto unthought = pool.SubmitLeastLoaded(thinking, sink);
+  ASSERT_FALSE(unthought.has_value());
+  EXPECT_EQ(unthought.error(), StatusCode::UnsupportedFeature);
+  GenerateOptions bad_sample;
+  bad_sample.prompt_tokens = {0};
+  bad_sample.max_completion_tokens = 1;
+  bad_sample.sample = true;
+  bad_sample.sampling.temperature = -1.0f;
+  auto unsampled = pool.SubmitLeastLoaded(bad_sample, sink);
+  ASSERT_FALSE(unsampled.has_value());
+  EXPECT_EQ(unsampled.error(), StatusCode::InvalidArgument);
+  tessera::RunnerPool empty;
+  GenerateOptions fine;
+  fine.prompt_tokens = {0};
+  fine.max_completion_tokens = 1;
+  auto noroute = empty.SubmitLeastLoaded(fine, sink);
+  ASSERT_FALSE(noroute.has_value());
+  EXPECT_EQ(noroute.error(), StatusCode::InvalidArgument);
 }
 
 // GenerateStreaming emits one callback per produced token, matches the

@@ -6,10 +6,72 @@
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "core/sampling.hpp"
 #include "core/think_budget.hpp"
 #include "core/timing.hpp"
 
 namespace tessera {
+
+// One token from a logits row: the greedy argmax, or the per-sequence
+// seeded draw when sampling (penalties read the token history).
+std::uint32_t PickToken(std::span<const float> logits, bool sample,
+                        const SamplingOptions& sampling,
+                        const std::vector<std::uint32_t>& history,
+                        std::mt19937_64& rng) {
+  return sample ? core::SampleToken(logits, sampling, history, rng)
+                : core::detail::ArgMax(logits);
+}
+
+// Sampling parameters are in range; InvalidArgument otherwise (a
+// request is rejected before any device work). Warns once per call.
+StatusCode ValidateSamplingOptions(const SamplingOptions& sampling,
+                                   log::Diagnostics& diagnostics) {
+  const bool valid =
+      sampling.temperature >= 0.0f && sampling.top_p > 0.0f &&
+      sampling.top_p <= 1.0f && sampling.top_k >= 0 &&
+      sampling.min_p >= 0.0f && sampling.min_p < 1.0f &&
+      sampling.repetition_penalty > 0.0f;
+  if (!valid) {
+    diagnostics.Warn("engine", "invalid sampling parameters; using defaults "
+                               "is not attempted, request rejected");
+    return StatusCode::InvalidArgument;
+  }
+  return StatusCode::Ok;
+}
+
+// One greedy step for several sequences: a single batched forward when
+// the architecture supports it, else one DecodeToken per sequence.
+std::expected<std::vector<std::uint32_t>, StatusCode> AdvanceGreedyCaches(
+    Backend& backend, const Model& model, log::Diagnostics& diagnostics,
+    std::span<core::DecodeCache* const> caches,
+    std::span<const std::uint32_t> tokens) {
+  if (caches.size() != tokens.size()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const Architecture* arch = model.Arch();
+  if (arch != nullptr && caches.size() >= 2) {
+    auto advanced = arch->GreedyBatchMulti(backend, model, caches, tokens);
+    if (advanced) {
+      return *advanced;
+    }
+    if (advanced.error() != StatusCode::UnsupportedFeature) {
+      diagnostics.Warn("engine", std::string("batch decode failed: ") +
+                                     std::string(ToString(advanced.error())));
+      return std::unexpected(advanced.error());
+    }
+  }
+  std::vector<std::uint32_t> next(tokens.begin(), tokens.end());
+  for (std::size_t i = 0; i < caches.size(); ++i) {
+    auto token = core::DecodeToken(backend, model, *caches[i], tokens[i]);
+    if (!token) {
+      diagnostics.Warn("engine", std::string("batch decode failed: ") +
+                                     std::string(ToString(token.error())));
+      return std::unexpected(token.error());
+    }
+    next[i] = *token;
+  }
+  return next;
+}
 
 // The stop set for one request: the model's declared stop tokens first, then
 // the caller's extras from GenerateOptions, without duplicates.
@@ -150,6 +212,9 @@ std::expected<void, StatusCode> PrefillCapturing(
     if (!status) {
       return std::unexpected(status.error());
     }
+    // Bound the work per device submit (see PrefillTokens): one fence
+    // wait per chunk; chunks run in order anyway.
+    backend.Synchronize();
     off += len;
     if (progress != nullptr) {
       (*progress)(off, prompt.size());
@@ -184,6 +249,9 @@ std::expected<void, StatusCode> PrefillCapturing(
     if (!status) {
       return std::unexpected(status.error());
     }
+    // Bound the work per device submit (see PrefillTokens): one fence
+    // wait per chunk; chunks run in order anyway.
+    backend.Synchronize();
     auto appended = strategy.AppendPrefill(backend, model, cache,
                                            prompt.subspan(off, len), off,
                                            cap_ptrs);

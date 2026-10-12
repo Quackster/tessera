@@ -5,6 +5,7 @@
 
 #include "core/json.hpp"
 #include "serve/session.hpp"
+#include "tessera/runner.hpp"
 
 // Model-generated chat titles: on the first prompt of a new session the
 // model names the chat window from that prompt, replacing the
@@ -30,6 +31,11 @@ namespace serve {
 // session or the history.
 void MaybeAutoTitle(Engine& engine, Model& model, const Tokenizer& tokenizer,
                     const std::shared_ptr<Session>& session, bool enabled);
+
+// Pool form of the above: titles through the shared scheduler when
+// the engine allows it, else a brief exclusive lease. Same result.
+void MaybeAutoTitle(RunnerPool& pool, const std::shared_ptr<Session>& session,
+                    bool enabled);
 
 }  // namespace serve
 

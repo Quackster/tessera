@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <random>
 #include <span>
 #include <utility>
 #include <vector>
@@ -9,19 +11,43 @@
 #include "core/decode.hpp"
 #include "core/think_budget.hpp"
 #include "tessera/engine.hpp"
+#include "tessera/log.hpp"
 #include "tessera/model.hpp"
 #include "tessera/speculative.hpp"
 
 // Shared setup for the generation entry points (generate.cpp,
-// generate_multimodal.cpp): one canonical implementation lives here,
-// never copied into the callers.
+// generate_batch.cpp, generate_multimodal.cpp, scheduler.cpp): one
+// canonical implementation lives here, never copied into callers.
 
 namespace tessera {
+
+// Sampling parameters are in range; InvalidArgument otherwise (a
+// request is rejected before any device work). Warns once per call.
+[[nodiscard]] StatusCode ValidateSamplingOptions(
+    const SamplingOptions& sampling, log::Diagnostics& diagnostics);
 
 // The stop set for one request: the model's declared stop tokens first,
 // then the caller's extras from GenerateOptions, without duplicates.
 [[nodiscard]] std::vector<std::uint32_t> StopSet(
     const Model& model, const GenerateOptions& options);
+
+// One token from a logits row: the greedy argmax, or the per-sequence
+// seeded draw when sampling (penalties read the token history).
+[[nodiscard]] std::uint32_t PickToken(std::span<const float> logits,
+                                      bool sample,
+                                      const SamplingOptions& sampling,
+                                      const std::vector<std::uint32_t>& history,
+                                      std::mt19937_64& rng);
+
+// One greedy step for several sequences: a single batched forward when
+// the architecture supports it, else one DecodeToken per sequence.
+// Returns the next token per input sequence, in input order. Anything
+// but UnsupportedFeature from the batched path fails the call.
+[[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
+AdvanceGreedyCaches(Backend& backend, const Model& model,
+                     log::Diagnostics& diagnostics,
+                     std::span<core::DecodeCache* const> caches,
+                     std::span<const std::uint32_t> tokens);
 
 // Think tags for a thinking budget: the tokenizer's special ids when
 // declared, else the BPE encoding of the markers. A disengaged budget

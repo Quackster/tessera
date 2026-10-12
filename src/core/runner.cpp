@@ -20,7 +20,10 @@ Runner::Runner(std::unique_ptr<Engine> engine, std::unique_ptr<Model> model,
     : engine_(std::move(engine)),
       model_(std::move(model)),
       device_index_(device_index),
-      calibration_(std::move(calibration)) {}
+      calibration_(std::move(calibration)) {
+  scheduler_ =
+      std::make_unique<Scheduler>(*engine_, *model_, mutex_, SchedulerOptions{});
+}
 
 Engine& Runner::engine() const { return *engine_; }
 
@@ -31,6 +34,21 @@ const Tokenizer* Runner::tokenizer() const { return model_->GetTokenizer(); }
 int Runner::device_index() const { return device_index_; }
 
 const CalibrationConfig& Runner::calibration() const { return calibration_; }
+
+std::expected<GenerateOutcome, StatusCode> Runner::Submit(
+    const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token,
+    const std::function<bool()>& cancelled) const {
+  GenerateOptions tuned = options;
+  ApplyToGenerateOptions(calibration_, tuned);
+  return scheduler_->Submit(tuned, on_token, cancelled);
+}
+
+std::size_t Runner::SchedulerActive() const { return scheduler_->Active(); }
+
+std::size_t Runner::SchedulerPending() const {
+  return scheduler_->Pending();
+}
 
 RunnerLease::RunnerLease(Runner& runner, std::unique_lock<std::mutex> lock)
     : runner_(&runner), lock_(std::move(lock)) {
@@ -106,11 +124,36 @@ std::optional<RunnerLease> RunnerPool::Acquire(
   }
 }
 
+std::expected<GenerateOutcome, StatusCode> RunnerPool::SubmitLeastLoaded(
+    const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token,
+    const std::function<bool()>& cancelled) const {
+  std::unique_lock<std::mutex> pool_lock(mutex_);
+  if (runners_.empty()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  Runner* chosen = runners_.front().get();
+  std::size_t head_load =
+      chosen->SchedulerActive() + chosen->SchedulerPending();
+  for (const auto& runner : runners_) {
+    const std::size_t load =
+        runner->SchedulerActive() + runner->SchedulerPending();
+    if (load < head_load) {
+      head_load = load;
+      chosen = runner.get();
+    }
+  }
+  Runner& target = *chosen;
+  pool_lock.unlock();
+  return target.Submit(options, on_token, cancelled);
+}
+
 std::vector<std::size_t> RunnerPool::Active() const {
   std::vector<std::size_t> active;
   active.reserve(runners_.size());
   for (const auto& runner : runners_) {
-    active.push_back(runner->active_.load(std::memory_order_relaxed));
+    active.push_back(runner->active_.load(std::memory_order_relaxed) +
+                     runner->SchedulerActive());
   }
   return active;
 }

@@ -82,15 +82,10 @@ std::expected<std::uint32_t, StatusCode> Engine::MtpDraft(
 std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     Model& model, const GenerateOptions& options,
     const std::function<bool(std::uint32_t)>& on_token) {
-  if (options.sample) {
-    const SamplingOptions& p = options.sampling;
-    if (!(p.temperature >= 0.0f) || !(p.top_p > 0.0f && p.top_p <= 1.0f) ||
-        p.top_k < 0 || !(p.min_p >= 0.0f && p.min_p < 1.0f) ||
-        p.repetition_penalty <= 0.0f) {
-      diagnostics_.Warn("engine", "invalid sampling parameters; using defaults "
-                                  "is not attempted, request rejected");
-      return std::unexpected(StatusCode::InvalidArgument);
-    }
+  if (options.sample &&
+      ValidateSamplingOptions(options.sampling, diagnostics_) !=
+          StatusCode::Ok) {
+    return std::unexpected(StatusCode::InvalidArgument);
   }
   core::DecodeCache cache;
   cache.kv_type = options.kv_type;

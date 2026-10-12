@@ -16,8 +16,8 @@
 #include "tessera/tokenizer.hpp"
 
 // Web UI session turns over the chat model. One instance is shared by
-// all connection threads; generations queue in arrival order on the
-// single device (a second turn waits instead of failing). Sessions
+// all connection threads; turns time-slice on the shared scheduler
+// (a second turn waits instead of failing). Sessions
 // carry no tools: turns are plain user/assistant text with the model
 // thinking split into `reasoning_content`.
 
@@ -68,7 +68,10 @@ class SessionHandler {
 
   private:
   // Shared turn core for chat and retry (see the .cpp for the flow).
-  void RunTurn(const RunnerLease& lease, const std::shared_ptr<Session>& session,
+  // A null lease runs the turn on the shared scheduler; otherwise the
+  // lease's device runs it exclusively (thinking budgets and
+  // strategy-backed engines).
+  void RunTurn(const RunnerLease* lease, const std::shared_ptr<Session>& session,
                ResponseWriter& writer, const core::Json& request,
                std::size_t max_completion_tokens,
                std::size_t max_thinking_tokens, bool enable_thinking,
@@ -78,6 +81,10 @@ class SessionHandler {
   bool BeginTurn(const std::shared_ptr<Session>& session,
                  ResponseWriter& writer, RunnerLease& lease,
                  SessionTurn& guard) const;
+  // 409 when the session is busy; otherwise take the turn for the
+  // shared scheduler (no device is held). The guard releases it.
+  bool BeginTurnShared(const std::shared_ptr<Session>& session,
+                       ResponseWriter& writer, SessionTurn& guard) const;
 
   RunnerPool& pool_;
   const Tokenizer& tokenizer_;

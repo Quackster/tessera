@@ -39,6 +39,7 @@ add_library(tessera STATIC
     src/core/hybrid.cpp
     src/core/generate.cpp
     src/core/generate_batch.cpp
+    src/core/scheduler.cpp
     src/core/generate_helpers.cpp
     src/core/generate_multimodal.cpp
     src/core/calibrate/calibrate.cpp

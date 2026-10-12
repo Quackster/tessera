@@ -1,6 +1,7 @@
 #include "serve/session_chat.hpp"
 
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -11,6 +12,7 @@
 #include "serve/render.hpp"
 #include "serve/respond.hpp"
 #include "serve/tools/tool_call.hpp"
+#include "tessera/scheduler.hpp"
 
 namespace tessera::serve {
 
@@ -182,6 +184,16 @@ bool BodyFlag(const Json& body, std::string_view key, bool fallback) {
   return fallback;
 }
 
+// True when this turn can ride the shared scheduler: plain greedy or
+// sampled text with no thinking budget on a strategy-free engine.
+bool UseSharedTurn(RunnerPool& pool, std::size_t max_thinking_tokens) {
+  if (pool.empty() || max_thinking_tokens > 0) {
+    return false;
+  }
+  GenerateOptions probe;
+  return CanSchedule(pool.At(0).engine(), probe);
+}
+
 }  // namespace
 
 SessionHandler::SessionHandler(RunnerPool& pool, const Tokenizer& tokenizer,
@@ -255,15 +267,14 @@ void SessionHandler::HandleRename(ResponseWriter& writer, std::string_view id,
 // with live think/content deltas, persist the assistant message. The
 // stop flag aborts the decode loop (prefill has no token hook and runs
 // to completion); pause blocks it between tokens.
-void SessionHandler::RunTurn(const RunnerLease& lease,
+void SessionHandler::RunTurn(const RunnerLease* lease,
                              const std::shared_ptr<Session>& session,
                              ResponseWriter& writer, const Json& request,
                              std::size_t max_completion_tokens,
                              std::size_t max_thinking_tokens,
                              bool enable_thinking, bool stream,
                              std::string_view title) const {
-  Engine& engine = lease.engine();
-  Model& model = lease.model();
+  Model& model = lease != nullptr ? lease->model() : pool_.At(0).model();
   auto view = sessions_.View(session->Id());
   Json prompt_body = Json::Object();
   prompt_body.Set("messages", SessionHistoryJson(*view));
@@ -294,7 +305,9 @@ void SessionHandler::RunTurn(const RunnerLease& lease,
   options.max_completion_tokens = max_completion_tokens;
   options.max_thinking_tokens = max_thinking_tokens;
   options.prompt_tokens = *ids;
-  ApplyToGenerateOptions(lease.runner().calibration(), options);
+  if (lease != nullptr) {
+    ApplyToGenerateOptions(lease->runner().calibration(), options);
+  }
   ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
   std::string reasoning_text;
   std::string content_text;
@@ -335,6 +348,15 @@ void SessionHandler::RunTurn(const RunnerLease& lease,
     }
     return true;
   };
+  // Shared turns enqueue on the least-loaded device and stream back
+  // on this thread; exclusive turns hold the lease's device outright.
+  const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
+    if (lease == nullptr) {
+      return pool_.SubmitLeastLoaded(
+          options, next, [&writer] { return writer.IsPeerGone(); });
+    }
+    return lease->engine().GenerateStreaming(lease->model(), options, next);
+  };
   if (stream) {
     (void)writer.SendHeaders(200, "text/event-stream", true);
     Json role = Json::Object();
@@ -358,9 +380,8 @@ void SessionHandler::RunTurn(const RunnerLease& lease,
       WriteSse(writer, "", SseDelta(std::move(delta), ""), false);
     };
     const auto gen_started = std::chrono::steady_clock::now();
-    auto streamed = engine.GenerateStreaming(
-        model, options,
-        [&](std::uint32_t token) { return on_token(token, true); });
+    auto streamed =
+        drive([&](std::uint32_t token) { return on_token(token, true); });
     stats.elapsed_ms = MillisBetween(gen_started,
                                      std::chrono::steady_clock::now());
     if (!streamed) {
@@ -390,9 +411,8 @@ void SessionHandler::RunTurn(const RunnerLease& lease,
     (void)writer.Write("data: [DONE]\n\n");
   } else {
     const auto gen_started = std::chrono::steady_clock::now();
-    auto streamed = engine.GenerateStreaming(
-        model, options,
-        [&](std::uint32_t token) { return on_token(token, false); });
+    auto streamed =
+        drive([&](std::uint32_t token) { return on_token(token, false); });
     stats.elapsed_ms = MillisBetween(gen_started,
                                      std::chrono::steady_clock::now());
     if (!streamed) {
@@ -440,6 +460,19 @@ bool SessionHandler::BeginTurn(const std::shared_ptr<Session>& session,
   return true;
 }
 
+// Take the session turn for the shared scheduler: 409 when the
+// session is busy. No device is held; the turn enqueues on submit.
+bool SessionHandler::BeginTurnShared(const std::shared_ptr<Session>& session,
+                                     ResponseWriter& writer,
+                                     SessionTurn& guard) const {
+  if (!session->TryBegin()) {
+    SendError(writer, 409, "session is already generating");
+    return false;
+  }
+  guard.session = session;
+  return true;
+}
+
 void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
                                 const Json& body) const {
   auto session = sessions_.Get(std::string(id));
@@ -458,16 +491,31 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
                                  false, /*stats=*/{}, /*created_ms=*/0});
   SessionTurn guard;
   RunnerLease lease;
-  if (!BeginTurn(session, writer, lease, guard)) {
-    return;
+  const std::size_t max_thinking = MaxThinkingTokensFrom(body);
+  const bool shared = UseSharedTurn(pool_, max_thinking);
+  const RunnerLease* slot = nullptr;
+  if (shared) {
+    if (!BeginTurnShared(session, writer, guard)) {
+      return;
+    }
+  } else {
+    if (!BeginTurn(session, writer, lease, guard)) {
+      return;
+    }
+    slot = &lease;
   }
-  // Name a fresh chat before its first answer: the title turn runs on
-  // the device slot first, so the reply streams under the final title.
-  MaybeAutoTitle(lease.engine(), lease.model(), tokenizer_, session, auto_title_);
+  // Name a fresh chat before its first answer: the title turn runs
+  // first, so the reply streams under the final title.
+  if (shared) {
+    MaybeAutoTitle(pool_, session, auto_title_);
+  } else {
+    MaybeAutoTitle(slot->engine(), slot->model(), tokenizer_, session,
+                   auto_title_);
+  }
   const std::string title = session->View().title;
-  RunTurn(lease, session, writer, body,
+  RunTurn(slot, session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
-          MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
+          max_thinking, BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body), title);
 }
 
@@ -485,13 +533,22 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
   }
   SessionTurn guard;
   RunnerLease lease;
-  if (!BeginTurn(session, writer, lease, guard)) {
+  const std::size_t max_thinking = MaxThinkingTokensFrom(body);
+  const bool shared = UseSharedTurn(pool_, max_thinking);
+  const RunnerLease* slot = nullptr;
+  if (shared) {
+    if (!BeginTurnShared(session, writer, guard)) {
+      return;
+    }
+  } else if (!BeginTurn(session, writer, lease, guard)) {
     return;
+  } else {
+    slot = &lease;
   }
   const std::string title = session->View().title;
-  RunTurn(lease, session, writer, body,
+  RunTurn(slot, session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
-          MaxThinkingTokensFrom(body), BodyFlag(body, "enable_thinking", true),
+          max_thinking, BodyFlag(body, "enable_thinking", true),
           WantsSessionStream(body), title);
 }
 

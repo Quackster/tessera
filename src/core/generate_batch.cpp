@@ -42,10 +42,8 @@ struct BatchSequence {
 // Pick the next token: the per-sequence seeded draw when sampling, the
 // device argmax otherwise.
 std::uint32_t Pick(BatchSequence& sequence, std::span<const float> logits) {
-  return sequence.sample
-             ? core::SampleToken(logits, sequence.sampling, sequence.history,
-                                 sequence.rng)
-             : core::detail::ArgMax(logits);
+  return PickToken(logits, sequence.sample, sequence.sampling,
+                   sequence.history, sequence.rng);
 }
 
 }  // namespace
@@ -142,43 +140,21 @@ Engine::GenerateBatch(Model& model, std::span<const GenerateOptions> requests) {
       (sequence.sample ? sampled_advance : greedy_advance).push_back(i);
     }
     if (!greedy_advance.empty()) {
-      bool batched = false;
-      const Architecture* arch = model.Arch();
-      if (arch != nullptr && greedy_advance.size() >= 2) {
-        std::vector<core::DecodeCache*> caches;
-        std::vector<std::uint32_t> tokens_in;
-        caches.reserve(greedy_advance.size());
-        tokens_in.reserve(greedy_advance.size());
-        for (std::size_t i : greedy_advance) {
-          caches.push_back(&sequences[i].cache);
-          tokens_in.push_back(sequences[i].next);
-        }
-        auto advanced =
-            arch->GreedyBatchMulti(*backend_, model, caches, tokens_in);
-        if (advanced) {
-          for (std::size_t k = 0; k < greedy_advance.size(); ++k) {
-            sequences[greedy_advance[k]].next = (*advanced)[k];
-          }
-          batched = true;
-        } else if (advanced.error() != StatusCode::UnsupportedFeature) {
-          diagnostics_.Warn(
-              "engine", std::string("batch decode failed: ") +
-                            std::string(ToString(advanced.error())));
-          return std::unexpected(advanced.error());
-        }
+      std::vector<core::DecodeCache*> caches;
+      std::vector<std::uint32_t> tokens_in;
+      caches.reserve(greedy_advance.size());
+      tokens_in.reserve(greedy_advance.size());
+      for (std::size_t i : greedy_advance) {
+        caches.push_back(&sequences[i].cache);
+        tokens_in.push_back(sequences[i].next);
       }
-      if (!batched) {
-        for (std::size_t i : greedy_advance) {
-          auto token = core::DecodeToken(*backend_, model, sequences[i].cache,
-                                         sequences[i].next);
-          if (!token) {
-            diagnostics_.Warn(
-                "engine", std::string("batch decode failed: ") +
-                              std::string(ToString(token.error())));
-            return std::unexpected(token.error());
-          }
-          sequences[i].next = *token;
-        }
+      auto advanced = AdvanceGreedyCaches(*backend_, model, diagnostics_,
+                                          caches, tokens_in);
+      if (!advanced) {
+        return std::unexpected(advanced.error());
+      }
+      for (std::size_t k = 0; k < greedy_advance.size(); ++k) {
+        sequences[greedy_advance[k]].next = (*advanced)[k];
       }
     }
     for (std::size_t i : sampled_advance) {
