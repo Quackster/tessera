@@ -40,23 +40,19 @@ bool BeginSession(SessionStore& sessions, const std::string& session_id,
                   ResponseWriter& writer, std::shared_ptr<Session>* session,
                   SessionTurn* turn);
 
-// True when no runner holds a lease or an admitted scheduler turn.
-// The serve layer takes the exclusive speculative fast path only
-// then; otherwise the turn rides the shared scheduler so a long
-// generation never starves other sessions.
-[[nodiscard]] bool PoolIdle(const RunnerPool& pool);
-
 // Take the device for one turn (session turn already held, or no
 // session for stateless requests). Queued exclusive for thinking and
-// tools, fast exclusive for an idle strategy-backed device, shared
-// (null lease) otherwise. False means the peer went away: return.
+// tools, shared (null lease) otherwise: plain turns always share the
+// scheduler so a second session time-slices beside the first instead
+// of starving behind an exclusive generation. False means the peer
+// went away: return.
 bool RouteDevice(RunnerPool& pool, std::size_t max_thinking_tokens,
                  bool wants_tools,
                  const std::function<bool()>& cancelled, RunnerLease& lease,
                  RunnerLease** slot);
 
-// Yield the device every few exclusive tokens so scheduler turns
-// progress beside a long exclusive generation. Call from the
+// Yield the device every few exclusive (thinking, tools) tokens so
+// scheduler turns progress beside a long exclusive generation. Call from the
 // on_token hook with a per-turn counter starting at zero; shared
 // turns skip it (null lease).
 void MaybeYieldExclusive(RunnerLease& lease, int& since_yield);

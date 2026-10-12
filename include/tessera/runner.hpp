@@ -147,9 +147,8 @@ class RunnerPool {
 
   // One non-blocking pass over the runners: a lease on the first free
   // device, or nullopt when every device is busy (or the pool is
-  // empty). The serve layer uses this for the speculative fast path:
-  // an idle device keeps exclusive drafting, a busy one falls back to
-  // the shared scheduler instead of queueing behind a whole turn.
+  // empty). Used by Acquire's queue loop; callers that must not wait
+  // take the lease when free and fall back otherwise.
   //
   // Usage:
   //   if (auto fast = pool.TryAcquire()) { /* exclusive */ }

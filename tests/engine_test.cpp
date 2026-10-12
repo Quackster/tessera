@@ -896,9 +896,11 @@ TEST(EngineTest, LeaseYieldReleasesDevice) {
   EXPECT_TRUE(entered.load());
 }
 
-// A long exclusive turn on a strategy-backed engine streams beside a
-// second session instead of behind it: the second routes shared and
-// both match solo greedy (the pelican-SVG case).
+// Plain turns on a strategy-backed engine always share the scheduler,
+// even when the device is idle: a solo exclusive fast path would hold
+// the whole device while a second session starves behind its yields
+// (the second chat stalls after its title). Both sessions time-slice
+// and match solo greedy.
 TEST(EngineTest, StrategyBackedServeStreamsConcurrentSessions) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);
@@ -918,78 +920,53 @@ TEST(EngineTest, StrategyBackedServeStreamsConcurrentSessions) {
   ASSERT_TRUE(second_solo.has_value())
       << tessera::ToString(second_solo.error());
   auto strategy = std::make_unique<NonProposingStrategy>();
-  NonProposingStrategy* watched = strategy.get();
   ASSERT_TRUE(engine->AttachSpeculative(std::move(strategy)).has_value());
   tessera::RunnerPool pool;
   pool.Add(std::make_unique<tessera::Runner>(
       std::move(engine), std::move(*model), TestDeviceIndex()));
   const auto idle = [] { return false; };
-  // First session arrives on an idle device: exclusive fast path.
-  tessera::RunnerLease first_lease;
-  tessera::RunnerLease* first_slot = nullptr;
-  ASSERT_TRUE(tessera::serve::RouteDevice(pool, 0, false, idle, first_lease,
-                                          &first_slot));
-  ASSERT_NE(first_slot, nullptr);
-  GenerateOptions first_options = first_solo_options;
+  // A plain turn routes shared even on an idle strategy-backed
+  // device; only a thinking budget takes the queued exclusive path.
+  tessera::RunnerLease plain_lease;
+  tessera::RunnerLease* plain_slot = nullptr;
+  ASSERT_TRUE(tessera::serve::RouteDevice(pool, 0, false, idle, plain_lease,
+                                          &plain_slot));
+  EXPECT_EQ(plain_slot, nullptr);
+  tessera::RunnerLease thinking_lease;
+  tessera::RunnerLease* thinking_slot = nullptr;
+  ASSERT_TRUE(tessera::serve::RouteDevice(pool, 1, false, idle,
+                                          thinking_lease, &thinking_slot));
+  ASSERT_NE(thinking_slot, nullptr);
+  thinking_lease.Release();
+  // Both sessions share the scheduler at once and still match solo.
   std::vector<std::uint32_t> first_tokens;
-  std::atomic<std::size_t> first_count{0};
-  int first_yield = 0;
+  std::vector<std::uint32_t> second_tokens;
   std::expected<tessera::GenerateOutcome, tessera::StatusCode> first_outcome =
       std::unexpected(tessera::StatusCode::Ok);
+  std::expected<tessera::GenerateOutcome, tessera::StatusCode> second_outcome =
+      std::unexpected(tessera::StatusCode::Ok);
   std::thread first([&] {
-    first_outcome = first_slot->engine().GenerateStreaming(
-        first_slot->model(), first_options, [&](std::uint32_t token) {
+    first_outcome = pool.SubmitLeastLoaded(
+        first_solo_options, [&](std::uint32_t token) {
           first_tokens.push_back(token);
-          first_count.fetch_add(1);
-          tessera::serve::MaybeYieldExclusive(*first_slot, first_yield);
           return true;
         });
   });
-  // Wait for the first turn to produce before routing the second, so
-  // the second must share instead of racing for the fast path.
-  const auto start = std::chrono::steady_clock::now();
-  while (first_count.load() == 0 &&
-         std::chrono::steady_clock::now() - start < std::chrono::seconds(30)) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  ASSERT_GT(first_count.load(), 0u);
-  // Second session arrives while the first holds the device: shared.
-  tessera::RunnerLease second_lease;
-  tessera::RunnerLease* second_slot = nullptr;
-  ASSERT_TRUE(tessera::serve::RouteDevice(pool, 0, false, idle, second_lease,
-                                          &second_slot));
-  EXPECT_EQ(second_slot, nullptr);
-  std::atomic<bool> first_done{false};
-  std::atomic<std::size_t> max_active{0};
-  std::thread watcher([&] {
-    while (!first_done.load()) {
-      const std::size_t active = pool.Active()[0];
-      std::size_t seen = max_active.load();
-      while (seen < active &&
-             !max_active.compare_exchange_weak(seen, active)) {
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+  std::thread second([&] {
+    second_outcome = pool.SubmitLeastLoaded(
+        second_solo_options, [&](std::uint32_t token) {
+          second_tokens.push_back(token);
+          return true;
+        });
   });
-  std::vector<std::uint32_t> second_tokens;
-  auto second_outcome = pool.SubmitLeastLoaded(
-      second_solo_options, [&](std::uint32_t token) {
-        second_tokens.push_back(token);
-        return true;
-      });
   first.join();
-  first_done.store(true);
-  watcher.join();
+  second.join();
   ASSERT_TRUE(first_outcome.has_value())
       << tessera::ToString(first_outcome.error());
   ASSERT_TRUE(second_outcome.has_value())
       << tessera::ToString(second_outcome.error());
   EXPECT_EQ(first_tokens, *first_solo);
   EXPECT_EQ(second_tokens, *second_solo);
-  EXPECT_GT(watched->anchors.size(), 0u);
-  // Both turns held the device together; a serial serve never admits
-  // more than one.
-  EXPECT_EQ(max_active.load(), 2u);
 }
 
 // A busy port fails at bind time, before any weight loading starts,

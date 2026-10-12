@@ -51,9 +51,9 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     }
     prompt_body = SessionPromptBody(body, view);
   }
-  // Plain turns share the scheduler when contended and keep the
-  // exclusive draft fast path when solo; thinking budgets and tool
-  // calls stay queued exclusive (see RouteDevice).
+  // Plain turns always share the scheduler so concurrent sessions
+  // time-slice; thinking budgets and tool calls stay queued exclusive
+  // (see RouteDevice).
   const bool wants_tools = !anthropic && WantsTools(prompt_body);
   const std::size_t max_thinking_tokens =
       MaxThinkingTokensFrom(prompt_body);
@@ -100,8 +100,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     return;
   }
   // Shared turns enqueue on the least-loaded device and stream back
-  // on this thread; exclusive turns hold the lease's device while
-  // yielding every few tokens (see MaybeYieldExclusive).
+  // on this thread; exclusive (thinking) turns hold the lease's device
+  // while yielding every few tokens (see MaybeYieldExclusive).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (shared) {
       return pool.SubmitLeastLoaded(
@@ -112,8 +112,9 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   const std::string model_name(model.Name());
   TurnStats stats;
   stats.prompt_tokens = ids->size();
-  // Exclusive turns yield the device every few tokens so a queued
-  // scheduler turn streams beside them instead of behind them.
+  // Exclusive (thinking) turns yield the device every few tokens so
+  // a queued scheduler turn streams beside them instead of behind
+  // them.
   int yield_count = 0;
   // Thinking is on unless the request turns it off. The chat template
   // then opens the <think> block in the prompt, so the model streams

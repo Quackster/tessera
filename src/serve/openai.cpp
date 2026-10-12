@@ -145,10 +145,11 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   if (pool.empty()) {
     return;
   }
-  // Plain turns share the scheduler when contended and keep the
-  // exclusive draft fast path when solo; thinking budgets stay queued
-  // exclusive (see RouteDevice). The runners hold the same model, so
-  // render and metadata read it without holding a device.
+  // Plain turns always share the scheduler so concurrent sessions
+  // time-slice instead of queueing behind one exclusive generation;
+  // thinking budgets stay queued exclusive (see RouteDevice). The
+  // runners hold the same model, so render and metadata read it
+  // without holding a device.
   const std::size_t max_thinking_tokens = MaxThinkingTokensFrom(body);
   RunnerLease lease;
   RunnerLease* slot = nullptr;
@@ -192,8 +193,8 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
     return;
   }
   // Shared turns enqueue on the least-loaded device and stream back
-  // on this thread; exclusive turns hold the lease's device while
-  // yielding every few tokens (see MaybeYieldExclusive).
+  // on this thread; exclusive (thinking, tools) turns hold the lease's
+  // device while yielding every few tokens (see MaybeYieldExclusive).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (shared) {
       return pool.SubmitLeastLoaded(
@@ -203,8 +204,9 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   };
   TurnStats stats;
   stats.prompt_tokens = ids->size();
-  // Exclusive turns yield the device every few tokens so a queued
-  // scheduler turn streams beside them instead of behind them.
+  // Exclusive (thinking, tools) turns yield the device every few
+  // tokens so a queued scheduler turn streams beside them instead of
+  // behind them.
   int yield_count = 0;
   if (!stream) {
     // GenerateStreaming with a liveness hook instead of Generate:
@@ -316,15 +318,6 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   (void)count;
 }
 
-bool PoolIdle(const RunnerPool& pool) {
-  for (const std::size_t active : pool.Active()) {
-    if (active != 0) {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool RouteDevice(RunnerPool& pool, std::size_t max_thinking_tokens,
                  bool wants_tools,
                  const std::function<bool()>& cancelled, RunnerLease& lease,
@@ -335,6 +328,10 @@ bool RouteDevice(RunnerPool& pool, std::size_t max_thinking_tokens,
   }
   // Thinking budgets and tool calls stay queued exclusive: the
   // scheduler drives neither, so a contended turn waits its turn.
+  // Every other turn shares the scheduler (as plain greedy, which
+  // equals the speculative output): a solo exclusive fast path would
+  // hold the whole device while a second session starves behind its
+  // yields, so the serve layer never takes it.
   GenerateOptions probe;
   probe.max_thinking_tokens = max_thinking_tokens;
   if (wants_tools || !CanSchedule(pool.At(0).engine(), probe)) {
@@ -345,16 +342,6 @@ bool RouteDevice(RunnerPool& pool, std::size_t max_thinking_tokens,
     lease = std::move(*held);
     *slot = &lease;
     return true;
-  }
-  // Plain turns share the scheduler, except a solo turn on a
-  // strategy-backed device keeps the exclusive draft fast path. A
-  // lost try-race falls back to shared instead of queueing behind
-  // the winner's whole generation.
-  if (pool.At(0).engine().Speculative() != nullptr && PoolIdle(pool)) {
-    if (auto fast = pool.TryAcquire()) {
-      lease = std::move(*fast);
-      *slot = &lease;
-    }
   }
   return true;
 }

@@ -304,8 +304,9 @@ void SessionHandler::RunTurn(RunnerLease* lease,
   bool saw_stop = false;
   TurnStats stats;
   stats.prompt_tokens = ids->size();
-  // Exclusive turns yield the device every few tokens so a queued
-  // scheduler turn streams beside them instead of behind them.
+  // Exclusive (thinking) turns yield the device every few tokens so
+  // a queued scheduler turn streams beside them instead of behind
+  // them.
   int yield_count = 0;
   // One decode step: stop aborts, pause blocks, deltas stream live
   // (buffered mode only accumulates into the totals below).
@@ -345,8 +346,8 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     return true;
   };
   // Shared turns enqueue on the least-loaded device and stream back
-  // on this thread; exclusive turns hold the lease's device while
-  // yielding every few tokens (see on_token above).
+  // on this thread; exclusive (thinking) turns hold the lease's device
+  // while yielding every few tokens (see on_token above).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (lease == nullptr) {
       return pool_.SubmitLeastLoaded(
@@ -466,10 +467,10 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   session->Append(SessionMessage{"user", message->AsString(), /*reasoning=*/{},
                                  /*tool_calls_json=*/{}, /*tool_call_id=*/{},
                                  false, /*stats=*/{}, /*created_ms=*/0});
-  // The session turn is held first; the device routes shared, fast
-  // exclusive, or queued exclusive (see RouteDevice). A contended
-  // strategy-backed turn shares the scheduler as plain greedy, so a
-  // long answer never blocks other sessions behind the whole turn.
+  // The session turn is held first; the device routes shared or
+  // queued exclusive (see RouteDevice). Plain turns share the
+  // scheduler as plain greedy, so a long answer never blocks other
+  // sessions behind the whole turn.
   SessionTurn guard;
   RunnerLease lease;
   if (!BeginTurnShared(session, writer, guard)) {
