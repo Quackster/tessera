@@ -225,7 +225,6 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
       !ReadNumber(item, "draft_tokens", draft) ||
       !ReadOptionalNumber(item, "draft_context", draft_context) ||
       !ReadOptionalNumber(item, "max_context", max_context) ||
-      !ReadOptionalString(item, "comment", entry.comment) ||
       !ReadNumber(item, "decode_tps", entry.decode_tps) ||
       !ReadNumber(item, "prefill_tps", entry.prefill_tps) ||
       !ReadString(item, "date", entry.date)) {
@@ -517,7 +516,6 @@ std::expected<void, StatusCode> CalibrationFile::Save(
     item.Set("decode_tps", core::Json::Number(entry.decode_tps));
     item.Set("prefill_tps", core::Json::Number(entry.prefill_tps));
     item.Set("date", core::Json::String(entry.date));
-    item.Set("comment", core::Json::String(entry.comment));
     entries.Push(std::move(item));
   }
   root.Set("entries", std::move(entries));
@@ -619,13 +617,13 @@ ExampleCommands BuildExampleCommands(const CalibrationReport& report) {
       (report.strategy == "dflash2" && !report.draft_path.empty())
           ? " --draft " + report.draft_path
           : "";
-  // Both commands carry the key context, so the --calibration form matches
-  // the stored entry and a copy-paste run applies it.
+  // Both commands run at the memory-bound max context: the sweep tunes
+  // speed knobs, and the bound is the cache size worth running with.
   ExampleCommands commands;
   commands.explicit_flags =
       "tessera-cli run --model " + report.model_path + draft_flag + " " +
       report.kv_flag + report.parallel_flags + "\\\n      --context " +
-      std::to_string(report.key_context);
+      std::to_string(report.max_context);
   commands.explicit_flags += " --prefill-chunk " +
                              std::to_string(report.chosen.prefill_chunk_tokens);
   if (report.split_applicable) {
@@ -634,15 +632,13 @@ ExampleCommands BuildExampleCommands(const CalibrationReport& report) {
     commands.explicit_flags +=
         " --split-cap " + std::to_string(report.chosen.mxfp4_split_cap);
   }
-  if (report.attention_applicable && report.chosen.attention_split > 0) {
+  if (report.attention_applicable) {
     commands.explicit_flags +=
         " --attention-split " + std::to_string(report.chosen.attention_split);
   }
-  if (report.draft_attached && report.chosen.draft_tokens > 0) {
+  if (report.draft_attached) {
     commands.explicit_flags +=
         " --draft-block " + std::to_string(report.chosen.draft_tokens);
-  }
-  if (report.draft_attached && report.chosen.draft_context > 0) {
     commands.explicit_flags +=
         " --draft-context " + std::to_string(report.chosen.draft_context);
   }
@@ -653,7 +649,7 @@ ExampleCommands BuildExampleCommands(const CalibrationReport& report) {
   commands.from_file = "tessera-cli run --model " + report.model_path +
                        draft_flag + " " + report.kv_flag +
                        report.parallel_flags + "\\\n      --context " +
-                       std::to_string(report.key_context) +
+                       std::to_string(report.max_context) +
                        (report.strategy == "mtp" ? " --speculate" : "") +
                        " --calibration " + report.file +
                        " --prompt-text \"Hello\"";

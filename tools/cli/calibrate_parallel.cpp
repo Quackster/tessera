@@ -291,6 +291,14 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
       options.context, ToString(options.kv_type), "none", label);
   entry.max_context = max_context;
   entry.date = TodayIso();
+  if (auto saved = SaveCalibrationEntry(log, options.calibration_file,
+                                        std::move(entry));
+      !saved) {
+    log.Error("calibrate",
+              std::string("cannot write '") + options.calibration_file +
+                  "' (" + std::string(ToString(saved.error())) + ")");
+    return kExitError;
+  }
   CalibrationReport report;
   report.backend = backend;
   report.device = device_name + " x" + std::to_string(ranks);
@@ -307,18 +315,6 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   report.key_context = options.context;
   report.max_context = max_context;
   report.file = options.calibration_file;
-  // The stored entry carries the example commands as its comment, so the
-  // file records the exact repro alongside the tuned values.
-  const ExampleCommands commands = BuildExampleCommands(report);
-  entry.comment = commands.explicit_flags + "\n" + commands.from_file;
-  if (auto saved = SaveCalibrationEntry(log, options.calibration_file,
-                                        std::move(entry));
-      !saved) {
-    log.Error("calibrate",
-              std::string("cannot write '") + options.calibration_file +
-                  "' (" + std::string(ToString(saved.error())) + ")");
-    return kExitError;
-  }
   std::fputs("\n", stdout);
   std::fputs(FormatCalibrationReport(report).c_str(), stdout);
   std::fflush(stdout);

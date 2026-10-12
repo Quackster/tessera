@@ -26,8 +26,6 @@ using tessera::CalibrationReport;
 using tessera::CandidateValues;
 using tessera::FormatCalibrationReport;
 using tessera::HardwareKey;
-using tessera::ExampleCommands;
-using tessera::BuildExampleCommands;
 using tessera::kMinGain;
 using tessera::KvCacheType;
 using tessera::MakeHardwareKey;
@@ -111,7 +109,6 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   CalibrationFile file;
   CalibrationEntry entry = MakeEntry(key, config, 61.5, 1234.0);
   entry.max_context = 197632;
-  entry.comment = "tessera-cli run --model /m --context 197632";
   file.Set(std::move(entry));
 
   ASSERT_TRUE(file.Save(path).has_value());
@@ -125,7 +122,6 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   EXPECT_DOUBLE_EQ(found->decode_tps, 61.5);
   EXPECT_DOUBLE_EQ(found->prefill_tps, 1234.0);
   EXPECT_EQ(found->max_context, 197632u);
-  EXPECT_EQ(found->comment, "tessera-cli run --model /m --context 197632");
   EXPECT_EQ(found->date, "2026-10-10");
 
   // An unknown key has no entry.
@@ -180,11 +176,10 @@ TEST(CalibrateTest, FileWithoutMaxContextStillLoads) {
   ASSERT_TRUE(loaded.has_value()) << tessera::ToString(loaded.error());
   ASSERT_EQ(loaded->Entries().size(), 1u);
   EXPECT_EQ(loaded->Entries()[0].max_context, 0u);
-  EXPECT_EQ(loaded->Entries()[0].comment, "");
 }
 
 // The report prints the memory-bound max context and its example commands
-// carry the key context, so a saved entry applies on a copy-paste run.
+// run at that bound with every calibrated knob spelled out.
 // A dflash2 entry repeats the draft checkpoint the sweep ran with.
 TEST(CalibrateTest, ReportNamesMaxContextAndKeyContext) {
   CalibrationReport report;
@@ -199,22 +194,29 @@ TEST(CalibrateTest, ReportNamesMaxContextAndKeyContext) {
   report.key_context = 4096;
   report.max_context = 197632;
   report.file = "/tmp/calibration.json";
+  report.split_applicable = true;
+  report.attention_applicable = true;
   report.draft_attached = true;
+  report.chosen.mxfp4_split_target = 320;
+  report.chosen.mxfp4_split_cap = 4;
+  report.chosen.prefill_chunk_tokens = 512;
+  report.chosen.attention_split = 16;
   report.chosen.draft_tokens = 8;
+  report.chosen.draft_context = 1024;
   const std::string text = FormatCalibrationReport(report);
   EXPECT_NE(text.find("197632 token(s), int8 memory bound"),
             std::string::npos);
-  EXPECT_NE(text.find("--context 4096"), std::string::npos);
-  EXPECT_EQ(text.find("--context 197632"), std::string::npos);
+  EXPECT_NE(text.find("--context 197632"), std::string::npos);
+  EXPECT_EQ(text.find("--context 4096"), std::string::npos);
   EXPECT_NE(text.find("--draft /models/Qwen3.8-27B-DFlash2-FP8"),
             std::string::npos);
+  EXPECT_NE(text.find("--split-target 320"), std::string::npos);
+  EXPECT_NE(text.find("--split-cap 4"), std::string::npos);
+  EXPECT_NE(text.find("--prefill-chunk 512"), std::string::npos);
+  EXPECT_NE(text.find("--attention-split 16"), std::string::npos);
+  EXPECT_NE(text.find("--draft-block 8"), std::string::npos);
+  EXPECT_NE(text.find("--draft-context 1024"), std::string::npos);
   EXPECT_NE(text.find("--calibration /tmp/calibration.json"),
-            std::string::npos);
-  // The stored comment carries the same commands the report prints.
-  const ExampleCommands commands = BuildExampleCommands(report);
-  EXPECT_NE(commands.explicit_flags.find("--context 4096"),
-            std::string::npos);
-  EXPECT_NE(commands.from_file.find("--calibration /tmp/calibration.json"),
             std::string::npos);
 }
 
