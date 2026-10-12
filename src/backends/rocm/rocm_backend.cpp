@@ -240,12 +240,10 @@ class RocmBackend final : public Backend {
     device_name_ = props.name;
     LogInfo("selected GPU " + std::to_string(device_index_) + " of " +
             std::to_string(device_count) + ": " + device_name_);
-    // A dedicated stream with the blocking synchronization policy. The
-    // default policy (hipSyncPolicyAuto) actively waits in the runtime on
-    // every host synchronization, so a decode step that waits for the GPU
-    // burns CPU. hipSyncPolicyBlockingSync sleeps instead. All work is
-    // enqueued on this one stream, which also keeps the copies ordered with
-    // the kernels.
+    // One stream with blocking sync (default busy-waits; one stream keeps
+    // copies ordered with kernels). Residual: HSA AsyncEventsLoop polls KFD
+    // WAIT_EVENTS (~660k/s, one core) during any activity
+    // (legacy-rocm-build#6522); HSA_TOOLS_DISABLE_REGISTER=1 has no effect.
     auto created = hipStreamCreate(&stream_);
     if (created != hipSuccess) {
       LogError(std::string("hipStreamCreate failed (") + HipErrorName(created) +
