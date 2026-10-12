@@ -427,6 +427,14 @@ std::expected<void, StatusCode> ServeInternal(
   };
   std::atomic<bool> stop{false};
   std::thread loader_thread;
+  log::Diagnostics& serve_log =
+      pool ? pool->At(0).engine().Diagnostics() : local_log;
+  // Bind before loading: a busy port fails here instead of after a
+  // multi-minute weight upload.
+  auto bound = serve::BindHttpServer(options.host, options.port, serve_log);
+  if (!bound) {
+    return std::unexpected(bound.error());
+  }
   if (loader) {
     // Bind and serve first, then load: a client reaches /health during
     // a slow load instead of finding the port closed.
@@ -449,9 +457,8 @@ std::expected<void, StatusCode> ServeInternal(
       local_log.Info("serve", "model ready");
     });
   }
-  auto served = serve::RunHttpServer(
-      options.host, options.port, handler, &stop,
-      pool ? pool->At(0).engine().Diagnostics() : local_log);
+  auto served =
+      serve::RunHttpServerOn(std::move(*bound), handler, &stop, serve_log);
   if (loader_thread.joinable()) {
     loader_thread.join();
   }

@@ -295,9 +295,8 @@ void ResponseWriter::Close() {
   (void)WriteAll(fd_, out);
 }
 
-std::expected<void, StatusCode> RunHttpServer(
-    const std::string& host, std::uint16_t port, const HttpHandler& handler,
-    const std::atomic<bool>* stop, log::Diagnostics& log) {
+std::expected<BoundListener, StatusCode> BindHttpServer(
+    const std::string& host, std::uint16_t port, log::Diagnostics& log) {
   const std::string endpoint = host + ":" + std::to_string(port);
   const int server = ::socket(AF_INET, SOCK_STREAM, 0);
   if (server < 0) {
@@ -328,6 +327,14 @@ std::expected<void, StatusCode> RunHttpServer(
     return std::unexpected(StatusCode::DeviceError);
   }
   log.Info("serve", "listening on " + endpoint);
+  return BoundListener{server, endpoint};
+}
+
+std::expected<void, StatusCode> RunHttpServerOn(
+    BoundListener listener, const HttpHandler& handler,
+    const std::atomic<bool>* stop, log::Diagnostics& log) {
+  const int server = listener.fd;
+  const std::string endpoint = std::move(listener.endpoint);
   while (stop == nullptr || !stop->load()) {
     sockaddr_in peer{};
     socklen_t peer_len = sizeof(peer);

@@ -19,6 +19,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/json.hpp"
@@ -36,6 +39,7 @@
 #include "tessera/tokenizer.hpp"
 #include "tessera/vision.hpp"
 #include "tessera/types.hpp"
+#include "serve/http.hpp"
 #include "serve/openai.hpp"
 #include "serve/openai_shared.hpp"
 
@@ -986,6 +990,34 @@ TEST(EngineTest, StrategyBackedServeStreamsConcurrentSessions) {
   // Both turns held the device together; a serial serve never admits
   // more than one.
   EXPECT_EQ(max_active.load(), 2u);
+}
+
+// A busy port fails at bind time, before any weight loading starts,
+// so a conflicting server surfaces immediately instead of after a
+// full model upload.
+TEST(EngineTest, BindConflictFailsFast) {
+  tessera::log::Diagnostics log;
+  const int holder = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(holder, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(0);
+  ASSERT_EQ(::bind(holder, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)),
+            0);
+  ASSERT_EQ(::listen(holder, 1), 0);
+  sockaddr_in bound{};
+  socklen_t bound_len = sizeof(bound);
+  ASSERT_EQ(::getsockname(holder, reinterpret_cast<sockaddr*>(&bound),
+                          &bound_len),
+            0);
+  const auto port = static_cast<std::uint16_t>(ntohs(bound.sin_port));
+  auto conflicted = tessera::serve::BindHttpServer("127.0.0.1", port, log);
+  EXPECT_FALSE(conflicted.has_value());
+  ::close(holder);
+  auto free = tessera::serve::BindHttpServer("127.0.0.1", port, log);
+  ASSERT_TRUE(free.has_value());
+  ::close(free->fd);
 }
 
 // Least-loaded routing splits concurrent turns across runners: with
