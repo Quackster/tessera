@@ -230,6 +230,7 @@ struct CalibrationReport {
   std::string device;
   std::string model;       // model identity in the key
   std::string model_path;  // the path a run command would take
+  std::string draft_path;  // DFlash2 checkpoint dir for the example, "" when none
   std::string kv_type;     // display name, "int8"
   std::string kv_flag;     // run flag prefix, "--kv-q8 " (empty for fp32)
   std::string strategy;

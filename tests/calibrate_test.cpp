@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -136,6 +137,27 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   EXPECT_DOUBLE_EQ(loaded->Find(key)->decode_tps, 99.0);
 }
 
+// Saving into missing parents creates them, so a first-time config path
+// works without a prior mkdir.
+TEST(CalibrateTest, CalibrationSaveCreatesMissingParents) {
+  const auto dir = FreshTempDir("tessera_tests_calibration_parents");
+  const std::filesystem::path path =
+      dir / "nested" / "deep" / "calibration.json";
+  const HardwareKey key =
+      MakeHardwareKey("rocm", "R9700", "Qwen3.8-27B", 4096, "fp32", "dflash2");
+  CalibrationConfig config;
+  config.mxfp4_split_target = 320;
+  CalibrationFile file;
+  file.Set(MakeEntry(key, config, 10.0, 20.0));
+
+  auto saved = file.Save(path.string());
+  ASSERT_TRUE(saved.has_value()) << tessera::ToString(saved.error());
+  auto loaded = CalibrationFile::Load(path.string());
+  ASSERT_TRUE(loaded.has_value()) << tessera::ToString(loaded.error());
+  ASSERT_NE(loaded->Find(key), nullptr);
+  EXPECT_DOUBLE_EQ(loaded->Find(key)->decode_tps, 10.0);
+}
+
 // An entry written before max_context existed still loads; the missing
 // field reads as 0.
 TEST(CalibrateTest, FileWithoutMaxContextStillLoads) {
@@ -158,22 +180,29 @@ TEST(CalibrateTest, FileWithoutMaxContextStillLoads) {
 
 // The report prints the memory-bound max context and its example commands
 // carry the key context, so a saved entry applies on a copy-paste run.
+// A dflash2 entry repeats the draft checkpoint the sweep ran with.
 TEST(CalibrateTest, ReportNamesMaxContextAndKeyContext) {
   CalibrationReport report;
   report.backend = "rocm";
   report.device = "AMD Radeon RX 7900 XTX";
   report.model = "Qwen3.8-27B";
   report.model_path = "/models/Qwen3.8-27B-MXFP4-MTPFP8";
+  report.draft_path = "/models/Qwen3.8-27B-DFlash2-FP8";
   report.kv_type = "int8";
   report.kv_flag = "--kv-q8 ";
-  report.strategy = "none";
+  report.strategy = "dflash2";
   report.key_context = 4096;
   report.max_context = 197632;
   report.file = "/tmp/calibration.json";
+  report.draft_attached = true;
+  report.chosen.draft_tokens = 8;
   const std::string text = FormatCalibrationReport(report);
   EXPECT_NE(text.find("197632 token(s), int8 memory bound"),
             std::string::npos);
   EXPECT_NE(text.find("--context 4096"), std::string::npos);
+  EXPECT_EQ(text.find("--context 197632"), std::string::npos);
+  EXPECT_NE(text.find("--draft /models/Qwen3.8-27B-DFlash2-FP8"),
+            std::string::npos);
 }
 
 

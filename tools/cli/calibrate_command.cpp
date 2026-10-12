@@ -487,6 +487,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   report.device = std::string(engine.Owner().DeviceName());
   report.model = model_id;
   report.model_path = model_path;
+  report.draft_path = draft_path;
   report.kv_type = std::string(ToString(kv_type));
   report.kv_flag = KvFlag(kv_type);
   report.strategy = strategy_label;

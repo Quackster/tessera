@@ -703,9 +703,15 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += row("decode", format_rate(report.decode_tps) + " tok/s", 21);
   out += row("prefill", format_rate(report.prefill_tps) + " tok/s", 21);
   out += "\nWrote " + report.file + "\n";
+  // The draft checkpoint the run must attach for a dflash2 entry: without
+  // it the example would run a different strategy than the sweep used.
+  const std::string draft_flag =
+      (report.strategy == "dflash2" && !report.draft_path.empty())
+          ? " --draft " + report.draft_path
+          : "";
   std::string example = "  tessera-cli run --model " + report.model_path +
-                        " " + report.kv_flag + report.parallel_flags +
-                        "\\\n      --context " +
+                        draft_flag + " " + report.kv_flag +
+                        report.parallel_flags + "\\\n      --context " +
                         std::to_string(report.key_context);
   example += " --prefill-chunk " +
              std::to_string(report.chosen.prefill_chunk_tokens);
@@ -733,7 +739,7 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += "\nExample\n-------\n";
   out += example + "\n";
   out += "  # or apply the saved entry directly:\n";
-  out += "  tessera-cli run --model " + report.model_path + " " +
+  out += "  tessera-cli run --model " + report.model_path + draft_flag + " " +
          report.kv_flag + report.parallel_flags + "\\\n      --context " +
          std::to_string(report.key_context) +
          (report.strategy == "mtp" ? " --speculate" : "") + " --calibration " +
