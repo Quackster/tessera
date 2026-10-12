@@ -529,6 +529,7 @@ async function openSession(id) {
   }
   const session = await api('GET', '/api/sessions/' + id);
   if (currentId !== id) return;  // a newer selection won the race
+  if (live[id]) return;  // a turn started while fetching owns the view
   currentMessages = session.messages.map(normalizeMessage);
   cachedFull[session.id] = {
     id: session.id,
@@ -586,6 +587,10 @@ async function streamTurn(path, payload, base, sid) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    // A server-side failure arrives as a data chunk carrying `error`
+    // instead of a delta; surfacing it beats silent nothing (the
+    // finally below would otherwise just wipe the painted turn).
+    let streamError = null;
     for (;;) {
       const {done, value} = await reader.read();
       if (done) break;
@@ -598,6 +603,10 @@ async function streamTurn(path, payload, base, sid) {
           const data = line.slice(5).trim();
           if (data === '[DONE]') break;
           const chunk = JSON.parse(data);
+          if (chunk && typeof chunk.error === 'string' && chunk.error) {
+            streamError = chunk.error;
+            break;
+          }
           const delta = ((chunk.choices || [])[0] || {}).delta || {};
           if (delta.session_title) {
             applyTitle(sid, delta.session_title);
@@ -619,8 +628,11 @@ async function streamTurn(path, payload, base, sid) {
           turn.thinkingOpen = !turn.content;
           drawTurn(sid);
         }
+        if (streamError) break;
       }
+      if (streamError) break;
     }
+    if (streamError) throw new Error(streamError);
   } catch (error) {
     if (error.name !== 'AbortError' && sid === currentId) {
       showError(String(error));
