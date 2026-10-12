@@ -91,7 +91,10 @@ std::expected<void, StatusCode> QuantizeMxFp4Input(
 std::expected<bool, StatusCode> ProjectWmma(Backend& backend, Qwen35State& h,
                                             Buffer& a, const Buffer& w,
                                             Buffer& out, std::size_t m,
-                                            std::size_t n, std::size_t k) {
+                                             std::size_t n, std::size_t k) {
+  if (h.wmma_unavailable) {
+    return false;
+  }
   if (m > 16 || k % 128 != 0 || k % 4 != 0) {
     return false;
   }
@@ -103,6 +106,7 @@ std::expected<bool, StatusCode> ProjectWmma(Backend& backend, Qwen35State& h,
     auto kernel = backend.LoadKernel(name, {});
     if (!kernel) {
       if (kernel.error() == StatusCode::UnsupportedFeature) {
+        h.wmma_unavailable = true;
         return false;
       }
       return std::unexpected(kernel.error());

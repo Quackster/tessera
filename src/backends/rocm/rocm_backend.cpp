@@ -64,12 +64,12 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_mxfp4", reinterpret_cast<void*>(&GemmMxFp4Kernel)},
     {"gemm_mxfp4_batched", reinterpret_cast<void*>(&GemmMxFp4BatchedKernel)},
     {"gemm_mxfp4_rows", reinterpret_cast<void*>(&GemmMxFp4RowsKernel)},
+    {"mxfp4_row_ref", reinterpret_cast<void*>(&MxFp4RowRefKernel)},
 #if defined(TESSERA_ROCM_WMMA)
     {"gemm_mxfp4_wmma", reinterpret_cast<void*>(&GemmMxFp4WmmaKernel)},
     {"gemm_mxfp4_wmma_reduce",
      reinterpret_cast<void*>(&GemmMxFp4WmmaReduceKernel)},
     {"gemm_bf16_wmma", reinterpret_cast<void*>(&GemmBf16WmmaKernel)},
-    {"mxfp4_row_ref", reinterpret_cast<void*>(&MxFp4RowRefKernel)},
 #endif
     {"gemm_q5k", reinterpret_cast<void*>(&GemmQ5KKernel)},
     {"gemm_q5k_vec", reinterpret_cast<void*>(&GemmQ5KVecKernel)},
@@ -527,6 +527,15 @@ class RocmBackend final : public Backend {
     }
     auto index = LookupBuiltIn(name);
     if (index < 0) {
+#if !defined(TESSERA_ROCM_WMMA)
+      // ISA-gated tensor-core probes the engine makes on headed
+      // projections: without gfx12 they fall back to scalar kernels,
+      // so a miss stays silent (Vulkan skips the same probes quietly).
+      if (name == "gemm_mxfp4_wmma" || name == "gemm_bf16_wmma" ||
+          name == "gemm_mxfp4_wmma_reduce") {
+        return std::unexpected(StatusCode::UnsupportedFeature);
+      }
+#endif
       LogError(std::string("kernel '") + std::string(name) +
                "' is not a built-in on the rocm backend; add the kernel to "
                "the rocm kernel table");

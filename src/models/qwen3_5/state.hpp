@@ -90,6 +90,9 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Kernel> mxfp4_rowref_kernel;
   std::unique_ptr<Kernel> mxfp4_wmma_kernel;
   std::unique_ptr<Kernel> mxfp4_reduce_kernel;
+  // True once a WMMA kernel probe missed: the backend has no tensor-core
+  // path, so later projections skip the probe instead of logging per call.
+  bool wmma_unavailable = false;
   std::unique_ptr<Buffer> wmma_a;
   std::unique_ptr<Buffer> wmma_as;
   std::unique_ptr<Buffer> wmma_part;

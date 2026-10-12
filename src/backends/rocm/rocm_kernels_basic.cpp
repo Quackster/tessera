@@ -988,6 +988,27 @@ __global__ void GemmMxFp4BatchedKernel(const float* a, const unsigned char* w,
   }
 }
 
+// Built-in "mxfp4_row_ref": per-row max of the E8M0 block scales of a packed
+// MXFP4 weight (n*k/2 nibbles then n*k/32 scales), the Wref the fp8 GEMM
+// folds against. One thread per row. Buffers: 0 W (packed), 1 Wref (n bytes);
+// scalars n, k. Grid ceil(n/256), block 256.
+__global__ void MxFp4RowRefKernel(const unsigned char* w, unsigned char* wref,
+                                  unsigned long long n, unsigned long long k) {
+  const unsigned long long r =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (r >= n) {
+    return;
+  }
+  const unsigned char* scales = w + (n * k) / 2;
+  const unsigned long long blocks = k / 32;
+  unsigned char ref = 0;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    const unsigned char s = scales[r * blocks + b];
+    ref = s > ref ? s : ref;
+  }
+  wref[r] = ref;
+}
+
 // fp8 tensor-core WMMA: C[m,n] fp32 = A_fp8[m,k] . dequant(W_mxfp4)[n,k]^T
 // with per-token As[m]. 4 waves per workgroup, each a 16x16 output tile; the
 // A and W tiles (kWmmaDbk deep) are staged in padded shared memory and the
@@ -1027,27 +1048,6 @@ __device__ __constant__ unsigned char kMagDev[16][8] = {
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 };
-
-// Built-in "mxfp4_row_ref": per-row max of the E8M0 block scales of a packed
-// MXFP4 weight (n*k/2 nibbles then n*k/32 scales), the Wref the fp8 GEMM
-// folds against. One thread per row. Buffers: 0 W (packed), 1 Wref (n bytes);
-// scalars n, k. Grid ceil(n/256), block 256.
-__global__ void MxFp4RowRefKernel(const unsigned char* w, unsigned char* wref,
-                                  unsigned long long n, unsigned long long k) {
-  const unsigned long long r =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (r >= n) {
-    return;
-  }
-  const unsigned char* scales = w + (n * k) / 2;
-  const unsigned long long blocks = k / 32;
-  unsigned char ref = 0;
-  for (unsigned long long b = 0; b < blocks; ++b) {
-    const unsigned char s = scales[r * blocks + b];
-    ref = s > ref ? s : ref;
-  }
-  wref[r] = ref;
-}
 
 __global__ void GemmMxFp4WmmaKernel(const unsigned char* a,
                                     const unsigned char* w,

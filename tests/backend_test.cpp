@@ -5833,6 +5833,42 @@ TEST(BackendTest, MxFp4RowRefMatchesHost) {
   }
 }
 
+// Device: probing an ISA-gated tensor-core kernel the build lacks reports
+// UnsupportedFeature with no error line; a truly unknown kernel still logs
+// one. The engine probes these on headed projections and takes the scalar
+// fallback, so the misses stay silent (Vulkan skips them quietly too).
+TEST(BackendTest, OptionalTensorCoreProbeStaysSilent) {
+  auto backend = CreateBackend();
+  ASSERT_TRUE(backend != nullptr);
+  backend->SetDeviceIndex(TestDeviceIndex());
+  tessera::log::Diagnostics log;
+  int errors = 0;
+  log.SetSink([&](tessera::log::Level level, std::string_view,
+                  std::string_view) {
+    if (level == tessera::log::Level::Error) {
+      ++errors;
+    }
+  });
+  backend->SetDiagnostics(&log);
+  auto init = backend->Init();
+  if (!init) {
+    GTEST_SKIP() << "no device available: "
+                 << tessera::ToString(init.error());
+  }
+  for (const char* name :
+       {"gemm_bf16_wmma", "gemm_mxfp4_wmma", "gemm_mxfp4_wmma_reduce"}) {
+    auto kernel = backend->LoadKernel(name, {});
+    if (!kernel) {
+      EXPECT_EQ(kernel.error(), StatusCode::UnsupportedFeature) << name;
+    }
+  }
+  EXPECT_EQ(errors, 0);
+  auto unknown = backend->LoadKernel("no_such_kernel_xyz", {});
+  ASSERT_FALSE(unknown.has_value());
+  EXPECT_EQ(unknown.error(), StatusCode::UnsupportedFeature);
+  EXPECT_EQ(errors, 1);
+}
+
 // Device: the WMMA split reduce sums partials in order exactly.
 TEST(BackendTest, GemmMxFp4WmmaReduceMatchesRef) {
   std::unique_ptr<Backend> backend;
