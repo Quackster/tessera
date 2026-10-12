@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <span>
@@ -129,7 +130,8 @@ bool BeginSession(SessionStore& sessions, const std::string& session_id,
 
 void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
                     SessionStore& sessions, ResponseWriter& writer,
-                    const Json& body, std::size_t default_max) {
+                    const Json& body, std::size_t default_max,
+                    std::size_t stats_interval_seconds) {
   const std::string session_id = SessionIdFrom(body);
   const Json* prompt = body.Find("prompt");
   if (prompt == nullptr || !prompt->isString()) {
@@ -209,6 +211,15 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   };
   TurnStats stats;
   stats.prompt_tokens = ids->size();
+  // Console tok/s for this turn, every stats interval (zero off).
+  // The completions stream shape stays pure: no speed deltas on wire.
+  const std::string speed_label =
+      session != nullptr ? "session " + session->Id() : "completions";
+  log::Diagnostics& speed_log =
+      shared ? pool.At(0).engine().Diagnostics() : lease.engine().Diagnostics();
+  TurnSpeedometer speedometer(std::chrono::seconds(stats_interval_seconds),
+                              speed_label, speed_log);
+  speedometer.Begin();
   // Exclusive (thinking, tools) turns yield the device every few
   // tokens so a queued scheduler turn streams beside them instead of
   // behind them.
@@ -227,6 +238,7 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
       if (!shared) {
         MaybeYieldExclusive(lease, yield_count);
       }
+      (void)speedometer.NoteToken();
       return true;
     });
     stats.elapsed_ms = MillisBetween(gen_started,
@@ -291,6 +303,7 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
     if (!shared) {
       MaybeYieldExclusive(lease, yield_count);
     }
+    (void)speedometer.NoteToken();
     return true;
   });
   stats.elapsed_ms = MillisBetween(gen_started,
@@ -357,6 +370,47 @@ void MaybeYieldExclusive(RunnerLease& lease, int& since_yield) {
   }
   since_yield = 0;
   lease.YieldFor(std::chrono::milliseconds(kYieldQuantumMs));
+}
+
+TurnSpeedometer::TurnSpeedometer(std::chrono::seconds interval,
+                                 std::string label, log::Diagnostics& log,
+                                 Clock now)
+    : interval_(interval), label_(std::move(label)), log_(&log) {
+  if (now) {
+    now_ = std::move(now);
+  } else {
+    now_ = [] { return std::chrono::steady_clock::now(); };
+  }
+}
+
+void TurnSpeedometer::Begin() {
+  begun_ = true;
+  window_started_ = now_();
+  window_tokens_ = 0;
+  total_tokens_ = 0;
+}
+
+std::optional<SpeedSample> TurnSpeedometer::NoteToken() {
+  if (!begun_ || interval_.count() <= 0) {
+    return std::nullopt;
+  }
+  ++window_tokens_;
+  ++total_tokens_;
+  const auto now = now_();
+  if (now - window_started_ < interval_) {
+    return std::nullopt;
+  }
+  const double seconds =
+      std::chrono::duration<double>(now - window_started_).count();
+  const double tps = seconds > 0 ? window_tokens_ / seconds : 0.0;
+  char rate[32];
+  std::snprintf(rate, sizeof(rate), "%.1f", tps);
+  log_->Info("serve", label_ + ": " + std::to_string(total_tokens_) +
+                         " completion token(s) at " + rate + " tok/s");
+  const SpeedSample sample{tps, total_tokens_};
+  window_started_ = now;
+  window_tokens_ = 0;
+  return sample;
 }
 
 

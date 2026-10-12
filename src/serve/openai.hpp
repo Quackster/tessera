@@ -31,12 +31,13 @@ namespace serve {
 
 void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
                     SessionStore& sessions, ResponseWriter& writer,
-                    const core::Json& body, std::size_t default_max);
+                    const core::Json& body, std::size_t default_max,
+                    std::size_t stats_interval_seconds);
 
 void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
                 SessionStore& sessions, ResponseWriter& writer,
                 const core::Json& body, std::size_t default_max,
-                bool anthropic);
+                bool anthropic, std::size_t stats_interval_seconds);
 
 }  // namespace serve
 

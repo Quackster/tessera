@@ -31,7 +31,8 @@ using core::Json;
 
 void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
                 SessionStore& sessions, ResponseWriter& writer,
-                const Json& body, std::size_t default_max, bool anthropic) {
+                const Json& body, std::size_t default_max, bool anthropic,
+                std::size_t stats_interval_seconds) {
   const std::string session_id = SessionIdFrom(body);
   std::shared_ptr<Session> session;
   SessionTurn turn;
@@ -119,6 +120,17 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   const std::string model_name(model.Name());
   TurnStats stats;
   stats.prompt_tokens = ids->size();
+  // Console tok/s for this turn, every stats interval (zero off).
+  // The OpenAI stream shape stays pure: no speed deltas on the wire.
+  const std::string speed_label =
+      session != nullptr
+          ? "session " + session->Id()
+          : (anthropic ? "messages" : "chat completions");
+  log::Diagnostics& speed_log =
+      shared ? pool.At(0).engine().Diagnostics() : lease.engine().Diagnostics();
+  TurnSpeedometer speedometer(std::chrono::seconds(stats_interval_seconds),
+                              speed_label, speed_log);
+  speedometer.Begin();
   // Exclusive (thinking) turns yield the device every few tokens so
   // a queued scheduler turn streams beside them instead of behind
   // them.
@@ -146,6 +158,7 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
         if (!shared) {
           MaybeYieldExclusive(lease, yield_count);
         }
+        (void)speedometer.NoteToken();
         return true;
       });
       stats.elapsed_ms = MillisBetween(gen_started,
@@ -228,6 +241,7 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
       if (!shared) {
         MaybeYieldExclusive(lease, yield_count);
       }
+      (void)speedometer.NoteToken();
       return true;
     });
     stats.elapsed_ms = MillisBetween(gen_started,
@@ -269,6 +283,7 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
       if (!shared) {
         MaybeYieldExclusive(lease, yield_count);
       }
+      (void)speedometer.NoteToken();
       return true;
     });
     stats.elapsed_ms = MillisBetween(chat_started,
@@ -362,6 +377,7 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     if (!shared) {
       MaybeYieldExclusive(lease, yield_count);
     }
+    (void)speedometer.NoteToken();
     return true;
   });
   stream_piece(streamer.Finish());

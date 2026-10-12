@@ -267,10 +267,25 @@ function messageHtml(message, thinkingOpen) {
       message.prefill)
       ? '<div class="prefill">' + escapeHtml(message.prefill) + '</div>'
       : '';
+  // Live tok/s rides `message.speed`; stored turns fall back to the
+  // recorded average. The footer sits at the base of the thinking box.
+  const speed = (message.speed && message.speed.tps > 0)
+      ? message.speed
+      : (message.tokens_per_second > 0
+          ? {
+            tps: message.tokens_per_second,
+            tokens: message.completion_tokens,
+          }
+          : null);
+  const speedFooter = speed
+      ? '<div class="thinking-speed">' + speed.tps.toFixed(1) +
+        ' tok/s \u00b7 ' + speed.tokens + ' tokens</div>'
+      : '';
   const thinking = message.reasoning_content
       ? '<details class="thinking"' + (thinkingOpen ? ' open' : '') +
         '><summary>Thinking</summary><div class="thinking-body">' +
-        renderMarkdown(message.reasoning_content) + '</div></details>'
+        renderMarkdown(message.reasoning_content) + '</div>' + speedFooter +
+        '</details>'
       : '';
   const stopped = message.stopped
       ? ' <span class="stopped-badge">(stopped)</span>' : '';
@@ -406,6 +421,7 @@ function liveMessage(turn) {
     tokens_per_second: 0,
     prompt_tokens: 0,
     completion_tokens: 0,
+    speed: turn.speed,
     prefill: (!turn.thinking && !turn.content) ? turn.prefill : '',
   };
 }
@@ -554,6 +570,7 @@ async function streamTurn(path, payload, base, sid) {
     thinking: '',
     content: '',
     prefill: '',
+    speed: null,
     generating: false,
     paused: false,
     thinkingOpen: true,
@@ -619,6 +636,14 @@ async function streamTurn(path, payload, base, sid) {
                 ? 'Prefill ' + done + '/' + total + ' (' +
                   Math.round(done / total * 100) + '%)'
                 : 'Prefill ' + done + ' tokens';
+            drawTurn(sid);
+            continue;
+          }
+          if (delta.tokens_per_second !== undefined) {
+            turn.speed = {
+              tps: Number(delta.tokens_per_second) || 0,
+              tokens: Number(delta.completion_tokens) || 0,
+            };
             drawTurn(sid);
             continue;
           }

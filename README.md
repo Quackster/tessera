@@ -303,6 +303,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--kv-fp8` | run | off | Store the KV cache in FP8 E4M3. |
 | `--host <ip>` | serve | 127.0.0.1 | Bind address. |
 | `--port <n>` | serve | 8080 | Bind port. |
+| `--stats-interval <s>` | serve | 5 | Live tok/s cadence on streams and console. 0 disables. |
 | `--no-auto-title` | serve | off | Keep the first user line as the chat title instead of asking the model. |
 | `--api-key <k>` | serve | none | Accepted API key. Repeatable. |
 | `--allow-origin <o>` | serve | none | CORS origin. Repeatable. `*` allows all origins. |

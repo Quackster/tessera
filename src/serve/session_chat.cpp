@@ -189,12 +189,14 @@ bool BodyFlag(const Json& body, std::string_view key, bool fallback) {
 SessionHandler::SessionHandler(RunnerPool& pool, const Tokenizer& tokenizer,
                                SessionStore& sessions,
                                std::size_t default_max_completion_tokens,
-                               bool auto_title)
+                               bool auto_title,
+                               std::size_t stats_interval_seconds)
     : pool_(pool),
       tokenizer_(tokenizer),
       sessions_(sessions),
       default_max_completion_tokens_(default_max_completion_tokens),
-      auto_title_(auto_title) {}
+      auto_title_(auto_title),
+      stats_interval_seconds_(stats_interval_seconds) {}
 
 void SessionHandler::HandleList(ResponseWriter& writer) const {
   Json items = Json::Array();
@@ -313,6 +315,15 @@ void SessionHandler::RunTurn(RunnerLease* lease,
   // a queued scheduler turn streams beside them instead of behind
   // them.
   int yield_count = 0;
+  // Live tok/s for the thinking-box footer and the server log, every
+  // stats interval (zero disables both).
+  log::Diagnostics& speed_log = lease != nullptr
+                                    ? lease->engine().Diagnostics()
+                                    : pool_.At(0).engine().Diagnostics();
+  TurnSpeedometer speedometer(
+      std::chrono::seconds(stats_interval_seconds_),
+      "session " + session->Id(), speed_log);
+  speedometer.Begin();
   // One decode step: stop aborts, pause blocks, deltas stream live
   // (buffered mode only accumulates into the totals below).
   auto on_token = [&](std::uint32_t token, bool live) {
@@ -347,6 +358,16 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     }
     if (lease != nullptr) {
       MaybeYieldExclusive(*lease, yield_count);
+    }
+    if (auto sample = speedometer.NoteToken()) {
+      if (live) {
+        Json delta = Json::Object();
+        delta.Set("tokens_per_second",
+                  Json::Number(sample->tokens_per_second));
+        delta.Set("completion_tokens",
+                  Json::Number(static_cast<double>(sample->completion_tokens)));
+        WriteSse(writer, "", SseDelta(std::move(delta), ""), false);
+      }
     }
     return true;
   };

@@ -1037,6 +1037,65 @@ TEST(EngineTest, BindConflictFailsFast) {
   ::close(free->fd);
 }
 
+// The speedometer stays silent off-cadence and reports the sliding
+// window rate with one console line per window (manual clock, so no
+// wall-clock dependence).
+TEST(EngineTest, TurnSpeedometerReportsLiveSpeed) {
+  tessera::log::Diagnostics log;
+  std::vector<std::string> lines;
+  log.SetSink([&](auto, auto prefix, auto message) {
+    lines.push_back(std::string(prefix) + ": " + std::string(message));
+  });
+  auto now = std::chrono::steady_clock::now();
+  tessera::serve::TurnSpeedometer speed(std::chrono::seconds(5), "session s9",
+                                        log, [&] { return now; });
+  EXPECT_FALSE(speed.NoteToken().has_value());
+  speed.Begin();
+  EXPECT_FALSE(speed.NoteToken().has_value());
+  EXPECT_FALSE(speed.NoteToken().has_value());
+  EXPECT_TRUE(lines.empty());
+  now += std::chrono::seconds(6);
+  auto first = speed.NoteToken();
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(first->completion_tokens, 3u);
+  EXPECT_DOUBLE_EQ(first->tokens_per_second, 3.0 / 6.0);
+  ASSERT_EQ(lines.size(), 1u);
+  EXPECT_NE(lines[0].find("session s9"), std::string::npos);
+  EXPECT_NE(lines[0].find("tok/s"), std::string::npos);
+  // The window slides: the boundary report covers only new tokens.
+  now += std::chrono::seconds(5);
+  auto second = speed.NoteToken();
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(second->completion_tokens, 4u);
+  EXPECT_DOUBLE_EQ(second->tokens_per_second, 1.0 / 5.0);
+  now += std::chrono::seconds(1);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_FALSE(speed.NoteToken().has_value());
+  }
+  now += std::chrono::seconds(4);
+  auto third = speed.NoteToken();
+  ASSERT_TRUE(third.has_value());
+  EXPECT_EQ(third->completion_tokens, 8u);
+  EXPECT_DOUBLE_EQ(third->tokens_per_second, 4.0 / 5.0);
+  EXPECT_EQ(lines.size(), 3u);
+}
+
+// Zero interval disables reports and console lines entirely.
+TEST(EngineTest, TurnSpeedometerDisabledStaysSilent) {
+  tessera::log::Diagnostics log;
+  bool logged = false;
+  log.SetSink([&](auto, auto, auto) { logged = true; });
+  auto now = std::chrono::steady_clock::now();
+  tessera::serve::TurnSpeedometer speed(std::chrono::seconds(0), "s", log,
+                                        [&] { return now; });
+  speed.Begin();
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_FALSE(speed.NoteToken().has_value());
+    now += std::chrono::seconds(60);
+  }
+  EXPECT_FALSE(logged);
+}
+
 // Least-loaded routing splits concurrent turns across runners: with
 // two runners each turn lands on a different device slot while both
 // still match their solo greedy text.
@@ -1173,7 +1232,8 @@ TEST(EngineTest, OpenAiCompleteMatchesSoloThroughScheduler) {
   {
     tessera::serve::ResponseWriter writer(fds[0]);
     tessera::serve::OpenAiComplete(pool, tokenizer, sessions, writer, body,
-                                   /*default_max=*/8);
+                                   /*default_max=*/8,
+                                   /*stats_interval_seconds=*/0);
     writer.Close();
   }
   ASSERT_EQ(shutdown(fds[0], SHUT_WR), 0);

@@ -90,6 +90,12 @@ details.thinking .thinking-body {
 }
 details.thinking .thinking-body p:first-child { margin-top: 0; }
 details.thinking .thinking-body p:last-child { margin-bottom: 0; }
+details.thinking .thinking-speed {
+  border-top: 1px solid var(--line);
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--dim);
+}
 pre {
   background: #101216;
   padding: 10px;

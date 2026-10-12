@@ -26,6 +26,11 @@ namespace tessera {
 //   options.default_max_completion_tokens = kDefaultMaxCompletionTokens;
 constexpr std::size_t kDefaultMaxCompletionTokens = 0;
 
+// Default live speed cadence: streamed turns report tok/s to the
+// session SSE stream and the server log every this many seconds.
+// Zero disables both; --stats-interval overrides it per serve run.
+constexpr std::size_t kDefaultStatsIntervalSeconds = 5;
+
 // Options for Serve.
 struct ServeOptions {
   // Interface to bind (dotted IPv4 literal).
@@ -42,6 +47,9 @@ struct ServeOptions {
   // Ask the model for a chat title after the first prompt of a new
   // session; off keeps the first user line as the title.
   bool auto_title = true;
+  // Seconds between live tok/s reports on streamed turns, to the
+  // session SSE stream and the server log (0 disables both).
+  std::size_t stats_interval_seconds = kDefaultStatsIntervalSeconds;
 };
 
 // Reports the loader's current step (for example "loading weights" or

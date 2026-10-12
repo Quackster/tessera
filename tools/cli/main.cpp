@@ -139,6 +139,7 @@ int main(int argc, char** argv) {
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   std::uint64_t seed = 0;
   std::uint16_t port = 8080;
+  std::size_t stats_interval_seconds = tessera::kDefaultStatsIntervalSeconds;
   std::size_t max_completion_tokens = 0;
   std::size_t max_thinking_tokens = 0;
   std::size_t context = kDefaultContext;
@@ -182,6 +183,8 @@ int main(int argc, char** argv) {
       auto_title = false;
     } else if (arg == "--port" && i + 1 < argc) {
       port = static_cast<std::uint16_t>(std::stoul(argv[++i]));
+    } else if (arg == "--stats-interval" && i + 1 < argc) {
+      stats_interval_seconds = std::stoul(argv[++i]);
     } else if (arg == "--context" && i + 1 < argc) {
       context = std::stoul(argv[++i]);
     } else if (arg == "--gpu" && i + 1 < argc) {
@@ -359,6 +362,7 @@ int main(int argc, char** argv) {
     serve_options.api_keys = api_keys;
     serve_options.allow_origins = allow_origins;
     serve_options.auto_title = auto_title;
+    serve_options.stats_interval_seconds = stats_interval_seconds;
     // Build one runner per device on the loader thread. Devices load and
     // warm one at a time, so only one model is in host memory at once.
     // The server binds first, so a client reaches /health while loading.
