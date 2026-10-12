@@ -88,8 +88,8 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS and IQ3_S. Checks bounds. |
 | MXFP4 safetensors | Done | Parses the map and packs the weights. config.json drives the decode config. |
-| NVFP4 MoE | Partial | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. MXFP4 MoE and the grouped-expert GEMM remain. |
-| DFlash2 FP8 draft | Partial | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. Step cost work remains. |
+| NVFP4 MoE | Done | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. |
+| DFlash2 FP8 draft | Done | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. |
 
 Model weights live outside the repo. Each variant uses one flat directory. Model paths are runtime configuration. Code and tests never hard code model paths.
 
