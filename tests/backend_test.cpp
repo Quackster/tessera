@@ -90,6 +90,20 @@ TEST(BackendTest, CreateAndInit) {
   ASSERT_TRUE(second.has_value()) << tessera::ToString(second.error());
 }
 
+// Free memory comes from VK_EXT_memory_budget on vulkan and
+// hipMemGetInfo on rocm. A zero free figure made the serve pre-check
+// refuse every model, so both backends must report it here.
+TEST(BackendTest, MemoryInfoReportsFree) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  const tessera::DeviceMemoryInfo memory = backend->MemoryInfo();
+  EXPECT_GT(memory.total_bytes, 0u) << "backend " << backend->Name();
+  EXPECT_GT(memory.free_bytes, 0u)
+      << "backend " << backend->Name() << " reports no free memory";
+  EXPECT_LE(memory.free_bytes, memory.total_bytes)
+      << "backend " << backend->Name();
+}
+
 // HIP's current device is per-thread, so a launch from a worker thread
 // (the serve loader) lands on device 0 unless every backend entry point
 // re-selects the configured device. Before the fix, serve on any GPU

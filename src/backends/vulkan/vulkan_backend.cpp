@@ -179,10 +179,33 @@ class VulkanBackend final : public Backend {
         total += properties.memoryHeaps[i].size;
       }
     }
-    // Vulkan has no portable free-memory query (that needs
-    // VK_EXT_memory_budget), so report the device-local total; a caller
-    // works from it.
-    return DeviceMemoryInfo{total, 0};
+    // VK_EXT_memory_budget (present on RADV and most desktop drivers)
+    // reports per-heap budget and usage through properties2. Free is
+    // budget minus usage over the device-local heaps. All-zero budgets
+    // mean the driver lacks the extension; report total only then.
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 properties2{};
+    properties2.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    properties2.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(state_.physical, &properties2);
+    std::uint64_t free = 0;
+    bool has_budget = false;
+    for (std::uint32_t i = 0; i < properties.memoryHeapCount; ++i) {
+      if ((properties.memoryHeaps[i].flags &
+           VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+        continue;
+      }
+      if (budget.heapBudget[i] != 0) {
+        has_budget = true;
+        if (budget.heapBudget[i] > budget.heapUsage[i]) {
+          free += budget.heapBudget[i] - budget.heapUsage[i];
+        }
+      }
+    }
+    return DeviceMemoryInfo{total, has_budget ? free : 0};
   }
 
   std::expected<void, StatusCode> Init() override {

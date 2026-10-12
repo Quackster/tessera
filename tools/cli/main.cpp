@@ -343,12 +343,14 @@ int main(int argc, char** argv) {
         // Refuse a device that cannot hold the weights before the load
         // starts, so a two-device serve does not half-load. Under paging
         // the file size is not the resident size, so the resident set
-        // plus the KV cache is judged instead.
+        // plus the KV cache is judged instead. A zero free figure means
+        // the backend reports no free memory; skip the check then and
+        // let the load fail on its own when it truly cannot fit.
         const std::uint64_t needed = PathSizeBytes(model_path);
         const tessera::DeviceMemoryInfo memory =
             engine_ptr->Owner().MemoryInfo();
         if (gpu_layers == 0 && memory.total_bytes != 0 && needed != 0 &&
-            memory.free_bytes < needed) {
+            memory.free_bytes != 0 && memory.free_bytes < needed) {
           std::fprintf(stderr,
                        "cli: gpu %d has %s MiB free but the model needs about "
                        "%s MiB; use fewer devices or a smaller quantization\n",
