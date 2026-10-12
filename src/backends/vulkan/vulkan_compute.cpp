@@ -265,6 +265,7 @@ std::expected<void, StatusCode> VulkanCompute::Init(VkDevice device,
 }
 
 void VulkanCompute::DestroyResources() {
+  desc_cache_.clear();
   if (fence_ != VK_NULL_HANDLE) {
     vkDestroyFence(device_, fence_, nullptr);
     fence_ = VK_NULL_HANDLE;
@@ -531,6 +532,23 @@ void VulkanCompute::InvalidateDescriptors() {
   desc_cache_.clear();
   if (descriptor_pool_ != VK_NULL_HANDLE) {
     (void)vkResetDescriptorPool(device_, descriptor_pool_, 0);
+  }
+}
+
+void VulkanCompute::InvalidateBuffer(VkBuffer buffer) {
+  for (auto it = desc_cache_.begin(); it != desc_cache_.end();) {
+    bool bound = false;
+    for (std::uint32_t i = 0; i < it->first.count; ++i) {
+      if (it->first.buffers[i] == buffer) {
+        bound = true;
+        break;
+      }
+    }
+    if (bound) {
+      it = desc_cache_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 

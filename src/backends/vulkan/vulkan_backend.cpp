@@ -435,6 +435,9 @@ class VulkanBackend final : public Backend {
     // A pending command buffer may still reference the buffer; flush and
     // wait so the driver never reads freed memory.
     (void)compute_.Synchronize();
+    // Drop cached descriptor sets bound to the buffer before its handle
+    // value recycles to a later allocation.
+    compute_.InvalidateBuffer(it->second.buffer);
     ReleaseRecord(it->second);
     memories_.erase(it);
   }

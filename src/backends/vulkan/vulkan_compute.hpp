@@ -129,6 +129,11 @@ class VulkanCompute {
   [[nodiscard]] std::expected<void, StatusCode> Flush();
   // Wait for a prior Flush and release its descriptor sets. Idempotent.
   [[nodiscard]] std::expected<void, StatusCode> Wait();
+  // Drop the cached sets bound to `buffer`. The backend calls this when
+  // it destroys a buffer: handle values recycle, so a set cached for a
+  // dead buffer would otherwise hit for a later buffer with the same
+  // value and read the wrong memory.
+  void InvalidateBuffer(VkBuffer buffer);
 
  private:
   void DestroyResources();
