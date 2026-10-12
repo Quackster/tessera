@@ -140,6 +140,7 @@ std::expected<void, StatusCode> PrefillCapturing(
     std::vector<Buffer*>& strategy_buffers, std::vector<float>& hidden_out,
     std::vector<float>& logits_out, const core::PrefillProgress* progress,
     double* compute_ms) {
+  core::detail::CachePhaseGuard phase(backend);
   const std::size_t tail = strategy.PrefillCaptureTail();
   const std::size_t keep =
       (tail == 0 || tail >= prompt.size()) ? prompt.size() : tail;

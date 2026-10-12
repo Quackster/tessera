@@ -70,6 +70,9 @@ class VulkanCompute {
       std::string_view name, std::span<const std::byte> code);
   // Release a VkKernel; destroys its pipeline.
   void FreeKernel(VkKernel* kernel);
+  // Attribute descriptor-set lookups to the core's prefill/decode phase
+  // for hit-rate accounting; the backend forwards its phase here.
+  void SetCachePhase(CachePhase phase) { cache_phase_ = phase; }
   // Record a compute dispatch into the pending command buffer. The
   // submission is deferred: the dispatch is flushed by Synchronize() (or
   // when the descriptor pool fills), so a decode step that issues
@@ -101,6 +104,11 @@ class VulkanCompute {
  private:
   void DestroyResources();
   void LogError(std::string_view message) const;
+  // Count one descriptor-set lookup in the current phase.
+  void CountDescLookup(bool hit);
+  // Log the per-phase descriptor-set hit rates (phases with traffic
+  // only); silent without diagnostics or without lookups.
+  void ReportDescHitRate() const;
   // End and submit the pending command buffer, wait on its fence, and
   // reset the descriptor pool. A no-op when nothing is recording.
   [[nodiscard]] std::expected<void, StatusCode> FlushAndWait();
@@ -136,6 +144,15 @@ class VulkanCompute {
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
   log::Diagnostics* diagnostics_ = nullptr;
   bool ready_ = false;
+  // Descriptor-set lookup counters per generation phase, for the
+  // end-of-run hit-rate report (see Shutdown). A hit reuses a set with
+  // no alloc or update; a miss allocates and writes one.
+  std::uint64_t desc_prefill_hits_ = 0;
+  std::uint64_t desc_prefill_misses_ = 0;
+  std::uint64_t desc_decode_hits_ = 0;
+  std::uint64_t desc_decode_misses_ = 0;
+  // Phase the backend forwarded for hit-rate accounting (default decode).
+  CachePhase cache_phase_ = CachePhase::kDecode;
 };
 
 }  // namespace tessera::backends::vulkan

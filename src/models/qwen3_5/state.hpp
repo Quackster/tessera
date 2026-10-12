@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -113,9 +114,9 @@ struct Qwen35State final : core::ArchState {
   std::unordered_map<const void*, std::unique_ptr<Buffer>> mxfp4_wref;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
-  std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
+  core::KernelCache gemms;
   // Device embedding-gather kernel, keyed by the embedding weight dtype.
-  std::unordered_map<int, std::unique_ptr<Kernel>> embed_kernels;
+  core::KernelCache embed_kernels;
   // Token ids for the embedding-gather launch, grown on demand.
   std::unique_ptr<Buffer> embed_ids;
   // Split-K scratch for the warp-per-output GEMV family (split x m x n
@@ -124,7 +125,7 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> gemv_part;
   std::unique_ptr<Kernel> gemv_reduce_kernel;
   // Tiled batched GEMM kernels, keyed by dtype (used when rows > 1).
-  std::unordered_map<int, std::unique_ptr<Kernel>> gemm_tiled;
+  core::KernelCache gemm_tiled;
   // Shared scratch buffers (sized from the config).
   std::unique_ptr<Buffer> x, xn, proj, logits, pos;
   std::unique_ptr<Buffer> fused, q, gate, kf, vf, attn;
@@ -210,6 +211,13 @@ struct Qwen35State final : core::ArchState {
   core::CpContext* cp = nullptr;
   std::size_t position = 0;  // full-layer KV rows equal the position
   bool ready = false;
+
+  void ReportCaches(const log::Diagnostics& log,
+                    std::string_view prefix) const override {
+    gemms.Report(log, prefix, "target gemm");
+    embed_kernels.Report(log, prefix, "target embedding");
+    gemm_tiled.Report(log, prefix, "target tiled");
+  }
 };
 
 // The state for `cache`, created on first use. One architecture module per

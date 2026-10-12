@@ -34,6 +34,11 @@ class DFlash2Strategy final : public SpeculativeStrategy {
  public:
   std::string_view Name() const override { return "dflash2"; }
 
+  void ReportCaches(const log::Diagnostics& log,
+                    std::string_view prefix) const override {
+    gemms_.Report(log, prefix, "draft gemm");
+  }
+
   std::expected<void, StatusCode> Attach(
       const StrategyOptions& options) override {
     if (attached_) {
@@ -481,7 +486,7 @@ class DFlash2Strategy final : public SpeculativeStrategy {
   spec::DFlash2Drafter drafter_;
   const DeviceTensor* embed_ = nullptr;
   const DeviceTensor* output_ = nullptr;
-  std::unordered_map<int, std::unique_ptr<Kernel>> gemms_;
+  core::KernelCache gemms_;
   Kernel* head_gemm_ = nullptr;
   std::unique_ptr<Kernel> head_gemm_wmma_;
   std::unique_ptr<Kernel> selector_gemm_;

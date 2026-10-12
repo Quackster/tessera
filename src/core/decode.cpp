@@ -121,6 +121,7 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
     std::span<const std::uint32_t> tokens, std::vector<float>* hidden_out,
     const Buffer* embeddings, std::size_t chunk_tokens,
     const PrefillProgress* progress, double* compute_ms) {
+  detail::CachePhaseGuard phase(backend);
   if (tokens.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }

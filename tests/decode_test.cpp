@@ -1924,3 +1924,124 @@ TEST(ProfileTest, EnvSwitchTreatsZeroAndEmptyAsOff) {
   EXPECT_TRUE(tessera::core::DecodeProfilingEnabled());
   unsetenv("TESSERA_PROFILE");
 }
+
+// A Backend stub that counts LoadKernel probes. Only "fill" resolves;
+// every other name reports UnsupportedFeature, like an optional
+// tensor-core kernel on a backend without it.
+class CountingBackend final : public tessera::Backend {
+ public:
+  int loads = 0;
+  std::string_view Name() const override { return "stub"; }
+  std::string_view DeviceName() const override { return "stub device"; }
+  tessera::DeviceMemoryInfo MemoryInfo() const override { return {}; }
+  std::expected<void, tessera::StatusCode> Init() override { return {}; }
+  std::expected<std::unique_ptr<tessera::Buffer>, tessera::StatusCode>
+  AllocateBuffer(std::size_t, tessera::MemoryKind) override {
+    return std::unexpected(tessera::StatusCode::OutOfMemory);
+  }
+  void FreeBuffer(tessera::MemoryKind, void*) override {}
+  std::expected<void, tessera::StatusCode> CopyH2D(
+      tessera::Buffer&, std::span<const std::byte>) override {
+    return std::unexpected(tessera::StatusCode::DeviceError);
+  }
+  std::expected<void, tessera::StatusCode> CopyH2DAt(
+      tessera::Buffer&, std::size_t, std::span<const std::byte>) override {
+    return std::unexpected(tessera::StatusCode::DeviceError);
+  }
+  std::expected<void, tessera::StatusCode> CopyD2H(const tessera::Buffer&,
+                                                  std::byte*,
+                                                  std::size_t) override {
+    return std::unexpected(tessera::StatusCode::DeviceError);
+  }
+  std::expected<void, tessera::StatusCode> CopyD2HAt(const tessera::Buffer&,
+                                                    std::size_t, std::byte*,
+                                                    std::size_t) override {
+    return std::unexpected(tessera::StatusCode::DeviceError);
+  }
+  std::expected<void, tessera::StatusCode> CopyD2D(const tessera::Buffer&,
+                                                  std::size_t,
+                                                  tessera::Buffer&,
+                                                  std::size_t,
+                                                  std::size_t) override {
+    return std::unexpected(tessera::StatusCode::DeviceError);
+  }
+  std::expected<std::unique_ptr<tessera::Kernel>, tessera::StatusCode>
+  LoadKernel(std::string_view name, std::span<const std::byte>) override {
+    ++loads;
+    if (name == "fill") {
+      return AdoptKernel(reinterpret_cast<void*>(1), name);
+    }
+    return std::unexpected(tessera::StatusCode::UnsupportedFeature);
+  }
+  void FreeKernel(void*) override {}
+  std::expected<void, tessera::StatusCode> LaunchKernel(
+      const tessera::Kernel&, const tessera::KernelLaunch&) override {
+    return std::unexpected(tessera::StatusCode::DeviceError);
+  }
+  void Synchronize() override {}
+};
+
+TEST(DecodeInternalTest, CachedKernelProbesMissingKernelOnce) {
+  CountingBackend backend;
+  tessera::core::KernelCache cache;
+  for (int i = 0; i < 3; ++i) {
+    auto kernel = tessera::core::detail::CachedKernel(backend, cache, 7,
+                                                      "no-such-kernel");
+    EXPECT_FALSE(kernel.has_value());
+    EXPECT_EQ(kernel.error(), tessera::StatusCode::UnsupportedFeature);
+  }
+  EXPECT_EQ(backend.loads, 1);
+  // The first probe missed; the remembered miss serves from the cache.
+  EXPECT_EQ(cache.decode_misses, 1u);
+  EXPECT_EQ(cache.decode_hits, 2u);
+  auto first = tessera::core::detail::CachedKernel(backend, cache, 8, "fill");
+  auto second =
+      tessera::core::detail::CachedKernel(backend, cache, 8, "fill");
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(*first, *second);
+  EXPECT_EQ(backend.loads, 2);
+  EXPECT_EQ(cache.decode_misses, 2u);
+  EXPECT_EQ(cache.decode_hits, 3u);
+  // Prefill lookups attribute to the prefill phase, keyed off the
+  // backend's phase bracket.
+  backend.SetCachePhase(tessera::CachePhase::kPrefill);
+  EXPECT_EQ(backend.cache_phase(), tessera::CachePhase::kPrefill);
+  auto prefill = tessera::core::detail::CachedKernel(backend, cache, 9,
+                                                     "no-such-kernel");
+  EXPECT_FALSE(prefill.has_value());
+  EXPECT_EQ(backend.loads, 3);
+  EXPECT_EQ(cache.prefill_misses, 1u);
+  EXPECT_EQ(cache.prefill_hits, 0u);
+  auto remembered = tessera::core::detail::CachedKernel(backend, cache, 9,
+                                                        "no-such-kernel");
+  EXPECT_FALSE(remembered.has_value());
+  EXPECT_EQ(backend.loads, 3);
+  EXPECT_EQ(cache.prefill_hits, 1u);
+}
+
+// The kernel cache reports one hit-rate line per phase with traffic and
+// stays silent when never queried.
+TEST(DecodeInternalTest, KernelCacheReportsPerPhaseHitRates) {
+  tessera::core::KernelCache cache;
+  std::vector<std::string> lines;
+  tessera::log::Diagnostics log;
+  log.SetSink([&lines](tessera::log::Level, std::string_view prefix,
+                       std::string_view message) {
+    lines.push_back(std::string(prefix) + ": " + std::string(message));
+  });
+  cache.Report(log, "engine 1", "target gemm");
+  EXPECT_TRUE(lines.empty());
+  cache.Record(true, tessera::CachePhase::kDecode);
+  cache.Record(true, tessera::CachePhase::kDecode);
+  cache.Record(false, tessera::CachePhase::kDecode);
+  cache.Record(false, tessera::CachePhase::kPrefill);
+  cache.Report(log, "engine 1", "target gemm");
+  ASSERT_EQ(lines.size(), 2u);
+  EXPECT_EQ(lines[0],
+            "engine 1: cache: target gemm prefill hit rate 0.0% over "
+            "1 lookup(s) (1 backend probe(s))");
+  EXPECT_EQ(lines[1],
+            "engine 1: cache: target gemm decode hit rate 66.7% over "
+            "3 lookup(s) (1 backend probe(s))");
+}

@@ -27,6 +27,22 @@
 
 namespace tessera::core::detail {
 
+// RAII prefill bracket for cache hit-rate accounting: sets the backend's
+// cache phase to prefill on entry, restores decode on exit (all paths).
+// Prefill entry points (PrefillTokens, PrefillCapturing) never nest.
+class CachePhaseGuard {
+ public:
+  explicit CachePhaseGuard(Backend& backend) : backend_(backend) {
+    backend_.SetCachePhase(CachePhase::kPrefill);
+  }
+  CachePhaseGuard(const CachePhaseGuard&) = delete;
+  CachePhaseGuard& operator=(const CachePhaseGuard&) = delete;
+  ~CachePhaseGuard() { backend_.SetCachePhase(CachePhase::kDecode); }
+
+ private:
+  Backend& backend_;
+};
+
 // Largest full-attention work in one prefill forward, as query-key
 // pairs at the measured reference shape. On RADV GFX1201 (24 heads,
 // head dim 256) 512x8192 pairs finish one attention launch in about
@@ -1125,37 +1141,42 @@ inline std::string_view EmbeddingKernelName(DType dtype) {
 // `name`, or UnsupportedFeature for an empty name. A miss is remembered
 // with a null slot, so an optional kernel the backend lacks (a tensor-core
 // probe with its scalar fallback) touches the backend on the first probe
-// only instead of once per token. The cache key must imply the name.
+// only instead of once per token. Every lookup records a hit (served
+// without a backend probe, including a remembered miss) or a miss in the
+// current cache phase. The cache key must imply the name.
 inline std::expected<Kernel*, StatusCode> CachedKernel(
-    Backend& backend, std::unordered_map<int, std::unique_ptr<Kernel>>& cache,
-    int key, std::string_view name) {
-  auto it = cache.find(key);
-  if (it != cache.end()) {
+    Backend& backend, KernelCache& cache, int key, std::string_view name) {
+  const CachePhase phase = backend.cache_phase();
+  auto it = cache.kernels.find(key);
+  if (it != cache.kernels.end()) {
+    cache.Record(/*hit=*/true, phase);
     if (it->second == nullptr) {
       return std::unexpected(StatusCode::UnsupportedFeature);
     }
     return it->second.get();
   }
   if (name.empty()) {
+    cache.Record(/*hit=*/false, phase);
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
   auto kernel = backend.LoadKernel(name, {});
+  cache.Record(/*hit=*/false, phase);
   if (!kernel) {
     if (kernel.error() == StatusCode::UnsupportedFeature) {
-      cache.emplace(key, nullptr);
+      cache.kernels.emplace(key, nullptr);
     }
     return std::unexpected(kernel.error());
   }
   Kernel* raw = kernel->get();
-  cache.emplace(key, std::move(*kernel));
+  cache.kernels.emplace(key, std::move(*kernel));
   return raw;
 }
 
 // Load (once, into `cache`) and return the GEMM kernel for a projection
 // dtype.
-inline std::expected<Kernel*, StatusCode> GemmFor(
-    Backend& backend, std::unordered_map<int, std::unique_ptr<Kernel>>& cache,
-    DType dtype) {
+inline std::expected<Kernel*, StatusCode> GemmFor(Backend& backend,
+                                                  KernelCache& cache,
+                                                  DType dtype) {
   return CachedKernel(backend, cache, static_cast<int>(dtype),
                       GemmKernelName(dtype));
 }
@@ -1244,9 +1265,9 @@ inline std::string_view GemmTiledKernelName(DType dtype) {
 
 // Load (once, into `cache`) and return the tiled batched GEMM kernel for
 // a dtype, or UnsupportedFeature when the dtype has none.
-inline std::expected<Kernel*, StatusCode> GemmTiledFor(
-    Backend& backend, std::unordered_map<int, std::unique_ptr<Kernel>>& cache,
-    DType dtype) {
+inline std::expected<Kernel*, StatusCode> GemmTiledFor(Backend& backend,
+                                                       KernelCache& cache,
+                                                       DType dtype) {
   return CachedKernel(backend, cache, static_cast<int>(dtype),
                       GemmTiledKernelName(dtype));
 }

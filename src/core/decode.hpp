@@ -3,17 +3,20 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <expected>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "tessera/backend.hpp"
 #include "tessera/architecture.hpp"
+#include "tessera/log.hpp"
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
 
@@ -81,6 +84,73 @@ struct CpContext {
 // DecodeCache::arch; src/core never names the fields.
 struct ArchState {
   virtual ~ArchState() = default;
+  // Report the subclass's kernel-cache hit rates, if it keeps any (the
+  // default reports nothing). Called once per generation next to the
+  // decode summary; prefix identifies the engine.
+  virtual void ReportCaches(const log::Diagnostics& log,
+                            std::string_view prefix) const {
+    (void)log;
+    (void)prefix;
+  }
+};
+
+// Device kernels loaded once and reused, with per-phase hit-rate
+// counters. A hit serves the kernel without touching the backend; a miss
+// probes the backend once (a miss the backend lacks is remembered, so an
+// optional kernel costs one probe). The core brackets prefill sections,
+// so the counters attribute lookups to prefill vs decode. Not
+// thread-safe: used from the generation thread only.
+struct KernelCache {
+  std::unordered_map<int, std::unique_ptr<Kernel>> kernels;
+  std::uint64_t prefill_hits = 0;
+  std::uint64_t prefill_misses = 0;
+  std::uint64_t decode_hits = 0;
+  std::uint64_t decode_misses = 0;
+
+  void Record(bool hit, CachePhase phase) {
+    if (phase == CachePhase::kPrefill) {
+      if (hit) {
+        ++prefill_hits;
+      } else {
+        ++prefill_misses;
+      }
+    } else if (hit) {
+      ++decode_hits;
+    } else {
+      ++decode_misses;
+    }
+  }
+
+  [[nodiscard]] std::uint64_t Lookups(CachePhase phase) const {
+    return phase == CachePhase::kPrefill ? prefill_hits + prefill_misses
+                                         : decode_hits + decode_misses;
+  }
+
+  // One summary line per phase with traffic: hit rate over lookups plus
+  // the backend-probe count. Silent when the cache was never queried, so
+  // unused caches add no log noise.
+  void Report(const log::Diagnostics& log, std::string_view prefix,
+              std::string_view name) const {
+    for (const CachePhase phase :
+         {CachePhase::kPrefill, CachePhase::kDecode}) {
+      const std::uint64_t hits =
+          phase == CachePhase::kPrefill ? prefill_hits : decode_hits;
+      const std::uint64_t misses =
+          phase == CachePhase::kPrefill ? prefill_misses : decode_misses;
+      if (hits + misses == 0) {
+        continue;
+      }
+      char rate[32];
+      std::snprintf(rate, sizeof(rate), "%.1f",
+                    100.0 * static_cast<double>(hits) /
+                        static_cast<double>(hits + misses));
+      log.Info(prefix, std::string("cache: ") + std::string(name) + " " +
+                          (phase == CachePhase::kPrefill ? "prefill" : "decode") +
+                          " hit rate " + rate + "% over " +
+                          std::to_string(hits + misses) + " lookup(s) (" +
+                          std::to_string(misses) + " backend probe(s))");
+    }
+  }
 };
 
 // Host tuning values one request carries into the decode loop. Generic
@@ -154,11 +224,11 @@ struct DeviceDecodeState {
   std::unique_ptr<Kernel> quant_kernel;
   std::unique_ptr<Buffer> kv_scratch;
   std::unique_ptr<Buffer> scale_scratch;
-  std::unordered_map<int, std::unique_ptr<Kernel>> gemms;
+  KernelCache gemms;
   // Device embedding-gather kernel keyed by the embedding weight dtype,
   // plus one token-id slot: quantized embeddings gather on the device
   // instead of downloading one row for a host dequantize per token.
-  std::unordered_map<int, std::unique_ptr<Kernel>> embed_kernels;
+  KernelCache embed_kernels;
   std::unique_ptr<Buffer> embed_ids;
   // On-device top-1 over the logits, so greedy decode reads back one id
   // instead of the whole vocabulary.

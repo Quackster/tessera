@@ -587,6 +587,20 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   if (profiling) {
     profile.Report(diagnostics_, "engine", loop_steps);
   }
+  // Kernel-cache hit rates per phase: a low rate means the same kernels
+  // reload every token instead of once, so the line names the cache to
+  // fix. Caches without traffic stay silent.
+  if (cache.device != nullptr) {
+    cache.device->gemms.Report(diagnostics_, "engine", "decode gemm");
+    cache.device->embed_kernels.Report(diagnostics_, "engine",
+                                       "decode embedding");
+  }
+  if (cache.arch != nullptr) {
+    cache.arch->ReportCaches(diagnostics_, "engine");
+  }
+  if (strategy != nullptr) {
+    strategy->ReportCaches(diagnostics_, "engine");
+  }
   if (produced > 0) {
     const long long decode_ms_ll = static_cast<long long>(decode_ms);
     const long long decode_tps =

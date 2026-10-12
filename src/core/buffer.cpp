@@ -138,6 +138,12 @@ void Backend::SetDeviceIndex(int index) {
 
 int Backend::DeviceIndex() const { return device_index_; }
 
+void Backend::SetCachePhase(CachePhase phase) {
+  cache_phase_ = phase;
+}
+
+CachePhase Backend::cache_phase() const { return cache_phase_; }
+
 std::expected<void, StatusCode> Backend::CopyPeerFrom(Buffer& dst,
                                                       const Buffer& src,
                                                       std::size_t bytes) {

@@ -149,6 +149,18 @@ class SpeculativeStrategy {
   virtual std::expected<void, StatusCode> Commit(
       Backend& backend, Model& target, core::DecodeCache& cache,
       std::size_t accepted) = 0;
+
+  // Report the strategy's kernel-cache hit rates, if it keeps any (the
+  // default reports nothing). Called once per generation next to the
+  // decode summary; prefix identifies the engine.
+  //
+  // Usage:
+  //   strategy->ReportCaches(diagnostics, "engine");
+  virtual void ReportCaches(const log::Diagnostics& log,
+                            std::string_view prefix) const {
+    (void)log;
+    (void)prefix;
+  }
 };
 
 // Factories (implemented in src/spec/).

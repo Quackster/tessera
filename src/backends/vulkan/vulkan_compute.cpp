@@ -6,6 +6,7 @@
 #include "kernels_spirv.hpp"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -295,8 +296,52 @@ void VulkanCompute::Shutdown() {
   auto flushed = Synchronize();
   (void)flushed;
   vkQueueWaitIdle(queue_);
+  ReportDescHitRate();
   DestroyResources();
   ready_ = false;
+}
+
+void VulkanCompute::CountDescLookup(bool hit) {
+  if (cache_phase_ == CachePhase::kPrefill) {
+    if (hit) {
+      ++desc_prefill_hits_;
+    } else {
+      ++desc_prefill_misses_;
+    }
+  } else if (hit) {
+    ++desc_decode_hits_;
+  } else {
+    ++desc_decode_misses_;
+  }
+}
+
+void VulkanCompute::ReportDescHitRate() const {
+  if (diagnostics_ == nullptr) {
+    return;
+  }
+  const struct PhaseCount {
+    const char* name;
+    std::uint64_t hits;
+    std::uint64_t misses;
+  } phases[] = {
+      {"decode", desc_decode_hits_, desc_decode_misses_},
+      {"prefill", desc_prefill_hits_, desc_prefill_misses_},
+  };
+  for (const PhaseCount& phase : phases) {
+    if (phase.hits + phase.misses == 0) {
+      continue;
+    }
+    char rate[32];
+    std::snprintf(rate, sizeof(rate), "%.1f",
+                  100.0 * static_cast<double>(phase.hits) /
+                      static_cast<double>(phase.hits + phase.misses));
+    diagnostics_->Info("kernel",
+                       std::string("cache: descriptor ") + phase.name +
+                           " hit rate " + rate + "% over " +
+                           std::to_string(phase.hits + phase.misses) +
+                           " lookup(s) (" + std::to_string(phase.misses) +
+                           " alloc(s))");
+  }
 }
 
 std::expected<std::unique_ptr<VkKernel>, StatusCode>
@@ -614,6 +659,7 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   auto result = VK_SUCCESS;
   if (cached != desc_cache_.end()) {
     set = cached->second;
+    CountDescLookup(/*hit=*/true);
   } else {
     VkDescriptorSetAllocateInfo set_alloc{};
     set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -648,6 +694,7 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   // vectors), so a decode step issuing thousands of launches pays no
   // per-launch heap cost.
   if (cached == desc_cache_.end()) {
+    CountDescLookup(/*hit=*/false);
     for (std::size_t i = 0; i < bindings.size(); ++i) {
       info_scratch_[i] =
           VkDescriptorBufferInfo{bindings[i].buffer, 0, bindings[i].size};

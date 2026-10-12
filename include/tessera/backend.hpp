@@ -24,6 +24,16 @@ enum class MemoryKind : int {
   HostVisible = 1,  // pinned host memory, mappable by the accelerator
 };
 
+// Cache-statistics phase: which generation section a kernel or descriptor
+// lookup belongs to. The core brackets prefill sections with SetCachePhase
+// so hit-rate counters stay attributable per phase; everything outside a
+// bracket counts as decode. Backends without a launch cache inherit the
+// default tracking (no override needed).
+enum class CachePhase : int {
+  kDecode = 0,
+  kPrefill = 1,
+};
+
 // Device-local memory in bytes. `free_bytes` is the memory available for
 // new allocations at query time; it is zero when the backend cannot report
 // it (the caller then works from `total_bytes`).
@@ -840,6 +850,17 @@ class Backend {
   // The GPU index selected by SetDeviceIndex (default 0).
   [[nodiscard]] int DeviceIndex() const;
 
+  // Enter or leave a prefill section for cache hit-rate accounting: the
+  // core calls this with kPrefill around prefill work (PrefillTokens,
+  // PrefillCapturing) and the phase returns to kDecode after. A backend
+  // with a launch-side cache (Vulkan descriptor sets) overrides this to
+  // rotate its own counters; the default only records the phase for the
+  // core-side kernel cache to read back.
+  virtual void SetCachePhase(CachePhase phase);
+
+  // The phase set by SetCachePhase (kDecode until the first call).
+  [[nodiscard]] CachePhase cache_phase() const;
+
   // One-time device initialization. Returns Ok when already done.
   virtual std::expected<void, StatusCode> Init() = 0;
 
@@ -958,6 +979,8 @@ class Backend {
   log::Diagnostics* diagnostics_ = nullptr;
   // GPU index chosen by SetDeviceIndex (default 0, the first GPU).
   int device_index_ = 0;
+  // Phase chosen by SetCachePhase (default kDecode).
+  CachePhase cache_phase_ = CachePhase::kDecode;
 };
 
 // Copy `bytes` from a buffer owned by one backend into a buffer owned by

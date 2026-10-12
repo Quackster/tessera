@@ -166,6 +166,11 @@ class VulkanBackend final : public Backend {
     return device_name_;
   }
 
+  void SetCachePhase(CachePhase phase) override {
+    Backend::SetCachePhase(phase);
+    compute_.SetCachePhase(phase);
+  }
+
   DeviceMemoryInfo MemoryInfo() const override {
     if (state_.physical == VK_NULL_HANDLE) {
       return {};
