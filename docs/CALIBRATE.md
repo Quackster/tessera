@@ -69,7 +69,7 @@ What it stores:
 
 * One entry under key `backend | device | model | context | kv type | strategy | none`.
 * Strategy is `none`, `mtp`, or `dflash2`.
-* The entry holds the chosen settings, the median decode rate, the median prefill rate, the memory bound context, and the date.
+* The entry holds the chosen settings, the median decode rate, the median prefill rate, the memory bound context, the date, and a comment with the example `run` commands.
 * The memory bound is informational. It equals free device memory minus a 2 GiB reserve, divided by KV bytes per token.
 * The report prints each point, the chosen values, and an example `run` command.
 

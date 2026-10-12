@@ -470,15 +470,6 @@ int RunCalibrateCommand(int argc, char** argv) {
   // Keep the identity for the report: `entry` is moved into the file below.
   const std::string model_id = entry.key.model;
 
-  if (auto saved =
-          SaveCalibrationEntry(log, calibration_file, std::move(entry));
-      !saved) {
-    log.Error("calibrate", std::string("cannot write '") + calibration_file +
-                               "' (" + std::string(ToString(saved.error())) +
-                               ")");
-    return kExitError;
-  }
-
   // A readable report to stdout: identity, the sweep, the chosen settings,
   // and an example command that reproduces them. The formatter lives in the
   // library so it is unit tested.
@@ -503,6 +494,20 @@ int RunCalibrateCommand(int argc, char** argv) {
   report.split_applicable = backend == "rocm";
   report.attention_applicable = sweep.sweep_attention_split;
   report.draft_attached = draft_attached;
+  // The stored entry carries the example commands as its comment, so the
+  // file records the exact repro alongside the tuned values.
+  const ExampleCommands commands = BuildExampleCommands(report);
+  entry.comment = commands.explicit_flags + "\n" + commands.from_file;
+
+  if (auto saved =
+          SaveCalibrationEntry(log, calibration_file, std::move(entry));
+      !saved) {
+    log.Error("calibrate", std::string("cannot write '") + calibration_file +
+                               "' (" + std::string(ToString(saved.error())) +
+                               ")");
+    return kExitError;
+  }
+
   std::fputs("\n", stdout);
   std::fputs(FormatCalibrationReport(report).c_str(), stdout);
   std::fflush(stdout);

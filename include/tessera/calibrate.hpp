@@ -175,6 +175,10 @@ struct CalibrationEntry {
   // key's KV type when the entry was written. Informational; 0 when the
   // entry predates the field.
   std::size_t max_context = 0;
+  // The example run commands for this entry, joined by a newline.
+  // Informational only; never read back for tuning. Empty when the entry
+  // predates the field.
+  std::string comment;
   std::string date;
 };
 
@@ -250,6 +254,23 @@ struct CalibrationReport {
   bool attention_applicable = false;
   bool draft_attached = false;
 };
+
+// The two copy-paste run commands for a report: the explicit-flags form
+// and the --calibration form. Both carry the key context so the latter
+// matches the stored entry.
+struct ExampleCommands {
+  std::string explicit_flags;
+  std::string from_file;
+};
+
+// Build the example commands for a report: the tuned flags plus the draft
+// checkpoint for a dflash2 entry and --speculate for mtp. One canonical
+// implementation feeding the text report and the stored entry comment.
+//
+// Usage:
+//   ExampleCommands example = BuildExampleCommands(report);
+[[nodiscard]] ExampleCommands BuildExampleCommands(
+    const CalibrationReport& report);
 
 // Format the report as plain text: the identity, the sweep, the chosen
 // settings, and an example `run` command that reproduces them.

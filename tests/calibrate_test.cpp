@@ -26,6 +26,8 @@ using tessera::CalibrationReport;
 using tessera::CandidateValues;
 using tessera::FormatCalibrationReport;
 using tessera::HardwareKey;
+using tessera::ExampleCommands;
+using tessera::BuildExampleCommands;
 using tessera::kMinGain;
 using tessera::KvCacheType;
 using tessera::MakeHardwareKey;
@@ -109,6 +111,7 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   CalibrationFile file;
   CalibrationEntry entry = MakeEntry(key, config, 61.5, 1234.0);
   entry.max_context = 197632;
+  entry.comment = "tessera-cli run --model /m --context 197632";
   file.Set(std::move(entry));
 
   ASSERT_TRUE(file.Save(path).has_value());
@@ -122,6 +125,7 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   EXPECT_DOUBLE_EQ(found->decode_tps, 61.5);
   EXPECT_DOUBLE_EQ(found->prefill_tps, 1234.0);
   EXPECT_EQ(found->max_context, 197632u);
+  EXPECT_EQ(found->comment, "tessera-cli run --model /m --context 197632");
   EXPECT_EQ(found->date, "2026-10-10");
 
   // An unknown key has no entry.
@@ -176,6 +180,7 @@ TEST(CalibrateTest, FileWithoutMaxContextStillLoads) {
   ASSERT_TRUE(loaded.has_value()) << tessera::ToString(loaded.error());
   ASSERT_EQ(loaded->Entries().size(), 1u);
   EXPECT_EQ(loaded->Entries()[0].max_context, 0u);
+  EXPECT_EQ(loaded->Entries()[0].comment, "");
 }
 
 // The report prints the memory-bound max context and its example commands
@@ -202,6 +207,14 @@ TEST(CalibrateTest, ReportNamesMaxContextAndKeyContext) {
   EXPECT_NE(text.find("--context 4096"), std::string::npos);
   EXPECT_EQ(text.find("--context 197632"), std::string::npos);
   EXPECT_NE(text.find("--draft /models/Qwen3.8-27B-DFlash2-FP8"),
+            std::string::npos);
+  EXPECT_NE(text.find("--calibration /tmp/calibration.json"),
+            std::string::npos);
+  // The stored comment carries the same commands the report prints.
+  const ExampleCommands commands = BuildExampleCommands(report);
+  EXPECT_NE(commands.explicit_flags.find("--context 4096"),
+            std::string::npos);
+  EXPECT_NE(commands.from_file.find("--calibration /tmp/calibration.json"),
             std::string::npos);
 }
 

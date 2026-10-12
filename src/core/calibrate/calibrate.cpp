@@ -225,6 +225,7 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
       !ReadNumber(item, "draft_tokens", draft) ||
       !ReadOptionalNumber(item, "draft_context", draft_context) ||
       !ReadOptionalNumber(item, "max_context", max_context) ||
+      !ReadOptionalString(item, "comment", entry.comment) ||
       !ReadNumber(item, "decode_tps", entry.decode_tps) ||
       !ReadNumber(item, "prefill_tps", entry.prefill_tps) ||
       !ReadString(item, "date", entry.date)) {
@@ -516,6 +517,7 @@ std::expected<void, StatusCode> CalibrationFile::Save(
     item.Set("decode_tps", core::Json::Number(entry.decode_tps));
     item.Set("prefill_tps", core::Json::Number(entry.prefill_tps));
     item.Set("date", core::Json::String(entry.date));
+    item.Set("comment", core::Json::String(entry.comment));
     entries.Push(std::move(item));
   }
   root.Set("entries", std::move(entries));
@@ -608,6 +610,54 @@ void ApplyToGenerateOptions(const CalibrationConfig& config,
   if (config.draft_context != 0) {
     options.draft_context = config.draft_context;
   }
+}
+
+ExampleCommands BuildExampleCommands(const CalibrationReport& report) {
+  // The draft checkpoint the run must attach for a dflash2 entry: without
+  // it the example would run a different strategy than the sweep used.
+  const std::string draft_flag =
+      (report.strategy == "dflash2" && !report.draft_path.empty())
+          ? " --draft " + report.draft_path
+          : "";
+  // Both commands carry the key context, so the --calibration form matches
+  // the stored entry and a copy-paste run applies it.
+  ExampleCommands commands;
+  commands.explicit_flags =
+      "tessera-cli run --model " + report.model_path + draft_flag + " " +
+      report.kv_flag + report.parallel_flags + "\\\n      --context " +
+      std::to_string(report.key_context);
+  commands.explicit_flags += " --prefill-chunk " +
+                             std::to_string(report.chosen.prefill_chunk_tokens);
+  if (report.split_applicable) {
+    commands.explicit_flags += " --split-target " +
+                               std::to_string(report.chosen.mxfp4_split_target);
+    commands.explicit_flags +=
+        " --split-cap " + std::to_string(report.chosen.mxfp4_split_cap);
+  }
+  if (report.attention_applicable && report.chosen.attention_split > 0) {
+    commands.explicit_flags +=
+        " --attention-split " + std::to_string(report.chosen.attention_split);
+  }
+  if (report.draft_attached && report.chosen.draft_tokens > 0) {
+    commands.explicit_flags +=
+        " --draft-block " + std::to_string(report.chosen.draft_tokens);
+  }
+  if (report.draft_attached && report.chosen.draft_context > 0) {
+    commands.explicit_flags +=
+        " --draft-context " + std::to_string(report.chosen.draft_context);
+  }
+  if (report.strategy == "mtp") {
+    commands.explicit_flags += " --speculate";
+  }
+  commands.explicit_flags += " --prompt-text \"Hello\"";
+  commands.from_file = "tessera-cli run --model " + report.model_path +
+                       draft_flag + " " + report.kv_flag +
+                       report.parallel_flags + "\\\n      --context " +
+                       std::to_string(report.key_context) +
+                       (report.strategy == "mtp" ? " --speculate" : "") +
+                       " --calibration " + report.file +
+                       " --prompt-text \"Hello\"";
+  return commands;
 }
 
 std::string FormatCalibrationReport(const CalibrationReport& report) {
@@ -703,47 +753,11 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += row("decode", format_rate(report.decode_tps) + " tok/s", 21);
   out += row("prefill", format_rate(report.prefill_tps) + " tok/s", 21);
   out += "\nWrote " + report.file + "\n";
-  // The draft checkpoint the run must attach for a dflash2 entry: without
-  // it the example would run a different strategy than the sweep used.
-  const std::string draft_flag =
-      (report.strategy == "dflash2" && !report.draft_path.empty())
-          ? " --draft " + report.draft_path
-          : "";
-  std::string example = "  tessera-cli run --model " + report.model_path +
-                        draft_flag + " " + report.kv_flag +
-                        report.parallel_flags + "\\\n      --context " +
-                        std::to_string(report.key_context);
-  example += " --prefill-chunk " +
-             std::to_string(report.chosen.prefill_chunk_tokens);
-  if (report.split_applicable) {
-    example +=
-        " --split-target " + std::to_string(report.chosen.mxfp4_split_target);
-    example +=
-        " --split-cap " + std::to_string(report.chosen.mxfp4_split_cap);
-  }
-  if (report.attention_applicable && report.chosen.attention_split > 0) {
-    example +=
-        " --attention-split " + std::to_string(report.chosen.attention_split);
-  }
-  if (report.draft_attached && report.chosen.draft_tokens > 0) {
-    example += " --draft-block " + std::to_string(report.chosen.draft_tokens);
-  }
-  if (report.draft_attached && report.chosen.draft_context > 0) {
-    example +=
-        " --draft-context " + std::to_string(report.chosen.draft_context);
-  }
-  if (report.strategy == "mtp") {
-    example += " --speculate";
-  }
-  example += " --prompt-text \"Hello\"";
+  const ExampleCommands commands = BuildExampleCommands(report);
   out += "\nExample\n-------\n";
-  out += example + "\n";
+  out += "  " + commands.explicit_flags + "\n";
   out += "  # or apply the saved entry directly:\n";
-  out += "  tessera-cli run --model " + report.model_path + draft_flag + " " +
-         report.kv_flag + report.parallel_flags + "\\\n      --context " +
-         std::to_string(report.key_context) +
-         (report.strategy == "mtp" ? " --speculate" : "") + " --calibration " +
-         report.file + " --prompt-text \"Hello\"\n";
+  out += "  " + commands.from_file + "\n";
   return out;
 }
 
