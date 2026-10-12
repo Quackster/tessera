@@ -1,0 +1,80 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+
+
+// Warp-per-output Q8_0 GEMV ("gemm_q80_vec" contract): one 32-lane group
+// per output element, eight groups per 256-thread workgroup, grid_x =
+// ceil(m n / 8) and grid_y = the split-K chunk. A Q8_0 block is 34 bytes:
+// d fp16 then 32 signed bytes; lane l owns element l of every block.
+// split == 1 writes the output; a split > 1 writes its partial to region
+// `grid_y` of C for "gemm_vec_reduce". The per-group shared reduction
+// mirrors the ROCm shuffle tree (same association).
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) readonly buffer W {
+  uint8_t w[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer C {
+  float c[];
+};
+
+// 32-lane (warp-equivalent) reduction; the cluster leader writes the
+// result. Replaces a shared-memory tree with five barriers per output.
+float reduce32(float v) {
+  return subgroupClusteredAdd(v, 32u);
+}
+
+
+
+uint wbyte(uint offset) {
+  return uint(w[offset]);
+}
+
+// Hardware FP16 decode, as ROCm __half2float and the attention
+// kernels: the manual exp2 path cost a transcendental per scale.
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  return unpackHalf2x16(h).x;
+}
+
+void main() {
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  uint split = pc.v[6];
+  uint warps = gl_WorkGroupSize.x / 32u;
+  uint idx = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
+  if (idx >= m * n) {
+    return;
+  }
+  uint lane = gl_LocalInvocationID.x % 32u;
+  uint blocks = k / 32u;
+  uint per = blocks / split;
+  uint b0 = gl_WorkGroupID.y * per;
+  uint row_a = idx / n;
+  uint row_w = idx % n;
+  uint w_base = row_w * (blocks * 34u);
+  float acc = 0.0;
+  for (uint b = b0; b < b0 + per; ++b) {
+    uint base = w_base + b * 34u;
+    float d = fp16_at(base);
+    uint q = wbyte(base + 2u + lane);
+    int qi = q >= 128u ? int(q) - 256 : int(q);
+    acc += a[row_a * k + b * 32u + lane] * (d * float(qi));
+  }
+  float sum = reduce32(acc);
+  if ((gl_SubgroupInvocationID % 32u) == 0u) {
+    c[gl_WorkGroupID.y * (m * n) + idx] = sum;
+  }
+}

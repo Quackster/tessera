@@ -1,0 +1,40 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+
+// Per-row max of the E8M0 block scales of a packed MXFP4 weight, the
+// Vulkan twin of MxFp4RowRefKernel. Buffers: 0 W (n*k/2 nibbles then
+// n*k/32 scales), 1 Wref (n bytes); scalars n v[0], k v[2]. Grid
+// ceil(n / 256), one thread per row.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer W {
+  uint w[];
+};
+layout(set = 0, binding = 1) writeonly buffer Ref {
+  uint8_t wref[];
+};
+
+uint wbyte(uint offset) {
+  return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+void main() {
+  uint r = gl_GlobalInvocationID.x;
+  uint n = pc.v[0];
+  uint k = pc.v[2];
+  if (r >= n) {
+    return;
+  }
+  uint scale_base = (n * k) >> 1u;
+  uint blocks = k / 32u;
+  uint best = 0u;
+  for (uint b = 0u; b < blocks; ++b) {
+    best = max(best, wbyte(scale_base + r * blocks + b));
+  }
+  wref[r] = uint8_t(best);
+}

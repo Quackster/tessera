@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -7,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <vulkan/vulkan.h>
@@ -50,6 +52,33 @@ struct VkKernel {
   std::string name;
   std::uint32_t read_mask = 0xffffffffu;
   std::uint32_t write_mask = 0xffffffffu;
+};
+
+// Key for the descriptor-set cache: the pipeline plus the bound buffers
+// and their sizes. Only the first `count` entries matter.
+struct DescKey {
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  std::uint32_t count = 0;
+  std::array<VkBuffer, kMaxBoundBuffers> buffers{};
+  std::array<std::size_t, kMaxBoundBuffers> sizes{};
+  bool operator==(const DescKey& other) const = default;
+};
+
+// Mix prime for the descriptor-set cache hash.
+constexpr std::size_t kDescKeyHashMix = 1315423911u;
+
+struct DescKeyHash {
+  std::size_t operator()(const DescKey& key) const noexcept {
+    std::size_t hash =
+        std::hash<void*>{}(static_cast<void*>(key.pipeline));
+    hash = hash * kDescKeyHashMix + key.count;
+    for (std::uint32_t i = 0; i < key.count; ++i) {
+      hash = hash * kDescKeyHashMix +
+             std::hash<void*>{}(static_cast<void*>(key.buffers[i]));
+      hash = hash * kDescKeyHashMix + key.sizes[i];
+    }
+    return hash;
+  }
 };
 
 // Kernel launch plumbing for the vulkan backend: SPIR-V pipelines on one
@@ -119,6 +148,9 @@ class VulkanCompute {
   // bindings into the pending hazard sets.
   void OrderAccess(std::span<const VkBinding> bindings, std::uint32_t read_mask,
                    std::uint32_t write_mask);
+  // Drop every cached descriptor set and reset the pool (after a flush).
+  // The pool outgrowing path and teardown call this.
+  void InvalidateDescriptors();
 
   // Buffers touched since the last barrier, split by access. A dispatch needs
   // a barrier only against these sets, so independent dispatches overlap.
@@ -153,6 +185,17 @@ class VulkanCompute {
   std::uint64_t desc_decode_misses_ = 0;
   // Phase the backend forwarded for hit-rate accounting (default decode).
   CachePhase cache_phase_ = CachePhase::kDecode;
+  // Cached descriptor sets by pipeline and bindings: a decode step binds
+  // the same weights every token, so repeats skip alloc and update.
+  std::unordered_map<DescKey, VkDescriptorSet, DescKeyHash> desc_cache_;
+  // Per-launch scratch for the descriptor writes on a cache miss. Sized
+  // for the binding limit and kept on the backend, so a launch pays no
+  // per-launch heap cost.
+  std::array<VkDescriptorBufferInfo, kMaxBoundBuffers> info_scratch_{};
+  std::array<VkWriteDescriptorSet, kMaxBoundBuffers> write_scratch_{};
+  // Tensor-core (cooperative matrix) support, probed at Init. False keeps
+  // the tensor-core kernels on their scalar fallbacks.
+  bool coopmat_ = false;
 };
 
 }  // namespace tessera::backends::vulkan

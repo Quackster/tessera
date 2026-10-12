@@ -1,0 +1,119 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+
+
+// Multi-row Q5_K GEMV ("gemm_q5k_rows5" contract): one warp per
+// weight column decodes each 176-byte superblock once and applies it to
+// all `m` activation rows (m = 5), the folding MTP verify shape.
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[8];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer A {
+  float a[];
+};
+
+layout(set = 0, binding = 1) readonly buffer W {
+  uint8_t w[];
+};
+
+layout(set = 0, binding = 2) writeonly buffer C {
+  float c[];
+};
+
+// 32-lane (warp-equivalent) reduction; the cluster leader writes the
+// result. Replaces a shared-memory tree with five barriers per output.
+float reduce32(float v) {
+  return subgroupClusteredAdd(v, 32u);
+}
+
+
+
+uint wbyte(uint offset) {
+  return uint(w[offset]);
+}
+
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+void scale_min4(uint j, uint base, out uint scale, out uint min) {
+  uint sj = wbyte(base + 4 + j);
+  uint sj4 = wbyte(base + 8 + j);
+  uint sjm4 = wbyte(base + j);
+  if (j < 4) {
+    scale = sj & 63;
+    min = sj4 & 63;
+  } else {
+    scale = (sj4 & 15) | ((sjm4 >> 6) << 4);
+    min = (sj4 >> 4) | ((sj >> 6) << 4);
+  }
+}
+
+
+void main() {
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  uint split = pc.v[6];
+  uint warps = gl_WorkGroupSize.x / 32u;
+  uint warp = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
+  uint lane = gl_LocalInvocationID.x % 32u;
+  if (warp >= n) {
+    return;
+  }
+  uint rows = 5u;
+  uint blocks = k / 256u;
+  uint per = blocks / split;
+  uint b0 = gl_WorkGroupID.y * per;
+  uint wbase = warp * (blocks * 176u) + b0 * 176u;
+  float acc[5] = float[5](0.0, 0.0, 0.0, 0.0, 0.0);
+  for (uint b = 0u; b < per; ++b) {
+    uint base = wbase + b * 176u;
+    float d = fp16_at(base);
+    float dm = fp16_at(base + 2u);
+    uint qh = wbyte(base + 16u + lane);
+    for (uint g = 0u; g < 4u; ++g) {
+      uint sc0, mn0, sc1, mn1;
+      scale_min4(g * 2u, base, sc0, mn0);
+      scale_min4(g * 2u + 1u, base, sc1, mn1);
+      uint ql = wbyte(base + 48u + g * 32u + lane);
+      uint v0 = (ql & 15u) + (((qh >> (2u * g)) & 1u) << 4);
+      uint v1 = (ql >> 4) + (((qh >> (2u * g + 1u)) & 1u) << 4);
+      float wl = d * float(sc0) * float(v0) - dm * float(mn0);
+      float wh = d * float(sc1) * float(v1) - dm * float(mn1);
+      uint t0 = (b0 + b) * 256u + g * 64u + lane;
+      for (uint r = 0u; r < 5u; ++r) {
+        if (r < rows) {
+          uint t = r * k + t0;
+          acc[r] += a[t] * wl + a[t + 32u] * wh;
+        }
+      }
+    }
+  }
+
+  uint out_base = gl_WorkGroupID.y * (m * n);
+  for (uint r = 0u; r < 5u; ++r) {
+    if (r < rows) {
+      float sum = reduce32(acc[r]);
+      if ((gl_SubgroupInvocationID % 32u) == 0u) {
+        c[out_base + r * n + warp] = sum;
+      }
+    }
+  }
+}

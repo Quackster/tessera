@@ -1,0 +1,117 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : require
+
+// Scalar twin of GemmMxFp4WmmaKernel (the W4A8 MXFP4 GEMM). Buffers: 0 A
+// (fp8 E4M3 bytes, m x k), 1 W (n*k/2 E2M1 nibbles then n*k/32 E8M0
+// scales), 2 As (fp32 per-token scales, m), 3 Wref (per-column E8M0
+// reference bytes, n), 4 C (fp32, m x n per split region). Scalars: m
+// v[0], n v[2], k v[4], split v[6], wperm v[8] (only 0, the packed
+// layout, is implemented). Grid ((n + 63) / 64, split); a split > 1
+// writes each chunk's partial to its region of C for the split reduce.
+// Vulkan never loads this kernel (tensor-core dispatches stay disabled
+// until the driver stabilizes); it is the compilable contract twin.
+layout(local_size_x = 128) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer A {
+  uint8_t ab[];
+};
+layout(set = 0, binding = 1) readonly buffer W {
+  uint8_t w[];
+};
+layout(set = 0, binding = 2) readonly buffer Scales {
+  float as_[];
+};
+layout(set = 0, binding = 3) readonly buffer WRef {
+  uint8_t wref[];
+};
+layout(set = 0, binding = 4) writeonly buffer C {
+  float c[];
+};
+
+// E2M1 magnitudes folded to fp8 bytes per relative exponent d0, the
+// kMag table of the ROCm twin: row d0 holds the magnitudes scaled by
+// 2^-d0, so the fold has no per-block rescale.
+const uint kMag[128] = uint[128](
+    0x00u, 0x30u, 0x38u, 0x3cu, 0x40u, 0x44u, 0x48u, 0x4cu,
+    0x00u, 0x28u, 0x30u, 0x34u, 0x38u, 0x3cu, 0x40u, 0x44u,
+    0x00u, 0x20u, 0x28u, 0x2cu, 0x30u, 0x34u, 0x38u, 0x3cu,
+    0x00u, 0x18u, 0x20u, 0x24u, 0x28u, 0x2cu, 0x30u, 0x34u,
+    0x00u, 0x10u, 0x18u, 0x1cu, 0x20u, 0x24u, 0x28u, 0x2cu,
+    0x00u, 0x08u, 0x10u, 0x14u, 0x18u, 0x1cu, 0x20u, 0x24u,
+    0x00u, 0x04u, 0x08u, 0x0cu, 0x10u, 0x14u, 0x18u, 0x1cu,
+    0x00u, 0x02u, 0x04u, 0x06u, 0x08u, 0x0cu, 0x10u, 0x14u,
+    0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x06u, 0x08u, 0x0cu,
+    0x00u, 0x00u, 0x01u, 0x01u, 0x02u, 0x03u, 0x04u, 0x06u,
+    0x00u, 0x00u, 0x00u, 0x01u, 0x01u, 0x01u, 0x02u, 0x03u,
+    0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x01u, 0x01u, 0x01u,
+    0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x01u,
+    0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u,
+    0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u,
+    0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u);
+
+// OCP FP8 E4M3 byte -> fp32 (port of the core Fp8E4M3ToFloat): bias 7,
+// subnormals at mant * 2^-9, only the all-ones mantissa is NaN.
+float fp8_dec(uint b) {
+  uint sign = b >> 7u;
+  uint exp = (b >> 3u) & 15u;
+  uint mant = b & 7u;
+  float value;
+  if (exp == 0u) {
+    value = float(mant) * 0.001953125;
+  } else if (exp == 15u) {
+    if (mant == 7u) {
+      value = uintBitsToFloat(0x7FC00000u);
+    } else {
+      value = (1.0 + float(mant) / 8.0) * 256.0;
+    }
+  } else {
+    value = (1.0 + float(mant) / 8.0) * ldexp(1.0, int(exp) - 7);
+  }
+  return sign != 0u ? -value : value;
+}
+
+void main() {
+  uint m = pc.v[0];
+  uint n = pc.v[2];
+  uint k = pc.v[4];
+  uint split = pc.v[6];
+  uint wperm = pc.v[8];
+  if (wperm != 0u) {
+    return;
+  }
+  uint tid = gl_LocalInvocationID.x;
+  uint col_base = gl_WorkGroupID.x * 64u;
+  uint chunks = (k + 127u) / 128u;
+  uint per = (chunks + split - 1u) / split;
+  uint k_lo = gl_WorkGroupID.y * per * 128u;
+  uint k_hi = min(k_lo + per * 128u, k);
+  uint scale_base = (n * k) >> 1u;
+  uint blocks = k / 32u;
+  uint count = 64u * m;
+  for (uint o = tid; o < count; o += 128u) {
+    uint col = col_base + (o % 64u);
+    uint r = o / 64u;
+    if (col >= n) {
+      continue;
+    }
+    uint ref = uint(wref[col]);
+    float acc = 0.0;
+    for (uint k2 = k_lo; k2 < k_hi; ++k2) {
+      float av = fp8_dec(uint(ab[r * k + k2]));
+      uint nib = uint(w[(col * k + k2) >> 1u]);
+      uint v = ((k2 & 1u) == 0u) ? (nib & 15u) : (nib >> 4u);
+      uint sbyte = uint(w[scale_base + col * blocks + k2 / 32u]);
+      int d0 = int(ref) - int(sbyte);
+      d0 = clamp(d0, 0, 15);
+      uint wbits = kMag[uint(d0) * 8u + (v & 7u)] | ((v & 8u) << 4u);
+      acc += av * fp8_dec(wbits);
+    }
+    uint base = gl_WorkGroupID.y * (m * n);
+    c[base + r * n + col] = acc * as_[r] * ldexp(1.0, int(ref) - 127);
+  }
+}
