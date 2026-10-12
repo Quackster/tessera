@@ -120,7 +120,9 @@ void PrintCalibrateUsage() {
        "  --gpu <n>         GPU index to use (default 0, the first)\n"
        "  --gpus <a,b>      parallel max-context: measure every listed GPU\n"
        "  --tp | --cp | --pipeline  parallel route for --gpus (exactly one)\n"
-      "  --prompts <file>  fixed prompts, one per non-empty line\n"
+       "  --prompts <file>  fixed prompts, one per non-empty line\n"
+       "  --calibrate-limit <n> test at most n prompts per sweep point\n"
+       "                    (default all prompts)\n"
       "  --wmma|--no-wmma  fp8 tensor-core MXFP4 GEMM (diagnostic)\n"
       "  --w4a8            MXFP4 W4A8 activation quant (diagnostic)\n"
       "  --target-bf16     round projection outputs to bf16 (diagnostic)\n"
@@ -150,6 +152,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   std::string draft_path;
   std::string calibration_path;
   std::string prompts_path;
+  std::size_t calibrate_limit = 0;
   std::size_t context = kDefaultContext;
   // int8 (kv8) is the default KvType for calibration, the memory-efficient
   // cache the maximum context is found for.
@@ -173,6 +176,8 @@ int RunCalibrateCommand(int argc, char** argv) {
       calibration_path = argv[++i];
     } else if (arg == "--prompts" && i + 1 < argc) {
       prompts_path = argv[++i];
+    } else if (arg == "--calibrate-limit" && i + 1 < argc) {
+      calibrate_limit = std::stoul(argv[++i]);
     } else if (arg == "--context" && i + 1 < argc) {
       context = std::stoul(argv[++i]);
     } else if (arg == "--gpu" && i + 1 < argc) {
@@ -211,6 +216,11 @@ int RunCalibrateCommand(int argc, char** argv) {
     return kExitUsage;
   }
   if (!gpus.empty() || tp_mode || cp_mode || pipeline_mode) {
+    if (calibrate_limit > 0) {
+      std::fprintf(stderr, "cli: --calibrate-limit needs a speed sweep; the "
+                           "--gpus path measures memory only\n");
+      return kExitUsage;
+    }
     // Parallel max-context calibration: no speed sweep, one entry per
     // layout carrying the largest KV-cache context it allows.
     ParallelCalibrateOptions parallel_options;
@@ -397,6 +407,11 @@ int RunCalibrateCommand(int argc, char** argv) {
 
   SweepOptions sweep;
   sweep.prompt_count = prefill_ids.size();
+  // A limit tests only the first prompts of the set, for a quick pass that
+  // still picks the best of what it measured. Zero means all prompts.
+  if (calibrate_limit > 0 && calibrate_limit < sweep.prompt_count) {
+    sweep.prompt_count = calibrate_limit;
+  }
   sweep.defaults = defaults;
   sweep.sweep_split_target = backend == "rocm";
   sweep.sweep_split_cap = backend == "rocm";
@@ -434,7 +449,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   // decode rate on the short prompts, the prefill rate on the long ones.
   std::vector<double> decode_rates;
   std::vector<double> prefill_rates;
-  for (std::size_t prompt = 0; prompt < prefill_ids.size(); ++prompt) {
+  for (std::size_t prompt = 0; prompt < sweep.prompt_count; ++prompt) {
     auto decode_measured =
         measure(Setting::MxFp4SplitTarget, outcome->config, prompt, false);
     if (!decode_measured) {

@@ -40,6 +40,7 @@ Useful flags:
 * `--draft <dir>`: DFlash2 draft checkpoint. It enables the draft sweeps.
 * `--speculate`: MTP draft from the target head. It enables the draft block sweep.
 * `--prompts <file>`: prompts for the sweep, one per line. Default is three fixed prompts.
+* `--calibrate-limit <n>`: test at most this many prompts per sweep point. Default is all prompts. A small value runs faster and still keeps the best of what it measured.
 * `--calibration <file>`: file to read and write. You can also set `TESSERA_CALIBRATION`. One of the two is required.
 * `--quiet`: hide progress logs.
 
@@ -137,6 +138,29 @@ Only `calibrate` writes the file. `run` and `serve` only read it. A missing file
 * It does not store model paths. The key stores the model name only.
 
 Note: `run` with two or more `--prompt-text` flags runs concurrent sessions on one device. That path is a functional run. It is not a calibration sweep. It writes no file.
+
+## Save and read the calibration log
+
+The log is the console output of `calibrate`. It is separate from the JSON file. The JSON file applies settings. The log only records what happened.
+
+Save it with `tee`:
+
+```sh
+./cmake-build-rocm/tessera-cli calibrate \
+  --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --calibration ~/.config/tessera/calibration.json \
+  2>&1 | tee calibration.log
+```
+
+Progress lines go to stderr. The report goes to stdout. Redirect both, or the file misses the progress lines. `--quiet` hides the progress lines. The report still prints.
+
+Read it top to bottom:
+
+* Identity rows name the backend, device, model, KV type, strategy, key context, and memory bound.
+* `Sweep` lists each tested value with its tok/s. `(default)` marks the built-in value. `(kept)` marks the winner.
+* `Chosen` lists the values the run keeps.
+* `Wrote` names the JSON file the entry went to.
+* `Example` shows two `run` commands that reuse the result. The first spells the flags. The second applies the saved entry with `--calibration`.
 
 ## TODO
 

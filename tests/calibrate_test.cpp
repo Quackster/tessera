@@ -251,6 +251,25 @@ TEST(CalibrateTest, SweepFindsSplitTargetGain) {
   EXPECT_TRUE(kept);
 }
 
+// A single-prompt sweep still finds a real gain: the --calibrate-limit
+// fast path measures each candidate once and keeps the best of those.
+TEST(CalibrateTest, SweepWorksWithSinglePrompt) {
+  SweepOptions options;
+  options.prompt_count = 1;
+  options.defaults.mxfp4_split_target = 320;
+  OnlySweep(options, Setting::MxFp4SplitTarget);
+  auto measure = [](Setting, const CalibrationConfig& config, std::size_t, bool)
+      -> std::expected<Measurement, StatusCode> {
+    Measurement m;
+    m.decode_tps = config.mxfp4_split_target == 640 ? 1.5 : 1.0;
+    m.prefill_tps = m.decode_tps;
+    return m;
+  };
+  auto outcome = tessera::RunCalibrationSweep(options, measure);
+  ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  EXPECT_EQ(outcome->config.mxfp4_split_target, 640u);
+}
+
 // A real gain in the draft block is found and kept.
 
 // The interleaved confirmation rejects a win that was a single burst of
