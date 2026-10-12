@@ -91,8 +91,18 @@ std::expected<void, StatusCode> SweepSetting(
     outcome.not_applicable.push_back(setting);
     return {};
   }
-  std::vector<double> rates(candidates.size(), 0.0);
+  // Measure candidates one after another until the point budget runs out.
+  // The budget counts every measured point in total, whatever the setting.
+  std::vector<std::size_t> measured;
+  std::vector<double> rates;
+  measured.reserve(candidates.size());
+  rates.reserve(candidates.size());
+  const std::size_t base = outcome.points.size();
   for (std::size_t i = 0; i < candidates.size(); ++i) {
+    if (options.max_points > 0 &&
+        outcome.points.size() >= options.max_points) {
+      break;
+    }
     CalibrationConfig probe = options.defaults;
     ApplySetting(probe, setting, candidates[i]);
     auto rate =
@@ -100,11 +110,33 @@ std::expected<void, StatusCode> SweepSetting(
     if (!rate) {
       return std::unexpected(rate.error());
     }
-    rates[i] = *rate;
+    measured.push_back(candidates[i]);
+    rates.push_back(*rate);
+    outcome.points.push_back(SweepPoint{setting, candidates[i], *rate, false});
+  }
+  if (measured.empty()) {
+    outcome.skipped.push_back(setting);
+    return {};
   }
   std::size_t chosen = default_value;
+  if (options.max_points > 0) {
+    // Budget mode keeps the fastest measured value as is: no gain gate
+    // and no interleaved confirmation, both cost extra measurements.
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < measured.size(); ++i) {
+      if (rates[i] > rates[best]) {
+        best = i;
+      }
+    }
+    chosen = measured[best];
+    ApplySetting(outcome.config, setting, chosen);
+    for (std::size_t i = 0; i < measured.size(); ++i) {
+      outcome.points[base + i].kept = (measured[i] == chosen);
+    }
+    return {};
+  }
   const std::optional<std::size_t> best =
-      PickBest(candidates, default_value, rates);
+      PickBest(measured, default_value, rates);
   if (best.has_value() && *best != default_value) {
     CalibrationConfig winner = options.defaults;
     ApplySetting(winner, setting, *best);
@@ -136,9 +168,8 @@ std::expected<void, StatusCode> SweepSetting(
     }
   }
   ApplySetting(outcome.config, setting, chosen);
-  for (std::size_t i = 0; i < candidates.size(); ++i) {
-    outcome.points.push_back(SweepPoint{setting, candidates[i], rates[i],
-                                        candidates[i] == chosen});
+  for (std::size_t i = 0; i < measured.size(); ++i) {
+    outcome.points[base + i].kept = (measured[i] == chosen);
   }
   return {};
 }
@@ -724,7 +755,11 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
                  format_rate(point.tps) + " tok/s" + note, 8);
     }
     if (!any) {
-      out += "  not applicable on " + report.backend + "\n";
+      const bool skipped =
+          std::find(report.skipped.begin(), report.skipped.end(), setting) !=
+          report.skipped.end();
+      out += skipped ? "  skipped (point budget)\n"
+                     : "  not applicable on " + report.backend + "\n";
     }
   }
   out += "\nChosen\n------\n";

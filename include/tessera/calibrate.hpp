@@ -97,12 +97,22 @@ struct SweepOptions {
   bool sweep_attention_split = true;
   bool sweep_draft_tokens = false;
   bool sweep_draft_context = false;
+  // At most this many candidate evaluations in total, counted straight
+  // through the sweep whatever the setting. A setting cut short keeps the
+  // fastest measured value with no gain gate and no confirmation; a
+  // setting with no measured value keeps its default and is reported as
+  // skipped. Zero means no budget: every enabled setting is swept.
+  std::size_t max_points = 0;
 };
 
 struct SweepOutcome {
   std::vector<SweepPoint> points;
   CalibrationConfig config;  // the chosen configuration
   std::vector<Setting> not_applicable;
+  // Settings with no measured value under a point budget. Unlike
+  // not_applicable, these could run on this backend; the budget ran out
+  // before any of their candidates was tested.
+  std::vector<Setting> skipped;
 };
 
 // Candidate values for one setting: the fixed list from the design, the
@@ -242,6 +252,7 @@ struct CalibrationReport {
   CalibrationConfig defaults;
   std::vector<SweepPoint> points;
   std::vector<Setting> not_applicable;
+  std::vector<Setting> skipped;  // settings the point budget skipped
   CalibrationConfig chosen;
   double decode_tps = 0.0;
   double prefill_tps = 0.0;

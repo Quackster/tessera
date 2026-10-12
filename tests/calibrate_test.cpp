@@ -270,6 +270,79 @@ TEST(CalibrateTest, SweepWorksWithSinglePrompt) {
   EXPECT_EQ(outcome->config.mxfp4_split_target, 640u);
 }
 
+// A point budget counts every measured point in total, whatever the
+// setting: the first setting sweeps fully and the next keeps the best of
+// the one point it fits.
+TEST(CalibrateTest, BudgetMeasuresAtMostMaxPoints) {
+  SweepOptions options;
+  options.prompt_count = 1;
+  options.defaults.mxfp4_split_target = 320;
+  options.defaults.mxfp4_split_cap = 4;
+  options.sweep_split_target = true;
+  options.sweep_split_cap = true;
+  options.sweep_prefill_chunk = false;
+  options.sweep_attention_split = false;
+  options.max_points = 4;
+  auto measure = [](Setting setting, const CalibrationConfig& config,
+                    std::size_t, bool)
+      -> std::expected<Measurement, StatusCode> {
+    Measurement m;
+    if (setting == Setting::MxFp4SplitTarget) {
+      m.decode_tps = config.mxfp4_split_target == 640 ? 1.5 : 1.0;
+    } else {
+      m.decode_tps = 1.0;
+    }
+    m.prefill_tps = m.decode_tps;
+    return m;
+  };
+  auto outcome = tessera::RunCalibrationSweep(options, measure);
+  ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  EXPECT_EQ(outcome->points.size(), 4u);
+  EXPECT_EQ(outcome->config.mxfp4_split_target, 640u);
+  EXPECT_EQ(outcome->config.mxfp4_split_cap, 2u);
+  EXPECT_TRUE(outcome->skipped.empty());
+}
+
+// A setting with no measured point keeps its default and is reported as
+// skipped, not as not applicable.
+TEST(CalibrateTest, BudgetSkipsUnmeasuredSettings) {
+  SweepOptions options;
+  options.prompt_count = 1;
+  options.defaults.mxfp4_split_target = 320;
+  options.defaults.mxfp4_split_cap = 4;
+  options.sweep_split_target = true;
+  options.sweep_split_cap = true;
+  options.sweep_prefill_chunk = false;
+  options.sweep_attention_split = false;
+  options.max_points = 2;
+  auto measure = [](Setting setting, const CalibrationConfig& config,
+                    std::size_t, bool)
+      -> std::expected<Measurement, StatusCode> {
+    Measurement m;
+    if (setting == Setting::MxFp4SplitTarget) {
+      m.decode_tps = config.mxfp4_split_target == 640 ? 1.5 : 1.0;
+    } else {
+      m.decode_tps = 1.0;
+    }
+    m.prefill_tps = m.decode_tps;
+    return m;
+  };
+  auto outcome = tessera::RunCalibrationSweep(options, measure);
+  ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  EXPECT_EQ(outcome->points.size(), 2u);
+  EXPECT_EQ(outcome->config.mxfp4_split_target, 120u);
+  EXPECT_EQ(outcome->config.mxfp4_split_cap, 4u);
+  ASSERT_EQ(outcome->skipped.size(), 1u);
+  EXPECT_EQ(outcome->skipped[0], Setting::MxFp4SplitCap);
+  CalibrationReport report;
+  report.backend = "rocm";
+  report.skipped = outcome->skipped;
+  report.file = "/tmp/calibration.json";
+  report.model_path = "/models/m";
+  EXPECT_NE(FormatCalibrationReport(report).find("skipped (point budget)"),
+            std::string::npos);
+}
+
 // A real gain in the draft block is found and kept.
 
 // The interleaved confirmation rejects a win that was a single burst of

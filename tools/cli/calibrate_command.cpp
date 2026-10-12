@@ -121,8 +121,8 @@ void PrintCalibrateUsage() {
        "  --gpus <a,b>      parallel max-context: measure every listed GPU\n"
        "  --tp | --cp | --pipeline  parallel route for --gpus (exactly one)\n"
        "  --prompts <file>  fixed prompts, one per non-empty line\n"
-       "  --calibrate-limit <n> test at most n prompts per sweep point\n"
-       "                    (default all prompts)\n"
+       "  --calibrate-limit <n> measure at most n sweep points in total,\n"
+       "                    in sweep order (default unlimited)\n"
       "  --wmma|--no-wmma  fp8 tensor-core MXFP4 GEMM (diagnostic)\n"
       "  --w4a8            MXFP4 W4A8 activation quant (diagnostic)\n"
       "  --target-bf16     round projection outputs to bf16 (diagnostic)\n"
@@ -407,11 +407,9 @@ int RunCalibrateCommand(int argc, char** argv) {
 
   SweepOptions sweep;
   sweep.prompt_count = prefill_ids.size();
-  // A limit tests only the first prompts of the set, for a quick pass that
-  // still picks the best of what it measured. Zero means all prompts.
-  if (calibrate_limit > 0 && calibrate_limit < sweep.prompt_count) {
-    sweep.prompt_count = calibrate_limit;
-  }
+  // A limit measures at most that many points in total, whatever the
+  // setting, and keeps the fastest measured value. Zero means no limit.
+  sweep.max_points = calibrate_limit;
   sweep.defaults = defaults;
   sweep.sweep_split_target = backend == "rocm";
   sweep.sweep_split_cap = backend == "rocm";
@@ -426,11 +424,15 @@ int RunCalibrateCommand(int argc, char** argv) {
   sweep.sweep_draft_context = dflash2_attached;
 
   if (!quiet) {
+    const std::string budget =
+        sweep.max_points > 0
+            ? ", max " + std::to_string(sweep.max_points) + " points"
+            : "";
     log.Info("calibrate", std::string("sweeping on ") + backend + " (" +
-                              std::string(engine.Owner().DeviceName()) +
-                              "), " + std::to_string(sweep.prompt_count) +
-                              " prompt(s), greedy decode, " +
-                              std::string(ToString(kv_type)) + " KV");
+                               std::string(engine.Owner().DeviceName()) +
+                               "), " + std::to_string(sweep.prompt_count) +
+                               " prompt(s)" + budget + ", greedy decode, " +
+                               std::string(ToString(kv_type)) + " KV");
   }
   auto outcome = RunCalibrationSweep(sweep, measure);
   if (!outcome) {
@@ -449,7 +451,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   // decode rate on the short prompts, the prefill rate on the long ones.
   std::vector<double> decode_rates;
   std::vector<double> prefill_rates;
-  for (std::size_t prompt = 0; prompt < sweep.prompt_count; ++prompt) {
+  for (std::size_t prompt = 0; prompt < prefill_ids.size(); ++prompt) {
     auto decode_measured =
         measure(Setting::MxFp4SplitTarget, outcome->config, prompt, false);
     if (!decode_measured) {
@@ -511,6 +513,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   report.defaults = defaults;
   report.points = outcome->points;
   report.not_applicable = outcome->not_applicable;
+  report.skipped = outcome->skipped;
   report.chosen = outcome->config;
   report.decode_tps = MedianOf(decode_rates);
   report.prefill_tps = MedianOf(prefill_rates);

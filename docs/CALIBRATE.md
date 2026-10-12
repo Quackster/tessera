@@ -40,7 +40,7 @@ Useful flags:
 * `--draft <dir>`: DFlash2 draft checkpoint. It enables the draft sweeps.
 * `--speculate`: MTP draft from the target head. It enables the draft block sweep.
 * `--prompts <file>`: prompts for the sweep, one per line. Default is three fixed prompts.
-* `--calibrate-limit <n>`: test at most this many prompts per sweep point. Default is all prompts. A small value runs faster and still keeps the best of what it measured.
+* `--calibrate-limit <n>`: measure at most this many sweep points in total, in sweep order. Default is unlimited. A setting cut short keeps its fastest measured value; a setting with no measured point keeps its default and shows as skipped. A limited sweep skips the interleaved confirmation.
 * `--calibration <file>`: file to read and write. You can also set `TESSERA_CALIBRATION`. One of the two is required.
 * `--quiet`: hide progress logs.
 
