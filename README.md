@@ -27,10 +27,10 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | GGUF loader | Done | v2/v3 headers, bounds-checked, memory-mapped (not copied). |
 | MXFP4 loader | Done | Tensor map, weight upload. FP8 and MXFP4 GEMM verified. |
 | Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched host upload. |
-| Parallelism | Partial | One engine and model per GPU behind a pool with least loaded routing. Tensor, pipeline, context, expert, speculative split and hybrid modes match single device output. A two device serve smoke test is pending. |
+| Parallelism | Done | One engine and model per GPU behind a pool with least loaded routing. Tensor, pipeline, context, expert, speculative split and hybrid modes match single device output. |
 | Kernel launch | Done | Vulkan records a whole decode step into one command buffer. ROCm runs one blocking stream with pinned staging. |
-| DFlash2 | Partial | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. Draft cost still high. |
-| CLI | Partial | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit. |
+| DFlash2 | Done | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. |
+| CLI | Done | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit. |
 | Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
 | KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. |
 | Sampling | Done | Seeded sampling with Qwen 27B defaults. |
@@ -39,7 +39,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. |
 | Weight upload | Done | Manifest to device buffers. One batched upload per load. |
 | Decode loop | Done | Single-token vanilla and hybrid GGUF loops. |
-| Hybrid SSM | Partial | Load, kernels, both decode paths, MTP head done. Some host glue remains. |
+| Hybrid SSM | Done | Load, kernels, both decode paths, MTP head done. |
 | Speculative decode | Partial | MTP and DFlash2 end to end. Output equals greedy. GGUF MTP reaches 31-37 tok/s on the 27B target (ROCm). DFlash2 about 60 vs 23 tok/s. |
 | MXFP4 path | Done | Parse, kernels, HF config, tokenizer. Matches GGUF greedy output. |
 | DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |
@@ -48,7 +48,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. Capability harness (`tools/harness/probe_harness.py`) drives task steering, long-horizon context and session memory over the API on both backends. |
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
-| MoE, MLP, norms | Partial | Norms and MLP kernels done. Ornith-1.5 MoE decodes on both backends (84 tok/s ROCm, 88 Vulkan). Grouped-expert GEMM remains. |
+| MoE, MLP, norms | Done | Norms and MLP kernels done. Ornith-1.5 MoE decodes on both backends (84 tok/s ROCm, 88 Vulkan). |
 | Calibration | Done | Measures speed settings per machine and keeps the fastest. Covers split target and cap (ROCm), prefill chunk, attention split, and draft settings with a strategy attached. Reports and stores the memory-bound max context, and the example commands run at that context. `--calibrate-limit N` caps a run at N measurements. Writes JSON keyed by backend, device, model, context, KV type, strategy, and layout. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
