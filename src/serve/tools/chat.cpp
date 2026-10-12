@@ -216,7 +216,8 @@ bool WantsTools(const Json& body) {
 
 bool ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
                    ResponseWriter& writer, const Json& body,
-                   std::size_t default_max, SessionMessage* out_turn) {
+                   std::size_t default_max, SessionMessage* out_turn,
+                   KvCacheType kv_type) {
   std::string error;
   const std::string prompt = RenderPrompt(model, body, &error);
   if (!error.empty()) {
@@ -232,6 +233,7 @@ bool ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
   options.max_completion_tokens = MaxCompletionTokensFrom(body, default_max);
   options.max_thinking_tokens = MaxThinkingTokensFrom(body);
   options.prompt_tokens = *ids;
+  options.kv_type = kv_type;
   if (RejectOversizePrompt(writer, ids->size(),
                            model.MaxContextLength())) {
     return false;

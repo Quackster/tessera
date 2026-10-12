@@ -867,6 +867,46 @@ TEST(EngineTest, TryAcquireSkipsBusyDevice) {
   ASSERT_TRUE(fast.has_value());
 }
 
+// The pool carries the launcher's KV storage type onto each turn: a
+// serve pool built with --kv-q8 decodes quantized while the default
+// stays F32. Without the plumbing every serve turn decoded F32 and an
+// unlimited turn never fit the device.
+TEST(EngineTest, RunnerCarriesKvType) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("runner_kv.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  {
+    tessera::RunnerPool pool;
+    pool.Add(std::make_unique<tessera::Runner>(
+        std::move(engine), std::move(*model), TestDeviceIndex()));
+    EXPECT_EQ(pool.At(0).kv_type(), tessera::KvCacheType::F32);
+  }
+  std::unique_ptr<Engine> qengine;
+  MakeEngineOrSkip(qengine);
+  auto qmodel = qengine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(qmodel.has_value()) << tessera::ToString(qmodel.error());
+  GenerateOptions q8;
+  q8.prompt_tokens = {3};
+  q8.max_completion_tokens = 8;
+  q8.kv_type = tessera::KvCacheType::Q8;
+  auto solo = qengine->Generate(**qmodel, q8);
+  ASSERT_TRUE(solo.has_value()) << tessera::ToString(solo.error());
+  tessera::RunnerPool qpool;
+  qpool.Add(std::make_unique<tessera::Runner>(
+      std::move(qengine), std::move(*qmodel), TestDeviceIndex(),
+      tessera::CalibrationConfig{}, tessera::KvCacheType::Q8));
+  EXPECT_EQ(qpool.At(0).kv_type(), tessera::KvCacheType::Q8);
+  std::vector<std::uint32_t> tokens;
+  auto shared = qpool.SubmitLeastLoaded(q8, [&](std::uint32_t token) {
+    tokens.push_back(token);
+    return true;
+  });
+  ASSERT_TRUE(shared.has_value()) << tessera::ToString(shared.error());
+  EXPECT_EQ(tokens, *solo);
+}
+
 // YieldFor drops the device lock so a waiter acquires mid-turn.
 TEST(EngineTest, LeaseYieldReleasesDevice) {
   std::unique_ptr<Engine> engine;

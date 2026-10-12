@@ -295,6 +295,11 @@ void SessionHandler::RunTurn(RunnerLease* lease,
   options.max_completion_tokens = max_completion_tokens;
   options.max_thinking_tokens = max_thinking_tokens;
   options.prompt_tokens = *ids;
+  // The pool carries the launcher's KV storage type (--kv-q8 and
+  // friends); without it every serve turn would decode F32 and an
+  // unlimited turn would never fit the device.
+  options.kv_type =
+      lease != nullptr ? lease->runner().kv_type() : pool_.At(0).kv_type();
   if (lease != nullptr) {
     ApplyToGenerateOptions(lease->runner().calibration(), options);
   }
@@ -489,7 +494,7 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
     MaybeAutoTitle(pool_, session, auto_title_);
   } else {
     MaybeAutoTitle(slot->engine(), slot->model(), tokenizer_, session,
-                   auto_title_);
+                   auto_title_, slot->runner().kv_type());
   }
   const std::string title = session->View().title;
   RunTurn(slot, session, writer, body,

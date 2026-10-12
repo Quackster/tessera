@@ -67,9 +67,11 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   Model& model = shared ? pool.At(0).model() : lease.model();
   if (wants_tools) {
     SessionMessage assistant;
-    const bool ok = ChatWithTools(lease.engine(), lease.model(), tokenizer,
-                                  writer, prompt_body, default_max,
-                                  session != nullptr ? &assistant : nullptr);
+    const bool ok =
+        ChatWithTools(lease.engine(), lease.model(), tokenizer, writer,
+                      prompt_body, default_max,
+                      session != nullptr ? &assistant : nullptr,
+                      lease.runner().kv_type());
     if (session != nullptr && ok) {
       session->Append(std::move(assistant));
     }
@@ -93,6 +95,11 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   options.max_completion_tokens = max_completion_tokens;
   options.max_thinking_tokens = max_thinking_tokens;
   options.prompt_tokens = *ids;
+  // The pool carries the launcher's KV storage type (--kv-q8 and
+  // friends); without it every serve turn would decode F32 and an
+  // unlimited turn would never fit the device.
+  options.kv_type =
+      shared ? pool.At(0).kv_type() : lease.runner().kv_type();
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
   }

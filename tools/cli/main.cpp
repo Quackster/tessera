@@ -427,6 +427,9 @@ int main(int argc, char** argv) {
         tessera::GenerateOptions warm;
         warm.max_completion_tokens = 1;
         warm.progress_every = 0;
+        // Warm the kernels with the serve-wide KV storage type, so the
+        // first real turn pays no first-touch cost on another type.
+        warm.kv_type = kv_type;
         if (!calibration_path.empty()) {
           tessera::ApplyToGenerateOptions(calibration, warm);
         }
@@ -436,8 +439,12 @@ int main(int argc, char** argv) {
                        tessera::ToString(warmed.error()).data());
           return std::unexpected(warmed.error());
         }
-        pool->Add(std::make_unique<tessera::Runner>(
-            std::move(engine_ptr), std::move(*model), device, calibration));
+        // The pool carries the launcher's KV storage type (--kv-q8 and
+        // friends); the serve layer reads it onto every turn, so an
+        // unlimited turn reserves quantized rows and fits the device.
+        pool->Add(std::make_unique<tessera::Runner>(std::move(engine_ptr),
+                                                    std::move(*model), device,
+                                                    calibration, kv_type));
       }
       report("ready");
       return pool;

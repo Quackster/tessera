@@ -3,6 +3,7 @@
 #include <cstddef>
 
 #include "core/json.hpp"
+#include "tessera/types.hpp"
 
 // Tool-aware OpenAI chat handler: renders the request tools into the
 // model template, generates one turn, and answers with text or with
@@ -24,15 +25,18 @@ struct SessionMessage;
 
 // Run one tool-aware chat turn and write the OpenAI chat response
 // (buffered or SSE). Falls back to a plain text answer when the model
-// emits no tool call. `out_turn` (null to skip) receives the assistant
-// turn for session history: text content, reasoning and the OpenAI-form
-// tool_calls dump. True when the turn generated (and `out_turn`, when
-// given, is valid); the error response is already sent otherwise.
+// emits no tool call. `kv_type` is the runner's KV storage type, read
+// onto the request like every other serve turn. `out_turn` (null to
+// skip) receives the assistant turn for session history: text content,
+// reasoning and the OpenAI-form tool_calls dump. True when the turn
+// generated (and `out_turn`, when given, is valid); the error response
+// is already sent otherwise.
 [[nodiscard]] bool ChatWithTools(Engine& engine, Model& model,
                                 const Tokenizer& tokenizer,
                                 ResponseWriter& writer, const core::Json& body,
                                 std::size_t default_max,
-                                SessionMessage* out_turn);
+                                SessionMessage* out_turn,
+                                KvCacheType kv_type);
 
 }  // namespace serve
 

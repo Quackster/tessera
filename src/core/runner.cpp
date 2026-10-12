@@ -16,11 +16,13 @@ constexpr int kAcquirePollMs = 10;
 }  // namespace
 
 Runner::Runner(std::unique_ptr<Engine> engine, std::unique_ptr<Model> model,
-               int device_index, CalibrationConfig calibration)
+               int device_index, CalibrationConfig calibration,
+               KvCacheType kv_type)
     : engine_(std::move(engine)),
       model_(std::move(model)),
       device_index_(device_index),
-      calibration_(std::move(calibration)) {
+      calibration_(std::move(calibration)),
+      kv_type_(kv_type) {
   scheduler_ =
       std::make_unique<Scheduler>(*engine_, *model_, mutex_, SchedulerOptions{});
 }
@@ -34,6 +36,8 @@ const Tokenizer* Runner::tokenizer() const { return model_->GetTokenizer(); }
 int Runner::device_index() const { return device_index_; }
 
 const CalibrationConfig& Runner::calibration() const { return calibration_; }
+
+KvCacheType Runner::kv_type() const { return kv_type_; }
 
 std::expected<GenerateOutcome, StatusCode> Runner::Submit(
     const GenerateOptions& options,

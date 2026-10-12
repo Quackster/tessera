@@ -14,6 +14,7 @@
 #include "tessera/model.hpp"
 #include "tessera/scheduler.hpp"
 #include "tessera/tokenizer.hpp"
+#include "tessera/types.hpp"
 
 namespace tessera {
 
@@ -21,7 +22,10 @@ namespace tessera {
 // serializes that device and the scheduler that shares it. The pool
 // owns runners; Submit time-slices turns on the scheduler while
 // Acquire still hands out the whole device for paths the scheduler
-// does not drive (speculation, thinking budgets, tools).
+// does not drive (speculation, thinking budgets, tools). The runner
+// also carries the KV cache storage type every turn on it decodes
+// with; the serve layer reads it onto each request because the pool
+// outlives any single turn's options.
 //
 // Usage:
 //   auto runner = std::make_unique<Runner>(engine, model, 0);
@@ -29,7 +33,8 @@ namespace tessera {
 class Runner {
  public:
   Runner(std::unique_ptr<Engine> engine, std::unique_ptr<Model> model,
-         int device_index, CalibrationConfig calibration = {});
+         int device_index, CalibrationConfig calibration = {},
+         KvCacheType kv_type = KvCacheType::F32);
   Runner(const Runner&) = delete;
   Runner& operator=(const Runner&) = delete;
 
@@ -38,6 +43,13 @@ class Runner {
   [[nodiscard]] const Tokenizer* tokenizer() const;
   [[nodiscard]] int device_index() const;
   [[nodiscard]] const CalibrationConfig& calibration() const;
+  // Storage type of the full-attention KV cache for turns on this
+  // runner (F32 unless the launcher passed --kv-f16|--kv-q8|--kv-q4).
+  //
+  // Usage:
+  //   GenerateOptions options;
+  //   options.kv_type = pool.At(0).kv_type();
+  [[nodiscard]] KvCacheType kv_type() const;
 
   // Enqueue a turn on this device's scheduler and run it to
   // completion, streaming on the caller thread. Applies this
@@ -63,6 +75,7 @@ class Runner {
   std::unique_ptr<Model> model_;
   int device_index_ = 0;
   CalibrationConfig calibration_;
+  KvCacheType kv_type_ = KvCacheType::F32;
   // Held while a lease is active and around every scheduler round;
   // the only lock that serializes a device. Declared before the
   // scheduler so it outlives the dispatcher thread that borrows it.
