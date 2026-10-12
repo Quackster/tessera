@@ -9,6 +9,7 @@ using detail::LoadU16;
 using detail::Q4KCodec;
 using detail::Q5KCodec;
 using detail::Q6KCodec;
+using detail::Q80Codec;
 
 // Shared body of the warp-per-output family: grid covers m*n 32-lane
 // outputs, eight per 256-thread workgroup, five shuffles to reduce.
@@ -74,6 +75,14 @@ __global__ void GemmQ6KVecKernel(const float* a, const unsigned char* w,
                                  unsigned long long n, unsigned long long k,
                                  unsigned long long split) {
   GemvVecBody<Q6KCodec>(a, w, c, m, n, k, split);
+}
+
+// Built-in "gemm_q80_vec": warp-per-output Q8_0 GEMV (see Q80Codec).
+__global__ void GemmQ80VecKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k,
+                                 unsigned long long split) {
+  GemvVecBody<Q80Codec>(a, w, c, m, n, k, split);
 }
 
 // Built-in "gemm_vec_reduce": sums the `split` partial regions written by
@@ -309,6 +318,9 @@ template __global__ void GemmQ4KRowsKernel<3>(
 template __global__ void GemmQ4KRowsKernel<4>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
+template __global__ void GemmQ4KRowsKernel<5>(
+    const float*, const unsigned char*, float*, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long);
 template __global__ void GemmQ5KRowsKernel<2>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
@@ -318,6 +330,9 @@ template __global__ void GemmQ5KRowsKernel<3>(
 template __global__ void GemmQ5KRowsKernel<4>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
+template __global__ void GemmQ5KRowsKernel<5>(
+    const float*, const unsigned char*, float*, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long);
 template __global__ void GemmQ6KRowsKernel<2>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
@@ -325,6 +340,9 @@ template __global__ void GemmQ6KRowsKernel<3>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
 template __global__ void GemmQ6KRowsKernel<4>(
+    const float*, const unsigned char*, float*, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long);
+template __global__ void GemmQ6KRowsKernel<5>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
 

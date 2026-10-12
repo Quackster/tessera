@@ -169,5 +169,28 @@ struct Q6KCodec {
   }
 };
 
+// Q8_0: lane l owns element l of each 32-element block of the 34-byte
+// block (d fp16, then 32 signed bytes). Same lane mapping as the Vulkan
+// twin, so both backends agree element for element.
+struct Q80Codec {
+  static constexpr unsigned kBlockElements = 32;
+  static constexpr unsigned kBlockBytes = 34;
+
+  __device__ __forceinline__ static float Dot(const float* av,
+                                              const unsigned char* wr,
+                                              unsigned long long blocks,
+                                              unsigned int lane) {
+    float acc = 0.0f;
+    for (unsigned long long b = 0; b < blocks; ++b) {
+      const unsigned char* base = wr + b * kBlockBytes;
+      const float d = Fp16ToFloatDev(LoadU16(base));
+      const auto q = static_cast<std::int8_t>(base[2 + lane]);
+      acc = fmaf(av[b * kBlockElements + lane],
+                 d * static_cast<float>(q), acc);
+    }
+    return acc;
+  }
+};
+
 }  // namespace detail
 }  // namespace tessera::backends::rocm
