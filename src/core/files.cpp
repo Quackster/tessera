@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <filesystem>
 #include <fstream>
 #include <utility>
 
@@ -45,6 +46,15 @@ std::expected<void, StatusCode> WriteFile(
   // ofstream open below reports any real I/O failure.
   if (std::filesystem::is_directory(path, ec)) {
     return std::unexpected(StatusCode::MalformedFile);
+  }
+  // Create missing parents so a config path works on first use.
+  const std::filesystem::path parent = path.parent_path();
+  if (!parent.empty()) {
+    std::error_code mkdir_ec;
+    std::filesystem::create_directories(parent, mkdir_ec);
+    if (mkdir_ec) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
   }
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream) {

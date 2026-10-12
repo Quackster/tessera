@@ -63,6 +63,28 @@ std::uint64_t PathSizeBytes(const std::string& path) {
   return total;
 }
 
+// Render one prompt through a chat template with the thinking options.
+// Without thinking options a missing template falls back to the raw text.
+// With them a render failure is an error, so an explicit thinking request
+// never silently runs without thinking.
+std::expected<std::string, tessera::StatusCode> RenderPromptText(
+    const std::string& source, bool no_chat, bool enable_thinking,
+    const std::string& reasoning_effort,
+    const std::function<std::expected<std::string, tessera::StatusCode>()>&
+        render) {
+  if (no_chat) {
+    return source;
+  }
+  auto chat = render();
+  if (chat) {
+    return *chat;
+  }
+  if (enable_thinking || !reasoning_effort.empty()) {
+    return std::unexpected(chat.error());
+  }
+  return source;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -99,6 +121,8 @@ int main(int argc, char** argv) {
   std::uint32_t image_token = 0;
   bool quiet = false;
   bool no_chat = false;
+  bool enable_thinking = false;
+  std::string reasoning_effort;
   std::string host = "127.0.0.1";
   bool auto_title = true;
   std::vector<std::string> api_keys;
@@ -144,6 +168,10 @@ int main(int argc, char** argv) {
       quiet = true;
     } else if (arg == "--no-chat") {
       no_chat = true;
+    } else if (arg == "--enable-thinking") {
+      enable_thinking = true;
+    } else if (arg == "--reasoning-effort" && i + 1 < argc) {
+      reasoning_effort = argv[++i];
     } else if (arg == "--api-key" && i + 1 < argc) {
       api_keys.emplace_back(argv[++i]);
     } else if (arg == "--allow-origin" && i + 1 < argc) {
@@ -319,6 +347,12 @@ int main(int argc, char** argv) {
   }
 
   if (command == "serve") {
+    if (enable_thinking || !reasoning_effort.empty()) {
+      std::fprintf(stderr,
+                   "cli: serve needs no --enable-thinking/--reasoning-effort; "
+                   "thinking is per request in the HTTP API\n");
+      return kExitUsage;
+    }
     tessera::ServeOptions serve_options;
     serve_options.host = host;
     serve_options.port = port;
@@ -442,13 +476,18 @@ int main(int argc, char** argv) {
     }
     const auto encode = [&](const std::string& source,
                             std::vector<std::uint32_t>* ids) -> bool {
-      std::string text = source;
-      if (!no_chat) {
-        auto chat = (*pipeline)->ChatPrompt(source);
-        if (chat) {
-          text = *chat;
-        }
+      auto rendered = RenderPromptText(source, no_chat, enable_thinking,
+                                       reasoning_effort, [&] {
+                                         return (*pipeline)->ChatPrompt(
+                                             source, enable_thinking,
+                                             reasoning_effort);
+                                       });
+      if (!rendered) {
+        std::fprintf(stderr, "cli: prompt render failed (%s)\n",
+                     tessera::ToString(rendered.error()).data());
+        return false;
       }
+      std::string text = *rendered;
       auto encoded = tokenizer->Encode(text);
       if (!encoded) {
         return false;
@@ -502,13 +541,18 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "cli: this model has no tokenizer\n");
       return kExitError;
     }
-    std::string text = prompt_text;
-    if (!no_chat) {
-      auto chat = (*tp)->ChatPrompt(prompt_text);
-      if (chat) {
-        text = *chat;
-      }
+    auto rendered = RenderPromptText(prompt_text, no_chat, enable_thinking,
+                                        reasoning_effort, [&] {
+                                          return (*tp)->ChatPrompt(
+                                              prompt_text, enable_thinking,
+                                              reasoning_effort);
+                                        });
+    if (!rendered) {
+      std::fprintf(stderr, "cli: prompt render failed (%s)\n",
+                   tessera::ToString(rendered.error()).data());
+      return kExitError;
     }
+    std::string text = *rendered;
     auto ids = tokenizer->Encode(text);
     if (!ids) {
       std::fprintf(stderr, "cli: prompt encode failed\n");
@@ -554,13 +598,18 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "cli: this model has no tokenizer\n");
       return kExitError;
     }
-    std::string text = prompt_text;
-    if (!no_chat) {
-      auto chat = (*cp)->ChatPrompt(prompt_text);
-      if (chat) {
-        text = *chat;
-      }
+    auto rendered = RenderPromptText(prompt_text, no_chat, enable_thinking,
+                                        reasoning_effort, [&] {
+                                          return (*cp)->ChatPrompt(
+                                              prompt_text, enable_thinking,
+                                              reasoning_effort);
+                                        });
+    if (!rendered) {
+      std::fprintf(stderr, "cli: prompt render failed (%s)\n",
+                   tessera::ToString(rendered.error()).data());
+      return kExitError;
     }
+    std::string text = *rendered;
     auto ids = tokenizer->Encode(text);
     if (!ids) {
       std::fprintf(stderr, "cli: prompt encode failed\n");
@@ -612,13 +661,18 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "cli: this model has no tokenizer\n");
       return kExitError;
     }
-    std::string text = prompt_text;
-    if (!no_chat) {
-      auto chat = (*split)->ChatPrompt(prompt_text);
-      if (chat) {
-        text = *chat;
-      }
+    auto rendered = RenderPromptText(prompt_text, no_chat, enable_thinking,
+                                        reasoning_effort, [&] {
+                                          return (*split)->ChatPrompt(
+                                              prompt_text, enable_thinking,
+                                              reasoning_effort);
+                                        });
+    if (!rendered) {
+      std::fprintf(stderr, "cli: prompt render failed (%s)\n",
+                   tessera::ToString(rendered.error()).data());
+      return kExitError;
     }
+    std::string text = *rendered;
     auto ids = tokenizer->Encode(text);
     if (!ids) {
       std::fprintf(stderr, "cli: prompt encode failed\n");
@@ -670,14 +724,18 @@ int main(int argc, char** argv) {
     std::vector<std::vector<std::uint32_t>> prompts;
     prompts.reserve(dp_groups);
     for (std::size_t g = 0; g < dp_groups; ++g) {
-      std::string text = prompt_text;
-      if (!no_chat) {
-        auto chat = (*hybrid)->ChatPrompt(prompt_text);
-        if (chat) {
-          text = *chat;
-        }
+      auto rendered = RenderPromptText(prompt_text, no_chat, enable_thinking,
+                                       reasoning_effort, [&] {
+                                         return (*hybrid)->ChatPrompt(
+                                             prompt_text, enable_thinking,
+                                             reasoning_effort);
+                                       });
+      if (!rendered) {
+        std::fprintf(stderr, "cli: prompt render failed (%s)\n",
+                     tessera::ToString(rendered.error()).data());
+        return kExitError;
       }
-      auto encoded = tokenizer->Encode(text);
+      auto encoded = tokenizer->Encode(*rendered);
       if (!encoded) {
         std::fprintf(stderr, "cli: prompt encode failed\n");
         return kExitError;
@@ -788,13 +846,20 @@ int main(int argc, char** argv) {
     std::vector<tessera::GenerateOptions> requests;
     requests.reserve(prompt_texts.size());
     for (const std::string& source : prompt_texts) {
-      std::string text = source;
-      if (!no_chat) {
-        auto chat = loaded.ChatPrompt(source);
-        if (chat) {
-          text = *chat;
-        }
+      auto rendered = RenderPromptText(source, no_chat, enable_thinking,
+                                       reasoning_effort, [&] {
+                                         return loaded.ChatPrompt(
+                                             source, enable_thinking,
+                                             reasoning_effort);
+                                       });
+      if (!rendered) {
+        log.Warn("cli", std::string("prompt render failed (") +
+                            std::string(
+                                tessera::ToString(rendered.error())) +
+                            ")");
+        return kExitError;
       }
+      std::string text = *rendered;
       auto ids = encode_tokenizer->Encode(text);
       if (!ids) {
         log.Warn("cli", "prompt encode failed");
@@ -854,7 +919,8 @@ int main(int argc, char** argv) {
     return failed ? kExitError : kExitOk;
   }
   if (!prompt_texts.empty() || !image_path.empty() ||
-      max_completion_tokens > 0 || max_thinking_tokens > 0) {
+      max_completion_tokens > 0 || max_thinking_tokens > 0 || enable_thinking ||
+      !reasoning_effort.empty()) {
     const std::string prompt_text =
         prompt_texts.empty() ? std::string() : prompt_texts.front();
     tessera::GenerateOptions gen;
@@ -876,6 +942,13 @@ int main(int argc, char** argv) {
     if (!quiet) {
       log.Info("cli", "kv cache: " +
                           std::string(tessera::ToString(kv_type)));
+      if (enable_thinking || !reasoning_effort.empty()) {
+        log.Info("cli", "thinking: enabled" +
+                            (reasoning_effort.empty()
+                                 ? std::string()
+                                 : " (reasoning_effort=" + reasoning_effort +
+                                       ")"));
+      }
       if (sample) {
         log.Info("cli", "sampling: temperature=" +
                             std::to_string(sampling.temperature) +
@@ -906,12 +979,18 @@ int main(int argc, char** argv) {
       auto chat = no_chat
                       ? std::expected<std::string, tessera::StatusCode>(
                             std::unexpect, tessera::StatusCode::UnsupportedFeature)
-                      : loaded.ChatPrompt(prompt_text);
+                      : loaded.ChatPrompt(prompt_text, enable_thinking,
+                                          reasoning_effort);
       if (chat.has_value()) {
         text = *chat;
         if (!quiet) {
           log.Info("cli", "applied the model chat template to the prompt");
         }
+      } else if (enable_thinking || !reasoning_effort.empty()) {
+        log.Warn("cli", std::string("prompt render failed (") +
+                            std::string(tessera::ToString(chat.error())) +
+                            ")");
+        return kExitError;
       } else if (!quiet) {
         log.Info("cli", "no chat template; using the raw prompt text");
       }

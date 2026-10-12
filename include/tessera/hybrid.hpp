@@ -67,7 +67,8 @@ class Hybrid {
   [[nodiscard]] std::size_t GroupCount() const;
   [[nodiscard]] const Tokenizer* GetTokenizer() const;
   [[nodiscard]] std::expected<std::string, StatusCode> ChatPrompt(
-      std::string_view user_text, bool enable_thinking = false) const;
+      std::string_view user_text, bool enable_thinking = false,
+      std::string_view reasoning_effort = "") const;
 
  private:
   struct Impl;

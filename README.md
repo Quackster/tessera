@@ -287,6 +287,8 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--no-chat` | run | off | Do not apply the chat template. |
 | `--max-completion-tokens <n>` | run | 0 | Completion tokens. 0 fills the remaining context. |
 | `--max-thinking-tokens <n>` | run | 0 | Think-block budget per turn. 0 leaves thinking unlimited. |
+| `--enable-thinking` | run | off | Render the chat template with thinking enabled. |
+| `--reasoning-effort <level>` | run | unset | Thinking difficulty for the chat template (for example `xhigh`). Ignored with `--no-chat`. |
 | `--speculate` | both | off | MTP speculative decode. It drafts from the target's own nextn head, so it needs no checkpoint path and drives both `run` and served turns. |
 | `--sample` | run | off | Sample instead of greedy decode. |
 | `--temperature <f>` | run | 0.6 | Sampling temperature. |

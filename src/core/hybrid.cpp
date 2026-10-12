@@ -167,18 +167,19 @@ const Tokenizer* Hybrid::GetTokenizer() const {
 }
 
 std::expected<std::string, StatusCode> Hybrid::ChatPrompt(
-    std::string_view user_text, bool enable_thinking) const {
+    std::string_view user_text, bool enable_thinking,
+    std::string_view reasoning_effort) const {
   if (impl_->groups.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
   const Impl::Group& group = impl_->groups.front();
   if (group.tp != nullptr) {
-    return group.tp->ChatPrompt(user_text, enable_thinking);
+    return group.tp->ChatPrompt(user_text, enable_thinking, reasoning_effort);
   }
   if (group.cp != nullptr) {
-    return group.cp->ChatPrompt(user_text, enable_thinking);
+    return group.cp->ChatPrompt(user_text, enable_thinking, reasoning_effort);
   }
-  return group.model->ChatPrompt(user_text, enable_thinking);
+  return group.model->ChatPrompt(user_text, enable_thinking, reasoning_effort);
 }
 
 }  // namespace tessera

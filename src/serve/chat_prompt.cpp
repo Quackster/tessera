@@ -7,7 +7,8 @@
 namespace tessera {
 
 std::expected<std::string, StatusCode> Model::ChatPrompt(
-    std::string_view user_text, bool enable_thinking) const {
+    std::string_view user_text, bool enable_thinking,
+    std::string_view reasoning_effort) const {
   const std::string tmpl(ChatTemplate());
   if (tmpl.empty()) {
     return std::unexpected(StatusCode::UnsupportedFeature);
@@ -23,6 +24,11 @@ std::expected<std::string, StatusCode> Model::ChatPrompt(
   context.emplace_back("tools", serve::jinja::Value::None());
   context.emplace_back("enable_thinking",
                        serve::jinja::Value::Bool(enable_thinking));
+  if (!reasoning_effort.empty()) {
+    context.emplace_back(
+        "reasoning_effort",
+        serve::jinja::Value::Str(std::string(reasoning_effort)));
+  }
   auto rendered = serve::jinja::Render(tmpl, context);
   if (!rendered.ok) {
     return std::unexpected(StatusCode::MalformedFile);

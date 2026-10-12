@@ -214,6 +214,39 @@ TEST(EngineTest, LoadGgufModelParsesManifest) {
   EXPECT_EQ(loaded->Path(), path.string());
 }
 
+// The chat template sees the thinking options: thinking stays off by
+// default, enable_thinking opens it, and a reasoning effort reaches the
+// template as the reasoning_effort argument.
+TEST(EngineTest, ChatPromptThinkingFlags) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 2);
+  builder.KvString("general.name", "test-model");
+  builder.KvString("tokenizer.chat_template",
+                   "{% if enable_thinking %}T{% else %}F{% endif %}"
+                   "{{ reasoning_effort }}");
+  builder.Tensor("w_a", 1, {4}, 0, 0);  // F32, 1x4, offset 0
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 16);
+  auto dir = FreshTempDir("tessera_tests_chat");
+  auto path = dir / "chat.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  auto prompt = (*model)->ChatPrompt("hi");
+  ASSERT_TRUE(prompt.has_value()) << tessera::ToString(prompt.error());
+  EXPECT_EQ(*prompt, "F");
+  prompt = (*model)->ChatPrompt("hi", true);
+  ASSERT_TRUE(prompt.has_value()) << tessera::ToString(prompt.error());
+  EXPECT_EQ(*prompt, "T");
+  prompt = (*model)->ChatPrompt("hi", true, "xhigh");
+  ASSERT_TRUE(prompt.has_value()) << tessera::ToString(prompt.error());
+  EXPECT_EQ(*prompt, "Txhigh");
+  prompt = (*model)->ChatPrompt("hi", false, "low");
+  ASSERT_TRUE(prompt.has_value()) << tessera::ToString(prompt.error());
+  EXPECT_EQ(*prompt, "Flow");
+}
+
 TEST(EngineTest, LoadGgufModelUploadsWeights) {
   std::unique_ptr<Engine> engine;
   MakeEngineOrSkip(engine);

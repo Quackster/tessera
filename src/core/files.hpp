@@ -16,8 +16,8 @@ namespace tessera::core {
 [[nodiscard]] std::expected<std::vector<std::byte>, StatusCode> ReadFile(
     const std::filesystem::path& path);
 
-// Write bytes to a file, creating it if needed. MalformedFile on I/O
-// error (e.g. the path points at a directory).
+// Write bytes to a file, creating it and missing parents if needed.
+// MalformedFile on I/O error (e.g. the path points at a directory).
 [[nodiscard]] std::expected<void, StatusCode> WriteFile(
     const std::filesystem::path& path, std::span<const std::byte> data);
 

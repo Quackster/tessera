@@ -246,11 +246,13 @@ const Tokenizer* ContextParallel::GetTokenizer() const {
 }
 
 std::expected<std::string, StatusCode> ContextParallel::ChatPrompt(
-    std::string_view user_text, bool enable_thinking) const {
+    std::string_view user_text, bool enable_thinking,
+    std::string_view reasoning_effort) const {
   if (impl_->ranks.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
-  return impl_->ranks.front().model->ChatPrompt(user_text, enable_thinking);
+  return impl_->ranks.front().model->ChatPrompt(user_text, enable_thinking,
+                                                reasoning_effort);
 }
 
 }  // namespace tessera

@@ -241,9 +241,15 @@ class Model {
   // Render a single user message through the model's chat template with
   // the generation prompt appended, so a tokenizer can produce the ids the
   // model was trained on. UnsupportedFeature when the model has no chat
-  // template.
+  // template. Thinking stays off unless enable_thinking is set; a non-empty
+  // reasoning_effort (for example "xhigh") reaches the template as the
+  // reasoning_effort argument.
+  //
+  // Usage:
+  //   auto prompt = model.ChatPrompt("hi", true, "xhigh");
   [[nodiscard]] std::expected<std::string, StatusCode> ChatPrompt(
-      std::string_view user_text, bool enable_thinking = false) const;
+      std::string_view user_text, bool enable_thinking = false,
+      std::string_view reasoning_effort = "") const;
   // The architecture module for this model (from general.architecture), or
   // nullptr when no module is registered. Generic code dispatches through
   // it for architecture specific behavior.

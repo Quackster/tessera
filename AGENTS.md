@@ -239,11 +239,6 @@ These are hard rules, set by the project owner:
       27B target and the draft for every value of a sweep.
     - When you only need a small value, do not load a full model to get it. Use
       `TESSERA_TEST_*` paths that point at the model you need.
-    - Cap every command's timeout at 5 minutes. A test, build or run that needs
-      longer is a signal something is wrong (too heavy, a slow kernel, a
-      runaway); stop and fix it instead of waiting. A GPU test that used to
-      finish in under a minute but now takes five means the change made it
-      slow, not that the wait is expected.
     - Run a model server in the foreground. A full serve (hipfire, vLLM, or the
       radiance container that compiles gfx1201 kernels and loads the 27B target
       plus the draft) holds tens of GB of device and host memory for the whole
@@ -308,6 +303,9 @@ Repository-specific constraints on top of the hard rules:
   ends) and fix the root cause before continuing. A model must stop when it
   emits its declared end-of-turn or end-of-text token; a run that streams past
   that token is a defect in the engine, not a property of the model.
+- Run generation without caps by default. No `--max-completion-tokens` or
+  `--max-thinking-tokens` are allowed unless explicitly stated. A missing
+  limit fills the remaining context. A stated limit uses that value.
 
 ## Git
 

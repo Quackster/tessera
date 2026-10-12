@@ -93,12 +93,17 @@ refinement. Backend ref tests cover every staging kernel.
 
 - Prefetch of layer L plus 1 stays deferred. Transfers are
   bandwidth bound, not round-trip bound. Overlap would hide at most
-  layer compute at about 0.3 ms.
+  layer compute at about 0.3 ms. Re-audited 2026-10-12: the expert
+  cache keeps this true. Miss traffic still dominates token cost.
+  No async transfer interface exists on either backend.
 - Cooperative-matrix tensor cores on Vulkan stay deferred. The
   device exposes the combinations and the shaders compile, but
   cooperative-matrix dispatches wedge this RADV snapshot. One run
   rebooted the machine. Scalar fallbacks deliver the numbers above.
-  Retry with a newer RADV before re-enabling.
+  Re-audited 2026-10-12 on Mesa 26.0.8 RADV GFX1201: the driver is
+  unchanged since the crash. Retry risks another reboot. Both WMMA
+  kernels stay disabled in source. Retry with a newer RADV before
+  re-enabling.
 
 ## How to run
 
