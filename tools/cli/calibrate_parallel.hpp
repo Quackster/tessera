@@ -41,7 +41,7 @@ struct ParallelCalibrateOptions {
   bool tp = false;
   bool cp = false;
   bool pipeline = false;
-  std::size_t context = 4096;
+  std::size_t context = 32768;
   KvCacheType kv_type = KvCacheType::Q8;
   std::string calibration_file;
   bool quiet = false;

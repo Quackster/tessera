@@ -29,7 +29,7 @@ struct HybridOptions {
   std::vector<int> devices;  // dp_groups * mp_ranks, group-major
   std::size_t dp_groups = 1;
   HybridMpKind mp_kind = HybridMpKind::Tensor;
-  std::size_t context = 4096;
+  std::size_t context = 32768;
   KvCacheType kv_type = KvCacheType::F32;
 };
 

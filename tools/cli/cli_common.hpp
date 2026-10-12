@@ -15,7 +15,7 @@
 namespace tessera::cli {
 
 // Default maximum context length (a tunable) for run, serve and calibrate.
-constexpr std::size_t kDefaultContext = 4096;
+constexpr std::size_t kDefaultContext = 32768;
 
 // 0 keeps the draft checkpoint's configured block size. A block-diffusion
 // drafter is trained for one fixed block; a mismatched block silently

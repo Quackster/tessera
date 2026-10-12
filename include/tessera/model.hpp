@@ -53,7 +53,7 @@ struct ModelOptions {
   // Path to a .gguf file, or to a model directory (MXFP4 layout).
   std::string path;
   // Maximum context length to prepare for; a tunable.
-  std::size_t max_context_length = 4096;
+  std::size_t max_context_length = 32768;
   // Materialize the MTP (next-token-prediction) head. Only MTP
   // speculation reads it, so the engine clears this when a strategy that
   // does not read it is attached. The MXFP4 directory loader honors the

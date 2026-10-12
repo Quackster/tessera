@@ -27,7 +27,7 @@ struct PipelineOptions {
   // layer count must be at least the device count.
   std::vector<int> devices;
   // Maximum context length to prepare for.
-  std::size_t context = 4096;
+  std::size_t context = 32768;
   // Storage type of the full-attention KV cache.
   KvCacheType kv_type = KvCacheType::F32;
 };
