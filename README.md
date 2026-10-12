@@ -88,7 +88,8 @@ See `AGENTS.md` for architecture rules and for hard rules.
 
 | Format | State | Detail |
 | --- | --- | --- |
-| GGUF | Done | Parses v2 and v3. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS and IQ3_S. Checks bounds. |
+| GGUF | Done | Parses v2 and v3, single files and `-00001-of-00005` splits. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, Q2_0, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS and IQ2_S. Checks bounds. |
+| Qwen4-Exp split GGUF | Partial | Qwen3.8-Flash-Next GSQ-RCO loads: split shards merge, config parses, the 51B n-gram table streams rows from SSD and never uploads. Decode kernels (QSA indexer, hyper-connection mixer, PLE gather) land next. |
 | MXFP4 safetensors | Done | Parses the map and packs the weights. config.json drives the decode config. |
 | NVFP4 MoE | Done | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. |
 | DFlash2 FP8 draft | Done | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. |
@@ -98,12 +99,33 @@ Model weights live outside the repo. Each variant uses one flat directory. Model
 | Path | Contents | Use | Hugging Face |
 | --- | --- | --- | --- |
 | `~/models/Qwen3.8-27B-GGUF/` | `Qwen3.8-27B-UD-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, `config.json` | Main GGUF target. | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
-| `~/models/Qwen3.8-27B-MXFP4-MTPFP8/` | MXFP4 weights with FP8 MTP | Main MXFP4 target. | [amd/Qwen3.8-27B-Quark-AWQ-MXFP4](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4) |
+| `~/models/Qwen3.8-27B-MXFP4-MTPFP8/` | MXFP4 weights with FP8 MTP, converted output, see below | Main MXFP4 target. | [amd/Qwen3.8-27B-Quark-AWQ-MXFP4](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4) |
 | `~/models/Qwen3.8-27B-DFlash2-FP8/` | DFlash2 draft checkpoint | Draft layout tests. | [tcclaviger/Qwen3.8-27B-DFlash2-FP8](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8) |
 | `~/models/Ornith-1.5-35B-A3B-GGUF/` | `Ornith-1.5-35B-Q4_K_M.gguf`, `mmproj-Ornith-1.5-35B-BF16.gguf` | MoE GGUF target. | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) |
 | `~/models/Ornith-1.5-35B-A3B-MXFP4-GGUF/` | MoE MXFP4 GGUF weights | Not yet supported. | [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) |
 | `~/models/Ornith-1.5-35B-A3B-BF16/` | bf16 safetensors | Not yet supported. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
-| `/home/alex/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S` split, `IQ3_XXS` split, `mmproj-Qwen3.8-Flash-Next-BF16.gguf`, RCO allocation files | (Planned, not working) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
+| `~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S/*-00001-of-00002.gguf` (compute shard plus n-gram shard), `mmproj-Qwen3.8-Flash-Next-BF16.gguf` | Flash-Next loader and n-gram streaming target. Decode is a follow-up. | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
+
+### MXFP4 Qwen checkpoint preparation
+
+The MXFP4 target needs a converted checkpoint. The base download ships the MTP head in bf16. Tessera serves the FP8 MTP variant. The converter is `fp8_mtp.py`. It rewrites the eight MTP projections to FP8. It updates `config.json`. It copies the tokenizer files.
+
+The raw source is [fp8_mtp.py](https://codeberg.org/ggz14/radiance-vllm-mxfp4/raw/commit/dba9defefb2de7f914fe9cb45ffdf49989c923d6/fp8_mtp.py).
+
+```sh
+# Download the base MXFP4 checkpoint.
+hf download amd/Qwen3.8-27B-Quark-AWQ-MXFP4 --local-dir ~/models/Qwen3.8-27B-Quark-AWQ-MXFP4
+
+# Fetch the converter. It needs torch on the host. CPU torch is enough. No GPU is needed.
+# pip install torch --index-url https://download.pytorch.org/whl/cpu
+curl -fsSL "https://codeberg.org/ggz14/radiance-vllm-mxfp4/raw/commit/dba9defefb2de7f914fe9cb45ffdf49989c923d6/fp8_mtp.py" \
+  -o /tmp/fp8_mtp.py
+
+# Convert the checkpoint. This takes about 15 minutes. It writes about 19 GB.
+python3 /tmp/fp8_mtp.py ~/models/Qwen3.8-27B-Quark-AWQ-MXFP4 ~/models/Qwen3.8-27B-MXFP4-MTPFP8
+```
+
+The script prints one relative error per MTP tensor. Good rows read about 0.02 to 0.03. A row near 0.116 means that layer was not converted. The output directory is the `--model` path for tessera.
 
 CLI examples:
 
@@ -166,21 +188,9 @@ The `calibrate` flags:
   sweep order. Each point is one engine run. A cut setting keeps its
   fastest measured value. A skipped setting keeps its default.
 
-The settings it sweeps are the same settings in the tables below:
+It sweeps the speed settings for the current backend and draft setup. A skipped setting keeps its default.
 
-* `mxfp4_split_target` and `mxfp4_split_cap` on ROCm only. On Vulkan the fp8
-  kernel does not exist, so the command reports both as not applicable.
-* `prefill_chunk_tokens` on both backends.
-* `attention_split` on both backends, when the prompts reach the split
-  threshold (1024 keys).
-* `draft_tokens` and `draft_context` only when a draft is attached.
-
-Apply a saved entry to `run` or `serve` with `--calibration <file>`, or set
-`TESSERA_CALIBRATION`. The engine uses the saved value for the current machine
-and model unless an explicit flag overrides it. An explicit flag always wins.
-Only `calibrate` writes the file. `run` and `serve` only read it. A missing
-file on `run` or `serve` is not an error. Create the parent directory before
-you run `calibrate`.
+`run` and `serve` apply a saved entry with `--calibration <file>` or `TESSERA_CALIBRATION`. An explicit flag always wins. Only `calibrate` writes the file. Create the parent directory before you run `calibrate`.
 
 ```sh
 # Serve with the calibrated values for this machine and model.
@@ -191,13 +201,7 @@ you run `calibrate`.
   --port 8080
 ```
 
-The file is JSON. It holds one entry per hardware key. The key joins the
-backend, the device name, the model name, the context, the KV type, and the
-strategy. Each entry stores the chosen settings, the measured decode and
-prefill rates, the memory-bound context for the KV type, and the date. A
-machine, model, context, KV type, or strategy that differs from the key does
-not match the entry. The path is runtime configuration and is never
-hard-coded.
+The file is JSON keyed by backend, device, model, context, KV type, and strategy. A non matching entry is ignored.
 
 ## Usage
 
