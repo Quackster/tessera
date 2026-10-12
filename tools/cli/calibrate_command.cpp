@@ -316,38 +316,6 @@ int RunCalibrateCommand(int argc, char** argv) {
   const std::string strategy_label =
       dflash2_attached ? "dflash2" : (draft_attached ? "mtp" : "none");
 
-  // Report the maximum context length the device allows for this KV cache
-  // type: free memory (or total memory minus the weights) minus a reserve,
-  // divided by the per-token KV size. Informational; the run's context is
-  // the configured --context.
-  const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
-  std::uint64_t model_bytes = 0;
-  for (const auto& weight : loaded.Weights()) {
-    model_bytes += weight.device->Size();
-  }
-  std::uint64_t available = 0;
-  if (memory.free_bytes > 0) {
-    available = memory.free_bytes;
-  } else if (memory.total_bytes > model_bytes) {
-    available = memory.total_bytes - model_bytes;
-  }
-  available = available > kMemoryReserveBytes ? available - kMemoryReserveBytes
-                                              : 0;
-  auto model_config = loaded.Config();
-  std::size_t max_context =
-      model_config ? MaxContextForKv(available, *model_config, kv_type) : 0;
-  if (max_context < kMinReportedContext) {
-    max_context = kMinReportedContext;
-  }
-  if (!quiet) {
-    log.Info("calibrate",
-             std::string("max context for ") + std::string(ToString(kv_type)) +
-                 ": " + std::to_string(max_context) + " token(s) (" +
-                 std::to_string(memory.free_bytes) + " free / " +
-                 std::to_string(memory.total_bytes) + " total, reserve " +
-                 std::to_string(kMemoryReserveBytes) + ")");
-  }
-
   CalibrationConfig defaults;
   defaults.mxfp4_split_target = kDefaultMxFp4SplitTarget;
   defaults.mxfp4_split_cap = kDefaultMxFp4SplitCap;
@@ -493,6 +461,38 @@ int RunCalibrateCommand(int argc, char** argv) {
     }
     decode_tps = MedianOf(decode_rates);
     prefill_tps = MedianOf(prefill_rates);
+  }
+
+  // Report the maximum context length the device allows for this KV
+  // cache type, measured after warmup so the draft weights are
+  // resident: free memory minus a reserve, divided by the per-token
+  // KV size. KV-only and informational; the run used --context.
+  const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
+  std::uint64_t model_bytes = 0;
+  for (const auto& weight : loaded.Weights()) {
+    model_bytes += weight.device->Size();
+  }
+  std::uint64_t available = 0;
+  if (memory.free_bytes > 0) {
+    available = memory.free_bytes;
+  } else if (memory.total_bytes > model_bytes) {
+    available = memory.total_bytes - model_bytes;
+  }
+  available = available > kMemoryReserveBytes ? available - kMemoryReserveBytes
+                                              : 0;
+  auto model_config = loaded.Config();
+  std::size_t max_context =
+      model_config ? MaxContextForKv(available, *model_config, kv_type) : 0;
+  if (max_context < kMinReportedContext) {
+    max_context = kMinReportedContext;
+  }
+  if (!quiet) {
+    log.Info("calibrate",
+             std::string("max context for ") + std::string(ToString(kv_type)) +
+                 ": " + std::to_string(max_context) + " token(s) (" +
+                 std::to_string(memory.free_bytes) + " free / " +
+                 std::to_string(memory.total_bytes) + " total, reserve " +
+                 std::to_string(kMemoryReserveBytes) + ")");
   }
 
   CalibrationEntry entry;
