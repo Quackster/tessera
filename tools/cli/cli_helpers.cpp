@@ -1,16 +1,24 @@
 #include "cli_helpers.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <expected>
 #include <filesystem>
+#include <functional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include "cli_common.hpp"
 #include "tessera/budget.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
+#include "tessera/runner.hpp"
 #include "tessera/serve.hpp"
 #include "tessera/types.hpp"
 
@@ -111,8 +119,8 @@ void PrintUsage() {
                "dispatch thresholds (diagnostic)\n"
                "  --prefill-attn-pairs <n>  prefill attention work budget "
                "(diagnostic)\n"
-               "  --prompt-text <s> text prompt (tokenized; needs a "
-               "tokenizer)\n"
+                "  --prompt-text <s> text prompt, repeatable for parallel\n"
+                "                sessions (tokenized; needs a tokenizer)\n"
                "  --max-completion-tokens <n> completion tokens (0 fills the "
                "remaining context, default %zu)\n"
                "  --max-thinking-tokens <n> think-block budget per turn (0 "
@@ -289,6 +297,36 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
                budget_label + "; lower --gpu-layers (try --gpu-layers help), "
                               "lower --context, or quantize the KV cache");
   return false;
+}
+
+std::vector<ConcurrentSessionResult> RunConcurrentSessions(
+    const RunnerPool& pool, std::span<const GenerateOptions> requests,
+    std::function<void(std::size_t, std::uint32_t)> on_token) {
+  std::vector<ConcurrentSessionResult> results(requests.size());
+  if (requests.empty()) {
+    return results;
+  }
+  // One worker per session; each blocks in SubmitLeastLoaded while the
+  // dispatcher time-slices the device, so all sessions decode together.
+  std::vector<std::thread> workers;
+  workers.reserve(requests.size());
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    workers.emplace_back([&, i] {
+      auto outcome = pool.SubmitLeastLoaded(
+          requests[i], [&](std::uint32_t token) {
+            results[i].tokens.push_back(token);
+            if (on_token) {
+              on_token(i, token);
+            }
+            return true;
+          });
+      results[i].outcome = std::move(outcome);
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  return results;
 }
 
 }  // namespace tessera::cli

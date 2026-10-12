@@ -5,6 +5,7 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -91,7 +92,7 @@ int main(int argc, char** argv) {
   }
   std::string model_path;
   std::string draft_path;
-  std::string prompt_text;
+  std::vector<std::string> prompt_texts;
   std::string calibration_path;
   std::string mmproj_path;
   std::string image_path;
@@ -134,7 +135,7 @@ int main(int argc, char** argv) {
     } else if (arg == "--draft" && i + 1 < argc) {
       draft_path = argv[++i];
     } else if (arg == "--prompt-text" && i + 1 < argc) {
-      prompt_text = argv[++i];
+      prompt_texts.emplace_back(argv[++i]);
     } else if (arg == "--mmproj" && i + 1 < argc) {
       mmproj_path = argv[++i];
     } else if (arg == "--image" && i + 1 < argc) {
@@ -418,10 +419,11 @@ int main(int argc, char** argv) {
 
   if (pipeline_mode) {
     // Layer-split the model across the selected devices for one request.
-    if (prompt_text.empty()) {
-      std::fprintf(stderr, "cli: --pipeline needs --prompt-text\n");
+    if (prompt_texts.size() != 1) {
+      std::fprintf(stderr, "cli: --pipeline needs exactly one --prompt-text\n");
       return kExitUsage;
     }
+    const std::string& prompt_text = prompt_texts.front();
     tessera::PipelineOptions pipeline_options;
     pipeline_options.model_path = model_path;
     pipeline_options.devices = device_indices;
@@ -479,10 +481,11 @@ int main(int argc, char** argv) {
     // devices and run greedy generation with a per-rank thread and the
     // rank reduce. MoE routed experts split by expert dim on the same
     // ranks; each rank runs its local experts and reduces the sum.
-    if (prompt_text.empty()) {
-      std::fprintf(stderr, "cli: --tp needs --prompt-text\n");
+    if (prompt_texts.size() != 1) {
+      std::fprintf(stderr, "cli: --tp needs exactly one --prompt-text\n");
       return kExitUsage;
     }
+    const std::string& prompt_text = prompt_texts.front();
     tessera::TensorParallelOptions tp_options;
     tp_options.model_path = model_path;
     tp_options.devices = device_indices;
@@ -530,10 +533,11 @@ int main(int argc, char** argv) {
     // Context-parallel: split the key range across the selected devices
     // and run greedy generation with a per-rank thread and a per-layer
     // partial combine.
-    if (prompt_text.empty()) {
-      std::fprintf(stderr, "cli: --cp needs --prompt-text\n");
+    if (prompt_texts.size() != 1) {
+      std::fprintf(stderr, "cli: --cp needs exactly one --prompt-text\n");
       return kExitUsage;
     }
+    const std::string& prompt_text = prompt_texts.front();
     tessera::ContextParallelOptions cp_options;
     cp_options.model_path = model_path;
     cp_options.devices = device_indices;
@@ -585,10 +589,11 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "cli: --spec-split needs --speculate\n");
       return kExitUsage;
     }
-    if (prompt_text.empty()) {
-      std::fprintf(stderr, "cli: --spec-split needs --prompt-text\n");
+    if (prompt_texts.size() != 1) {
+      std::fprintf(stderr, "cli: --spec-split needs exactly one --prompt-text\n");
       return kExitUsage;
     }
+    const std::string& prompt_text = prompt_texts.front();
     tessera::SpecSplitOptions split_options;
     split_options.model_path = model_path;
     split_options.devices = device_indices;
@@ -638,10 +643,11 @@ int main(int argc, char** argv) {
     // Hybrid: data-parallel groups of model-parallel teams behind one
     // device mesh. The one prompt runs on every group; --tp/--cp selects
     // the model-parallel route inside each multi-rank group.
-    if (prompt_text.empty()) {
-      std::fprintf(stderr, "cli: --hybrid needs --prompt-text\n");
+    if (prompt_texts.size() != 1) {
+      std::fprintf(stderr, "cli: --hybrid needs exactly one --prompt-text\n");
       return kExitUsage;
     }
+    const std::string& prompt_text = prompt_texts.front();
     tessera::HybridOptions hybrid_options;
     hybrid_options.model_path = model_path;
     hybrid_options.devices = device_indices;
@@ -737,8 +743,120 @@ int main(int argc, char** argv) {
     applied = ResolveCalibration(engine, loaded, context, kv_type, strategy,
                                  calibration_path, applied);
   }
-  if (!prompt_text.empty() || !image_path.empty() ||
+  if (prompt_texts.size() >= 2) {
+    // Parallel sessions: each --prompt-text is one session. The pool
+    // time-slices the device, so both decode and stream together.
+    if (!image_path.empty() || !mmproj_path.empty()) {
+      std::fprintf(stderr, "cli: parallel sessions need no --image\n");
+      return kExitUsage;
+    }
+    if (!draft_path.empty() || speculate) {
+      std::fprintf(stderr,
+                   "cli: parallel sessions need no --draft/--speculate\n");
+      return kExitUsage;
+    }
+    if (max_thinking_tokens > 0) {
+      std::fprintf(stderr,
+                   "cli: parallel sessions need no --max-thinking-tokens\n");
+      return kExitUsage;
+    }
+    tessera::GenerateOptions base;
+    base.max_completion_tokens = max_completion_tokens;
+    base.sample = sample;
+    base.sampling = sampling;
+    base.seed = seed;
+    base.draft_tokens = applied.draft_tokens;
+    base.prefill_chunk_tokens = applied.prefill_chunk_tokens;
+    base.mxfp4_split_target = applied.mxfp4_split_target;
+    base.mxfp4_split_cap = split_cap;
+    base.attention_split = applied.attention_split;
+    base.draft_context = applied.draft_context;
+    base.kv_type = kv_type;
+    base.progress_every = quiet ? 0 : 64;
+    if (!quiet) {
+      log.Info("cli", "kv cache: " +
+                         std::string(tessera::ToString(kv_type)));
+      log.Info("cli", sample ? "sampling: sampled" : "sampling: greedy");
+      log.Info("cli", "parallel sessions: " +
+                         std::to_string(prompt_texts.size()));
+    }
+    const tessera::Tokenizer* encode_tokenizer = loaded.GetTokenizer();
+    if (encode_tokenizer == nullptr) {
+      log.Warn("cli", "this model has no tokenizer");
+      return kExitError;
+    }
+    std::vector<tessera::GenerateOptions> requests;
+    requests.reserve(prompt_texts.size());
+    for (const std::string& source : prompt_texts) {
+      std::string text = source;
+      if (!no_chat) {
+        auto chat = loaded.ChatPrompt(source);
+        if (chat) {
+          text = *chat;
+        }
+      }
+      auto ids = encode_tokenizer->Encode(text);
+      if (!ids) {
+        log.Warn("cli", "prompt encode failed");
+        return kExitError;
+      }
+      tessera::GenerateOptions one = base;
+      one.prompt_tokens = std::move(*ids);
+      requests.push_back(std::move(one));
+    }
+    std::unique_ptr<tessera::Engine> engine_ptr =
+        std::move(*engine_result);
+    std::unique_ptr<tessera::Model> model_ptr = std::move(*model);
+    tessera::RunnerPool pool;
+    pool.Add(std::make_unique<tessera::Runner>(
+        std::move(engine_ptr), std::move(model_ptr),
+        device_indices.front()));
+    const tessera::Tokenizer* stream_tokenizer = pool.At(0).tokenizer();
+    std::mutex print_mutex;
+    auto results = tessera::cli::RunConcurrentSessions(
+        pool, requests,
+        [&](std::size_t session, std::uint32_t token) {
+          if (stream_tokenizer != nullptr) {
+            auto piece = stream_tokenizer->Decode(
+                std::span<const std::uint32_t>(&token, 1));
+            if (piece) {
+              std::lock_guard<std::mutex> lock(print_mutex);
+              std::fprintf(stdout, "[s%zu] %s", session, piece->c_str());
+              std::fflush(stdout);
+            }
+          }
+        });
+    {
+      std::lock_guard<std::mutex> lock(print_mutex);
+      std::fputc('\n', stdout);
+      std::fflush(stdout);
+    }
+    auto& pool_log = pool.At(0).engine().Diagnostics();
+    bool failed = false;
+    for (std::size_t i = 0; i < results.size(); ++i) {
+      if (!results[i].outcome) {
+        pool_log.Warn("cli", "session " + std::to_string(i) +
+                                 " failed (" +
+                                 std::string(tessera::ToString(
+                                     results[i].outcome.error())) +
+                                 ")");
+        failed = true;
+        continue;
+      }
+      if (stream_tokenizer != nullptr) {
+        auto output_text = stream_tokenizer->Decode(results[i].tokens);
+        if (output_text) {
+          pool_log.Info("cli", "session " + std::to_string(i) +
+                                   " output text: " + *output_text);
+        }
+      }
+    }
+    return failed ? kExitError : kExitOk;
+  }
+  if (!prompt_texts.empty() || !image_path.empty() ||
       max_completion_tokens > 0 || max_thinking_tokens > 0) {
+    const std::string prompt_text =
+        prompt_texts.empty() ? std::string() : prompt_texts.front();
     tessera::GenerateOptions gen;
     // Zero (the default) fills the remaining context; an explicit
     // budget caps the completion instead.

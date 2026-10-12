@@ -575,6 +575,66 @@ TEST(EngineTest, SchedulerSharesOneDeviceAcrossSessions) {
   EXPECT_EQ(max_active.load(), 3u);
 }
 
+// Two CLI sessions share one device: both decode together and each
+// streams while the other runs, matching a solo Generate per prompt.
+TEST(EngineTest, CliParallelSessionsStreamTogether) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("cli_parallel.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  std::vector<GenerateOptions> requests(2);
+  requests[0].prompt_tokens = {10};
+  requests[0].max_completion_tokens = 8;
+  requests[1].prompt_tokens = {3};
+  requests[1].max_completion_tokens = 8;
+  std::vector<std::vector<std::uint32_t>> expected;
+  for (const auto& request : requests) {
+    auto solo = engine->Generate(**model, request);
+    ASSERT_TRUE(solo.has_value()) << tessera::ToString(solo.error());
+    expected.push_back(*solo);
+  }
+  tessera::RunnerPool pool;
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(engine), std::move(*model), TestDeviceIndex()));
+  std::atomic<int> entered{0};
+  std::atomic<std::size_t> max_active{0};
+  struct Turn {
+    std::vector<std::uint32_t> tokens;
+    bool ok = false;
+  };
+  std::vector<Turn> turns(2);
+  std::vector<std::thread> workers;
+  for (int t = 0; t < 2; ++t) {
+    workers.emplace_back([&, t] {
+      entered.fetch_add(1);
+      while (entered.load() < 2) {
+        std::this_thread::yield();
+      }
+      auto outcome = pool.SubmitLeastLoaded(
+          requests[t], [&](std::uint32_t token) {
+            turns[t].tokens.push_back(token);
+            std::size_t active = pool.Active()[0];
+            std::size_t seen = max_active.load();
+            while (seen < active &&
+                   !max_active.compare_exchange_weak(seen, active)) {
+            }
+            return true;
+          });
+      turns[t].ok = outcome.has_value();
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+  for (int t = 0; t < 2; ++t) {
+    EXPECT_TRUE(turns[t].ok) << "session " << t << " failed";
+    EXPECT_EQ(turns[t].tokens, expected[t]) << "session " << t << " drifted";
+  }
+  // Both sessions decoded together; a serial device admits one at most.
+  EXPECT_EQ(max_active.load(), 2u);
+}
+
 
 
 

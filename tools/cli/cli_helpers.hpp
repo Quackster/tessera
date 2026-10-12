@@ -1,10 +1,17 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <functional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "tessera/calibrate.hpp"
+#include "tessera/engine.hpp"
+#include "tessera/runner.hpp"
 #include "tessera/types.hpp"
 
 // Shared front-end helpers used by the run, serve and calibrate commands:
@@ -52,6 +59,23 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
                        std::size_t context, KvCacheType kv_type,
                        std::string_view strategy, std::size_t gpu_layers,
                        int device);
+
+// One concurrent CLI session: the streamed tokens plus the outcome.
+// `outcome` holds the error when the session failed.
+struct ConcurrentSessionResult {
+  std::vector<std::uint32_t> tokens;
+  std::expected<GenerateOutcome, StatusCode> outcome{
+      std::unexpected(StatusCode::InvalidArgument)};
+};
+
+// Run each request on the pool at once, streaming per session. The
+// shared scheduler time-slices the device, so two sessions decode
+// together instead of one waiting for the other. `on_token` runs on
+// the session thread and must be safe across sessions.
+// Empty requests return empty results.
+[[nodiscard]] std::vector<ConcurrentSessionResult> RunConcurrentSessions(
+    const RunnerPool& pool, std::span<const GenerateOptions> requests,
+    std::function<void(std::size_t, std::uint32_t)> on_token = {});
 
 }  // namespace cli
 }  // namespace tessera
