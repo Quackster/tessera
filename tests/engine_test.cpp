@@ -439,6 +439,55 @@ TEST(EngineTest, GenerateWithPromptTokensPrefills) {
   EXPECT_EQ(*ids, *again);
 }
 
+// GenerateBatch interleaves chunked prefills with decodes: a long prompt
+// prefills chunk by chunk while a short sequence already decodes, and each
+// sequence still equals a separate Generate.
+TEST(EngineTest, GenerateBatchInterleavesChunkedPrefill) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("batch_interleave.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions first;
+  first.prompt_tokens = {0, 1, 2, 3, 4};
+  first.max_completion_tokens = 3;
+  first.prefill_chunk_tokens = 2;
+  GenerateOptions second;
+  second.prompt_tokens = {5, 6};
+  second.max_completion_tokens = 3;
+  second.prefill_chunk_tokens = 2;
+  // Progress hooks observe the chunk rounds: the long prompt reports three
+  // rounds while the short one finishes in one, which only happens when
+  // prefill runs chunk by chunk instead of blocking up front. The hooks
+  // live on the batch copies so the equivalence Generates below stay clean.
+  std::vector<std::pair<std::size_t, std::size_t>> first_progress;
+  std::vector<std::pair<std::size_t, std::size_t>> second_progress;
+  std::vector<GenerateOptions> requests = {first, second};
+  requests[0].prefill_progress = [&](std::size_t done, std::size_t total) {
+    first_progress.emplace_back(done, total);
+  };
+  requests[1].prefill_progress = [&](std::size_t done, std::size_t total) {
+    second_progress.emplace_back(done, total);
+  };
+  auto batched = engine->GenerateBatch(**model, requests);
+  ASSERT_TRUE(batched.has_value()) << tessera::ToString(batched.error());
+  ASSERT_EQ(batched->size(), 2u);
+  auto expect_first = engine->Generate(**model, first);
+  ASSERT_TRUE(expect_first.has_value())
+      << tessera::ToString(expect_first.error());
+  auto expect_second = engine->Generate(**model, second);
+  ASSERT_TRUE(expect_second.has_value())
+      << tessera::ToString(expect_second.error());
+  EXPECT_EQ((*batched)[0], *expect_first);
+  EXPECT_EQ((*batched)[1], *expect_second);
+  const std::vector<std::pair<std::size_t, std::size_t>> expect_first_progress{
+      {2, 5}, {4, 5}, {5, 5}};
+  const std::vector<std::pair<std::size_t, std::size_t>> expect_second_progress{
+      {2, 2}};
+  EXPECT_EQ(first_progress, expect_first_progress);
+  EXPECT_EQ(second_progress, expect_second_progress);
+}
+
 // GenerateStreaming emits one callback per produced token, matches the
 // blocking Generate sequence, and stops early when asked. The CLI
 // streams through this so output tokens reach the console at once.
@@ -464,6 +513,11 @@ TEST(EngineTest, GenerateStreamingEmitsIncrementally) {
   EXPECT_EQ(count->produced, 4u);
   EXPECT_EQ(count->reason, tessera::FinishReason::Length);
   EXPECT_EQ(streamed, *blocked);
+  // Prefill reports both windows: the end-to-end serving number and the
+  // forwards-only compute number nested inside it.
+  EXPECT_GT(count->prefill_ms, 0.0);
+  EXPECT_GT(count->prefill_compute_ms, 0.0);
+  EXPECT_LE(count->prefill_compute_ms, count->prefill_ms);
   // Early stop after two tokens reports the produced prefix only.
   std::vector<std::uint32_t> prefix;
   auto partial = engine->GenerateStreaming(

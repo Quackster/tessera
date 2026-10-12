@@ -533,6 +533,62 @@ __global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
   }
 }
 
+// Built-in "gemm_bf16_rows": the small-batch bf16 GEMV. One warp owns one
+// weight column (row_w) and accumulates every one of the m activation
+// rows, so the weight column is read once per column instead of once per
+// (row, column) as repeated "gemm_bf16" does. This is the shape the
+// speculative verifier and the draft block hit (m about 2 to 8), where
+// reading the weight matrix once instead of m times is the win. Grid:
+// ceil(n / 8) workgroups of 256. m must be 1..16.
+constexpr int kGemmBf16RowsMax = 16;
+
+__global__ void GemmBf16RowsKernel(const float* a, const unsigned short* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n,
+                                   unsigned long long k) {
+  const unsigned long long warp =
+      (static_cast<unsigned long long>(blockIdx.x) * blockDim.x +
+       threadIdx.x) /
+      32;
+  const unsigned long long lane = threadIdx.x & 31u;
+  if (warp >= n) {
+    return;
+  }
+  const unsigned long long row_w = warp;
+  const unsigned long long rows = m < kGemmBf16RowsMax ? m : kGemmBf16RowsMax;
+  const unsigned short* w_col = w + row_w * k;
+  float acc[kGemmBf16RowsMax];
+#pragma unroll
+  for (int r = 0; r < kGemmBf16RowsMax; ++r) {
+    acc[r] = 0.0f;
+  }
+  for (unsigned long long t = lane; t < k; t += 32) {
+    const float wt = Bf16ToF32(w_col[t]);
+#pragma unroll
+    for (int r = 0; r < kGemmBf16RowsMax; ++r) {
+      if (static_cast<unsigned long long>(r) >= rows) {
+        break;
+      }
+      acc[r] =
+          fmaf(a[static_cast<unsigned long long>(r) * k + t], wt, acc[r]);
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < kGemmBf16RowsMax; ++r) {
+    if (static_cast<unsigned long long>(r) >= rows) {
+      break;
+    }
+    float v = acc[r];
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      v += __shfl_down(v, offset);
+    }
+    if (lane == 0) {
+      c[static_cast<unsigned long long>(r) * n + row_w] = v;
+    }
+  }
+}
+
 // Built-in "round_bf16": one thread per element; round each fp32 value to
 // bfloat16 (round to nearest even), keeping it in fp32. This is the bf16
 // activation rounding the served target's fused epilogues apply.
@@ -580,10 +636,10 @@ __global__ void GemmF32Kernel(const float* a, const float* w, float* c,
   }
 }
 
-// Built-in "gemm_f32_batched": C = A x W^T for fp32 weights with a 32-row x
-// 8-column output tile, so a batch (the DFlash2 draft block) reads each
-// weight row once instead of once per row. Four independent partial sums
-// per thread keep the FMA chain shallow. Grid: ceil(m / 32) * ceil(n / 8).
+// Built-in "gemm_f32_batched": one workgroup covers 32 rows x 8 columns;
+// each 128-element k-slice is staged once into shared memory and reused
+// across the rows. Four partial sums keep the FMA chain shallow; the tail
+// folds into the first. Grid: ceil(m / 32) * ceil(n / 8).
 __global__ void GemmF32BatchedKernel(const float* a, const float* w, float* c,
                                      unsigned long long m,
                                      unsigned long long n,
@@ -591,31 +647,54 @@ __global__ void GemmF32BatchedKernel(const float* a, const float* w, float* c,
   const unsigned long long tid = static_cast<unsigned long long>(threadIdx.x);
   const unsigned long long col_tiles = (n + 7) / 8;
   const unsigned long long wg = static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
-  const float* ar = a + row_a * k;
-  const float* wr = w + row_w * k;
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 8;
+  const unsigned long long my_row = tid / 8;
+  const unsigned long long my_col = tid % 8;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
+  __shared__ float tile[8 * 128];
   float p0 = 0.0f;
   float p1 = 0.0f;
   float p2 = 0.0f;
   float p3 = 0.0f;
-  unsigned long long t = 0;
-  for (; t + 4 <= k; t += 4) {
-    p0 = fmaf(ar[t], wr[t], p0);
-    p1 = fmaf(ar[t + 1], wr[t + 1], p1);
-    p2 = fmaf(ar[t + 2], wr[t + 2], p2);
-    p3 = fmaf(ar[t + 3], wr[t + 3], p3);
+  const unsigned long long slices = (k + 127) / 128;
+  for (unsigned long long s = 0; s < slices; ++s) {
+    const unsigned long long base = s * 128;
+    const unsigned long long len = base + 128 <= k ? 128 : k - base;
+    for (unsigned long long j = 0; j < 4; ++j) {
+      const unsigned long long e = tid * 4 + j;
+      const unsigned long long col = e >> 7;
+      const unsigned long long el = e & 127;
+      const unsigned long long gc = col_base + col;
+      if (gc < n && el < len) {
+        tile[el * 8 + col] = w[gc * k + base + el];
+      }
+    }
+    LdsBarrier();
+    if (active) {
+      const float* ab = a + row_a * k + base;
+      unsigned long long t = 0;
+      for (; t + 4 <= len; t += 4) {
+        p0 = fmaf(ab[t], tile[t * 8 + my_col], p0);
+        p1 = fmaf(ab[t + 1], tile[(t + 1) * 8 + my_col], p1);
+        p2 = fmaf(ab[t + 2], tile[(t + 2) * 8 + my_col], p2);
+        p3 = fmaf(ab[t + 3], tile[(t + 3) * 8 + my_col], p3);
+      }
+      for (; t < len; ++t) {
+        p0 = fmaf(ab[t], tile[t * 8 + my_col], p0);
+      }
+    }
+    LdsBarrier();
   }
-  for (; t < k; ++t) {
-    p0 = fmaf(ar[t], wr[t], p0);
+  if (active) {
+    c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
   }
-  c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
 }
 
-// Built-in "gemm_bf16_batched": as gemm_f32_batched for bf16 weights.
+// Built-in "gemm_bf16_batched": as gemm_f32_batched for bf16 weights, with
+// the same 32-row x 8-column shared staging and partial-sum order.
 __global__ void GemmBf16BatchedKernel(const float* a, const unsigned short* w,
                                       float* c, unsigned long long m,
                                       unsigned long long n,
@@ -623,28 +702,50 @@ __global__ void GemmBf16BatchedKernel(const float* a, const unsigned short* w,
   const unsigned long long tid = static_cast<unsigned long long>(threadIdx.x);
   const unsigned long long col_tiles = (n + 7) / 8;
   const unsigned long long wg = static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
-  const float* ar = a + row_a * k;
-  const unsigned short* wr = w + row_w * k;
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 8;
+  const unsigned long long my_row = tid / 8;
+  const unsigned long long my_col = tid % 8;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
+  __shared__ float tile[8 * 128];
   float p0 = 0.0f;
   float p1 = 0.0f;
   float p2 = 0.0f;
   float p3 = 0.0f;
-  unsigned long long t = 0;
-  for (; t + 4 <= k; t += 4) {
-    p0 = fmaf(ar[t], Bf16ToF32(wr[t]), p0);
-    p1 = fmaf(ar[t + 1], Bf16ToF32(wr[t + 1]), p1);
-    p2 = fmaf(ar[t + 2], Bf16ToF32(wr[t + 2]), p2);
-    p3 = fmaf(ar[t + 3], Bf16ToF32(wr[t + 3]), p3);
+  const unsigned long long slices = (k + 127) / 128;
+  for (unsigned long long s = 0; s < slices; ++s) {
+    const unsigned long long base = s * 128;
+    const unsigned long long len = base + 128 <= k ? 128 : k - base;
+    for (unsigned long long j = 0; j < 4; ++j) {
+      const unsigned long long e = tid * 4 + j;
+      const unsigned long long col = e >> 7;
+      const unsigned long long el = e & 127;
+      const unsigned long long gc = col_base + col;
+      if (gc < n && el < len) {
+        tile[el * 8 + col] = Bf16ToF32(w[gc * k + base + el]);
+      }
+    }
+    LdsBarrier();
+    if (active) {
+      const float* ab = a + row_a * k + base;
+      unsigned long long t = 0;
+      for (; t + 4 <= len; t += 4) {
+        p0 = fmaf(ab[t], tile[t * 8 + my_col], p0);
+        p1 = fmaf(ab[t + 1], tile[(t + 1) * 8 + my_col], p1);
+        p2 = fmaf(ab[t + 2], tile[(t + 2) * 8 + my_col], p2);
+        p3 = fmaf(ab[t + 3], tile[(t + 3) * 8 + my_col], p3);
+      }
+      for (; t < len; ++t) {
+        p0 = fmaf(ab[t], tile[t * 8 + my_col], p0);
+      }
+    }
+    LdsBarrier();
   }
-  for (; t < k; ++t) {
-    p0 = fmaf(ar[t], Bf16ToF32(wr[t]), p0);
+  if (active) {
+    c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
   }
-  c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
 }
 
 // Built-in "gemm_fp8": C = A x (diag(s) x W)^T with fp32 sequential
@@ -819,65 +920,72 @@ __global__ void GemmMxFp4RowsKernel(const float* a, const unsigned char* w,
   }
 }
 
-// Built-in "gemm_mxfp4_batched": tiled C = A x dequant(W)^T for a batch.
-// One workgroup handles 8 activation rows x one weight column; the 32
-// MXFP4 elements of a block (and its E8M0 scale) are dequantized once
-// into shared memory and reused across the 8 rows. Buffers and scalars
-// match gemm_mxfp4 (m, n, k, k a multiple of 32); grid_x is
-// ceil(m / 8) * n, block_x is 256. The dot runs elements 0..31 in
-// order, the gemm_mxfp4 accumulation order. Threads 8..255 still help
-// dequantize but write no output.
+// Built-in "gemm_mxfp4_batched": one workgroup covers 32 rows x 32 columns
+// over 1024 threads; eight 32-element blocks form one 256-element tile
+// that is dequantized once into shared memory and reused across the rows.
+// Four partial sums keep the FMA chain shallow. Grid: ceil(m / 32) *
+// ceil(n / 32).
 __global__ void GemmMxFp4BatchedKernel(const float* a, const unsigned char* w,
                                        float* c, unsigned long long m,
                                        unsigned long long n,
                                        unsigned long long k) {
-  // Output tile: 32 rows x 8 columns per 256-thread workgroup. Threads in a
-  // warp share a row (eight each) and a column (four each), so the
-  // activation and weight reads coalesce or broadcast in cache instead of
-  // streaming one cache line per output element. Grid: ceil(m / 32) *
-  // ceil(n / 8) workgroups of 256 (see ProjectTiledDevice).
   const unsigned long long tid = static_cast<unsigned long long>(threadIdx.x);
-  const unsigned long long col_tiles = (n + 7) / 8;
+  const unsigned long long col_tiles = (n + 31) / 32;
   const unsigned long long wg = static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 32;
+  const unsigned long long my_row = tid / 32;
+  const unsigned long long my_col = tid % 32;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
   const unsigned long long blocks = k / 32;
   const unsigned char* s = w + (n * k) / 2;
-  const float* ar = a + row_a * k;
-  const unsigned int* wr =
-      reinterpret_cast<const unsigned int*>(w) + (row_w * k) / 8;
-  // Four independent partial sums (one per 8-element word of the block) so
-  // the FMA chain is four deep instead of one; a single accumulator left
-  // the kernel latency-bound (the prefill's dominant cost). Eight partial
-  // sums regressed: the extra live registers cost more occupancy than the
-  // added ILP bought.
+  __shared__ float tile[8 * 32 * 32];
   float p0 = 0.0f;
   float p1 = 0.0f;
   float p2 = 0.0f;
   float p3 = 0.0f;
-  for (unsigned long long b = 0; b < blocks; ++b) {
-    const float scale = E8M0ToFloatDev(s[row_w * blocks + b]);
-    const float* ab = ar + b * 32;
-    const unsigned int* wb = wr + b * 4;
-    unsigned int b0 = wb[0];
-    unsigned int b1 = wb[1];
-    unsigned int b2 = wb[2];
-    unsigned int b3 = wb[3];
-    for (unsigned long long j = 0; j < 8; ++j) {
-      p0 = fmaf(ab[j], scale * kE2M1Dev[b0 & 15u], p0);
-      p1 = fmaf(ab[8 + j], scale * kE2M1Dev[b1 & 15u], p1);
-      p2 = fmaf(ab[16 + j], scale * kE2M1Dev[b2 & 15u], p2);
-      p3 = fmaf(ab[24 + j], scale * kE2M1Dev[b3 & 15u], p3);
-      b0 >>= 4;
-      b1 >>= 4;
-      b2 >>= 4;
-      b3 >>= 4;
+  const unsigned long long pair = tid >> 2;
+  const unsigned long long col = pair & 31;
+  const unsigned long long sub0 = (pair >> 5) & 7;
+  const unsigned long long lane0 = (tid & 3) * 8;
+  const unsigned long long gc = col_base + col;
+  const unsigned long long qq = lane0 >> 3;
+  for (unsigned long long bb = 0; bb < blocks; bb += 8) {
+    const unsigned long long subs =
+        blocks - bb < 8 ? blocks - bb : 8;
+    if (gc < n && sub0 < subs) {
+      const unsigned int* wr =
+          reinterpret_cast<const unsigned int*>(w) + (gc * k) / 8;
+      const unsigned int word = wr[(bb + sub0) * 4 + qq];
+      const float scale =
+          E8M0ToFloatDev(s[gc * blocks + bb + sub0]);
+      for (unsigned long long jj = 0; jj < 8; ++jj) {
+        const unsigned char nib =
+            static_cast<unsigned char>((word >> (4 * jj)) & 15u);
+        tile[(sub0 * 32 + qq * 8 + jj) * 32 + col] =
+            scale * kE2M1Dev[nib];
+      }
     }
+    LdsBarrier();
+    if (active) {
+      const float* ab = a + row_a * k + bb * 32;
+      for (unsigned long long sub = 0; sub < subs; ++sub) {
+        for (unsigned long long jj = 0; jj < 8; ++jj) {
+          const unsigned long long tb = (sub * 32 + jj) * 32 + my_col;
+          p0 = fmaf(ab[sub * 32 + jj], tile[tb], p0);
+          p1 = fmaf(ab[sub * 32 + 8 + jj], tile[tb + 8 * 32], p1);
+          p2 = fmaf(ab[sub * 32 + 16 + jj], tile[tb + 16 * 32], p2);
+          p3 = fmaf(ab[sub * 32 + 24 + jj], tile[tb + 24 * 32], p3);
+        }
+      }
+    }
+    LdsBarrier();
   }
-  c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
+  if (active) {
+    c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
+  }
 }
 
 // fp8 tensor-core WMMA: C[m,n] fp32 = A_fp8[m,k] . dequant(W_mxfp4)[n,k]^T

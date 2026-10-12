@@ -1,9 +1,12 @@
 #version 450
 
-// Tiled batched bf16 GEMM: one workgroup covers a 32-row x 8-column output
-// tile (threads share a row and a column for cache reuse), each thread
-// keeping four partial sums so the FMA chain stays shallow. Dispatch is
-// ceil(m / 32) * ceil(n / 8) workgroups of 256.
+// Tiled batched bf16 GEMM: one workgroup covers 32 activation rows x 8
+// weight columns over 256 threads. Each 128-element k-slice is staged
+// once into shared memory and reused across the 32 rows (four floats per
+// thread), so a batch reads each weight row once per tile instead of once
+// per row. Each thread keeps four partial sums and the tail folds into
+// the first, matching the scalar gemm_bf16 order. Dispatch is ceil(m / 32)
+// * ceil(n / 8) workgroups of 256.
 layout(local_size_x = 256) in;
 
 // "gemm_bf16_batched" contract (tessera API): as gemm_bf16 (m, n, k).
@@ -23,6 +26,8 @@ layout(set = 0, binding = 2) buffer C {
   float c[];
 };
 
+shared float tile[1024];
+
 // bf16 -> fp32: shift the 16 bits into the high half of an fp32 word.
 float bf16_at(uint index) {
   uint word = w[index >> 1];
@@ -37,26 +42,47 @@ void main() {
   uint n = pc.v[2];
   uint k = pc.v[4];
   uint col_tiles = (n + 7u) / 8u;
-  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
-  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
-  uint ab = row_a * k;
-  uint wb = row_w * k;
+  uint row_base = (wg / col_tiles) * 32u;
+  uint col_base = (wg % col_tiles) * 8u;
+  uint my_row = tid / 8u;
+  uint my_col = tid % 8u;
+  uint row_a = row_base + my_row;
+  uint row_w = col_base + my_col;
+  bool has_out = row_a < m && row_w < n;
   float p0 = 0.0;
   float p1 = 0.0;
   float p2 = 0.0;
   float p3 = 0.0;
-  uint t = 0u;
-  for (; t + 4u <= k; t += 4u) {
-    p0 = fma(a[ab + t], bf16_at(wb + t), p0);
-    p1 = fma(a[ab + t + 1u], bf16_at(wb + t + 1u), p1);
-    p2 = fma(a[ab + t + 2u], bf16_at(wb + t + 2u), p2);
-    p3 = fma(a[ab + t + 3u], bf16_at(wb + t + 3u), p3);
+  uint slices = (k + 127u) / 128u;
+  for (uint s = 0u; s < slices; ++s) {
+    uint base = s * 128u;
+    uint len = base + 128u <= k ? 128u : k - base;
+    for (uint j = 0u; j < 4u; ++j) {
+      uint e = tid * 4u + j;
+      uint col = e >> 7u;
+      uint el = e & 127u;
+      uint gc = col_base + col;
+      if (gc < n && el < len) {
+        tile[el * 8u + col] = bf16_at(gc * k + base + el);
+      }
+    }
+    barrier();
+    if (has_out) {
+      uint abase = row_a * k + base;
+      uint t = 0u;
+      for (; t + 4u <= len; t += 4u) {
+        p0 = fma(a[abase + t], tile[(t) * 8u + my_col], p0);
+        p1 = fma(a[abase + t + 1u], tile[(t + 1u) * 8u + my_col], p1);
+        p2 = fma(a[abase + t + 2u], tile[(t + 2u) * 8u + my_col], p2);
+        p3 = fma(a[abase + t + 3u], tile[(t + 3u) * 8u + my_col], p3);
+      }
+      for (; t < len; ++t) {
+        p0 = fma(a[abase + t], tile[t * 8u + my_col], p0);
+      }
+    }
+    barrier();
   }
-  for (; t < k; ++t) {
-    p0 = fma(a[ab + t], bf16_at(wb + t), p0);
+  if (has_out) {
+    c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
   }
-  c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
 }

@@ -1,11 +1,11 @@
 #version 450
 
-// Tiled batched Q3_K GEMM: one workgroup covers 32 activation rows x 8
-// weight columns with one thread per output, so every thread computes.
-// Each thread decodes its own column's blocks in the gemm_q3k element
-// order (n2, j, then the low 16 and the high 16). Dispatch is
-// ceil(m / 32) * ceil(n / 8) workgroups of 256.
-layout(local_size_x = 256) in;
+// Tiled batched Q3_K GEMM: one workgroup covers 32 activation rows x 32
+// weight columns over 1024 threads. Each 256-element block is dequantized
+// once into shared memory and reused across the 32 rows. The dot keeps
+// the gemm_q3k element order (n2, j, then the low 16 and the high 16).
+// Dispatch is ceil(m / 32) * ceil(n / 32) workgroups of 1024.
+layout(local_size_x = 1024) in;
 
 // "gemm_q3k_batched" contract (tessera API): buffers and scalars match
 // gemm_q3k (m, n, k, k a multiple of 256). Scalars are 64-bit, so field
@@ -25,6 +25,8 @@ layout(set = 0, binding = 1) readonly buffer W {
 layout(set = 0, binding = 2) writeonly buffer C {
   float c[];
 };
+
+shared float tile[8192];
 
 // Byte `offset` of the Q3_K buffer (little-endian extraction).
 uint wbyte(uint offset) {
@@ -52,56 +54,73 @@ void main() {
   uint n = pc.v[2];
   uint k = pc.v[4];
   uint tid = gl_LocalInvocationID.x;
-  uint col_tiles = (n + 7u) / 8u;
+  uint col_tiles = (n + 31u) / 32u;
   uint wg = gl_WorkGroupID.x;
-  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
-  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  uint row_base = (wg / col_tiles) * 32u;
+  uint col_base = (wg % col_tiles) * 32u;
+  uint my_row = tid / 32u;
+  uint my_col = tid % 32u;
+  uint row_a = row_base + my_row;
+  uint row_w = col_base + my_col;
+  bool has_out = row_a < m && row_w < n;
   uint blocks = k / 256u;
-  uint abase = row_a * k;
-  uint wbase = row_w * (blocks * 110u);
   float acc = 0.0;
+  uint pair = tid >> 2u;
+  uint col = pair & 31u;
+  uint sub = (pair >> 5u) & 7u;
+  uint lane0 = (tid & 3u) * 8u;
+  uint gc = col_base + col;
+  uint n2 = sub >> 2u;
+  uint q = sub & 3u;
+  uint part = (lane0 >> 4u) & 1u;
+  uint shift = 2u * q;
+  uint mask = 1u << (n2 * 4u + q);
+  uint is = (n2 * 4u + q) * 2u + part;
   for (uint b = 0u; b < blocks; ++b) {
-    uint base = wbase + b * 110u;
-    float d_all = fp16_at(base + 108u);
-    // Unpack the 12 scale bytes into 16 int8 scales.
-    uint aux0 = 0u;
-    uint aux1 = 0u;
-    uint aux2 = 0u;
-    for (uint e = 0u; e < 4u; ++e) {
-      aux0 |= wbyte(base + 96u + e) << (8u * e);
-      aux1 |= wbyte(base + 100u + e) << (8u * e);
-      aux2 |= wbyte(base + 104u + e) << (8u * e);
-    }
-    uint s0 = (aux0 & 0x0f0f0f0fu) | (((aux2 >> 0u) & 0x03030303u) << 4u);
-    uint s1 = (aux1 & 0x0f0f0f0fu) | (((aux2 >> 2u) & 0x03030303u) << 4u);
-    uint s2 = ((aux0 >> 4u) & 0x0f0f0f0fu) | (((aux2 >> 4u) & 0x03030303u) << 4u);
-    uint s3 = ((aux1 >> 4u) & 0x0f0f0f0fu) | (((aux2 >> 6u) & 0x03030303u) << 4u);
-    uint is = 0u;
-    uint mask = 1u;
-    for (uint n2 = 0u; n2 < 2u; ++n2) {
-      uint shift = 0u;
-      for (uint j = 0u; j < 4u; ++j) {
-        for (uint part = 0u; part < 2u; ++part) {
-          uint sword = is < 4u ? s0 : (is < 8u ? s1 : (is < 12u ? s2 : s3));
-          uint sby = (sword >> (8u * (is % 4u))) & 0xFFu;
-          int s8 = sby >= 128u ? int(sby) - 256 : int(sby);
-          float dl = d_all * (float(s8) - 32.0);
-          for (uint l = 0u; l < 16u; ++l) {
-            uint qv =
-                (wbyte(base + 32u + n2 * 32u + part * 16u + l) >> shift) & 3u;
-            uint hb = (wbyte(base + part * 16u + l) & mask) > 0u ? 0u : 4u;
-            acc += a[abase + b * 256u + n2 * 128u + j * 32u + part * 16u + l] *
-                   (dl * (float(qv) - float(hb)));
-          }
-          is += 1u;
-        }
-        shift += 2u;
-        mask <<= 1u;
+    if (gc < n) {
+      uint base = gc * (blocks * 110u) + b * 110u;
+      float d_all = fp16_at(base + 108u);
+      uint aux0 = 0u;
+      uint aux1 = 0u;
+      uint aux2 = 0u;
+      for (uint t = 0u; t < 4u; ++t) {
+        aux0 |= wbyte(base + 96u + t) << (8u * t);
+        aux1 |= wbyte(base + 100u + t) << (8u * t);
+        aux2 |= wbyte(base + 104u + t) << (8u * t);
+      }
+      uint s0 = (aux0 & 0x0f0f0f0fu) | (((aux2 >> 0u) & 0x03030303u) << 4u);
+      uint s1 = (aux1 & 0x0f0f0f0fu) | (((aux2 >> 2u) & 0x03030303u) << 4u);
+      uint s2 = ((aux0 >> 4u) & 0x0f0f0f0fu) | (((aux2 >> 4u) & 0x03030303u) << 4u);
+      uint s3 = ((aux1 >> 4u) & 0x0f0f0f0fu) | (((aux2 >> 6u) & 0x03030303u) << 4u);
+      uint sword = is < 4u ? s0 : (is < 8u ? s1 : (is < 12u ? s2 : s3));
+      uint sby = (sword >> (8u * (is % 4u))) & 0xFFu;
+      int s8 = sby >= 128u ? int(sby) - 256 : int(sby);
+      float dl = d_all * (float(s8) - 32.0);
+      for (uint kk = 0u; kk < 8u; ++kk) {
+        uint lane = (lane0 + kk) & 15u;
+        uint qv = (wbyte(base + 32u + n2 * 32u + part * 16u + lane) >> shift) & 3u;
+        uint hb = (wbyte(base + part * 16u + lane) & mask) > 0u ? 0u : 4u;
+        uint elem = n2 * 128u + q * 32u + part * 16u + lane;
+        tile[elem * 32u + col] = dl * (float(qv) - float(hb));
       }
     }
+    barrier();
+    if (has_out) {
+      uint abase = row_a * k + b * 256u;
+      for (uint n2 = 0u; n2 < 2u; ++n2) {
+        for (uint q = 0u; q < 4u; ++q) {
+          for (uint part = 0u; part < 2u; ++part) {
+            for (uint lane = 0u; lane < 16u; ++lane) {
+              uint elem = n2 * 128u + q * 32u + part * 16u + lane;
+              acc += a[abase + elem] * tile[elem * 32u + my_col];
+            }
+          }
+        }
+      }
+    }
+    barrier();
   }
-  c[row_a * n + row_w] = acc;
+  if (has_out) {
+    c[row_a * n + row_w] = acc;
+  }
 }

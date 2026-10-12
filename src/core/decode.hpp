@@ -281,13 +281,16 @@ using PrefillProgress = std::function<void(std::size_t, std::size_t)>;
 // launches that stay under the driver hang timeout. The cache must be
 // empty: prefill always starts a request. The hybrid path runs one
 // batched trunk forward per chunk with the output head on the last row
-// only; other models fall back to a sequential loop.
+// only; other models fall back to a sequential loop. `compute_ms`, when
+// non-null, accumulates the chunk forwards' wall time in fractional
+// milliseconds (the llama.cpp-comparable compute number).
 [[nodiscard]] std::expected<std::vector<float>, StatusCode> PrefillTokens(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens,
     std::vector<float>* hidden_out = nullptr,
     const Buffer* embeddings = nullptr, std::size_t chunk_tokens = 0,
-    const PrefillProgress* progress = nullptr);
+    const PrefillProgress* progress = nullptr,
+    double* compute_ms = nullptr);
 
 // Greedy speculative verification. Given the target's distribution at the
 // current prefix (`prefix_logits`) and a draft, feed each draft token only

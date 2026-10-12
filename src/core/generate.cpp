@@ -1,6 +1,7 @@
 #include "tessera/engine.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -17,8 +18,16 @@
 #include "core/profile.hpp"
 #include "core/sampling.hpp"
 #include "core/think_budget.hpp"
+#include "core/timing.hpp"
 
 namespace tessera {
+
+namespace {
+
+// Milliseconds per second, for prompt tok/s from fractional timers.
+constexpr double kMillisPerSecond = 1000.0;
+
+}  // namespace
 
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::GenerateDraft(
     Model& model, const GenerateOptions& options,
@@ -137,9 +146,24 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
       capturing ? &capture_layers : nullptr;
   std::vector<Buffer*>* capture_ptr = capturing ? &capture_buffers : nullptr;
 
+  // Hoist the one-time trunk init (kernel loads, scratch) out of the
+  // prefill window, so the compute timer below measures forwards only.
+  // Idempotent: a later ForwardBatch skips init through the same flag.
+  if (const Architecture* arch = model.Arch(); arch != nullptr) {
+    auto ready = arch->EnsureReady(*backend_, model, cache);
+    if (!ready && ready.error() != StatusCode::UnsupportedFeature) {
+      diagnostics_.Warn("engine", std::string("trunk init failed: ") +
+                                      std::string(ToString(ready.error())));
+      return std::unexpected(ready.error());
+    }
+  }
   // The prefill clock starts after strategy preparation, so a one-time draft
   // weight load is not billed to the prompt.
   const auto prefill_started = std::chrono::steady_clock::now();
+  // Compute-only prefill time: the chunk forwards below accumulate here,
+  // so the end-to-end window above keeps allocations, readbacks and
+  // progress reports while this stays comparable across runs.
+  double compute_ms = 0.0;
   const std::size_t prefill_chunk = ResolvePrefillChunkTokens(
       prefill_chunk_tokens_, options.prefill_chunk_tokens,
       model.MaxContextLength());
@@ -175,7 +199,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     auto prefilled = PrefillCapturing(*backend_, model, cache, *strategy,
                                       prompt, prefill_chunk, capture_layers,
                                       capture_buffers, hidden, first_logits,
-                                      progress_ptr);
+                                      progress_ptr, &compute_ms);
     if (!prefilled) {
       diagnostics_.Warn("engine", std::string("prefill failed: ") +
                                       std::string(ToString(prefilled.error())));
@@ -183,7 +207,8 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     }
   } else {
     auto logits = core::PrefillTokens(*backend_, model, cache, prompt, &hidden,
-                                      nullptr, prefill_chunk, progress_ptr);
+                                      nullptr, prefill_chunk, progress_ptr,
+                                      &compute_ms);
     if (!logits) {
       diagnostics_.Warn("engine", std::string("prefill failed: ") +
                                       std::string(ToString(logits.error())));
@@ -192,10 +217,9 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     first_logits = std::move(*logits);
   }
 
-  const long long prefill_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - prefill_started)
-          .count();
+  const double prefill_ms_exact =
+      core::ElapsedMsDouble(prefill_started, std::chrono::steady_clock::now());
+  const long long prefill_ms = static_cast<long long>(prefill_ms_exact);
   if (options.progress_every > 0 && prefill_ms > 0) {
     const long long prompt_tps =
         static_cast<long long>(prompt.size()) * 1000 / prefill_ms;
@@ -204,6 +228,18 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
                           " prompt token(s) in " + std::to_string(prefill_ms) +
                           " ms (" + std::to_string(prompt_tps) +
                           " prompt tok/s)");
+    if (compute_ms > 0.0) {
+      const long long compute_ms_int =
+          static_cast<long long>(std::llround(compute_ms));
+      const long long compute_tps = static_cast<long long>(
+          std::llround(prompt.size() * kMillisPerSecond / compute_ms));
+      diagnostics_.Info("engine",
+                        std::string("prefill compute: ") +
+                            std::to_string(prompt.size()) +
+                            " prompt token(s) in " +
+                            std::to_string(compute_ms_int) + " ms (" +
+                            std::to_string(compute_tps) + " prompt tok/s)");
+    }
   }
   const auto decode_started = std::chrono::steady_clock::now();
   std::mt19937_64 rng(options.seed);
@@ -577,7 +613,8 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   outcome.produced = produced;
   outcome.reason = reason;
   outcome.prompt_tokens = prompt.size();
-  outcome.prefill_ms = static_cast<double>(prefill_ms);
+  outcome.prefill_ms = prefill_ms_exact;
+  outcome.prefill_compute_ms = compute_ms;
   outcome.decode_ms = decode_ms;
   return outcome;
 }

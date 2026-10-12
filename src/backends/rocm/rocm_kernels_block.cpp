@@ -291,254 +291,275 @@ __global__ void GemmQ3KKernel(const float* a, const unsigned char* w,
   c[idx] = acc;
 }
 
-// Built-in "gemm_q3k_batched": tiled C = A x dequant(W)^T for a batch.
-// One workgroup covers 32 activation rows x 8 weight columns with one
-// thread per output, so all 256 threads compute. Each thread decodes its
-// own column's Q3_K blocks in the gemm_q3k element order (n2, j, then the
-// low 16 and the high 16), so the result matches the scalar kernel.
-// Buffers and scalars match gemm_q3k (k a multiple of 256); grid_x is
-// ceil(m / 32) * ceil(n / 8), block_x is 256.
+// Built-in "gemm_q3k_batched": one workgroup covers 32 rows x 32 columns
+// over 1024 threads; each block is dequantized once into LDS and reused.
 __global__ void GemmQ3KBatchedKernel(const float* a, const unsigned char* w,
                                      float* c, unsigned long long m,
                                      unsigned long long n,
                                      unsigned long long k) {
   const unsigned long long tid =
       static_cast<unsigned long long>(threadIdx.x);
-  const unsigned long long col_tiles = (n + 7) / 8;
-  const unsigned long long wg =
-      static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  const unsigned long long col_tiles = (n + 31) / 32;
+  const unsigned long long wg = static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 32;
+  const unsigned long long my_row = tid / 32;
+  const unsigned long long my_col = tid % 32;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
   const unsigned long long blocks = k / 256;
-  const float* ar = a + row_a * k;
-  const unsigned char* wbase = w + row_w * blocks * 110;
+  __shared__ float tile[32 * 256];
   float acc = 0.0f;
+  const unsigned long long col = (tid >> 2) & 31;
+  const unsigned long long r = tid & 3;
+  const unsigned long long part = r >> 1;
+  const unsigned long long lane0 = (r & 1) * 8;
+  const unsigned long long gc = col_base + col;
+  const unsigned long long n2 = (tid >> 9) & 3;
+  const unsigned long long q = (tid >> 7) & 3;
+  const unsigned int shift = static_cast<unsigned int>(2 * q);
+  const unsigned int mask = 1u << (n2 * 4 + q);
+  const unsigned long long is = (n2 * 4 + q) * 2 + part;
   for (unsigned long long b = 0; b < blocks; ++b) {
-    const unsigned char* base = wbase + b * 110;
-    std::uint16_t d_bits = 0;
-    std::memcpy(&d_bits, base + 108, 2);
-    const float d_all = Fp16ToFloatDev(d_bits);
-    std::uint32_t aux[4] = {};
-    for (int e = 0; e < 3; ++e) {
-      std::uint32_t word = 0;
-      for (int f = 0; f < 4; ++f) {
-        word |= static_cast<std::uint32_t>(base[96 + e * 4 + f]) << (8 * f);
+    if (gc < n) {
+      const unsigned char* base = w + (gc * blocks + b) * 110;
+      std::uint16_t d_bits = 0;
+      std::memcpy(&d_bits, base + 108, 2);
+      const float d_all = Fp16ToFloatDev(d_bits);
+      std::uint32_t aux[4] = {};
+      for (int t = 0; t < 3; ++t) {
+        std::uint32_t word = 0;
+        for (int f = 0; f < 4; ++f) {
+          word |= static_cast<std::uint32_t>(base[96 + t * 4 + f])
+                  << (8 * f);
+        }
+        aux[t] = word;
       }
-      aux[e] = word;
-    }
-    const std::uint32_t tmp = aux[2];
-    aux[2] = ((aux[0] >> 4) & 0x0f0f0f0f) | (((tmp >> 4) & 0x03030303) << 4);
-    aux[3] = ((aux[1] >> 4) & 0x0f0f0f0f) | (((tmp >> 6) & 0x03030303) << 4);
-    aux[0] = (aux[0] & 0x0f0f0f0f) | (((tmp >> 0) & 0x03030303) << 4);
-    aux[1] = (aux[1] & 0x0f0f0f0f) | (((tmp >> 2) & 0x03030303) << 4);
-    const std::int8_t* scales = reinterpret_cast<const std::int8_t*>(aux);
-    const float* ab = ar + b * 256;
-    unsigned int is = 0;
-    unsigned int mask = 1;
-    for (unsigned long long n2 = 0; n2 < 2; ++n2) {
-      unsigned int shift = 0;
-      for (unsigned long long j = 0; j < 4; ++j) {
-        const float dl = d_all * (scales[is++] - 32);
-        for (unsigned long long l = 0; l < 16; ++l) {
-          const float qv =
-              static_cast<float>((base[32 + n2 * 32 + l] >> shift) & 3);
-          const float hb = (base[l] & mask) ? 0.0f : 4.0f;
-          acc += ab[n2 * 128 + j * 32 + l] * (dl * (qv - hb));
-        }
-        const float dl2 = d_all * (scales[is++] - 32);
-        for (unsigned long long l = 0; l < 16; ++l) {
-          const float qv = static_cast<float>(
-              (base[32 + n2 * 32 + 16 + l] >> shift) & 3);
-          const float hb = (base[16 + l] & mask) ? 0.0f : 4.0f;
-          acc += ab[n2 * 128 + j * 32 + 16 + l] * (dl2 * (qv - hb));
-        }
-        shift += 2;
-        mask <<= 1;
+      const std::uint32_t tmp = aux[2];
+      aux[2] = ((aux[0] >> 4) & 0x0f0f0f0f) | (((tmp >> 4) & 0x03030303) << 4);
+      aux[3] = ((aux[1] >> 4) & 0x0f0f0f0f) | (((tmp >> 6) & 0x03030303) << 4);
+      aux[0] = (aux[0] & 0x0f0f0f0f) | (((tmp >> 0) & 0x03030303) << 4);
+      aux[1] = (aux[1] & 0x0f0f0f0f) | (((tmp >> 2) & 0x03030303) << 4);
+      const std::int8_t* scales = reinterpret_cast<const std::int8_t*>(aux);
+      const float dl = d_all * (scales[is] - 32);
+      for (unsigned long long kk = 0; kk < 8; ++kk) {
+        const unsigned long long lane = lane0 + kk;
+        const float qv = static_cast<float>(
+            (base[32 + n2 * 32 + part * 16 + lane] >> shift) & 3);
+        const float hb = (base[part * 16 + lane] & mask) ? 0.0f : 4.0f;
+        const unsigned long long elem = n2 * 128 + q * 32 + part * 16 + lane;
+        tile[elem * 32 + col] = dl * (qv - hb);
       }
     }
+    LdsBarrier();
+    if (active) {
+      const float* ar = a + row_a * k + b * 256;
+      for (unsigned long long elem = 0; elem < 256; ++elem) {
+        acc += ar[elem] * tile[elem * 32 + my_col];
+      }
+    }
+    LdsBarrier();
   }
-  c[row_a * n + row_w] = acc;
+  if (active) {
+    c[row_a * n + row_w] = acc;
+  }
 }
 
-// Built-in "gemm_q4k_batched": tiled C = A x dequant(W)^T for a batch
-// of rows. One workgroup covers 32 activation rows x 8 weight columns
-// with one thread per output, so all 256 threads compute; the earlier
-// 8-row tile left 248 threads dequantizing only and held the prefill
-// back. Each thread decodes its own column's block, and the per-output
-// accumulation keeps the gemm_q4k element order (per 64-element group,
-// the low 32 then the high 32), so the result is bit-identical to the
-// GEMV kernel. Buffers and scalars match gemm_q4k (m, n, k, k a
-// multiple of 256); grid_x is ceil(m / 32) * ceil(n / 8), block_x is
-// 256 (the tiling core::detail::ProjectTiledDevice dispatches).
+// Built-in "gemm_q4k_batched": one workgroup covers 32 rows x 32 columns
+// over 1024 threads; each 256-element block is dequantized once into LDS
+// and reused across the rows. Grid ceil(m / 32) * ceil(n / 32).
 __global__ void GemmQ4KBatchedKernel(const float* a, const unsigned char* w,
                                      float* c, unsigned long long m,
                                      unsigned long long n,
                                      unsigned long long k) {
   const unsigned long long tid =
       static_cast<unsigned long long>(threadIdx.x);
-  const unsigned long long col_tiles = (n + 7) / 8;
-  const unsigned long long wg =
-      static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  const unsigned long long col_tiles = (n + 31) / 32;
+  const unsigned long long wg = static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 32;
+  const unsigned long long my_row = tid / 32;
+  const unsigned long long my_col = tid % 32;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
   const unsigned long long blocks = k / 256;
-  const float* abase = a + row_a * k;
-  const unsigned char* wbase = w + row_w * blocks * 144;
+  __shared__ float tile[32 * 256];
   float acc = 0.0f;
+  const unsigned long long pair = tid >> 2;
+  const unsigned long long col = pair & 31;
+  const unsigned long long sub = (pair >> 5) & 7;
+  const unsigned long long lane0 = (tid & 3) * 8;
+  const unsigned long long gc = col_base + col;
+  const unsigned long long g = sub >> 1;
+  const unsigned long long hf = sub & 1;
   for (unsigned long long b = 0; b < blocks; ++b) {
-    const unsigned char* base = wbase + b * 144;
-    std::uint16_t d_bits = 0;
-    std::uint16_t dm_bits = 0;
-    std::memcpy(&d_bits, base, 2);
-    std::memcpy(&dm_bits, base + 2, 2);
-    const float d = Fp16ToFloatDev(d_bits);
-    const float dm = Fp16ToFloatDev(dm_bits);
-    const unsigned char* scales = base + 4;
-    const unsigned char* qs = base + 16;
-    const float* ar = abase + b * 256;
-    // Element order (0..255): sub-block 2*grp+half, low nibble for the
-    // low half and high nibble for the high half, so the accumulation
-    // matches the host reference exactly.
-    for (unsigned long long grp = 0; grp < 4; ++grp) {
-      for (unsigned long long half = 0; half < 2; ++half) {
-        std::uint8_t sc = 0;
-        std::uint8_t mn = 0;
-        GetScaleMinDev(2 * grp + half, scales, &sc, &mn);
-        const float dsc = d * static_cast<float>(sc);
-        const float dmm = dm * static_cast<float>(mn);
-        for (unsigned long long l = 0; l < 32; ++l) {
-          const std::uint8_t q = qs[grp * 32 + l];
-          const std::uint8_t nib = half == 0 ? (q & 15) : (q >> 4);
-          acc += ar[grp * 64 + half * 32 + l] *
-                 (dsc * static_cast<float>(nib) - dmm);
-        }
+    if (gc < n) {
+      const unsigned char* base = w + (gc * blocks + b) * 144;
+      std::uint16_t d_bits = 0;
+      std::uint16_t dm_bits = 0;
+      std::memcpy(&d_bits, base, 2);
+      std::memcpy(&dm_bits, base + 2, 2);
+      const float d = Fp16ToFloatDev(d_bits);
+      const float dm = Fp16ToFloatDev(dm_bits);
+      std::uint8_t sc = 0;
+      std::uint8_t mn = 0;
+      GetScaleMinDev(static_cast<unsigned int>(g * 2 + hf), base + 4, &sc,
+                     &mn);
+      const float dsc = d * static_cast<float>(sc);
+      const float dmm = dm * static_cast<float>(mn);
+      for (unsigned long long kk = 0; kk < 8; ++kk) {
+        const unsigned long long l = lane0 + kk;
+        const std::uint8_t q = base[16 + g * 32 + l];
+        const std::uint8_t nib = hf == 0 ? (q & 15) : (q >> 4);
+        tile[(g * 64 + hf * 32 + l) * 32 + col] =
+            dsc * static_cast<float>(nib) - dmm;
       }
     }
+    LdsBarrier();
+    if (active) {
+      const float* ar = a + row_a * k + b * 256;
+      for (unsigned long long elem = 0; elem < 256; ++elem) {
+        acc += ar[elem] * tile[elem * 32 + my_col];
+      }
+    }
+    LdsBarrier();
   }
-  c[row_a * n + row_w] = acc;
+  if (active) {
+    c[row_a * n + row_w] = acc;
+  }
 }
 
-// Built-in "gemm_q5k_batched": tiled C = A x dequant(W)^T for a batch.
-// One workgroup covers 32 activation rows x 8 weight columns with one
-// thread per output, so all 256 threads compute. Element e is sub-block
-// s = e/32; sub-block s uses scale/min pair s, low nibble byte
-// 48 + (s/2)*32 + e%32, the high bit 1 << s of byte 16 + e%32, and the
-// high nibble for odd s. The dot keeps the gemm_q5k order (per
-// 64-element group, low then high half). Buffers and scalars match
-// gemm_q5k (k a multiple of 256); grid_x is ceil(m / 32) * ceil(n / 8),
-// block_x is 256.
+// Built-in "gemm_q5k_batched": one workgroup covers 32 rows x 32 columns
+// over 1024 threads; each 256-element block is dequantized once into LDS
+// and reused across the rows. Element e is sub-block s = e/32.
 __global__ void GemmQ5KBatchedKernel(const float* a, const unsigned char* w,
                                      float* c, unsigned long long m,
                                      unsigned long long n,
                                      unsigned long long k) {
   const unsigned long long tid =
       static_cast<unsigned long long>(threadIdx.x);
-  const unsigned long long col_tiles = (n + 7) / 8;
-  const unsigned long long wg =
-      static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  const unsigned long long col_tiles = (n + 31) / 32;
+  const unsigned long long wg = static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 32;
+  const unsigned long long my_row = tid / 32;
+  const unsigned long long my_col = tid % 32;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
   const unsigned long long blocks = k / 256;
-  const float* abase = a + row_a * k;
-  const unsigned char* wbase = w + row_w * blocks * 176;
+  __shared__ float tile[32 * 256];
   float acc = 0.0f;
+  const unsigned long long pair = tid >> 2;
+  const unsigned long long col = pair & 31;
+  const unsigned long long s = (pair >> 5) & 7;
+  const unsigned long long lane0 = (tid & 3) * 8;
+  const unsigned long long gc = col_base + col;
+  const unsigned long long grp = s / 2;
+  const unsigned long long parity = s % 2;
   for (unsigned long long b = 0; b < blocks; ++b) {
-    const unsigned char* base = wbase + b * 176;
-    std::uint16_t d_bits = 0;
-    std::uint16_t dm_bits = 0;
-    std::memcpy(&d_bits, base, 2);
-    std::memcpy(&dm_bits, base + 2, 2);
-    const float d = Fp16ToFloatDev(d_bits);
-    const float dm = Fp16ToFloatDev(dm_bits);
-    const unsigned char* scales = base + 4;
-    const float* ar = abase + b * 256;
-    // Element order (0..255): sub-block s = e/32, so the accumulation
-    // matches the host reference exactly.
-    for (unsigned long long s = 0; s < 8; ++s) {
+    if (gc < n) {
+      const unsigned char* base = w + (gc * blocks + b) * 176;
+      std::uint16_t d_bits = 0;
+      std::uint16_t dm_bits = 0;
+      std::memcpy(&d_bits, base, 2);
+      std::memcpy(&dm_bits, base + 2, 2);
+      const float d = Fp16ToFloatDev(d_bits);
+      const float dm = Fp16ToFloatDev(dm_bits);
       std::uint8_t sc = 0;
       std::uint8_t mn = 0;
-      GetScaleMinDev(s, scales, &sc, &mn);
+      GetScaleMinDev(s, base + 4, &sc, &mn);
       const float dsc = d * static_cast<float>(sc);
       const float dmm = dm * static_cast<float>(mn);
-      const unsigned long long grp = s / 2;
-      const unsigned long long parity = s % 2;
-      for (unsigned long long lane = 0; lane < 32; ++lane) {
+      for (unsigned long long kk = 0; kk < 8; ++kk) {
+        const unsigned long long lane = lane0 + kk;
         const std::uint8_t low = base[48 + grp * 32 + lane];
         const std::uint8_t high = base[16 + lane];
         const std::uint8_t nib = parity != 0 ? (low >> 4) : (low & 15);
         const std::uint8_t hb = (high & (1u << s)) != 0 ? 16u : 0u;
-        acc += ar[s * 32 + lane] *
-               (dsc * static_cast<float>(nib + hb) - dmm);
+        tile[(s * 32 + lane) * 32 + col] =
+            dsc * static_cast<float>(nib + hb) - dmm;
       }
     }
+    LdsBarrier();
+    if (active) {
+      const float* ar = a + row_a * k + b * 256;
+      for (unsigned long long elem = 0; elem < 256; ++elem) {
+        acc += ar[elem] * tile[elem * 32 + my_col];
+      }
+    }
+    LdsBarrier();
   }
-  c[row_a * n + row_w] = acc;
+  if (active) {
+    c[row_a * n + row_w] = acc;
+  }
 }
 
-// Built-in "gemm_q6k_batched": tiled C = A x dequant(W)^T for a batch.
-// One workgroup covers 32 activation rows x 8 weight columns with one
-// thread per output, so all 256 threads compute. Element e = n2*128 +
-// q*32 + l (n2 = e/128, q = (e%128)/32, l = e%32): the scale byte is
-// 192 + n2*8 + l/16 + 2*q, the nibble byte is n2*64 + (q%2)*32 + l, and
-// the 2-bit high comes from byte 128 + n2*32 + l at bits 2*q. The dot
-// keeps the gemm_q6k order (n2, l, q1..q4). Buffers and scalars match
-// gemm_q6k (k a multiple of 256); grid_x is ceil(m / 32) * ceil(n / 8),
-// block_x is 256.
+// Built-in "gemm_q6k_batched": one workgroup covers 32 rows x 32 columns
+// over 1024 threads; each 256-element block is dequantized once into LDS
+// and reused across the rows. Element e = n2*128 + q*32 + l.
 __global__ void GemmQ6KBatchedKernel(const float* a, const unsigned char* w,
                                      float* c, unsigned long long m,
                                      unsigned long long n,
                                      unsigned long long k) {
   const unsigned long long tid =
       static_cast<unsigned long long>(threadIdx.x);
-  const unsigned long long col_tiles = (n + 7) / 8;
-  const unsigned long long wg =
-      static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  const unsigned long long col_tiles = (n + 31) / 32;
+  const unsigned long long wg = static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 32;
+  const unsigned long long my_row = tid / 32;
+  const unsigned long long my_col = tid % 32;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
   const unsigned long long blocks = k / 256;
-  const float* abase = a + row_a * k;
-  const unsigned char* wbase = w + row_w * blocks * 210;
+  __shared__ float tile[32 * 256];
   float acc = 0.0f;
+  const unsigned long long pair = tid >> 2;
+  const unsigned long long col = pair & 31;
+  const unsigned long long sub = (pair >> 5) & 7;
+  const unsigned long long lane0 = (tid & 3) * 8;
+  const unsigned long long gc = col_base + col;
+  const unsigned long long n2 = sub >> 2;
+  const unsigned long long q = sub & 3;
   for (unsigned long long b = 0; b < blocks; ++b) {
-    const unsigned char* base = wbase + b * 210;
-    std::uint16_t d_bits = 0;
-    std::memcpy(&d_bits, base + 208, 2);
-    const float d = Fp16ToFloatDev(d_bits);
-    const float* ar = abase + b * 256;
-    // Element order (0..255): n2 = e/128, q = (e%128)/32, l = e%32, so
-    // the accumulation matches the host reference exactly.
-    for (unsigned long long n2 = 0; n2 < 2; ++n2) {
-      for (unsigned long long q = 0; q < 4; ++q) {
-        for (unsigned long long l = 0; l < 32; ++l) {
-          const unsigned char ql = base[n2 * 64 + (q % 2) * 32 + l];
-          const unsigned char qh = base[128 + n2 * 32 + l];
-          const unsigned char low = q < 2 ? (ql & 15) : (ql >> 4);
-          const unsigned char high =
-              static_cast<unsigned char>(((qh >> (2 * q)) & 3) << 4);
-          int scale = base[192 + n2 * 8 + l / 16 + 2 * q];
-          if (scale >= 128) {
-            scale -= 256;
-          }
-          const int qv = static_cast<int>(low | high) - 32;
-          acc += ar[n2 * 128 + q * 32 + l] *
-                 (d * static_cast<float>(scale) * static_cast<float>(qv));
-        }
+    if (gc < n) {
+      const unsigned char* base = w + (gc * blocks + b) * 210;
+      std::uint16_t d_bits = 0;
+      std::memcpy(&d_bits, base + 208, 2);
+      const float d = Fp16ToFloatDev(d_bits);
+      int scale = base[192 + n2 * 8 + lane0 / 16 + 2 * q];
+      if (scale >= 128) {
+        scale -= 256;
+      }
+      const float ds = d * static_cast<float>(scale);
+      for (unsigned long long kk = 0; kk < 8; ++kk) {
+        const unsigned long long l = lane0 + kk;
+        const unsigned char ql = base[n2 * 64 + (q % 2) * 32 + l];
+        const unsigned char qh = base[128 + n2 * 32 + l];
+        const unsigned char low = q < 2 ? (ql & 15) : (ql >> 4);
+        const unsigned char high =
+            static_cast<unsigned char>(((qh >> (2 * q)) & 3) << 4);
+        const int qv = static_cast<int>(low | high) - 32;
+        tile[(n2 * 128 + q * 32 + l) * 32 + col] =
+            ds * static_cast<float>(qv);
       }
     }
+    LdsBarrier();
+    if (active) {
+      const float* ar = a + row_a * k + b * 256;
+      for (unsigned long long elem = 0; elem < 256; ++elem) {
+        acc += ar[elem] * tile[elem * 32 + my_col];
+      }
+    }
+    LdsBarrier();
   }
-  c[row_a * n + row_w] = acc;
+  if (active) {
+    c[row_a * n + row_w] = acc;
+  }
 }
 
 // Built-in "gemm_q80": buffer 0 is the activation A (fp32, m x k),

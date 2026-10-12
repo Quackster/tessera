@@ -1,13 +1,12 @@
 #version 450
 
-// Tiled batched MXFP4 GEMM. One workgroup covers a 32-row x 8-column output
-// tile: threads in a group share a row (eight each) and a column (four
-// each), so the activation and weight reads reuse cache. Each thread keeps
-// four partial sums (one per 8-element word of the 32-element block) so the
-// FMA chain is four deep instead of one; a single accumulator is latency
-// bound. The dot runs elements 0..31 in order, the gemm_mxfp4 order.
-// Dispatch is ceil(m / 32) * ceil(n / 8) workgroups of 256.
-layout(local_size_x = 256) in;
+// Tiled batched MXFP4 GEMM: one workgroup covers 32 activation rows x 32
+// weight columns over 1024 threads. Eight 32-element blocks form one
+// 256-element tile that is dequantized once into shared memory and reused
+// across the 32 rows. Each thread keeps four partial sums (one per
+// 8-element word) so the FMA chain stays shallow, matching the gemm_mxfp4
+// order. Dispatch is ceil(m / 32) * ceil(n / 32) workgroups of 1024.
+layout(local_size_x = 1024) in;
 
 // "gemm_mxfp4_batched" contract (tessera API): buffers and scalars match
 // gemm_mxfp4 (m, n, k, k a multiple of 32). Scalars are 64-bit, so field
@@ -28,6 +27,8 @@ layout(set = 0, binding = 2) buffer C {
   float c[];
 };
 
+shared float tile[8192];
+
 // Byte `offset` of the packed weight buffer viewed as uint words.
 uint wbyte(uint offset) {
   return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
@@ -44,39 +45,53 @@ void main() {
   uint m = pc.v[0];
   uint n = pc.v[2];
   uint k = pc.v[4];
-  uint col_tiles = (n + 7u) / 8u;
-  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
-  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  uint col_tiles = (n + 31u) / 32u;
+  uint row_base = (wg / col_tiles) * 32u;
+  uint col_base = (wg % col_tiles) * 32u;
+  uint my_row = tid / 32u;
+  uint my_col = tid % 32u;
+  uint row_a = row_base + my_row;
+  uint row_w = col_base + my_col;
+  bool has_out = row_a < m && row_w < n;
   uint blocks = k / 32u;
   uint scale_base = (n * k) >> 1;
-  uint ar_base = row_a * k;
-  // Word index of the weight row start: (row_w * k) elements / 8 per word.
-  uint wqr = (row_w * k) >> 3u;
   float p0 = 0.0;
   float p1 = 0.0;
   float p2 = 0.0;
   float p3 = 0.0;
-  for (uint b = 0u; b < blocks; ++b) {
-    float scale = exp2(float(wbyte(scale_base + row_w * blocks + b)) - 127.0);
-    uint ab = ar_base + b * 32u;
-    uint wb = wqr + b * 4u;
-    uint w0 = w[wb + 0u];
-    uint w1 = w[wb + 1u];
-    uint w2 = w[wb + 2u];
-    uint w3 = w[wb + 3u];
-    for (uint j = 0u; j < 8u; ++j) {
-      p0 = fma(a[ab + j], scale * kE2M1[w0 & 15u], p0);
-      p1 = fma(a[ab + 8u + j], scale * kE2M1[w1 & 15u], p1);
-      p2 = fma(a[ab + 16u + j], scale * kE2M1[w2 & 15u], p2);
-      p3 = fma(a[ab + 24u + j], scale * kE2M1[w3 & 15u], p3);
-      w0 >>= 4u;
-      w1 >>= 4u;
-      w2 >>= 4u;
-      w3 >>= 4u;
+  uint pair = tid >> 2u;
+  uint col = pair & 31u;
+  uint sub = (pair >> 5u) & 7u;
+  uint lane0 = (tid & 3u) * 8u;
+  uint gc = col_base + col;
+  uint qq = lane0 >> 3u;
+  for (uint bb = 0u; bb < blocks; bb += 8u) {
+    uint subs = blocks - bb < 8u ? blocks - bb : 8u;
+    if (gc < n && sub < subs) {
+      uint wqr = (gc * k) >> 3u;
+      uint word = w[wqr + (bb + sub) * 4u + qq];
+      float scale = exp2(float(wbyte(scale_base + gc * blocks + bb + sub)) - 127.0);
+      for (uint jj = 0u; jj < 8u; ++jj) {
+        uint nib = (word >> (4u * jj)) & 15u;
+        tile[(sub * 32u + qq * 8u + jj) * 32u + col] = scale * kE2M1[nib];
+      }
     }
+    barrier();
+    if (has_out) {
+      uint abase = row_a * k + bb * 32u;
+      for (uint sub = 0u; sub < subs; ++sub) {
+        for (uint jj = 0u; jj < 8u; ++jj) {
+          uint tbase = (sub * 32u + jj) * 32u + my_col;
+          p0 = fma(a[abase + sub * 32u + jj], tile[tbase], p0);
+          p1 = fma(a[abase + sub * 32u + 8u + jj], tile[tbase + 8u * 32u], p1);
+          p2 = fma(a[abase + sub * 32u + 16u + jj], tile[tbase + 16u * 32u], p2);
+          p3 = fma(a[abase + sub * 32u + 24u + jj], tile[tbase + 24u * 32u], p3);
+        }
+      }
+    }
+    barrier();
   }
-  c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
+  if (has_out) {
+    c[row_a * n + row_w] = (p0 + p1) + (p2 + p3);
+  }
 }

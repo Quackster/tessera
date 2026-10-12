@@ -19,6 +19,13 @@ using PhaseClock = std::chrono::steady_clock;
       .count();
 }
 
+// Fractional milliseconds between two points, for rates that need
+// microsecond resolution (prompt tok/s on a short prompt).
+[[nodiscard]] inline double ElapsedMsDouble(PhaseClock::time_point start,
+                                            PhaseClock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 // One-line summary of a completed bulk transfer for diagnostics, shared by
 // the backends so both report the same shape:
 // "batched H2D upload of N bytes in M copies took T ms (R MiB/s)".

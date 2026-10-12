@@ -7,6 +7,7 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/think_budget.hpp"
+#include "core/timing.hpp"
 
 namespace tessera {
 
@@ -75,7 +76,8 @@ std::expected<void, StatusCode> PrefillCapturing(
     SpeculativeStrategy& strategy, std::span<const std::uint32_t> prompt,
     std::size_t chunk, const std::vector<std::size_t>& capture_layers,
     std::vector<Buffer*>& strategy_buffers, std::vector<float>& hidden_out,
-    std::vector<float>& logits_out, const core::PrefillProgress* progress) {
+    std::vector<float>& logits_out, const core::PrefillProgress* progress,
+    double* compute_ms) {
   const std::size_t tail = strategy.PrefillCaptureTail();
   const std::size_t keep =
       (tail == 0 || tail >= prompt.size()) ? prompt.size() : tail;
@@ -138,9 +140,13 @@ std::expected<void, StatusCode> PrefillCapturing(
       core::detail::PrefillLens(head, chunk, /*base=*/0, heads, head_dim);
   std::size_t off = 0;
   for (const std::size_t len : head_lens) {
+    const auto batch_started = core::PhaseClock::now();
     auto status = arch->ForwardBatch(backend, model, cache,
                                      prompt.subspan(off, len), nullptr,
                                      nullptr, /*all_logits=*/false, nullptr);
+    if (compute_ms != nullptr) {
+      *compute_ms += core::ElapsedMsDouble(batch_started, core::PhaseClock::now());
+    }
     if (!status) {
       return std::unexpected(status.error());
     }
@@ -167,10 +173,14 @@ std::expected<void, StatusCode> PrefillCapturing(
     const std::size_t off = head + tail_done;
     const bool last = off + len == prompt.size();
     std::vector<float> chunk_logits;
+    const auto batch_started = core::PhaseClock::now();
     auto status = arch->ForwardBatch(
         backend, model, cache, prompt.subspan(off, len),
         last ? &chunk_logits : nullptr, last ? &hidden_out : nullptr,
         /*all_logits=*/false, nullptr, &capture_layers, &cap_ptrs);
+    if (compute_ms != nullptr) {
+      *compute_ms += core::ElapsedMsDouble(batch_started, core::PhaseClock::now());
+    }
     if (!status) {
       return std::unexpected(status.error());
     }

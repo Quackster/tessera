@@ -153,6 +153,10 @@ __global__ void GemmBf16Kernel(const float* a, const unsigned short* w,
                                float* c, unsigned long long m,
                                unsigned long long n,
                                unsigned long long k);
+__global__ void GemmBf16RowsKernel(const float* a, const unsigned short* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n,
+                                   unsigned long long k);
 __global__ void GemmF32Kernel(const float* a, const float* w, float* c,
                               unsigned long long m,
                               unsigned long long n,
@@ -220,6 +224,10 @@ __global__ void GemmIq4XsVecKernel(const float* a, const unsigned char* w,
                                    float* c, unsigned long long m,
                                    unsigned long long n, unsigned long long k,
                                    unsigned long long split);
+__global__ void GemmQ80VecKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k,
+                                 unsigned long long split);
 __global__ void GemmVecReduceKernel(const float* part, float* c,
                                     unsigned long long total,
                                     unsigned long long split);
@@ -283,6 +291,10 @@ __global__ void GemmIq4XsBatchedKernel(const float* a,
 __global__ void GemmIq3SKernel(const float* a, const unsigned char* w,
                                 float* c, unsigned long long m,
                                 unsigned long long n, unsigned long long k);
+__global__ void GemmIq3SBatchedKernel(const float* a, const unsigned char* w,
+                                      float* c, unsigned long long m,
+                                      unsigned long long n,
+                                      unsigned long long k);
 __global__ void GemmQ80Kernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);

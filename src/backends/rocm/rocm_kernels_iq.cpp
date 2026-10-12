@@ -39,12 +39,10 @@ __global__ void GemmIq4NlKernel(const float* a, const unsigned char* w,
   c[idx] = acc;
 }
 
-// Built-in "gemm_iq4nl_batched": tiled C = A x dequant(W)^T for a batch.
-// One workgroup covers 32 activation rows x 8 weight columns with one
-// thread per output. A block is 18 bytes: d fp16 then 16 nibble bytes; the
-// element order matches the scalar gemm_iq4nl. Buffers and scalars match
-// gemm_iq4nl (k a multiple of 32); grid_x is ceil(m / 32) * ceil(n / 8),
-// block_x is 256.
+// Built-in "gemm_iq4nl_batched": one workgroup covers 32 rows x 32 columns
+// over 1024 threads; eight 18-byte blocks form one 256-element tile that
+// is dequantized once into LDS and reused across the rows. Grid ceil(m /
+// 32) * ceil(n / 32).
 __global__ void GemmIq4NlBatchedKernel(const float* a,
                                        const unsigned char* w, float* c,
                                        unsigned long long m,
@@ -52,31 +50,58 @@ __global__ void GemmIq4NlBatchedKernel(const float* a,
                                        unsigned long long k) {
   const unsigned long long tid =
       static_cast<unsigned long long>(threadIdx.x);
-  const unsigned long long col_tiles = (n + 7) / 8;
+  const unsigned long long col_tiles = (n + 31) / 32;
   const unsigned long long wg =
       static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 32;
+  const unsigned long long my_row = tid / 32;
+  const unsigned long long my_col = tid % 32;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
   const unsigned long long blocks = k / 32;
-  const float* ar = a + row_a * k;
-  const unsigned char* wbase = w + row_w * blocks * 18;
+  __shared__ float tile[8 * 32 * 32];
   float acc = 0.0f;
-  for (unsigned long long b = 0; b < blocks; ++b) {
-    const unsigned char* base = wbase + b * 18;
-    std::uint16_t d_bits = 0;
-    std::memcpy(&d_bits, base, 2);
-    const float d = Fp16ToFloatDev(d_bits);
-    const float* ab = ar + b * 32;
-    for (unsigned long long j = 0; j < 16; ++j) {
-      const unsigned char q = base[2 + j];
-      acc += ab[j] * (d * kIq4NlValuesDev[q & 15]);
-      acc += ab[j + 16] * (d * kIq4NlValuesDev[q >> 4]);
+  const unsigned long long pair = tid >> 2;
+  const unsigned long long col = pair & 31;
+  const unsigned long long sub0 = (pair >> 5) & 7;
+  const unsigned long long lane0 = (tid & 3) * 8;
+  const unsigned long long gc = col_base + col;
+  for (unsigned long long bb = 0; bb < blocks; bb += 8) {
+    const unsigned long long subs =
+        blocks - bb < 8 ? blocks - bb : 8;
+    if (gc < n && sub0 < subs) {
+      const unsigned char* base = w + (gc * blocks + bb + sub0) * 18;
+      std::uint16_t d_bits = 0;
+      std::memcpy(&d_bits, base, 2);
+      const float d = Fp16ToFloatDev(d_bits);
+      for (unsigned long long kk = 0; kk < 8; ++kk) {
+        const unsigned long long lane = lane0 + kk;
+        const unsigned long long jj = lane & 15;
+        const unsigned char q = base[2 + jj];
+        const unsigned char nib = (lane >> 4) ? (q >> 4) : (q & 15);
+        tile[(sub0 * 32 + lane) * 32 + col] =
+            d * kIq4NlValuesDev[nib];
+      }
     }
+    LdsBarrier();
+    if (active) {
+      const float* ab = a + row_a * k + bb * 32;
+      for (unsigned long long sub = 0; sub < subs; ++sub) {
+        for (unsigned long long j = 0; j < 16; ++j) {
+          const unsigned long long lo = sub * 32 + j;
+          const unsigned long long hi = lo + 16;
+          acc += ab[lo] * tile[lo * 32 + my_col];
+          acc += ab[hi] * tile[hi * 32 + my_col];
+        }
+      }
+    }
+    LdsBarrier();
   }
-  c[row_a * n + row_w] = acc;
+  if (active) {
+    c[row_a * n + row_w] = acc;
+  }
 }
 
 // Built-in "gemm_iq4xs": C = A x dequant(W)^T; W holds IQ4_XS blocks
@@ -197,16 +222,9 @@ __global__ void GemmIq4XsVecKernel(const float* a, const unsigned char* w,
   }
 }
 
-// Built-in "gemm_iq4xs_batched": tiled C = A x dequant(W)^T for a batch.
-// One workgroup covers 32 activation rows x 8 weight columns with one
-// thread per output, so all 256 threads compute. Element e: ib = e / 32,
-// the nibble byte is `8 + ib*16 + (e%16)` (low nibble for the low half of
-// the sub-block, high for the high half), the 6-bit scale is the 4 low
-// bits at `4 + ib/2` plus the 2 high bits at bit `2*ib` of the u16 at 2,
-// and the value is `d * (scale - 32) * codebook[nibble]`. The dot keeps
-// the gemm_iq4xs order (ib, j, low then high). Buffers and scalars match
-// gemm_iq4xs (k a multiple of 256); grid_x is ceil(m / 32) * ceil(n / 8),
-// block_x is 256.
+// Built-in "gemm_iq4xs_batched": one workgroup covers 32 rows x 32 columns
+// over 1024 threads; each 256-element block is dequantized once into LDS
+// and reused across the rows. Element e: ib = e / 32.
 __global__ void GemmIq4XsBatchedKernel(const float* a,
                                        const unsigned char* w, float* c,
                                        unsigned long long m,
@@ -214,41 +232,57 @@ __global__ void GemmIq4XsBatchedKernel(const float* a,
                                        unsigned long long k) {
   const unsigned long long tid =
       static_cast<unsigned long long>(threadIdx.x);
-  const unsigned long long col_tiles = (n + 7) / 8;
+  const unsigned long long col_tiles = (n + 31) / 32;
   const unsigned long long wg =
       static_cast<unsigned long long>(blockIdx.x);
-  const unsigned long long row_a = (wg / col_tiles) * 32 + tid / 8;
-  const unsigned long long row_w = (wg % col_tiles) * 8 + tid % 8;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 32;
+  const unsigned long long my_row = tid / 32;
+  const unsigned long long my_col = tid % 32;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
   const unsigned long long blocks = k / 256;
-  const float* abase = a + row_a * k;
-  const unsigned char* wbase = w + row_w * blocks * 136;
+  __shared__ float tile[32 * 256];
   float acc = 0.0f;
+  const unsigned long long pair = tid >> 2;
+  const unsigned long long col = pair & 31;
+  const unsigned long long ib = (pair >> 5) & 7;
+  const unsigned long long lane0 = (tid & 3) * 8;
+  const unsigned long long gc = col_base + col;
   for (unsigned long long b = 0; b < blocks; ++b) {
-    const unsigned char* base = wbase + b * 136;
-    std::uint16_t d_bits = 0;
-    std::uint16_t scales_h = 0;
-    std::memcpy(&d_bits, base, 2);
-    std::memcpy(&scales_h, base + 2, 2);
-    const float d = Fp16ToFloatDev(d_bits);
-    const float* ar = abase + b * 256;
-    // Element order (0..255): ib = e/32, lane = e%32, so the accumulation
-    // matches the host reference exactly.
-    for (unsigned long long ib = 0; ib < 8; ++ib) {
+    if (gc < n) {
+      const unsigned char* base = w + (gc * blocks + b) * 136;
+      std::uint16_t d_bits = 0;
+      std::uint16_t scales_h = 0;
+      std::memcpy(&d_bits, base, 2);
+      std::memcpy(&scales_h, base + 2, 2);
+      const float d = Fp16ToFloatDev(d_bits);
       const int ls = ((base[4 + ib / 2] >> (4 * (ib % 2))) & 15) |
                      (((scales_h >> (2 * ib)) & 3) << 4);
       const float dl = d * static_cast<float>(ls - 32);
-      for (unsigned long long lane = 0; lane < 32; ++lane) {
+      for (unsigned long long kk = 0; kk < 8; ++kk) {
+        const unsigned long long lane = lane0 + kk;
         const unsigned char byte = base[8 + ib * 16 + (lane % 16)];
         const unsigned char nib = lane < 16 ? (byte & 15) : (byte >> 4);
-        acc += ar[ib * 32 + lane] *
-               (dl * static_cast<float>(kIq4NlValuesDev[nib]));
+        tile[(ib * 32 + lane) * 32 + col] =
+            dl * static_cast<float>(kIq4NlValuesDev[nib]);
       }
     }
+    LdsBarrier();
+    if (active) {
+      const float* ar = a + row_a * k + b * 256;
+      for (unsigned long long ib = 0; ib < 8; ++ib) {
+        for (unsigned long long lane = 0; lane < 32; ++lane) {
+          acc += ar[ib * 32 + lane] * tile[(ib * 32 + lane) * 32 + my_col];
+        }
+      }
+    }
+    LdsBarrier();
   }
-  c[row_a * n + row_w] = acc;
+  if (active) {
+    c[row_a * n + row_w] = acc;
+  }
 }
 
 // IQ3_S 3-bit grid (ports iq3s_grid; see CREDITS.md).
@@ -385,6 +419,86 @@ __global__ void GemmIq3SKernel(const float* a, const unsigned char* w,
   }
   c[idx] = acc;
 }
+// Built-in "gemm_iq3s_batched": 32 rows x 32 columns over 1024 threads;
+// each block is dequantized once into shared memory and reused across
+// the rows. Grid ceil(m / 32) * ceil(n / 32).
+__global__ void GemmIq3SBatchedKernel(const float* a, const unsigned char* w,
+                                      float* c, unsigned long long m,
+                                      unsigned long long n,
+                                      unsigned long long k) {
+  const unsigned long long tid =
+      static_cast<unsigned long long>(threadIdx.x);
+  const unsigned long long col_tiles = (n + 31) / 32;
+  const unsigned long long wg =
+      static_cast<unsigned long long>(blockIdx.x);
+  const unsigned long long row_base = (wg / col_tiles) * 32;
+  const unsigned long long col_base = (wg % col_tiles) * 32;
+  const unsigned long long my_row = tid / 32;
+  const unsigned long long my_col = tid % 32;
+  const unsigned long long row_a = row_base + my_row;
+  const unsigned long long row_w = col_base + my_col;
+  const bool active = row_a < m && row_w < n;
+  const unsigned long long blocks = k / 256;
+  __shared__ float tile[32 * 256];
+  float acc = 0.0f;
+  const unsigned long long pair = tid >> 2;
+  const unsigned long long col = pair & 31;
+  const unsigned long long sub = (pair >> 5) & 7;
+  const unsigned long long lane0 = (tid & 3) * 8;
+  const unsigned long long gc = col_base + col;
+  const unsigned long long ibpair = sub >> 1;
+  const unsigned long long part = sub & 1;
+  const unsigned long long l0 = lane0 >> 3;
+  for (unsigned long long b = 0; b < blocks; ++b) {
+    if (gc < n) {
+      const unsigned char* base = w + (gc * blocks + b) * 110;
+      std::uint16_t d_bits = 0;
+      std::memcpy(&d_bits, base, 2);
+      const float d = Fp16ToFloatDev(d_bits);
+      const unsigned long long ib = ibpair * 2;
+      const unsigned char db_byte = base[106 + ibpair];
+      const float db =
+          d * (1 + 2 * ((part == 0 ? (db_byte & 15) : (db_byte >> 4))));
+      const unsigned char qh = base[66 + ib + part];
+      const unsigned char b0 = base[2 + ib * 8 + 2 * l0];
+      const unsigned char b1 = base[2 + ib * 8 + 2 * l0 + 1];
+      const std::uint32_t g1 =
+          kIq3sGridDev[b0 | ((qh << (8 - 2 * l0)) & 256)];
+      const std::uint32_t g2 =
+          kIq3sGridDev[b1 | ((qh << (7 - 2 * l0)) & 256)];
+      const unsigned char signs = base[74 + ib * 4 + part * 4 + l0];
+      for (unsigned long long kk = 0; kk < 8; ++kk) {
+        const unsigned long long lane = lane0 + kk;
+        const unsigned long long j = (lane >> 1) & 3;
+        const unsigned long long mm = lane & 1;
+        const float m1 = (signs & (1u << j)) ? -1.0f : 1.0f;
+        const float m2 = (signs & (1u << (j + 4))) ? -1.0f : 1.0f;
+        const float gv1 = static_cast<float>((g1 >> (8 * j)) & 255u);
+        const float gv2 = static_cast<float>((g2 >> (8 * j)) & 255u);
+        const unsigned long long t = sub * 32 + l0 * 8 + j * 2 + mm;
+        tile[t * 32 + col] =
+            db * (mm == 0 ? gv1 * m1 : gv2 * m2);
+      }
+    }
+    LdsBarrier();
+    if (active) {
+      const float* ab = a + row_a * k + b * 256;
+      for (unsigned long long sub2 = 0; sub2 < 8; ++sub2) {
+        for (unsigned long long l = 0; l < 4; ++l) {
+          for (unsigned long long j = 0; j < 4; ++j) {
+            const unsigned long long tb = (sub2 * 32 + l * 8 + j * 2) * 32 + my_col;
+            acc += ab[sub2 * 32 + l * 8 + j] * tile[tb];
+            acc += ab[sub2 * 32 + l * 8 + 4 + j] * tile[tb + 32];
+          }
+        }
+      }
+    }
+    LdsBarrier();
+  }
+  if (active) {
+    c[row_a * n + row_w] = acc;
+  }
+}
 // Built-in "gemm_iq4xs_rows{R}": R-row IQ4_XS GEMV. One warp per weight
 // column decodes each 136-byte block once and applies it to all R
 // activation rows (the folding MTP verify at R = 2). The row count is a
@@ -476,6 +590,9 @@ template __global__ void GemmIq4XsRowsKernel<3>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
 template __global__ void GemmIq4XsRowsKernel<4>(
+    const float*, const unsigned char*, float*, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long);
+template __global__ void GemmIq4XsRowsKernel<5>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
 

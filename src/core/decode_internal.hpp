@@ -719,11 +719,17 @@ constexpr std::size_t kGemmVecOutputsPerBlock = 8;
 // the memory rate; splitting the k range across grid_y workgroups raises
 // the resident workgroup count. The split targets this many output
 // blocks, is capped, and must divide k/256 so every chunk covers whole
-// quant superblocks.
+// quant superblocks. Measured 2026-10-11: raising the target to 8192 (so
+// the wide n = 17408 projections split four ways) shows no gain on the
+// Qwen target, so the wide projections are bandwidth-bound already.
 constexpr std::size_t kGemmVecSplitTargetBlocks = 2048;
 // The multi-row family starts from half the workgroups (one per column),
 // so it wants more split to recover occupancy.
 constexpr std::size_t kGemmRowsSplitTargetBlocks = 2048;
+// Split-K never pays more than this factor: partials plus the reduce
+// pass cost more than extra occupancy past it. Measured 2026-10-11:
+// forcing split 1 everywhere is performance-neutral on the Qwen target,
+// so the split overhead and its occupancy gain balance at this cap.
 constexpr std::size_t kGemmVecMaxSplit = 8;
 
 // Split factor for one "_vec"/"_rows" GEMV launch: 1 keeps the plain
@@ -1092,7 +1098,7 @@ inline std::string_view GemmKernelName(DType dtype) {
     case DType::Q5K: return "gemm_q5k_vec";
     case DType::Q6K: return "gemm_q6k_vec";
     case DType::Q3K: return "gemm_q3k";
-    case DType::Q80: return "gemm_q80";
+    case DType::Q80: return "gemm_q80_vec";
     case DType::IQ4_NL: return "gemm_iq4nl";
     case DType::IQ4_XS: return "gemm_iq4xs_vec";
     case DType::IQ3_S: return "gemm_iq3s";
@@ -1116,13 +1122,18 @@ inline std::string_view EmbeddingKernelName(DType dtype) {
 }
 
 // Load (once, into `cache`) and return the kernel registered under
-// `name`, or UnsupportedFeature for an empty name. The cache key can be
-// the dtype so a map serves every kernel family.
+// `name`, or UnsupportedFeature for an empty name. A miss is remembered
+// with a null slot, so an optional kernel the backend lacks (a tensor-core
+// probe with its scalar fallback) touches the backend on the first probe
+// only instead of once per token. The cache key must imply the name.
 inline std::expected<Kernel*, StatusCode> CachedKernel(
     Backend& backend, std::unordered_map<int, std::unique_ptr<Kernel>>& cache,
     int key, std::string_view name) {
   auto it = cache.find(key);
   if (it != cache.end()) {
+    if (it->second == nullptr) {
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
     return it->second.get();
   }
   if (name.empty()) {
@@ -1130,6 +1141,9 @@ inline std::expected<Kernel*, StatusCode> CachedKernel(
   }
   auto kernel = backend.LoadKernel(name, {});
   if (!kernel) {
+    if (kernel.error() == StatusCode::UnsupportedFeature) {
+      cache.emplace(key, nullptr);
+    }
     return std::unexpected(kernel.error());
   }
   Kernel* raw = kernel->get();
@@ -1178,28 +1192,32 @@ constexpr std::size_t kGemmTiledMinCols = kDefaultTiledMinCols;
 // Multi-row GEMV kernel id ("gemm_<fmt>_rows<rows>") for a dtype and a
 // row count, or empty when there is no specialization (the caller uses the
 // per-row GEMV). The row count is baked into the kernel so its row loop
-// unrolls; the verify batches the engine runs are m = 2, 3 or 4.
+// unrolls; the verify batches the engine runs are m = 2..5.
 inline std::string_view GemmRowsKernelName(DType dtype, std::size_t rows) {
   switch (dtype) {
     case DType::Q4K:
       return rows == 2   ? "gemm_q4k_rows2"
              : rows == 3 ? "gemm_q4k_rows3"
              : rows == 4 ? "gemm_q4k_rows4"
+             : rows == 5 ? "gemm_q4k_rows5"
                          : "";
     case DType::Q5K:
       return rows == 2   ? "gemm_q5k_rows2"
              : rows == 3 ? "gemm_q5k_rows3"
              : rows == 4 ? "gemm_q5k_rows4"
+             : rows == 5 ? "gemm_q5k_rows5"
                          : "";
     case DType::Q6K:
       return rows == 2   ? "gemm_q6k_rows2"
              : rows == 3 ? "gemm_q6k_rows3"
              : rows == 4 ? "gemm_q6k_rows4"
+             : rows == 5 ? "gemm_q6k_rows5"
                          : "";
     case DType::IQ4_XS:
       return rows == 2   ? "gemm_iq4xs_rows2"
              : rows == 3 ? "gemm_iq4xs_rows3"
              : rows == 4 ? "gemm_iq4xs_rows4"
+             : rows == 5 ? "gemm_iq4xs_rows5"
                          : "";
     default:
       return {};
@@ -1215,6 +1233,7 @@ inline std::string_view GemmTiledKernelName(DType dtype) {
     case DType::Q6K: return "gemm_q6k_batched";
     case DType::IQ4_XS: return "gemm_iq4xs_batched";
     case DType::Q3K: return "gemm_q3k_batched";
+    case DType::IQ3_S: return "gemm_iq3s_batched";
     case DType::IQ4_NL: return "gemm_iq4nl_batched";
     case DType::F4E2M1: return "gemm_mxfp4_batched";
     case DType::F32: return "gemm_f32_batched";
@@ -1234,30 +1253,36 @@ inline std::expected<Kernel*, StatusCode> GemmTiledFor(
 
 // C = A x dequant(W)^T with the tiled batched kernel: each weight block
 // is dequantized once per tile and reused across the tile's rows. The
-// MXFP4 kernel tiles a 32-row x 8-column output block (so both the
-// activation and the weight reads reuse cache across the block); the
-// K-quant kernels tile kGemmTileRows rows per weight column. Same buffers
-// and scalars as ProjectDevice (m, n, k); m must be positive and k a
-// multiple of the block elements.
+// converted kernels (Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, IQ3_S, MXFP4)
+// tile a 32-row x 32-column block over 1024 threads, so activation reads
+// over 32 columns; the F32/BF16 kernels tile 32 rows x 8 columns over
+// 256 threads with the same shared staging. Same buffers and scalars as
+// ProjectDevice (m, n, k); m must be positive and k a multiple of the
+// block elements.
 inline std::expected<void, StatusCode> ProjectTiledDevice(
     Backend& backend, const Kernel& kernel, const Buffer& a, const Buffer& w,
     Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
   KernelLaunch launch;
-  if (kernel.Id() == "gemm_mxfp4_batched" ||
-      kernel.Id() == "gemm_f32_batched" ||
-      kernel.Id() == "gemm_bf16_batched" ||
-      kernel.Id() == "gemm_q4k_batched" ||
+  if (kernel.Id() == "gemm_q4k_batched" ||
       kernel.Id() == "gemm_q5k_batched" ||
-      kernel.Id() == "gemm_q6k_batched" ||
-      kernel.Id() == "gemm_iq4xs_batched" ||
-      kernel.Id() == "gemm_q3k_batched" ||
-      kernel.Id() == "gemm_iq4nl_batched") {
+             kernel.Id() == "gemm_q6k_batched" ||
+             kernel.Id() == "gemm_iq4xs_batched" ||
+             kernel.Id() == "gemm_q3k_batched" ||
+             kernel.Id() == "gemm_iq4nl_batched" ||
+             kernel.Id() == "gemm_mxfp4_batched" ||
+             kernel.Id() == "gemm_iq3s_batched") {
+    launch.grid_x =
+        static_cast<std::uint32_t>(((m + 31) / 32) * ((n + 31) / 32));
+    launch.block_x = 1024;
+  } else if (kernel.Id() == "gemm_f32_batched" ||
+             kernel.Id() == "gemm_bf16_batched") {
     launch.grid_x = static_cast<std::uint32_t>(((m + 31) / 32) * ((n + 7) / 8));
+    launch.block_x = 256;
   } else {
     launch.grid_x = static_cast<std::uint32_t>(
         ((m + kGemmTileRows - 1) / kGemmTileRows) * n);
+    launch.block_x = 256;
   }
-  launch.block_x = 256;
   launch.buffers = {&a, &w, &c};
   launch.scalars = {m, n, k};
   return backend.LaunchKernel(kernel, launch);

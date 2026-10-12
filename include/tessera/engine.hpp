@@ -168,6 +168,12 @@ struct GenerateOutcome {
   // run.
   double prefill_ms = 0.0;
   double decode_ms = 0.0;
+  // Wall time of the prefill chunk forwards alone (fractional
+  // milliseconds). Excludes the one-time trunk init hoisted before the
+  // prefill clock, so this is the llama.cpp-comparable prompt number;
+  // prefill_ms above stays the end-to-end serving number. Zero when the
+  // path has no batched forward.
+  double prefill_compute_ms = 0.0;
 };
 
 // Top-level facade: owns the backend and the loaded models.
@@ -212,11 +218,12 @@ class Engine {
 
   // Greedy generation for several prompts at once. Each sequence owns its
   // own cache; the loop admits every sequence and retires one at its stop
-  // token or budget, so the sequences share the decode loop. The produced
-  // tokens of each request equal a separate greedy Generate for it.
-  // `max_completion_tokens` applies per request. This is the scheduling
-  // half of continuous batching; the compute is still one sequence per
-  // step.
+  // token or budget, so the sequences share the decode loop. Prefill runs
+  // chunk by chunk alongside decodes, so a long prompt does not stall the
+  // others. The produced tokens of each request equal a separate greedy
+  // Generate for it. `max_completion_tokens` applies per request. This is
+  // the scheduling half of continuous batching; the compute is still one
+  // sequence per step.
   //
   // Usage:
   //   std::vector<GenerateOptions> requests = ...;

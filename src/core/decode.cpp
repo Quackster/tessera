@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "core/decode_internal.hpp"
+#include "core/timing.hpp"
 
 namespace tessera::core {
 
@@ -119,7 +120,7 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* hidden_out,
     const Buffer* embeddings, std::size_t chunk_tokens,
-    const PrefillProgress* progress) {
+    const PrefillProgress* progress, double* compute_ms) {
   if (tokens.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -141,9 +142,13 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
         tokens.size(), want, /*base=*/0, heads, head_dim);
     if (lens.size() == 1 && lens[0] == tokens.size()) {
       std::vector<float> logits;
+      const auto batch_started = PhaseClock::now();
       auto status = arch->ForwardBatch(backend, model, cache, tokens, &logits,
                                        hidden_out, /*all_logits=*/false,
                                        embeddings);
+      if (compute_ms != nullptr) {
+        *compute_ms += ElapsedMsDouble(batch_started, PhaseClock::now());
+      }
       if (!status) {
         return std::unexpected(status.error());
       }
@@ -178,10 +183,14 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
       }
       std::vector<float>* chunk_hidden = last ? hidden_out : nullptr;
       std::vector<float> chunk_logits;
+      const auto batch_started = PhaseClock::now();
       auto status = arch->ForwardBatch(
           backend, model, cache, tokens.subspan(off, len),
           last ? &chunk_logits : nullptr, chunk_hidden,
           /*all_logits=*/false, chunk_emb);
+      if (compute_ms != nullptr) {
+        *compute_ms += ElapsedMsDouble(batch_started, PhaseClock::now());
+      }
       if (!status) {
         return std::unexpected(status.error());
       }
@@ -195,13 +204,18 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
     }
     return logits;
   }
+  const auto seq_started = PhaseClock::now();
   for (std::size_t i = 0; i + 1 < tokens.size(); ++i) {
     auto forward = DecodeForward(backend, model, cache, tokens[i]);
     if (!forward) {
       return std::unexpected(forward.error());
     }
   }
-  return DecodeLogits(backend, model, cache, tokens.back(), hidden_out);
+  auto logits = DecodeLogits(backend, model, cache, tokens.back(), hidden_out);
+  if (compute_ms != nullptr) {
+    *compute_ms += ElapsedMsDouble(seq_started, PhaseClock::now());
+  }
+  return logits;
 }
 
 std::expected<std::vector<std::vector<float>>, StatusCode> DecodeLogitsBatch(

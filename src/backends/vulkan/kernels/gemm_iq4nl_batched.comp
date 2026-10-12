@@ -1,10 +1,12 @@
 #version 450
 
-// Tiled batched IQ4_NL GEMM: one workgroup covers 32 activation rows x 8
-// weight columns with one thread per output. A block is 18 bytes: d fp16
-// then 16 nibble bytes; the element order matches the scalar gemm_iq4nl.
-// Dispatch is ceil(m / 32) * ceil(n / 8) workgroups of 256.
-layout(local_size_x = 256) in;
+// Tiled batched IQ4_NL GEMM: one workgroup covers 32 activation rows x 32
+// weight columns over 1024 threads. A block is 18 bytes (d fp16 then 16
+// nibble bytes); eight blocks form one 256-element tile that is
+// dequantized once into shared memory and reused across the 32 rows. The
+// element order matches the scalar gemm_iq4nl. Dispatch is ceil(m / 32) *
+// ceil(n / 32) workgroups of 1024.
+layout(local_size_x = 1024) in;
 
 // "gemm_iq4nl_batched" contract (tessera API): buffers and scalars match
 // gemm_iq4nl (m, n, k, k a multiple of 32). Scalars are 64-bit, so field
@@ -24,6 +26,8 @@ layout(set = 0, binding = 1) readonly buffer W {
 layout(set = 0, binding = 2) writeonly buffer C {
   float c[];
 };
+
+shared float tile[8192];
 
 // IQ4 codebook (ports kvalues_iq4nl).
 const int kValues[16] =
@@ -56,25 +60,49 @@ void main() {
   uint n = pc.v[2];
   uint k = pc.v[4];
   uint tid = gl_LocalInvocationID.x;
-  uint col_tiles = (n + 7u) / 8u;
+  uint col_tiles = (n + 31u) / 32u;
   uint wg = gl_WorkGroupID.x;
-  uint row_a = (wg / col_tiles) * 32u + tid / 8u;
-  uint row_w = (wg % col_tiles) * 8u + tid % 8u;
-  if (row_a >= m || row_w >= n) {
-    return;
-  }
+  uint row_base = (wg / col_tiles) * 32u;
+  uint col_base = (wg % col_tiles) * 32u;
+  uint my_row = tid / 32u;
+  uint my_col = tid % 32u;
+  uint row_a = row_base + my_row;
+  uint row_w = col_base + my_col;
+  bool has_out = row_a < m && row_w < n;
   uint blocks = k / 32u;
-  uint abase = row_a * k;
-  uint wbase = row_w * (blocks * 18u);
   float acc = 0.0;
-  for (uint b = 0u; b < blocks; ++b) {
-    uint base = wbase + b * 18u;
-    float d = fp16_at(base);
-    for (uint j = 0u; j < 16u; ++j) {
-      uint q = wbyte(base + 2u + j);
-      acc += a[abase + b * 32u + j] * (d * float(kValues[q & 15u]));
-      acc += a[abase + b * 32u + j + 16u] * (d * float(kValues[q >> 4u]));
+  uint pair = tid >> 2u;
+  uint col = pair & 31u;
+  uint sub = (pair >> 5u) & 7u;
+  uint lane0 = (tid & 3u) * 8u;
+  uint gc = col_base + col;
+  for (uint bb = 0u; bb < blocks; bb += 8u) {
+    uint subs = blocks - bb < 8u ? blocks - bb : 8u;
+    if (gc < n && sub < subs) {
+      uint base = gc * (blocks * 18u) + (bb + sub) * 18u;
+      float d = fp16_at(base);
+      for (uint kk = 0u; kk < 8u; ++kk) {
+        uint lane = lane0 + kk;
+        uint q = wbyte(base + 2u + (lane & 15u));
+        uint nib = lane < 16u ? (q & 15u) : (q >> 4u);
+        tile[(sub * 32u + lane) * 32u + col] = d * float(kValues[nib]);
+      }
     }
+    barrier();
+    if (has_out) {
+      uint abase = row_a * k + bb * 32u;
+      for (uint sub = 0u; sub < subs; ++sub) {
+        for (uint l = 0u; l < 16u; ++l) {
+          uint lo = sub * 32u + l;
+          uint hi = lo + 16u;
+          acc += a[abase + lo] * tile[lo * 32u + my_col];
+          acc += a[abase + hi] * tile[hi * 32u + my_col];
+        }
+      }
+    }
+    barrier();
   }
-  c[row_a * n + row_w] = acc;
+  if (has_out) {
+    c[row_a * n + row_w] = acc;
+  }
 }

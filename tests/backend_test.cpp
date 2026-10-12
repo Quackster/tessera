@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "core/decode_internal.hpp"
@@ -1586,8 +1587,9 @@ TEST(BackendTest, GemmQ4KDeviceMatchesRef) {
 }
 
 // Device: the tiled batched Q4_K GEMM (one workgroup covers 32 activation
-// rows x 8 weight columns, one output per thread) matches the reference,
-// including a row count that is not a multiple of the 32-row tile.
+// rows x 32 weight columns, weights shared across the rows) matches the
+// reference, including a non-multiple-of-32 row count and a multi-tile
+// multi-block shape that exercises the shared reuse across row tiles.
 TEST(BackendTest, GemmQ4KBatchedMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -1597,18 +1599,18 @@ TEST(BackendTest, GemmQ4KBatchedMatchesRef) {
   }
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   std::mt19937 rng(2027);
-  constexpr std::size_t kM = 40;   // 32-row tile plus an 8-row remainder
-  constexpr std::size_t kN = 24;   // 3 column tiles
-  constexpr std::size_t kK = 256;  // 1 block
-  std::vector<float> a(kM * kK);
-  for (auto& v : a) {
-    v = DrawValue(rng);
-  }
-  std::vector<std::byte> w = RandomBlocks(rng, kN, 144, 0);
-  for (std::size_t r = 0; r < kN; ++r) {  // small dmin, keeps the min term
-    w[r * 144 + 2] = std::byte{0};
-    w[r * 144 + 3] = std::byte{0x20};
-  }
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{40, 24, 256},
+        {96, 48, 512}}) {
+    std::vector<float> a(kM * kK);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    std::vector<std::byte> w = RandomBlocks(rng, kN * (kK / 256), 144, 0);
+    for (std::size_t r = 0; r < kN * (kK / 256); ++r) {
+      w[r * 144 + 2] = std::byte{0};  // small dmin, keeps the min term
+      w[r * 144 + 3] = std::byte{0x20};
+    }
   auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
   auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
   auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
@@ -1639,11 +1641,14 @@ TEST(BackendTest, GemmQ4KBatchedMatchesRef) {
     max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
   }
   EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
+      << "backend " << backend->Name() << " max_abs " << max_abs << " m=" << kM
+      << " n=" << kN << " k=" << kK;
+  }
 }
 
-// Device: the tiled batched Q6_K GEMM (32 rows x 8 columns, one output per
-// thread) matches the reference, including a non-multiple-of-32 row count.
+// Device: the tiled batched Q6_K GEMM (32 rows x 32 columns, weights shared
+// across the rows) matches the reference, including a non-multiple-of-32
+// row count and a multi-tile multi-block shape.
 TEST(BackendTest, GemmQ6KBatchedMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -1653,14 +1658,15 @@ TEST(BackendTest, GemmQ6KBatchedMatchesRef) {
   }
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   std::mt19937 rng(2028);
-  constexpr std::size_t kM = 40;
-  constexpr std::size_t kN = 24;
-  constexpr std::size_t kK = 256;
-  std::vector<float> a(kM * kK);
-  for (auto& v : a) {
-    v = DrawValue(rng);
-  }
-  std::vector<std::byte> w = RandomBlocks(rng, kN, 210, 208);
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{40, 24, 256},
+        {96, 48, 512}}) {
+    std::vector<float> a(kM * kK);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    std::vector<std::byte> w =
+        RandomBlocks(rng, kN * (kK / 256), 210, 208);
   auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
   auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
   auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
@@ -1691,11 +1697,14 @@ TEST(BackendTest, GemmQ6KBatchedMatchesRef) {
     max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
   }
   EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
+      << "backend " << backend->Name() << " max_abs " << max_abs << " m=" << kM
+      << " n=" << kN << " k=" << kK;
+  }
 }
 
-// Device: the tiled batched Q5_K GEMM (32 rows x 8 columns, one output per
-// thread) matches the reference, including a non-multiple-of-32 row count.
+// Device: the tiled batched Q5_K GEMM (32 rows x 32 columns, weights shared
+// across the rows) matches the reference, including a non-multiple-of-32
+// row count and a multi-tile multi-block shape.
 TEST(BackendTest, GemmQ5KBatchedMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -1705,18 +1714,18 @@ TEST(BackendTest, GemmQ5KBatchedMatchesRef) {
   }
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   std::mt19937 rng(2029);
-  constexpr std::size_t kM = 40;
-  constexpr std::size_t kN = 24;
-  constexpr std::size_t kK = 256;
-  std::vector<float> a(kM * kK);
-  for (auto& v : a) {
-    v = DrawValue(rng);
-  }
-  std::vector<std::byte> w = RandomBlocks(rng, kN, 176, 0);
-  for (std::size_t r = 0; r < kN; ++r) {  // small dmin, keeps the min term
-    w[r * 176 + 2] = std::byte{0};
-    w[r * 176 + 3] = std::byte{0x20};
-  }
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{40, 24, 256},
+        {96, 48, 512}}) {
+    std::vector<float> a(kM * kK);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    std::vector<std::byte> w = RandomBlocks(rng, kN * (kK / 256), 176, 0);
+    for (std::size_t r = 0; r < kN * (kK / 256); ++r) {
+      w[r * 176 + 2] = std::byte{0};  // small dmin, keeps the min term
+      w[r * 176 + 3] = std::byte{0x20};
+    }
   auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
   auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
   auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
@@ -1747,12 +1756,14 @@ TEST(BackendTest, GemmQ5KBatchedMatchesRef) {
     max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
   }
   EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
+      << "backend " << backend->Name() << " max_abs " << max_abs << " m=" << kM
+      << " n=" << kN << " k=" << kK;
+  }
 }
 
-// Device: the tiled batched IQ4_XS GEMM (32 rows x 8 columns, one output
-// per thread) matches the reference, including a non-multiple-of-32 row
-// count.
+// Device: the tiled batched IQ4_XS GEMM (32 rows x 32 columns, weights shared
+// across the rows) matches the reference, including a non-multiple-of-32
+// row count and a multi-tile multi-block shape.
 TEST(BackendTest, GemmIq4XsBatchedMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -1762,14 +1773,14 @@ TEST(BackendTest, GemmIq4XsBatchedMatchesRef) {
   }
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   std::mt19937 rng(2030);
-  constexpr std::size_t kM = 40;
-  constexpr std::size_t kN = 24;
-  constexpr std::size_t kK = 256;
-  std::vector<float> a(kM * kK);
-  for (auto& v : a) {
-    v = DrawValue(rng);
-  }
-  std::vector<std::byte> w = RandomBlocks(rng, kN, 136, 0);
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{40, 24, 256},
+        {96, 48, 512}}) {
+    std::vector<float> a(kM * kK);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    std::vector<std::byte> w = RandomBlocks(rng, kN * (kK / 256), 136, 0);
   auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
   auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
   auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
@@ -1800,11 +1811,14 @@ TEST(BackendTest, GemmIq4XsBatchedMatchesRef) {
     max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
   }
   EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
+      << "backend " << backend->Name() << " max_abs " << max_abs << " m=" << kM
+      << " n=" << kN << " k=" << kK;
+  }
 }
 
-// Device: the tiled batched Q3_K GEMM (32 rows x 8 columns, one output per
-// thread) matches the reference, including a non-multiple-of-32 row count.
+// Device: the tiled batched Q3_K GEMM (32 rows x 32 columns, weights shared
+// across the rows) matches the reference, including a non-multiple-of-32
+// row count and a multi-tile multi-block shape.
 TEST(BackendTest, GemmQ3KBatchedMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -1814,14 +1828,15 @@ TEST(BackendTest, GemmQ3KBatchedMatchesRef) {
   }
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   std::mt19937 rng(2031);
-  constexpr std::size_t kM = 40;
-  constexpr std::size_t kN = 24;
-  constexpr std::size_t kK = 256;
-  std::vector<float> a(kM * kK);
-  for (auto& v : a) {
-    v = DrawValue(rng);
-  }
-  std::vector<std::byte> w = RandomBlocks(rng, kN, 110, 108);
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{40, 24, 256},
+        {96, 48, 512}}) {
+    std::vector<float> a(kM * kK);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    std::vector<std::byte> w =
+        RandomBlocks(rng, kN * (kK / 256), 110, 108);
   auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
   auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
   auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
@@ -1852,12 +1867,14 @@ TEST(BackendTest, GemmQ3KBatchedMatchesRef) {
     max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
   }
   EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
+      << "backend " << backend->Name() << " max_abs " << max_abs << " m=" << kM
+      << " n=" << kN << " k=" << kK;
+  }
 }
 
-// Device: the tiled batched IQ4_NL GEMM (32 rows x 8 columns, one output
-// per thread) matches the reference, including a non-multiple-of-32 row
-// count.
+// Device: the tiled batched IQ4_NL GEMM (32 rows x 32 columns, weights
+// shared across the rows) matches the reference, including a
+// non-multiple-of-32 row count and a multi-tile multi-block shape.
 TEST(BackendTest, GemmIq4NlBatchedMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -1867,14 +1884,14 @@ TEST(BackendTest, GemmIq4NlBatchedMatchesRef) {
   }
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   std::mt19937 rng(2032);
-  constexpr std::size_t kM = 40;
-  constexpr std::size_t kN = 24;
-  constexpr std::size_t kK = 32;
-  std::vector<float> a(kM * kK);
-  for (auto& v : a) {
-    v = DrawValue(rng);
-  }
-  std::vector<std::byte> w = RandomBlocks(rng, kN, 18, 0);
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{40, 24, 32},
+        {96, 48, 128}}) {
+    std::vector<float> a(kM * kK);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    std::vector<std::byte> w = RandomBlocks(rng, kN * (kK / 32), 18, 0);
   auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
   auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
   auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
@@ -1905,12 +1922,69 @@ TEST(BackendTest, GemmIq4NlBatchedMatchesRef) {
     max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
   }
   EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
+      << "backend " << backend->Name() << " max_abs " << max_abs << " m=" << kM
+      << " n=" << kN << " k=" << kK;
+  }
 }
 
-// Device: the tiled batched MXFP4 GEMM (weight blocks dequantized once per
-// 8-row tile) matches the reference, including a row count that is not a
-// multiple of the tile.
+// Device: the tiled batched IQ3_S GEMM (32 rows x 32 columns, weight blocks
+// dequantized once per tile) matches the reference, including a
+// non-multiple-of-32 row count and a multi-tile multi-block shape.
+TEST(BackendTest, GemmIq3SBatchedMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  auto kernel = backend->LoadKernel("gemm_iq3s_batched", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no tiled IQ3_S kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  std::mt19937 rng(2033);
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{40, 24, 256},
+        {96, 48, 512}}) {
+    std::vector<float> a(kM * kK);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    std::vector<std::byte> w = RandomBlocks(rng, kN * (kK / 256), 110, 0);
+    auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+    auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+    auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+    ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+    ASSERT_TRUE(backend->CopyH2D(**a_buf,
+                                 std::span<const std::byte>(
+                                     reinterpret_cast<const std::byte*>(a.data()),
+                                     a.size() * 4))
+                    .has_value());
+    ASSERT_TRUE(
+        backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+    auto launch = core::detail::ProjectTiledDevice(
+        *backend, **kernel, **a_buf, **w_buf, **c_buf, kM, kN, kK);
+    ASSERT_TRUE(launch.has_value()) << tessera::ToString(launch.error());
+    backend->Synchronize();
+    std::vector<std::byte> readback(kM * kN * 4);
+    ASSERT_TRUE(
+        backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+    const auto* got = reinterpret_cast<const float*>(readback.data());
+    std::vector<float> ref(kM * kN);
+    auto ref_status = core::GemmIq3SRef(
+        std::span<const float>(a), std::span<const std::byte>(w),
+        std::span<float>(ref), kM, kN, kK);
+    ASSERT_TRUE(ref_status.has_value()) << tessera::ToString(ref_status.error());
+    const FpTolerance tol = FpToleranceFor(backend->Name());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << "backend " << backend->Name() << " max_abs " << max_abs << " m=" << kM
+        << " n=" << kN << " k=" << kK;
+  }
+}
+
+// Device: the tiled batched MXFP4 GEMM (32 rows x 32 columns, weight blocks
+// dequantized once per tile) matches the reference, including a
+// non-multiple-of-32 row count and a multi-tile multi-block shape.
 TEST(BackendTest, GemmMxFp4BatchedMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -1920,12 +1994,12 @@ TEST(BackendTest, GemmMxFp4BatchedMatchesRef) {
   }
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   std::mt19937 rng(2026);
-  constexpr std::size_t kM = 10;
-  constexpr std::size_t kN = 32;
-  constexpr std::size_t kK = 64;
-  constexpr float kGrid[8] = {0.0f, 0.5f, 1.0f, 1.5f,
-                              2.0f, 3.0f, 4.0f, 6.0f};
-  std::vector<float> a(kM * kK);
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{10, 32, 64},
+        {40, 48, 128}}) {
+    constexpr float kGrid[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                                2.0f, 3.0f, 4.0f, 6.0f};
+    std::vector<float> a(kM * kK);
   std::vector<std::byte> w(kN * kK / 2, std::byte{0});
   std::vector<std::byte> s(kN * kK / 32);
   for (auto& v : a) {
@@ -1988,9 +2062,12 @@ TEST(BackendTest, GemmMxFp4BatchedMatchesRef) {
                        std::abs(got[i] - ref[i]) / std::max(1.0f, std::abs(ref[i])));
   }
   EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
+      << "backend " << backend->Name() << " max_abs " << max_abs << " m=" << kM
+      << " n=" << kN << " k=" << kK;
   EXPECT_LE(max_rel, tol.rel)
-      << "backend " << backend->Name() << " max_rel " << max_rel;
+      << "backend " << backend->Name() << " max_rel " << max_rel << " m=" << kM
+      << " n=" << kN << " k=" << kK;
+  }
 }
 
 // Device: the coalesced Q4_K GEMV (one workgroup per output, shared-memory
@@ -4036,15 +4113,16 @@ TEST(BackendTest, GemmF32DeviceMatchesRef) {
 
 // Device: the tiled batched F32/BF16 GEMMs (the DFlash2 draft and the
 // target's batch-verify head) match the host reference for m > 1,
-// including a k that is not a multiple of the four-wide inner step.
+// including a k that is not a multiple of the four-wide inner step and a
+// multi-tile shape with a partial k-slice tail.
 TEST(BackendTest, GemmBatchedF32Bf16DeviceMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
   std::mt19937 rng(97);
-  constexpr std::size_t kM = 3;
-  constexpr std::size_t kN = 4;
-  constexpr std::size_t kK = 5;
-  std::vector<float> a(kM * kK), w_f32(kN * kK);
+  for (const auto [kM, kN, kK] :
+       {std::tuple<std::size_t, std::size_t, std::size_t>{3, 4, 5},
+        {40, 48, 70}}) {
+    std::vector<float> a(kM * kK), w_f32(kN * kK);
   for (auto& v : a) v = DrawValue(rng);
   for (auto& v : w_f32) v = DrawValue(rng);
   std::vector<std::byte> w_bf16(kN * kK * 2);
@@ -4112,7 +4190,9 @@ TEST(BackendTest, GemmBatchedF32Bf16DeviceMatchesRef) {
       max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
     }
     EXPECT_LE(max_abs, tol.abs)
-        << name << " backend " << backend->Name() << " max_abs " << max_abs;
+        << name << " backend " << backend->Name() << " max_abs " << max_abs
+        << " m=" << kM << " n=" << kN << " k=" << kK;
+  }
   }
 }
 // reference converts the same bf16 bits).
@@ -4170,6 +4250,65 @@ TEST(BackendTest, GemmBf16DeviceMatchesRef) {
   }
   EXPECT_LE(max_abs, tol.abs)
       << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: the small-batch bf16 GEMV matches the host reference: one warp
+// per weight column accumulates all m rows.
+TEST(BackendTest, GemmBf16RowsMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(92);
+  constexpr std::size_t kM = 3;
+  constexpr std::size_t kN = 24;
+  constexpr std::size_t kK = 64;
+  std::vector<float> a(kM * kK, 0.0f);
+  for (auto& v : a) v = DrawValue(rng);
+  std::vector<std::byte> w_bf16(kN * kK * 2);
+  for (std::size_t i = 0; i < kN * kK; ++i) {
+    const float value = DrawValue(rng);
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint16_t bf = static_cast<std::uint16_t>(bits >> 16);
+    w_bf16[i * 2] = static_cast<std::byte>(bf & 0xFF);
+    w_bf16[i * 2 + 1] = static_cast<std::byte>((bf >> 8) & 0xFF);
+  }
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w_bf16.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf && w_buf && c_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **a_buf, std::span<const std::byte>(
+                               reinterpret_cast<const std::byte*>(a.data()),
+                               a.size() * 4))
+                  .has_value());
+  ASSERT_TRUE(backend->CopyH2D(**w_buf, std::span<const std::byte>(w_bf16))
+                  .has_value());
+  auto kernel = backend->LoadKernel("gemm_bf16_rows", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = tessera::core::detail::GemmGridFor(**kernel, kM, kN);
+  launch.block_x = 256;
+  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+  launch.scalars = {kM, kN, kK};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kM * kN * 4);
+  ASSERT_TRUE(backend->CopyD2H(**c_buf, readback.data(), readback.size())
+                  .has_value());
+  std::vector<float> ref(kM * kN);
+  ASSERT_TRUE(core::GemmBf16Ref(std::span<const float>(a),
+                                std::span<const std::byte>(w_bf16),
+                                std::span<float>(ref), kM, kN, kK)
+                  .has_value());
+  const auto* got_rows = reinterpret_cast<const float*>(readback.data());
+  const AttentionTolerance tol_rows = AttentionToleranceFor(backend->Name());
+  float max_abs_rows = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) {
+    max_abs_rows =
+        std::max(max_abs_rows, std::abs(got_rows[i] - ref[i]));
+  }
+  EXPECT_LE(max_abs_rows, tol_rows.abs)
+      << "backend " << backend->Name() << " max_abs " << max_abs_rows;
 }
 
 // Device: the token-embedding gather matches a host gather for f32, bf16
@@ -5583,6 +5722,135 @@ TEST(BackendTest, QuantizeFp8PackMatchesRef) {
   }
 }
 
+// Device: the wide-row fp8 pack matches the host reference exactly.
+TEST(BackendTest, QuantizeFp8PackRowsMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(111);
+  constexpr std::size_t kRows = 2, kCols = 8;
+  std::vector<float> in(kRows * kCols);
+  for (auto& v : in) v = DrawValue(rng);
+  auto in_buf = backend->AllocateBuffer(in.size() * 4, MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(in.size(), MemoryKind::Device);
+  auto scale_buf = backend->AllocateBuffer(kRows * 4, MemoryKind::Device);
+  ASSERT_TRUE(in_buf && out_buf && scale_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **in_buf, std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(in.data()),
+                                in.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("quantize_fp8_pack_rows", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no quantize_fp8_pack_rows kernel on "
+                 << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = kRows;
+  launch.block_x = 1024;
+  launch.buffers = {(*in_buf).get(), (*out_buf).get(), (*scale_buf).get()};
+  launch.scalars = {kRows, kCols};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> got(in.size()), ref(in.size());
+  std::vector<float> got_scale(kRows), ref_scale(kRows);
+  backend->CopyD2H(**out_buf, got.data(), got.size());
+  backend->CopyD2H(**scale_buf, reinterpret_cast<std::byte*>(got_scale.data()),
+                   got_scale.size() * 4);
+  ASSERT_TRUE(core::QuantizeFp8PackRef(std::span<const float>(in),
+                                       std::span<std::byte>(ref),
+                                       std::span<float>(ref_scale), kRows, kCols)
+                  .has_value());
+  EXPECT_EQ(got, ref);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    EXPECT_FLOAT_EQ(got_scale[r], ref_scale[r]);
+  }
+}
+
+// Device: the MXFP4 per-row scale max matches the host loop exactly.
+TEST(BackendTest, MxFp4RowRefMatchesHost) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(112);
+  constexpr std::size_t kN = 8, kK = 64;
+  constexpr std::size_t kBlocks = kK / 32;
+  std::vector<std::byte> w(kN * kK / 2 + kN * kBlocks);
+  for (auto& b : w) {
+    b = static_cast<std::byte>(rng() & 0xFF);
+  }
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto ref_buf = backend->AllocateBuffer(kN, MemoryKind::Device);
+  ASSERT_TRUE(w_buf && ref_buf);
+  ASSERT_TRUE(
+      backend->CopyH2D(**w_buf, std::span<const std::byte>(w)).has_value());
+  auto kernel = backend->LoadKernel("mxfp4_row_ref", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no mxfp4_row_ref kernel on " << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kN + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*w_buf).get(), (*ref_buf).get()};
+  launch.scalars = {kN, kK};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> got(kN);
+  ASSERT_TRUE(backend->CopyD2H(**ref_buf, got.data(), got.size()).has_value());
+  const std::byte* scales = w.data() + kN * kK / 2;
+  for (std::size_t r = 0; r < kN; ++r) {
+    std::uint8_t want = 0;
+    for (std::size_t b = 0; b < kBlocks; ++b) {
+      const auto s = static_cast<std::uint8_t>(scales[r * kBlocks + b]);
+      want = s > want ? s : want;
+    }
+    EXPECT_EQ(static_cast<std::uint8_t>(got[r]), want) << "row " << r;
+  }
+}
+
+// Device: the WMMA split reduce sums partials in order exactly.
+TEST(BackendTest, GemmMxFp4WmmaReduceMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(113);
+  constexpr std::size_t kTotal = 32, kSplit = 4;
+  std::vector<float> part(kTotal * kSplit);
+  for (auto& v : part) v = DrawValue(rng);
+  auto part_buf = backend->AllocateBuffer(part.size() * 4, MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kTotal * 4, MemoryKind::Device);
+  ASSERT_TRUE(part_buf && c_buf);
+  ASSERT_TRUE(backend->CopyH2D(
+                  **part_buf,
+                  std::span<const std::byte>(
+                      reinterpret_cast<const std::byte*>(part.data()),
+                      part.size() * 4))
+                  .has_value());
+  auto kernel = backend->LoadKernel("gemm_mxfp4_wmma_reduce", {});
+  if (!kernel && kernel.error() == StatusCode::UnsupportedFeature) {
+    GTEST_SKIP() << "no gemm_mxfp4_wmma_reduce kernel on "
+                 << backend->Name();
+  }
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = (kTotal + 255) / 256;
+  launch.block_x = 256;
+  launch.buffers = {(*part_buf).get(), (*c_buf).get()};
+  launch.scalars = {kTotal, kSplit};
+  ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kTotal * 4);
+  ASSERT_TRUE(
+      backend->CopyD2H(**c_buf, readback.data(), readback.size()).has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  for (std::size_t i = 0; i < kTotal; ++i) {
+    float want = 0.0f;
+    for (std::size_t s = 0; s < kSplit; ++s) {
+      want += part[s * kTotal + i];
+    }
+    EXPECT_FLOAT_EQ(got[i], want) << "element " << i;
+  }
+}
+
 // Device: FP8 E4M3 GQA attention (the fp8 KV read) matches the host
 // reference within per-backend tolerance.
 TEST(BackendTest, AttentionFp8DeviceMatchesRef) {
@@ -6185,4 +6453,125 @@ static void ExpectGemvRowsMatchesRef(std::unique_ptr<Backend>& backend,
 
 
 
+
+// Device: the warp-per-output Q8_0 GEMV matches the host reference. The
+// narrow n keeps split-K on, so the engine's partials plus reduce path
+// is covered too.
+TEST(BackendTest, GemmQ80VecMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97532);
+  constexpr std::size_t kM = 1;
+  constexpr std::size_t kN = 48;
+  constexpr std::size_t kK = 5120;
+  const std::size_t row_bytes = (kK / 32) * 34;
+  std::vector<std::byte> w = RandomBlocks(rng, kN, row_bytes, 0);
+  for (std::size_t r = 0; r < kN; ++r) {
+    for (std::size_t b = 0; b < kK / 32; ++b) {
+      std::byte* base = w.data() + r * row_bytes + b * 34;
+      base[0] = std::byte{0};
+      base[1] = std::byte{0x20};
+    }
+  }
+  ExpectGemvVecMatchesRef(backend, "gemm_q80_vec", w, kM, kN, kK,
+                           core::GemmQ80Ref);
+}
+
+// The warp-per-output Q4_K GEMV matches the host reference.
+TEST(BackendTest, GemmQ4KVecMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97537);
+  constexpr std::size_t kM = 1;
+  constexpr std::size_t kN = 48;
+  constexpr std::size_t kK = 512;
+  auto w = RandomVecBlocks(rng, kN, kK, 144, 0);
+  // Finite block scales in every block (not just the first per row), so
+  // the absolute tolerance stays meaningful: random dmin bytes otherwise
+  // reach magnitudes where last-ulp association noise exceeds it.
+  for (std::size_t r = 0; r < kN; ++r) {
+    for (std::size_t b = 0; b < kK / 256; ++b) {
+      std::byte* base = w.data() + r * (kK / 256) * 144 + b * 144;
+      base[0] = std::byte{0};
+      base[1] = std::byte{0x20};
+      base[2] = std::byte{0};
+      base[3] = std::byte{0x20};
+    }
+  }
+  ExpectGemvVecMatchesRef(backend, "gemm_q4k_vec", w, kM, kN, kK,
+                           core::GemmQ4KRef);
+}
+
+// The 5-row multi-row GEMV family matches the host references, covering
+// the longer verify shape the engine runs for bigger draft blocks.
+TEST(BackendTest, GemmQ4KRows5MatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97533);
+  auto w = RandomVecBlocks(rng, 24, 512, 144, 0);
+  for (std::size_t r = 0; r < 24; ++r) {
+    for (std::size_t b = 0; b < 2; ++b) {
+      std::byte* base = w.data() + r * 2 * 144 + b * 144;
+      base[0] = std::byte{0};
+      base[1] = std::byte{0x20};
+      base[2] = std::byte{0};
+      base[3] = std::byte{0x20};
+    }
+  }
+  ExpectGemvRowsMatchesRef(backend, "gemm_q4k_rows5", w, 5, 24, 512,
+                            core::GemmQ4KRef);
+}
+
+// The 5-row Q5_K multi-row GEMV matches the host reference.
+TEST(BackendTest, GemmQ5KRows5MatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97534);
+  auto w = RandomVecBlocks(rng, 24, 512, 176, 0);
+  for (std::size_t r = 0; r < 24; ++r) {
+    for (std::size_t b = 0; b < 2; ++b) {
+      std::byte* base = w.data() + r * 2 * 176 + b * 176;
+      base[0] = std::byte{0};
+      base[1] = std::byte{0x20};
+      base[2] = std::byte{0};
+      base[3] = std::byte{0x20};
+    }
+  }
+  ExpectGemvRowsMatchesRef(backend, "gemm_q5k_rows5", w, 5, 24, 512,
+                            core::GemmQ5KRef);
+}
+
+// The 5-row Q6_K multi-row GEMV matches the host reference.
+TEST(BackendTest, GemmQ6KRows5MatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97535);
+  auto w = RandomVecBlocks(rng, 24, 512, 210, 0);
+  for (std::size_t r = 0; r < 24; ++r) {
+    for (std::size_t b = 0; b < 2; ++b) {
+      std::byte* base = w.data() + r * 2 * 210 + b * 210;
+      base[208] = std::byte{0};
+      base[209] = std::byte{0x20};
+    }
+  }
+  ExpectGemvRowsMatchesRef(backend, "gemm_q6k_rows5", w, 5, 24, 512,
+                            core::GemmQ6KRef);
+}
+
+// The 5-row IQ4_XS multi-row GEMV matches the host reference.
+TEST(BackendTest, GemmIq4XsRows5MatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97536);
+  auto w = RandomVecBlocks(rng, 24, 512, 136, 0);
+  for (std::size_t r = 0; r < 24; ++r) {
+    for (std::size_t b = 0; b < 2; ++b) {
+      std::byte* base = w.data() + r * 2 * 136 + b * 136;
+      base[0] = std::byte{0};
+      base[1] = std::byte{0x20};
+    }
+  }
+  ExpectGemvRowsMatchesRef(backend, "gemm_iq4xs_rows5", w, 5, 24, 512,
+                            core::GemmIq4XsRef);
+}
 

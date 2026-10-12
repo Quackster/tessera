@@ -39,6 +39,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_bf16", kGemmBf16SpirV, sizeof(kGemmBf16SpirV)},
     {"gemm_bf16_batched", kGemmBf16BatchedSpirV,
      sizeof(kGemmBf16BatchedSpirV)},
+    {"gemm_bf16_rows", kGemmBf16RowsSpirV, sizeof(kGemmBf16RowsSpirV)},
     {"gemm_mxfp4", kGemmMxfp4SpirV, sizeof(kGemmMxfp4SpirV)},
     {"gemm_q5k", kGemmQ5KSpirV, sizeof(kGemmQ5KSpirV)},
     {"gemm_q6k", kGemmQ6KSpirV, sizeof(kGemmQ6KSpirV)},
@@ -49,6 +50,8 @@ const BuiltInKernel kBuiltInKernels[] = {
      sizeof(kGemmIq4NlBatchedSpirV)},
     {"gemm_iq4xs", kGemmIq4XsSpirV, sizeof(kGemmIq4XsSpirV)},
     {"gemm_iq3s", kGemmIq3SSpirV, sizeof(kGemmIq3SSpirV)},
+    {"gemm_iq3s_batched", kGemmIq3SBatchedSpirV,
+     sizeof(kGemmIq3SBatchedSpirV)},
     {"gemm_q80", kGemmQ80SpirV, sizeof(kGemmQ80SpirV)},
     {"rmsnorm", kRmsnormSpirV, sizeof(kRmsnormSpirV)},
     {"sigmoid_gate", kSigmoidGateSpirV, sizeof(kSigmoidGateSpirV)},
@@ -107,6 +110,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_mxfp4_batched", kGemmMxfp4BatchedSpirV,
      sizeof(kGemmMxfp4BatchedSpirV)},
     {"gemm_mxfp4_rows", kGemmMxfp4RowsSpirV, sizeof(kGemmMxfp4RowsSpirV)},
+    {"gemm_mxfp4_wmma", kGemmMxfp4WmmaSpirV, sizeof(kGemmMxfp4WmmaSpirV)},
     {"gemm_q4k_row", kGemmQ4kRowSpirV, sizeof(kGemmQ4kRowSpirV)},
     {"gemm_q5k_batched", kGemmQ5kBatchedSpirV, sizeof(kGemmQ5kBatchedSpirV)},
     {"gemm_q6k_batched", kGemmQ6kBatchedSpirV, sizeof(kGemmQ6kBatchedSpirV)},
@@ -116,19 +120,29 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_q5k_vec", kGemmQ5kVecSpirV, sizeof(kGemmQ5kVecSpirV)},
     {"gemm_q6k_vec", kGemmQ6kVecSpirV, sizeof(kGemmQ6kVecSpirV)},
     {"gemm_iq4xs_vec", kGemmIq4XsVecSpirV, sizeof(kGemmIq4XsVecSpirV)},
+    {"gemm_q80_vec", kGemmQ80VecSpirV, sizeof(kGemmQ80VecSpirV)},
+    {"quantize_fp8_pack_rows", kQuantizeFp8PackRowsSpirV,
+     sizeof(kQuantizeFp8PackRowsSpirV)},
+    {"mxfp4_row_ref", kMxfp4RowRefSpirV, sizeof(kMxfp4RowRefSpirV)},
+    {"gemm_mxfp4_wmma_reduce", kGemmVecReduceSpirV,
+     sizeof(kGemmVecReduceSpirV)},
     {"gemm_vec_reduce", kGemmVecReduceSpirV, sizeof(kGemmVecReduceSpirV)},
     {"gemm_q4k_rows2", kGemmQ4kRows2SpirV, sizeof(kGemmQ4kRows2SpirV)},
     {"gemm_q4k_rows3", kGemmQ4kRows3SpirV, sizeof(kGemmQ4kRows3SpirV)},
     {"gemm_q4k_rows4", kGemmQ4kRows4SpirV, sizeof(kGemmQ4kRows4SpirV)},
+    {"gemm_q4k_rows5", kGemmQ4kRows5SpirV, sizeof(kGemmQ4kRows5SpirV)},
     {"gemm_q5k_rows2", kGemmQ5kRows2SpirV, sizeof(kGemmQ5kRows2SpirV)},
     {"gemm_q5k_rows3", kGemmQ5kRows3SpirV, sizeof(kGemmQ5kRows3SpirV)},
     {"gemm_q5k_rows4", kGemmQ5kRows4SpirV, sizeof(kGemmQ5kRows4SpirV)},
+    {"gemm_q5k_rows5", kGemmQ5kRows5SpirV, sizeof(kGemmQ5kRows5SpirV)},
     {"gemm_q6k_rows2", kGemmQ6kRows2SpirV, sizeof(kGemmQ6kRows2SpirV)},
     {"gemm_q6k_rows3", kGemmQ6kRows3SpirV, sizeof(kGemmQ6kRows3SpirV)},
     {"gemm_q6k_rows4", kGemmQ6kRows4SpirV, sizeof(kGemmQ6kRows4SpirV)},
+    {"gemm_q6k_rows5", kGemmQ6kRows5SpirV, sizeof(kGemmQ6kRows5SpirV)},
     {"gemm_iq4xs_rows2", kGemmIq4XsRows2SpirV, sizeof(kGemmIq4XsRows2SpirV)},
     {"gemm_iq4xs_rows3", kGemmIq4XsRows3SpirV, sizeof(kGemmIq4XsRows3SpirV)},
     {"gemm_iq4xs_rows4", kGemmIq4XsRows4SpirV, sizeof(kGemmIq4XsRows4SpirV)},
+    {"gemm_iq4xs_rows5", kGemmIq4XsRows5SpirV, sizeof(kGemmIq4XsRows5SpirV)},
 };
 
 int LookupBuiltIn(std::string_view name) {
@@ -293,6 +307,19 @@ VulkanCompute::LoadKernel(std::string_view name,
   }
   std::string entry(name);
   if (code.empty()) {
+    // Tensor-core kernels need the device support the backend verified at
+    // Init; without it they report UnsupportedFeature (not MalformedFile)
+    // so the engine takes its scalar fallback. gemm_mxfp4_wmma stays
+    // disabled unconditionally for now: cooperative-matrix dispatches
+    // wedge this RADV snapshot (machine crash 2026-10-12, see
+    // docs/MOE_performance.md); re-enable with the scalar fallback intact
+    // once the driver stabilizes. gemm_bf16_wmma has no Vulkan
+    // implementation in the tree, so it reports UnsupportedFeature
+    // silently too: the engine probes it on every bf16 head and falls
+    // back to gemm_bf16_rows, which must not log an error per run.
+    if (name == "gemm_mxfp4_wmma" || name == "gemm_bf16_wmma") {
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
     const int index = LookupBuiltIn(name);
     if (index < 0) {
       LogError(std::string("kernel '") + std::string(name) +
@@ -337,6 +364,15 @@ VulkanCompute::LoadKernel(std::string_view name,
   stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
   stage.module = module;
   stage.pName = entry.data();
+  // Tensor-core kernels assume 32-lane subgroups like their ROCm twins;
+  // require it explicitly (the extension is enabled with the support).
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size{};
+  if (coopmat_ && (name == "gemm_mxfp4_wmma" || name == "gemm_bf16_wmma")) {
+    subgroup_size.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroup_size.requiredSubgroupSize = 32;
+    stage.pNext = &subgroup_size;
+  }
   VkComputePipelineCreateInfo pipeline_info{};
   pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   pipeline_info.layout = layout_;
@@ -440,14 +476,17 @@ std::expected<void, StatusCode> VulkanCompute::Wait() {
               std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
-  // The submission is done, so every descriptor set it used can be released.
-  result = vkResetDescriptorPool(device_, descriptor_pool_, 0);
-  if (result != VK_SUCCESS) {
-    LogError(std::string("vkResetDescriptorPool failed (") +
-              std::to_string(static_cast<int>(result)) + ")");
-    return std::unexpected(FromVkResult(result));
-  }
+  // The descriptor pool is intentionally not reset here: cached sets stay
+  // valid across flushes (see InvalidateDescriptors for the cases that
+  // drop them).
   return {};
+}
+
+void VulkanCompute::InvalidateDescriptors() {
+  desc_cache_.clear();
+  if (descriptor_pool_ != VK_NULL_HANDLE) {
+    (void)vkResetDescriptorPool(device_, descriptor_pool_, 0);
+  }
 }
 
 std::expected<void, StatusCode> VulkanCompute::FlushAndWait() {
@@ -558,26 +597,45 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
   // serializes the whole step.
   OrderAccess(bindings, kernel.read_mask, kernel.write_mask);
   vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
-  VkDescriptorSetAllocateInfo set_alloc{};
-  set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  set_alloc.descriptorPool = descriptor_pool_;
-  set_alloc.descriptorSetCount = 1;
-  set_alloc.pSetLayouts = &set_layout_;
+  // Reuse the cached descriptor set for repeat bindings: a decode step
+  // binds the same weights every token.
+  if (bindings.size() > kMaxBoundBuffers) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  DescKey key;
+  key.pipeline = kernel.pipeline;
+  key.count = static_cast<std::uint32_t>(bindings.size());
+  for (std::size_t i = 0; i < bindings.size(); ++i) {
+    key.buffers[i] = bindings[i].buffer;
+    key.sizes[i] = bindings[i].size;
+  }
   VkDescriptorSet set = VK_NULL_HANDLE;
-  auto result = vkAllocateDescriptorSets(device_, &set_alloc, &set);
-  if (result == VK_ERROR_OUT_OF_POOL_MEMORY) {
-    // The window is larger than the pool: flush what is recorded, then
-    // start a new window and retry.
-    auto flushed = FlushAndWait();
-    if (!flushed) {
-      return flushed;
-    }
-    recording = EnsureRecording();
-    if (!recording) {
-      return recording;
-    }
-    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+  const auto cached = desc_cache_.find(key);
+  auto result = VK_SUCCESS;
+  if (cached != desc_cache_.end()) {
+    set = cached->second;
+  } else {
+    VkDescriptorSetAllocateInfo set_alloc{};
+    set_alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_alloc.descriptorPool = descriptor_pool_;
+    set_alloc.descriptorSetCount = 1;
+    set_alloc.pSetLayouts = &set_layout_;
     result = vkAllocateDescriptorSets(device_, &set_alloc, &set);
+    if (result == VK_ERROR_OUT_OF_POOL_MEMORY) {
+      // New bindings outgrew the pool: drain, drop the cache and retry
+      // once with a fresh pool.
+      auto flushed = FlushAndWait();
+      if (!flushed) {
+        return flushed;
+      }
+      InvalidateDescriptors();
+      recording = EnsureRecording();
+      if (!recording) {
+        return recording;
+      }
+      vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, kernel.pipeline);
+      result = vkAllocateDescriptorSets(device_, &set_alloc, &set);
+    }
   }
   if (result != VK_SUCCESS) {
     LogError(std::string("kernel ") + kernel.name +
@@ -585,30 +643,32 @@ std::expected<void, StatusCode> VulkanCompute::LaunchKernel(
              std::to_string(static_cast<int>(result)) + ")");
     return std::unexpected(FromVkResult(result));
   }
-  // One write per bound buffer: buffer i goes to binding i.
-  std::vector<VkDescriptorBufferInfo> buffer_infos;
-  buffer_infos.reserve(kMaxBoundBuffers);
-  for (std::size_t i = 0; i < bindings.size(); ++i) {
-    buffer_infos.push_back(
-        VkDescriptorBufferInfo{bindings[i].buffer, 0, bindings[i].size});
-  }
-  std::vector<VkWriteDescriptorSet> writes;
-  writes.reserve(kMaxBoundBuffers);
-  for (std::size_t i = 0; i < bindings.size(); ++i) {
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = set;
-    write.dstBinding = static_cast<std::uint32_t>(i);
-    write.dstArrayElement = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.pBufferInfo = &buffer_infos[i];
-    writes.push_back(write);
-  }
-  if (!writes.empty()) {
-    vkUpdateDescriptorSets(device_,
-                           static_cast<std::uint32_t>(writes.size()),
-                           writes.data(), 0, nullptr);
+  // One write per bound buffer, only on a cache miss: buffer i goes to
+  // binding i. Scratch arrays live on the backend (not per-launch
+  // vectors), so a decode step issuing thousands of launches pays no
+  // per-launch heap cost.
+  if (cached == desc_cache_.end()) {
+    for (std::size_t i = 0; i < bindings.size(); ++i) {
+      info_scratch_[i] =
+          VkDescriptorBufferInfo{bindings[i].buffer, 0, bindings[i].size};
+    }
+    for (std::size_t i = 0; i < bindings.size(); ++i) {
+      VkWriteDescriptorSet write{};
+      write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      write.dstSet = set;
+      write.dstBinding = static_cast<std::uint32_t>(i);
+      write.dstArrayElement = 0;
+      write.descriptorCount = 1;
+      write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      write.pBufferInfo = &info_scratch_[i];
+      write_scratch_[i] = write;
+    }
+    if (!bindings.empty()) {
+      vkUpdateDescriptorSets(device_,
+                             static_cast<std::uint32_t>(bindings.size()),
+                             write_scratch_.data(), 0, nullptr);
+    }
+    desc_cache_.emplace(key, set);
   }
   std::uint8_t push_constants[kPushConstantBytes];
   std::memset(push_constants, 0, kPushConstantBytes);

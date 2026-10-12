@@ -37,12 +37,15 @@ ResolveThinkBudget(const Model& model, std::size_t budget);
 // append keeps the per-token loop. Every chunk stays within the
 // per-launch attention work budget; the cache is empty (prefill starts
 // a request), so the keys a chunk's last row sees end at its absolute
-// end offset. Null progress disables chunk reports.
+// end offset. Null progress disables chunk reports. `compute_ms`, when
+// non-null, accumulates the chunk forwards' wall time in fractional
+// milliseconds (the llama.cpp-comparable compute number).
 [[nodiscard]] std::expected<void, StatusCode> PrefillCapturing(
     Backend& backend, Model& model, core::DecodeCache& cache,
     SpeculativeStrategy& strategy, std::span<const std::uint32_t> prompt,
     std::size_t chunk, const std::vector<std::size_t>& capture_layers,
     std::vector<Buffer*>& strategy_buffers, std::vector<float>& hidden_out,
-    std::vector<float>& logits_out, const core::PrefillProgress* progress);
+    std::vector<float>& logits_out, const core::PrefillProgress* progress,
+    double* compute_ms = nullptr);
 
 }  // namespace tessera
