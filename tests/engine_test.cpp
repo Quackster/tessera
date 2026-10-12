@@ -15,8 +15,12 @@
 #include <thread>
 #include <vector>
 
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "core/json.hpp"
 #include "core/loaders/shard.hpp"
 #include "core/sampling.hpp"
 #include "tessera/budget.hpp"
@@ -28,8 +32,10 @@
 #include "tessera/scheduler.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/image.hpp"
+#include "tessera/tokenizer.hpp"
 #include "tessera/vision.hpp"
 #include "tessera/types.hpp"
+#include "serve/openai.hpp"
 
 using tessera::Engine;
 using tessera::EngineOptions;
@@ -680,6 +686,175 @@ TEST(EngineTest, SchedulerRejectsBadRequests) {
   auto noroute = empty.SubmitLeastLoaded(fine, sink);
   ASSERT_FALSE(noroute.has_value());
   EXPECT_EQ(noroute.error(), StatusCode::InvalidArgument);
+}
+
+// Least-loaded routing splits concurrent turns across runners: with
+// two runners each turn lands on a different device slot while both
+// still match their solo greedy text.
+TEST(EngineTest, SubmitLeastLoadedSplitsAcrossRunners) {
+  std::unique_ptr<Engine> first_engine;
+  MakeEngineOrSkip(first_engine);
+  EngineOptions second_options;
+  // Same device: proves least-loaded routing splits turns across
+  // runners. Live multi-GPU serve stays repo-pending (heavy loads),
+  // and a busy device is never borrowed for tests.
+  second_options.device_index = TestDeviceIndex();
+  auto second_engine = Engine::Create(second_options);
+  if (!second_engine) {
+    GTEST_SKIP() << "no second engine: "
+                 << tessera::ToString(second_engine.error());
+  }
+  auto fixture_path = WriteTinyModelFixture("route.gguf");
+  auto first_model =
+      first_engine->LoadModel(ModelOptions{fixture_path.string(), 1024});
+  ASSERT_TRUE(first_model.has_value())
+      << tessera::ToString(first_model.error());
+  auto second_model = (*second_engine)->LoadModel(
+      ModelOptions{fixture_path.string(), 1024});
+  ASSERT_TRUE(second_model.has_value())
+      << tessera::ToString(second_model.error());
+  std::vector<std::uint32_t> prompt(100);
+  for (std::size_t i = 0; i < prompt.size(); ++i) {
+    prompt[i] = static_cast<std::uint32_t>(i % 32);
+  }
+  GenerateOptions request;
+  request.prompt_tokens = prompt;
+  request.max_completion_tokens = 4;
+  request.prefill_chunk_tokens = 2;
+  auto expect_first =
+      first_engine->Generate(**first_model, request);
+  ASSERT_TRUE(expect_first.has_value())
+      << tessera::ToString(expect_first.error());
+  auto expect_second =
+      (*second_engine)->Generate(**second_model, request);
+  ASSERT_TRUE(expect_second.has_value())
+      << tessera::ToString(expect_second.error());
+  tessera::RunnerPool pool;
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(first_engine), std::move(*first_model),
+      TestDeviceIndex()));
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(*second_engine), std::move(*second_model),
+      TestDeviceIndex()));
+  struct Turn {
+    std::vector<std::uint32_t> tokens;
+    bool ok = false;
+  };
+  std::vector<Turn> turns(2);
+  std::thread head([&] {
+    auto outcome = pool.SubmitLeastLoaded(
+        request, [&](std::uint32_t token) {
+          turns[0].tokens.push_back(token);
+          return true;
+        });
+    turns[0].ok = outcome.has_value();
+  });
+  // Wait until the first turn is admitted so the second routes away
+  // from it; simultaneous submits would both see idle runners.
+  for (int i = 0; i < 1000 && pool.Active() != std::vector<std::size_t>{1, 0};
+       ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  ASSERT_EQ(pool.Active(), (std::vector<std::size_t>{1, 0}));
+  std::thread tail([&] {
+    auto outcome = pool.SubmitLeastLoaded(
+        request, [&](std::uint32_t token) {
+          turns[1].tokens.push_back(token);
+          return true;
+        });
+    turns[1].ok = outcome.has_value();
+  });
+  bool saw_split = false;
+  for (int i = 0; i < 1000 && !saw_split; ++i) {
+    saw_split = pool.Active() == std::vector<std::size_t>{1, 1};
+    if (!saw_split) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+  head.join();
+  tail.join();
+  EXPECT_TRUE(turns[0].ok);
+  EXPECT_TRUE(turns[1].ok);
+  EXPECT_EQ(turns[0].tokens, *expect_first);
+  EXPECT_EQ(turns[1].tokens, *expect_second);
+  // Both runners held one turn at once; a first-free-wins router
+  // would stack both on runner zero.
+  EXPECT_TRUE(saw_split);
+}
+
+// The OpenAI completions endpoint drives the same shared scheduler:
+// a stateless, non-streaming turn returns exactly the solo greedy
+// text for the same prompt.
+TEST(EngineTest, OpenAiCompleteMatchesSoloThroughScheduler) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("openai_complete.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  // Single letters plus digits: 32 entries, so every id the tiny
+  // model emits decodes back to text.
+  std::vector<std::string> vocab;
+  for (char c = 'a'; c <= 'z'; ++c) {
+    vocab.emplace_back(1, c);
+  }
+  for (char c = '0'; c <= '5'; ++c) {
+    vocab.emplace_back(1, c);
+  }
+  ASSERT_EQ(vocab.size(), 32u);
+  tessera::Tokenizer tokenizer(vocab, std::vector<std::int32_t>(32, 1), {});
+  auto ids = tokenizer.Encode("abc");
+  ASSERT_TRUE(ids.has_value()) << tessera::ToString(ids.error());
+  GenerateOptions solo_options;
+  solo_options.prompt_tokens = *ids;
+  solo_options.max_completion_tokens = 4;
+  auto solo = engine->Generate(**model, solo_options);
+  ASSERT_TRUE(solo.has_value()) << tessera::ToString(solo.error());
+  auto want = tokenizer.Decode(*solo);
+  ASSERT_TRUE(want.has_value()) << tessera::ToString(want.error());
+  tessera::RunnerPool pool;
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(engine), std::move(*model), TestDeviceIndex()));
+  tessera::serve::SessionStore sessions;
+  tessera::core::Json body = tessera::core::Json::Object();
+  body.Set("prompt", tessera::core::Json::String("abc"));
+  body.Set("max_completion_tokens", tessera::core::Json::Number(4));
+  body.Set("stream", tessera::core::Json::Bool(false));
+  int fds[2];
+  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  {
+    tessera::serve::ResponseWriter writer(fds[0]);
+    tessera::serve::OpenAiComplete(pool, tokenizer, sessions, writer, body,
+                                   /*default_max=*/8);
+    writer.Close();
+  }
+  ASSERT_EQ(shutdown(fds[0], SHUT_WR), 0);
+  std::string raw;
+  char chunk[1024];
+  for (;;) {
+    const ssize_t count = read(fds[1], chunk, sizeof(chunk));
+    if (count <= 0) {
+      break;
+    }
+    raw.append(chunk, static_cast<std::size_t>(count));
+  }
+  close(fds[0]);
+  close(fds[1]);
+  const std::size_t split = raw.find("\r\n\r\n");
+  ASSERT_NE(split, std::string::npos);
+  EXPECT_EQ(raw.substr(0, 12), "HTTP/1.1 200");
+  auto response = tessera::core::Json::Parse(
+      std::string_view(raw).substr(split + 4));
+  ASSERT_TRUE(response != nullptr);
+  const tessera::core::Json* choices = response->Find("choices");
+  ASSERT_TRUE(choices != nullptr && choices->isArray());
+  ASSERT_EQ(choices->AsArray().size(), 1u);
+  const tessera::core::Json* text = choices->AsArray()[0].Find("text");
+  ASSERT_TRUE(text != nullptr && text->isString());
+  EXPECT_EQ(text->AsString(), *want);
+  const tessera::core::Json* reason =
+      choices->AsArray()[0].Find("finish_reason");
+  ASSERT_TRUE(reason != nullptr && reason->isString());
+  EXPECT_EQ(reason->AsString(), "length");
 }
 
 // GenerateStreaming emits one callback per produced token, matches the
