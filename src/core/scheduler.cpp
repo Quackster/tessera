@@ -207,11 +207,18 @@ struct Scheduler::Impl {
     return false;
   }
 
+  // Rows the admitted turns may still consume: the unproduced
+  // budget each. Prompt and produced rows already sit in the cache
+  // (and out of free memory), so charging full rows would double
+  // count them and ratchet every later turn out: a second unlimited
+  // turn would wait behind the first one's whole generation instead
+  // of time-slicing beside it. Produced never passes budget (the
+  // decode loop ends the turn there), so the subtraction is exact.
   std::size_t ReservedLocked() const {
     std::size_t rows = 0;
     for (const auto& job : active) {
       if (!job->finished.load()) {
-        rows += job->Rows();
+        rows += job->budget - job->produced.size();
       }
     }
     return rows;
