@@ -283,9 +283,11 @@ TEST(CalibrateTest, BudgetMeasuresAtMostMaxPoints) {
   options.sweep_prefill_chunk = false;
   options.sweep_attention_split = false;
   options.max_points = 4;
-  auto measure = [](Setting setting, const CalibrationConfig& config,
-                    std::size_t, bool)
+  std::size_t calls = 0;
+  auto measure = [&calls](Setting setting, const CalibrationConfig& config,
+                          std::size_t, bool)
       -> std::expected<Measurement, StatusCode> {
+    ++calls;
     Measurement m;
     if (setting == Setting::MxFp4SplitTarget) {
       m.decode_tps = config.mxfp4_split_target == 640 ? 1.5 : 1.0;
@@ -297,6 +299,7 @@ TEST(CalibrateTest, BudgetMeasuresAtMostMaxPoints) {
   };
   auto outcome = tessera::RunCalibrationSweep(options, measure);
   ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  EXPECT_EQ(calls, 4u);
   EXPECT_EQ(outcome->points.size(), 4u);
   EXPECT_EQ(outcome->config.mxfp4_split_target, 640u);
   EXPECT_EQ(outcome->config.mxfp4_split_cap, 2u);
@@ -315,9 +318,11 @@ TEST(CalibrateTest, BudgetSkipsUnmeasuredSettings) {
   options.sweep_prefill_chunk = false;
   options.sweep_attention_split = false;
   options.max_points = 2;
-  auto measure = [](Setting setting, const CalibrationConfig& config,
-                    std::size_t, bool)
+  std::size_t calls = 0;
+  auto measure = [&calls](Setting setting, const CalibrationConfig& config,
+                          std::size_t, bool)
       -> std::expected<Measurement, StatusCode> {
+    ++calls;
     Measurement m;
     if (setting == Setting::MxFp4SplitTarget) {
       m.decode_tps = config.mxfp4_split_target == 640 ? 1.5 : 1.0;
@@ -329,6 +334,7 @@ TEST(CalibrateTest, BudgetSkipsUnmeasuredSettings) {
   };
   auto outcome = tessera::RunCalibrationSweep(options, measure);
   ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  EXPECT_EQ(calls, 2u);
   EXPECT_EQ(outcome->points.size(), 2u);
   EXPECT_EQ(outcome->config.mxfp4_split_target, 120u);
   EXPECT_EQ(outcome->config.mxfp4_split_cap, 4u);

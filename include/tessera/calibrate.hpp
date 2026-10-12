@@ -98,8 +98,9 @@ struct SweepOptions {
   bool sweep_draft_tokens = false;
   bool sweep_draft_context = false;
   // At most this many candidate evaluations in total, counted straight
-  // through the sweep whatever the setting. A setting cut short keeps the
-  // fastest measured value with no gain gate and no confirmation; a
+  // through the sweep whatever the setting. Each evaluation is exactly
+  // one engine run (first prompt, no warmup). A setting cut short keeps
+  // the fastest measured value with no gain gate and no confirmation; a
   // setting with no measured value keeps its default and is reported as
   // skipped. Zero means no budget: every enabled setting is swept.
   std::size_t max_points = 0;

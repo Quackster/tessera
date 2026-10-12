@@ -398,11 +398,14 @@ int RunCalibrateCommand(int argc, char** argv) {
 
   // Warm the engine once before the first measurement (kernel compile and
   // the first-touch weight loads), so the sweep points measure steady state.
-  if (auto warmed = measure(Setting::MxFp4SplitTarget, defaults, 0, true);
-      !warmed) {
-    log.Error("calibrate", std::string("engine warmup failed (") +
-                               std::string(ToString(warmed.error())) + ")");
-    return kExitError;
+  // A limited run skips it: the passed count is the engine run count.
+  if (calibrate_limit == 0) {
+    if (auto warmed = measure(Setting::MxFp4SplitTarget, defaults, 0, true);
+        !warmed) {
+      log.Error("calibrate", std::string("engine warmup failed (") +
+                                 std::string(ToString(warmed.error())) + ")");
+      return kExitError;
+    }
   }
 
   SweepOptions sweep;
@@ -447,29 +450,49 @@ int RunCalibrateCommand(int argc, char** argv) {
                               (point.kept ? "  (kept)" : ""));
   }
 
-  // Measure the chosen configuration once more for the stored rates: the
-  // decode rate on the short prompts, the prefill rate on the long ones.
-  std::vector<double> decode_rates;
-  std::vector<double> prefill_rates;
-  for (std::size_t prompt = 0; prompt < prefill_ids.size(); ++prompt) {
-    auto decode_measured =
-        measure(Setting::MxFp4SplitTarget, outcome->config, prompt, false);
-    if (!decode_measured) {
-      log.Error("calibrate", std::string("final decode measurement failed (") +
-                                 std::string(ToString(decode_measured.error())) +
-                                 ")");
-      return kExitError;
+  // The stored rates: a full run measures the chosen configuration once
+  // more, while a limited run reuses the sweep points (decode settings
+  // measured decode, the prefill setting measured prefill), so the passed
+  // count stays the engine run count.
+  double decode_tps = 0.0;
+  double prefill_tps = 0.0;
+  if (sweep.max_points == 0) {
+    std::vector<double> decode_rates;
+    std::vector<double> prefill_rates;
+    for (std::size_t prompt = 0; prompt < prefill_ids.size(); ++prompt) {
+      auto decode_measured =
+          measure(Setting::MxFp4SplitTarget, outcome->config, prompt, false);
+      if (!decode_measured) {
+        log.Error("calibrate", std::string("final decode measurement failed (") +
+                                   std::string(ToString(decode_measured.error())) +
+                                   ")");
+        return kExitError;
+      }
+      decode_rates.push_back(decode_measured->decode_tps);
+      auto prefill_measured = measure(Setting::PrefillChunkTokens,
+                                      outcome->config, prompt, false);
+      if (!prefill_measured) {
+        log.Error("calibrate",
+                  std::string("final prefill measurement failed (") +
+                      std::string(ToString(prefill_measured.error())) + ")");
+        return kExitError;
+      }
+      prefill_rates.push_back(prefill_measured->prefill_tps);
     }
-    decode_rates.push_back(decode_measured->decode_tps);
-    auto prefill_measured =
-        measure(Setting::PrefillChunkTokens, outcome->config, prompt, false);
-    if (!prefill_measured) {
-      log.Error("calibrate",
-                std::string("final prefill measurement failed (") +
-                    std::string(ToString(prefill_measured.error())) + ")");
-      return kExitError;
+    decode_tps = MedianOf(decode_rates);
+    prefill_tps = MedianOf(prefill_rates);
+  } else {
+    std::vector<double> decode_rates;
+    std::vector<double> prefill_rates;
+    for (const SweepPoint& point : outcome->points) {
+      if (point.setting == Setting::PrefillChunkTokens) {
+        prefill_rates.push_back(point.tps);
+      } else {
+        decode_rates.push_back(point.tps);
+      }
     }
-    prefill_rates.push_back(prefill_measured->prefill_tps);
+    decode_tps = MedianOf(decode_rates);
+    prefill_tps = MedianOf(prefill_rates);
   }
 
   CalibrationEntry entry;
@@ -480,8 +503,8 @@ int RunCalibrateCommand(int argc, char** argv) {
                           : std::string(loaded.Name()),
                       context, ToString(kv_type), strategy_label);
   entry.config = outcome->config;
-  entry.decode_tps = MedianOf(decode_rates);
-  entry.prefill_tps = MedianOf(prefill_rates);
+  entry.decode_tps = decode_tps;
+  entry.prefill_tps = prefill_tps;
   entry.max_context = max_context;
   entry.date = TodayIso();
   // Keep the identity for the report: `entry` is moved into the file below.
@@ -515,8 +538,8 @@ int RunCalibrateCommand(int argc, char** argv) {
   report.not_applicable = outcome->not_applicable;
   report.skipped = outcome->skipped;
   report.chosen = outcome->config;
-  report.decode_tps = MedianOf(decode_rates);
-  report.prefill_tps = MedianOf(prefill_rates);
+  report.decode_tps = decode_tps;
+  report.prefill_tps = prefill_tps;
   report.file = calibration_file;
   report.split_applicable = backend == "rocm";
   report.attention_applicable = sweep.sweep_attention_split;

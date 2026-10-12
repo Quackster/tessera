@@ -93,33 +93,45 @@ std::expected<void, StatusCode> SweepSetting(
   }
   // Measure candidates one after another until the point budget runs out.
   // The budget counts every measured point in total, whatever the setting.
+  // Budget mode measures each candidate exactly once (first prompt, no
+  // warmup), so the passed count is the number of engine runs.
+  const bool budgeted = options.max_points > 0;
   std::vector<std::size_t> measured;
   std::vector<double> rates;
   measured.reserve(candidates.size());
   rates.reserve(candidates.size());
   const std::size_t base = outcome.points.size();
   for (std::size_t i = 0; i < candidates.size(); ++i) {
-    if (options.max_points > 0 &&
-        outcome.points.size() >= options.max_points) {
+    if (budgeted && outcome.points.size() >= options.max_points) {
       break;
     }
     CalibrationConfig probe = options.defaults;
     ApplySetting(probe, setting, candidates[i]);
-    auto rate =
-        MeasurePoint(measure, setting, probe, options.prompt_count, decode);
-    if (!rate) {
-      return std::unexpected(rate.error());
+    double tps = 0.0;
+    if (budgeted) {
+      auto measured_once = measure(setting, probe, 0, false);
+      if (!measured_once) {
+        return std::unexpected(measured_once.error());
+      }
+      tps = decode ? measured_once->decode_tps : measured_once->prefill_tps;
+    } else {
+      auto rate =
+          MeasurePoint(measure, setting, probe, options.prompt_count, decode);
+      if (!rate) {
+        return std::unexpected(rate.error());
+      }
+      tps = *rate;
     }
     measured.push_back(candidates[i]);
-    rates.push_back(*rate);
-    outcome.points.push_back(SweepPoint{setting, candidates[i], *rate, false});
+    rates.push_back(tps);
+    outcome.points.push_back(SweepPoint{setting, candidates[i], tps, false});
   }
   if (measured.empty()) {
     outcome.skipped.push_back(setting);
     return {};
   }
   std::size_t chosen = default_value;
-  if (options.max_points > 0) {
+  if (budgeted) {
     // Budget mode keeps the fastest measured value as is: no gain gate
     // and no interleaved confirmation, both cost extra measurements.
     std::size_t best = 0;
