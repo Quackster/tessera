@@ -26,21 +26,21 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Public API | Done | `Engine`, `Backend`, `SpeculativeStrategy`. |
 | GGUF loader | Done | v2/v3 headers, bounds-checked, memory-mapped (not copied). |
 | MXFP4 loader | Done | Tensor map, weight upload. FP8 and MXFP4 GEMM verified. |
-| Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched H2D upload (`CopyH2DBatch`); ROCm drains a 256 MiB pinned window, one sync per chunk. ROCm re-selects the configured GPU on every thread that touches the device. Shared gfx11/gfx12 device primitives (`rocm_device.hpp`, ported from libr4d v0.5.0); the ROCm kernels barrier on LDS scope (`LdsBarrier`). |
-| Parallelism | Partial | Data-parallel request replicas: one engine and model per GPU behind a `RunnerPool` with least-loaded routing. Continuous batching, layer pipeline with micro-batching, tensor parallelism, expert parallelism, context parallelism, speculative split and hybrid combinations match single-device output. Built on both backends; a two-device serve smoke is pending. |
+| Backends | Done | Vulkan and ROCm init, buffers, copy, sync. Batched host upload. |
+| Parallelism | Partial | One engine and model per GPU behind a pool with least loaded routing. Tensor, pipeline, context, expert, speculative split and hybrid modes match single device output. A two device serve smoke test is pending. |
 | Kernel launch | Done | Vulkan records a whole decode step into one command buffer. ROCm runs one blocking stream with pinned staging. |
 | DFlash2 | Partial | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. Draft cost still high. |
-| CLI | Partial | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, calibrate. |
+| CLI | Partial | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit. |
 | Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
 | KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. |
 | Sampling | Done | Seeded sampling with Qwen 27B defaults. |
-| GEMM | Done | Q4_K to IQ, FP8/MXFP4, block-scaled FP8, bf16, fp32. Tensor-core paths for decode and verify. Warp-per-output decode GEMVs plus a multi-row family for the small verify batch (each weight block decoded once per column), with a deterministic split-K pass. Prefill GEMMs tile 32 activation rows x 8 columns with one output per thread. |
+| GEMM | Done | Q4_K to IQ, FP8/MXFP4, bf16, fp32. Tensor core paths for decode and verify. |
 | Activation quant | Done | Per-token FP8 E4M3 quant-dequant. W4A8 opt-in. |
 | Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. |
-| Weight upload | Done | Manifest to device buffers. One batched upload per load, staged through a pinned window on ROCm. Each load phase is timed. |
+| Weight upload | Done | Manifest to device buffers. One batched upload per load. |
 | Decode loop | Done | Single-token vanilla and hybrid GGUF loops. |
 | Hybrid SSM | Partial | Load, kernels, both decode paths, MTP head done. Some host glue remains. |
-| Speculative decode | Partial | MTP and DFlash2 end to end. Output equals greedy. MTP folds the anchor into the verify batch and matches the reference hidden pairing, defaulting to a two-draft chain; GGUF MTP reaches 31-37 tok/s on the 27B Q4_K_M target (ROCm) and 27-32 on Vulkan against 17-19 greedy. DFlash2 about 60 vs 23 tok/s on 27B. |
+| Speculative decode | Partial | MTP and DFlash2 end to end. Output equals greedy. GGUF MTP reaches 31-37 tok/s on the 27B target (ROCm). DFlash2 about 60 vs 23 tok/s. |
 | MXFP4 path | Done | Parse, kernels, HF config, tokenizer. Matches GGUF greedy output. |
 | DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |
 | Baseline pinning | Done | Fixed-seed fixtures identical on Vulkan and ROCm. |
@@ -48,8 +48,8 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. Capability harness (`tools/harness/probe_harness.py`) drives task steering, long-horizon context and session memory over the API on both backends. |
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
-| MoE, MLP, norms | Partial | Norms and MLP kernels done. Sparse mixture-of-experts (Ornith-1.5) decodes on Vulkan and ROCm with fused routed-expert kernels (84 tok/s ROCm, 88 Vulkan). Grouped-expert batch GEMM is the follow-up. |
-| Calibration | Done | `calibrate` sweeps the split-K target and cap (ROCm), the prefill chunk (multiples of 256 from 512), the single-token attention split and, with a strategy attached, the draft settings: DFlash2 (`--draft`) the draft block and draft context, MTP (`--speculate`) the draft block. Keeps a value only above `MIN_GAIN` 0.03, confirms it interleaved, defaults the KV cache to int8, and reports and stores the memory-bound max context in the entry. Prints a report with an example `run` command; writes JSON keyed by backend, device, model, context, KV type and strategy; `run`/`serve` apply it with `--calibration`. |
+| MoE, MLP, norms | Partial | Norms and MLP kernels done. Ornith-1.5 MoE decodes on both backends (84 tok/s ROCm, 88 Vulkan). Grouped-expert GEMM remains. |
+| Calibration | Done | Measures speed settings per machine and keeps the fastest. Covers split target and cap (ROCm), prefill chunk, attention split, and draft settings with a strategy attached. Reports and stores the memory-bound max context, and the example commands run at that context. `--calibrate-limit N` caps a run at N measurements. Writes JSON keyed by backend, device, model, context, KV type, strategy, and layout. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 
@@ -87,7 +87,7 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | Format | State | Detail |
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, IQ4_NL, IQ4_XS and IQ3_S. Checks bounds. |
-| MXFP4 safetensors | Done | Parses the map, maps names, converts the value layout and packs the MXFP4 weights; config.json drives the decode config. |
+| MXFP4 safetensors | Done | Parses the map and packs the weights. config.json drives the decode config. |
 | NVFP4 MoE | Partial | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. MXFP4 MoE and the grouped-expert GEMM remain. |
 | DFlash2 FP8 draft | Partial | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. Step cost work remains. |
 
@@ -100,7 +100,7 @@ Model weights live outside the repo. Each variant uses one flat directory. Model
 | `~/models/Qwen3.8-27B-DFlash2-FP8/` | DFlash2 draft checkpoint | Draft layout tests. | [tcclaviger/Qwen3.8-27B-DFlash2-FP8](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8) |
 | `~/models/Ornith-1.5-35B-A3B-GGUF/` | `Ornith-1.5-35B-Q4_K_M.gguf`, `mmproj-Ornith-1.5-35B-BF16.gguf` | MoE GGUF target. | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) |
 | `~/models/Ornith-1.5-35B-A3B-MXFP4-GGUF/` | MoE MXFP4 GGUF weights | Not yet supported. | [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) |
-| `~/models/Ornith-1.5-35B-A3B-BF16/` | bf16 safetensors | Reference checkpoint. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
+| `~/models/Ornith-1.5-35B-A3B-BF16/` | bf16 safetensors | Not yet supported. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
 | `/home/alex/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S` split, `IQ3_XXS` split, `mmproj-Qwen3.8-Flash-Next-BF16.gguf`, RCO allocation files | (Planned, not working) | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
 
 CLI examples:
@@ -127,7 +127,7 @@ CLI examples:
   --draft ~/models/Qwen3.8-27B-DFlash2-FP8 --port 8080
 ```
 
-The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` or `--speculate` is set. It prints tensor count, total elements and device bytes. With `--max-completion-tokens N` it runs N greedy decode steps from `--prompt-text` and streams the decoded text to stdout as each token is generated. `--speculate` drafts with the MTP head on both `run` and `serve`. `--draft` drafts with the DFlash2 checkpoint. The DFlash2 draft is tested against the MXFP4 target, not the GGUF. `--mmproj` plus `--image` prepend image tokens. The image token id is detected from `<|image_pad|>`; no flag sets it.
+The CLI loads the model and uploads weights. It attaches the draft strategy when `--draft` or `--speculate` is set. With `--max-completion-tokens N` it runs N greedy decode steps and streams the text to stdout. `--speculate` drafts with the MTP head. `--draft` drafts with the DFlash2 checkpoint. The DFlash2 draft is tested against the MXFP4 target. `--mmproj` plus `--image` prepend image tokens.
 
 ## Calibration
 
@@ -136,11 +136,11 @@ the fastest value. It changes only speed. It never changes the produced
 tokens. Run it once on each machine and model, before the first `run` or
 `serve`.
 
-The `calibrate` subcommand loads the model one time, warms it, and sweeps the
-candidate values for each setting. The sweep has no time cap; it runs to
-completion, so the prompt set sizes the run. It writes a JSON file and prints
-a report with the identity, the sweep points, the chosen settings, and an
-example `run` command.
+The `calibrate` subcommand loads the model one time and sweeps the
+candidate values for each setting. Without a limit it runs to
+completion. It writes a JSON file and prints a report with the sweep
+points, the chosen settings, and an example `run` command. The example
+commands run at the memory-bound max context.
 
 ```sh
 # Sweep on ROCm with the DFlash2 draft and write the result.
@@ -166,6 +166,9 @@ The `calibrate` flags:
   (kv8).
 * `--prompts <file>` fixed prompts, one per non-empty line. Default three
   fixed prompts.
+* `--calibrate-limit <n>` measure at most n sweep points in total, in
+  sweep order. Each point is one engine run. A cut setting keeps its
+  fastest measured value. A skipped setting keeps its default.
 
 The settings it sweeps are the same settings in the tables below:
 
@@ -211,9 +214,9 @@ Simple text prompt with the CLI:
   --max-completion-tokens 64
 ```
 
-`--max-completion-tokens` is optional. Without it the run fills the remaining context. Output tokens stream to stdout during the run, so the first token shows at once instead of after the full run.
+`--max-completion-tokens` is optional. Without it the run fills the remaining context. Output tokens stream to stdout.
 
-The CLI applies the model chat template by default. It uses the raw text with `--no-chat`. String prompts need a model with a tokenizer. Both formats provide one: GGUF carries it in metadata, and the MXFP4 loader parses the HuggingFace `tokenizer.json` (and the chat template from `tokenizer_config.json` or `chat_template.jinja`). The CLI and the HTTP server accept string prompts for either format. String prompts still fail on a model without a tokenizer, such as a bare DFlash2 draft directory.
+The CLI applies the model chat template by default. It uses the raw text with `--no-chat`. String prompts need a model with a tokenizer. GGUF carries it in metadata. The MXFP4 loader parses `tokenizer.json`. String prompts fail on a model without a tokenizer, such as a bare DFlash2 draft directory.
 
 C++ API with a text prompt:
 
@@ -273,13 +276,13 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--draft <dir>` | both | none | DFlash2 draft checkpoint directory. |
 | `--context <n>` | both | 4096 | Maximum context length. |
 | `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
-| `--gpu-layers <n\|all>` | both | 0 | Layers kept in VRAM. The rest page from system RAM per token. 0 uploads everything. `help` prints the offloadable layer count and the fitting count for the current `--context` and KV cache without loading. A paged load that cannot fit is refused before it starts. |
-| `--draft-block <n>` | both | 0 | Draft block tokens. 0 keeps the draft checkpoint's configured block. |
-| `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects the automatic default (512). |
-| `--split-target <n>` | both | 0 | fp8 MXFP4 split-K workgroup target (ROCm only). 0 uses the built-in default (320). |
-| `--split-cap <n>` | both | 0 | fp8 MXFP4 split-K factor cap (ROCm only). 0 uses the built-in default (4). |
-| `--attention-split <n>` | both | 0 | Single-token flash-decoding chunks at long context (>= 1024 keys). 0 uses the built-in default (16). |
-| `--draft-context <n>` | both | 0 | DFlash2 draft context window in rows. 0 keeps the checkpoint's window. |
+| `--gpu-layers <n\|all>` | both | 0 | Layers kept in VRAM. The rest page from system RAM. 0 uploads everything. `help` prints counts without loading. |
+| `--draft-block <n>` | both | 0 | Draft block tokens. 0 uses the checkpoint block. |
+| `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects 512. |
+| `--split-target <n>` | both | 0 | fp8 MXFP4 split-K target (ROCm only). 0 uses 320. |
+| `--split-cap <n>` | both | 0 | fp8 MXFP4 split-K cap (ROCm only). 0 uses 4. |
+| `--attention-split <n>` | both | 0 | Flash-decoding chunks at long context. 0 uses 16. |
+| `--draft-context <n>` | both | 0 | DFlash2 draft context rows. 0 keeps the checkpoint window. |
 | `--quiet` | both | off | Suppress progress and info logs. |
 | `--prompt-text <str>` | run | none | Text prompt. It is tokenized, so the model needs a tokenizer. |
 | `--mmproj <path>` | run | none | Vision projector (mmproj) GGUF. |
@@ -289,7 +292,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--max-thinking-tokens <n>` | run | 0 | Think-block budget per turn. 0 leaves thinking unlimited. |
 | `--enable-thinking` | run | off | Render the chat template with thinking enabled. |
 | `--reasoning-effort <level>` | run | unset | Thinking difficulty for the chat template (for example `xhigh`). Ignored with `--no-chat`. |
-| `--speculate` | both | off | MTP speculative decode. It drafts from the target's own nextn head, so it needs no checkpoint path and drives both `run` and served turns. |
+| `--speculate` | both | off | MTP speculative decode from the target head. Needs no checkpoint. |
 | `--sample` | run | off | Sample instead of greedy decode. |
 | `--temperature <f>` | run | 0.6 | Sampling temperature. |
 | `--top-p <f>` | run | 0.95 | Nucleus probability. |
@@ -309,14 +312,15 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--allow-origin <o>` | serve | none | CORS origin. Repeatable. `*` allows all origins. |
 | `--calibration <file>` | run, serve, calibrate | env `TESSERA_CALIBRATION` | Calibration file. `run` and `serve` apply a saved entry for the current machine and model unless an explicit flag overrides it. `calibrate` reads and writes it. |
 | `--prompts <file>` | calibrate | three fixed prompts | Fixed prompts, one per non-empty line, for the calibration sweep. |
+| `--calibrate-limit <n>` | calibrate | none | Measure at most n sweep points in total. |
 | **Parallelism** | | | The flags below spread work across the `--gpus` devices. |
-| `--gpus <a,b>` | both | none | Serve one model replica per listed GPU for parallel requests (for example `--gpus 0,1`). Overrides `--gpu`. |
-| `--pipeline` | run | off | Split the model layers across the `--gpus` devices. |
-| `--tp` | run | off | Split attention, FFN and MoE experts across the `--gpus` devices with a rank reduce. |
-| `--cp` | run | off | Split the key range across the `--gpus` devices with a per-layer partial combine. |
-| `--spec-split` | run | off | Run the MTP draft head on the second `--gpus` device; needs `--speculate`. |
-| `--hybrid` | run | off | Data-parallel groups of model-parallel teams; the `--prompt-text` prompt runs on every group. |
-| `--dp <n>` | run | 1 | Data-parallel group count for `--hybrid`. |
+| `--gpus <a,b>` | both | none | One model replica per listed GPU (for example `--gpus 0,1`). Overrides `--gpu`. |
+| `--pipeline` | run | off | Split layers across the `--gpus` devices. |
+| `--tp` | run | off | Split attention, FFN and MoE experts across the `--gpus` devices. |
+| `--cp` | run | off | Split the key range across the `--gpus` devices. |
+| `--spec-split` | run | off | Run the MTP draft head on the second `--gpus` device. Needs `--speculate`. |
+| `--hybrid` | run | off | Data parallel groups of model parallel teams. |
+| `--dp <n>` | run | 1 | Group count for `--hybrid`. |
 
 The KV cache is fp32 when no `--kv-*` flag is set. The sampling defaults match the Qwen 3.8 27B defaults.
 
