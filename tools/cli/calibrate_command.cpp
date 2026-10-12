@@ -17,6 +17,7 @@
 #include "cli_common.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
+#include "tessera/model.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
 
@@ -98,6 +99,43 @@ std::string FormatRate(double rate) {
   char buffer[32];
   std::snprintf(buffer, sizeof(buffer), "%.2f", rate);
   return buffer;
+}
+
+// Samples the KV-only memory bound for `kv_type` and logs it: free
+// memory minus a reserve over the per-token KV size. Call after a
+// generate so lazily loaded weights (the draft) are resident;
+// otherwise the bound misses their footprint.
+[[nodiscard]] std::size_t LogMaxContext(Engine& engine, Model& loaded,
+                                        KvCacheType kv_type, bool quiet) {
+  log::Diagnostics& log = engine.Diagnostics();
+  const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
+  std::uint64_t model_bytes = 0;
+  for (const auto& weight : loaded.Weights()) {
+    model_bytes += weight.device->Size();
+  }
+  std::uint64_t available = 0;
+  if (memory.free_bytes > 0) {
+    available = memory.free_bytes;
+  } else if (memory.total_bytes > model_bytes) {
+    available = memory.total_bytes - model_bytes;
+  }
+  available = available > kMemoryReserveBytes ? available - kMemoryReserveBytes
+                                              : 0;
+  auto model_config = loaded.Config();
+  std::size_t max_context =
+      model_config ? MaxContextForKv(available, *model_config, kv_type) : 0;
+  if (max_context < kMinReportedContext) {
+    max_context = kMinReportedContext;
+  }
+  if (!quiet) {
+    log.Info("calibrate",
+             std::string("max context for ") + std::string(ToString(kv_type)) +
+                 ": " + std::to_string(max_context) + " token(s) (" +
+                 std::to_string(memory.free_bytes) + " free / " +
+                 std::to_string(memory.total_bytes) + " total, reserve " +
+                 std::to_string(kMemoryReserveBytes) + ")");
+  }
+  return max_context;
 }
 
 void PrintCalibrateUsage() {
@@ -374,6 +412,9 @@ int RunCalibrateCommand(int argc, char** argv) {
                                  std::string(ToString(warmed.error())) + ")");
       return kExitError;
     }
+    // Report the bound early too: the draft is resident now, so the
+    // number already reflects its footprint.
+    (void)LogMaxContext(engine, loaded, kv_type, quiet);
   }
 
   SweepOptions sweep;
@@ -464,36 +505,10 @@ int RunCalibrateCommand(int argc, char** argv) {
   }
 
   // Report the maximum context length the device allows for this KV
-  // cache type, measured after warmup so the draft weights are
-  // resident: free memory minus a reserve, divided by the per-token
-  // KV size. KV-only and informational; the run used --context.
-  const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
-  std::uint64_t model_bytes = 0;
-  for (const auto& weight : loaded.Weights()) {
-    model_bytes += weight.device->Size();
-  }
-  std::uint64_t available = 0;
-  if (memory.free_bytes > 0) {
-    available = memory.free_bytes;
-  } else if (memory.total_bytes > model_bytes) {
-    available = memory.total_bytes - model_bytes;
-  }
-  available = available > kMemoryReserveBytes ? available - kMemoryReserveBytes
-                                              : 0;
-  auto model_config = loaded.Config();
-  std::size_t max_context =
-      model_config ? MaxContextForKv(available, *model_config, kv_type) : 0;
-  if (max_context < kMinReportedContext) {
-    max_context = kMinReportedContext;
-  }
-  if (!quiet) {
-    log.Info("calibrate",
-             std::string("max context for ") + std::string(ToString(kv_type)) +
-                 ": " + std::to_string(max_context) + " token(s) (" +
-                 std::to_string(memory.free_bytes) + " free / " +
-                 std::to_string(memory.total_bytes) + " total, reserve " +
-                 std::to_string(kMemoryReserveBytes) + ")");
-  }
+  // cache type, measured after the sweep so the draft weights are
+  // resident. KV-only and informational; the run used --context.
+  const std::size_t max_context =
+      LogMaxContext(engine, loaded, kv_type, quiet);
 
   CalibrationEntry entry;
   entry.key =
