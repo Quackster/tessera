@@ -179,6 +179,9 @@ The settings it sweeps are the same settings in the tables below:
 Apply a saved entry to `run` or `serve` with `--calibration <file>`, or set
 `TESSERA_CALIBRATION`. The engine uses the saved value for the current machine
 and model unless an explicit flag overrides it. An explicit flag always wins.
+Only `calibrate` writes the file. `run` and `serve` only read it. A missing
+file on `run` or `serve` is not an error. Create the parent directory before
+you run `calibrate`.
 
 ```sh
 # Serve with the calibrated values for this machine and model.

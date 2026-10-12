@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full calibration matrix for Qwen 3.8 27B (see docs/CALIBRATE_COMMAND.md).
+# Full calibration matrix for Qwen 3.8 27B (see docs/CALIBRATE.md).
 # Runs the 8 single-GPU speed sweeps on GPU 0 and the 12 parallel memory-bound
 # runs, then prints the best entry per key from the calibration file.
 # Usage: MODELS_DIR=~/models CALIB_FILE=./calibration.json tools/calibrate_matrix.sh [--summary-only|--single-only|--parallel-only]

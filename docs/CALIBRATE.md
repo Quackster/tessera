@@ -1,266 +1,152 @@
 # Tessera calibration
 
-This file describes the calibration feature for tessera. Read it before you
-start the implementation.
+Calibration measures engine settings on your machine and keeps the fastest value. It changes speed only. It never changes the produced tokens.
 
-Calibration measures a few engine settings on the machine that runs the model
-and keeps the fastest value. It only changes speed. It never changes the
-produced tokens.
+There are two modes. Use one mode per command. One command never runs both modes.
 
-## Why calibrate
+## Modes at a glance
 
-Some engine settings depend on the machine more than on the model. The shipped
-defaults were measured on one machine. A different GPU, a different backend, or
-a different context length can move the best value. The goal is to find the
-value for the machine at hand without a code change.
+| Mode | Command | Result |
+| --- | --- | --- |
+| Single GPU speed sweep | `calibrate --model <path>` without `--gpus` | Best speed settings plus memory bound |
+| Parallel memory bound | `calibrate --model <path> --gpus 0,1 --tp` or `--cp` or `--pipeline` | Memory bound only, no speed settings |
 
-A calibrated run must equal the default run. The non-speculative baseline
-stays stable within the per-backend tolerance (`AGENTS.md`, architecture
-rules). The output is the reference, the setting is the speed.
+## Mode 1: single GPU speed sweep
 
-## Reference behavior in Strata
+Use this mode to tune one GPU for one model.
 
-Strata is a hybrid CPU and GPU engine. Its tool `../Strata/tools/calibrate.py`
-measures three settings that depend on the PC more than on the model:
+Example:
 
-- `--pcie-frac`: the share of the experts missing from VRAM that move over
-  PCIe and run on the GPU instead of the CPU.
-- `--spec-min-p`: how sure the draft layer must be to extend a verify window
-  by one more guess.
-- `--pool-workers`: the CPU threads that compute the experts.
+```sh
+# MXFP4 target with the DFlash2 draft.
+./cmake-build-rocm/tessera-cli calibrate \
+  --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --draft ~/models/Qwen3.8-27B-DFlash2-FP8 \
+  --calibration ~/.config/tessera/calibration.json
 
-The method in Strata is worth copying:
-
-- It measures decode speed only. The prompt path streams every expert, so the
-  tuned settings do not change it.
-- It sweeps a fixed candidate list per setting.
-- It keeps a setting only when the best value beats the default by more than
-  `MIN_GAIN` (0.03). The adaptive expert tier and the operating system make a
-  single measurement noisy by a few percent.
-- It confirms the winning value against the default with an interleaved
-  re-measurement, three times each.
-- The first two settings are applied per request through a `strata_tune` key in
-  the sampling map, so the sweep avoids a restart. The worker count needs a
-  restart per value.
-- It saves the result per machine and model in a settings file, and setup
-  applies the saved result on a later install.
-
-See `../Strata/setup.py` (`hardware_key`, `calibrate_config`,
-`saved_calibration`, `setup_calibration`) for the persistence, and
-`../Strata/tools/test_calibrate.py` for the stand-in engine test pattern.
-
-## What tessera exposes today
-
-Tessera is a GPU-only engine. There is no expert offload and no CPU expert
-pool, so the Strata settings have no direct analog. The same idea maps to the
-launch-shape and decode knobs below.
-
-Hardware-dependent knobs in the tree today:
-
-- The backend (Vulkan or ROCm). It is chosen at configure time with
-  `TESSERA_BACKEND` and cannot change at run time.
-- The GPU index (`EngineOptions::device_index`).
-- `EngineOptions::prefill_chunk_tokens`, default auto `512`
-  (`kDefaultPrefillChunkTokens`).
-- `GenerateOptions::draft_tokens`, default from the draft checkpoint.
-- `GenerateOptions::kv_type`, the KV cache type.
-- The MXFP4 fp8 tensor-core GEMM split-K target and cap. They are request
-  tunings (`GenerateOptions::mxfp4_split_target` / `mxfp4_split_cap`), with
-  the environment values `TESSERA_MXFP4_SPLIT` (target `320`) and
-  `TESSERA_MXFP4_SPLITCAP` (cap `4`) as a diagnostic override that wins over
-  the request value.
-- Split-N attention chunks: the count is a request tuning
-  (`GenerateOptions::attention_split`, default `16`), and the path applies
-  once the key range reaches `kSplitMinKeys` (1024).
-- The DFlash2 draft context window (`GenerateOptions::draft_context`, default
-  from the checkpoint; `TESSERA_DFLASH2_CTX` as a diagnostic override).
-- Diagnostic toggles: `TESSERA_MXFP4_WMMA`, `TESSERA_MXFP4_W4A8`,
-  `TESSERA_TARGET_BF16`, `TESSERA_DFLASH2_CTX`, `TESSERA_TILED_MIN_ROWS`,
-  `TESSERA_TILED_MIN_COLS`, `TESSERA_PREFILL_ATTN_PAIRS`. The tiled-GEMM
-  dispatch thresholds and the prefill attention pair budget are exposed for
-  measurement but are not swept automatically: the thresholds are coupled
-  and the prefill budget is a driver-hang safety clamp.
-
-## Settings to tune
-
-| Setting | What it controls | Default | Candidates | Metric |
-| --- | --- | --- | --- | --- |
-| `mxfp4_split_target` | Split-K workgroups for the fp8 tensor-core MXFP4 GEMM. A small GPU is latency-bound with one split, a large GPU wants more. | `320` | `120`, `320`, `640` | decode tok/s |
-| `mxfp4_split_cap` | Upper bound on the split-K factor, so one projection does not over-split. | `4` | `2`, `4`, `8` | decode tok/s |
-| `prefill_chunk_tokens` | Tokens per prefill forward. A larger chunk cuts launch overhead and raises scratch. A smaller chunk bounds memory. | auto `512` | `512`, `768`, `1024`, `1536`, `2048` | prefill tok/s |
-| `attention_split` | Flash-decoding chunks for the single-token (m=1) path once the key range is long (`kSplitMinKeys` 1024). Splitting trades parallel work against the reduction. | `16` | `4`, `8`, `16`, `32` | decode tok/s, long context |
-| `draft_tokens` | Draft block for speculative decode. A larger block trades acceptance against verify cost. | checkpoint value (DFlash2 block `8`) | `4`, `8`, and the checkpoint value | decode tok/s |
-| `draft_context` | DFlash2 draft context window in rows. A smaller window cuts draft cost, a larger one can raise acceptance. | checkpoint window | `512`, `1024`, `2048` | decode tok/s |
-
-The split-K, cap, attention-split, draft-block and draft-context settings
-target decode speed, as in Strata. The prefill chunk targets prefill speed.
-
-Backend scope: the split target and cap act only on ROCm, because the fp8
-WMMA MXFP4 path is ROCm-only. On Vulkan the kernel does not exist, so both
-are inert. Calibration detects this and reports the settings as not
-applicable, not as a failure. The attention split and the prefill chunk are
-swept on both backends; the attention split is reported not applicable when
-the prompts are shorter than `kSplitMinKeys`. The draft settings are swept
-only when a draft is attached.
-
-## Measurement protocol
-
-- Measure decode speed as `produced_tokens / decode_ms`. Measure prefill speed
-  as `prompt_tokens / prefill_ms`.
-- Use greedy decode. Greedy is the deterministic reference baseline. A fixed
-  candidate value must not change the tokens, only the time.
-- Use three fixed prompts. The rate of one setting is the median of the rates
-  over the prompts. A fixed prompt set is a file-local constant.
-- Keep a setting only when the best candidate beats the default by more than
-  `MIN_GAIN`. `MIN_GAIN` is a file-local constant, not a literal at the call
-  site (`AGENTS.md` rule 13).
-- Confirm the winner against the default with an interleaved re-measurement,
-  three rounds each. Use the median of the rounds.
-- Warm the engine before the first measurement, and warm each new configuration
-  once before its sweep point.
-- Run the whole sweep in one process with one model load. Do not load the model
-  per candidate (`AGENTS.md` rule 20). Each candidate is a per-request value,
-  so no restart is needed.
-- The sweep has no time cap; it runs to completion in one process. Every
-  point prefills its prompt, so the run length scales with the prompt set and
-  the model prefill rate. Size the prompt file for the time at hand. The
-  decode settings sweep a short prompt and the prefill chunk a long one, so
-  each measurement pays only the phase it tunes.
-
-The default path is the floor. A candidate is kept only when it is faster and
-its output matches the default within the per-backend tolerance. Do not trade
-correctness for speed.
-
-## Persistence and the hardware key
-
-Store the result in a JSON calibration file. The path is runtime configuration,
-never a hard-coded path (`AGENTS.md`, Model Data). Pass it with
-`--calibration <path>`, or through a documented environment variable. The tool
-reads and writes the same file.
-
-Key an entry by the hardware and model identity, the analog of Strata's
-`hardware_key`:
-
-```
-backend | device name | model name | context | kv type | strategy
+# Unsloth GGUF Q4_K_M with MTP speculation.
+./cmake-build-rocm/tessera-cli calibrate \
+  --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --speculate \
+  --calibration ~/.config/tessera/calibration.json
 ```
 
-The split target depends on the backend and the GPU. The draft block depends on
-the model and the strategy. The context and the KV type change the cache and
-the shapes. A change to any part of the key means the entry does not apply.
+Useful flags:
 
-The file holds one entry per key, each with the chosen settings, the measured
-tok/s, the memory-bound context for the KV type, and the date. A later run
-with the same key reuses the entry only when
-the caller passes `--calibration`. There is no implicit global lookup, so state
-flows through the command line (`AGENTS.md`, engineering principles).
+* `--model <path>`: model file or directory. Required.
+* `--gpu <n>`: device index. Default is 0.
+* `--context <n>`: context length stored in the key. Default is 4096.
+* `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`: KV cache type. Default is int8.
+* `--draft <dir>`: DFlash2 draft checkpoint. It enables the draft sweeps.
+* `--speculate`: MTP draft from the target head. It enables the draft block sweep.
+* `--prompts <file>`: prompts for the sweep, one per line. Default is three fixed prompts.
+* `--calibration <file>`: file to read and write. You can also set `TESSERA_CALIBRATION`. One of the two is required.
+* `--quiet`: hide progress logs.
 
-## Engine and CLI changes
+What it tunes:
 
-### Public API
+| Setting | Candidates | When it is swept |
+| --- | --- | --- |
+| `mxfp4_split_target` | `120`, `320`, `640` | ROCm only |
+| `mxfp4_split_cap` | `2`, `4`, `8` | ROCm only |
+| `prefill_chunk_tokens` | `512`, `768`, `1024`, `1536`, `2048` | Always |
+| `attention_split` | `4`, `8`, `16`, `32` | Only when prompts reach 1024 keys |
+| `draft_tokens` | `4`, `8`, plus checkpoint value | Only with `--draft` or `--speculate` |
+| `draft_context` | `512`, `1024`, `2048` | Only with `--draft` |
 
-- Add the split-K target and cap to `GenerateOptions`, next to the existing
-  `draft_tokens` and `prefill_chunk_tokens`. `0` means the built-in default.
-  This is the per-request tuning channel, the analog of Strata's `strata_tune`.
-- Move the two environment reads in `src/models/qwen3_5/project.cpp` to the
-  state. The decode entry copies the request tuning into the architecture
-  state. The architecture module reads the state. The core stays backend and
-  model agnostic. Keep the environment variables as a diagnostic override and
-  document that they win over the request value.
-- `draft_tokens` and `prefill_chunk_tokens` already exist, so only the split
-  fields are new.
+How it measures:
 
-### CLI
+* It loads the model one time in one process.
+* It uses greedy decode. Greedy output is the reference.
+* Decode settings use a short prompt and 32 decode tokens.
+* The prefill setting uses long prompts and measures prompt tokens per second.
+* The rate of one value is the median over the prompts.
+* It keeps a value only when it beats the default by more than 0.03.
+* It confirms a winner with three interleaved re-measurements.
+* It warms the engine before the first point and warms each new value once.
 
-Add a `calibrate` subcommand to `tools/cli/main.cpp`:
+What it stores:
 
+* One entry under key `backend | device | model | context | kv type | strategy | none`.
+* Strategy is `none`, `mtp`, or `dflash2`.
+* The entry holds the chosen settings, the median decode rate, the median prefill rate, the memory bound context, and the date.
+* The memory bound is informational. It equals free device memory minus a 2 GiB reserve, divided by KV bytes per token.
+* The report prints each point, the chosen values, and an example `run` command.
+
+## Mode 2: parallel memory bound
+
+Use this mode to find the largest KV context for a multi GPU layout.
+
+Example:
+
+```sh
+./cmake-build-rocm/tessera-cli calibrate \
+  --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --gpus 0,1 --tp \
+  --calibration ~/.config/tessera/calibration.json
 ```
-tessera-cli calibrate --model <path> [--draft <dir>]
-    [--context <n>] [--kv-*] [--calibration <file>]
-    [--gpu <n>] [--prompts <file>]
+
+Rules:
+
+* `--gpus` needs at least two devices, for example `0,1`.
+* Pass exactly one route: `--tp`, `--cp`, or `--pipeline`.
+* Do not pass `--draft` or `--speculate`. The entry always stores strategy `none`.
+* The entry stores one layout: `tp2`, `cp2`, or `pipe2`.
+
+How it measures:
+
+* It builds the route and measures free memory and weight bytes on each rank.
+* It combines the ranks. Tensor takes the minimum. Context multiplies the minimum by the rank count. Pipeline scales each stage by its layer share.
+* It runs one short validation generate of 8 tokens. It measures no speed.
+* It stores `max_context` and the date. Decode and prefill rates stay empty.
+
+## Use a saved entry
+
+Pass the same file to `run` or `serve`:
+
+```sh
+# MXFP4 target with the DFlash2 draft.
+./cmake-build-rocm/tessera-cli run \
+  --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --draft ~/models/Qwen3.8-27B-DFlash2-FP8 \
+  --calibration ~/.config/tessera/calibration.json \
+  --prompt-text "Hello" --max-completion-tokens 32
+
+# Unsloth GGUF Q4_K_M with MTP speculation.
+./cmake-build-rocm/tessera-cli run \
+  --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --speculate \
+  --calibration ~/.config/tessera/calibration.json \
+  --prompt-text "Hello" --max-completion-tokens 32
 ```
 
-The command loads the model once, warms it, sweeps the candidates, prints one
-line per sweep point and a final report, and writes the calibration file. On
-ROCm it sweeps the split target. On both backends it sweeps the prefill chunk
-and, when a draft is attached, the draft block. It defaults the KV cache to
-int8 (kv8) and reports the maximum context length the device allows for that
-cache type: free device memory minus a 2 GiB reserve, divided by the per-token
-KV bytes over the full-attention layers.
+The engine looks up the key for the current backend, device, model, context, KV type, strategy, and layout. An explicit flag always wins over a saved value. There is no global lookup. You must pass `--calibration`.
 
-A parallel run calibrates the memory bound only, with no speed sweep:
+Only `calibrate` writes the file. `run` and `serve` only read it. A missing file on `run` or `serve` is not an error. It means no calibration exists yet. Create the parent directory before you run `calibrate`. The tool does not create it.
 
-```
-tessera-cli calibrate --model <path> --gpus 0,1 --tp
-    [--kv-*] [--calibration <file>]
-```
+## What calibration does not do
 
-Exactly one of `--tp`, `--cp` or `--pipeline` selects the route. The
-command builds the route, measures each rank's resident weight bytes and
-free memory, and combines the per-device budgets: tensor takes the
-minimum (the KV cache is replicated), context multiplies the minimum by
-the rank count (one key chunk each), pipeline scales each stage by its
-layer share. The entry is stored under a key carrying the layout
-(`tp2`, `cp2`, `pipe2`), so it never collides with a single-device
-entry, and the report's example command reproduces the flags. Old files
-without the field still load; their entries read as unparallelized.
+* It does not tune speed for a parallel layout. The `--gpus` path stores memory only.
+* It does not benchmark concurrent sessions. There is no sweep over 2, 3, or 4 sessions with tok/s per count.
+* It does not report max KV cache under concurrent load.
+* It does not store speed rates for parallel entries.
+* It does not sweep the draft on the parallel path.
+* It does not select the KV cache type. The KV type is your choice. It changes numerics.
+* It does not select the backend. The backend is fixed at configure time.
+* It does not tune sampling. Sampling changes output.
+* It does not store model paths. The key stores the model name only.
 
-`run` and `serve` accept `--calibration <file>`. When the file has an entry for
-the current key, the engine uses the saved values unless an explicit flag
-overrides them. An explicit flag always wins.
+Note: `run` with two or more `--prompt-text` flags runs concurrent sessions on one device. That path is a functional run. It is not a calibration sweep. It writes no file.
 
-All engine logic stays in the library. The CLI is a thin front end
-(`AGENTS.md`, Where Things Live).
+## TODO
 
-## Where the code lives
+1. Add a speed sweep for parallel layouts. Sweep the same speed knobs through `--tp`, `--cp`, and `--pipeline` on the target GPUs. Store the winner under the layout key.
+2. Add the draft sweep to the parallel path. Cover `--draft` and `--speculate` for each layout.
+3. Add a concurrent session benchmark. Run 2, then 3, then 4 sessions on the calibrated model. Report total tok/s and per session tok/s for each count.
+4. Report max KV cache under concurrent load. Record the largest session count that fits the requested context.
+5. Store measured decode and prefill rates in parallel entries. Fill the rate fields that are empty today.
+6. Keep diagnostic flags out of the sweep. `TESSERA_MXFP4_WMMA`, `TESSERA_MXFP4_W4A8`, `TESSERA_TARGET_BF16`, tiled GEMM thresholds, and the prefill attention budget stay manual.
 
-- The sweep, the candidate lists, the pick rule, the hardware key, and the
-  calibration file reader and writer live in a new pair of files under
-  `src/core/` or a small `src/core/calibrate/` folder, behind one module. Keep
-  every file under 600 lines.
-- The split-K value reaches the kernel through the Qwen3.5 architecture module,
-  because the projection is architecture-owned. The core only carries the
-  value.
-- One canonical implementation of the pick rule, the candidate list, and the
-  key. Do not copy them into the CLI. No trivial pass-through methods
-  (`AGENTS.md` rules 2 and 3).
-- Record the borrowed Strata approach in `CREDITS.md` in the same change
-  (`AGENTS.md` rule 17).
+## File format
 
-## Tests
-
-Add the tests to the single test target (`tests/`), not a new executable.
-
-- A stand-in engine whose decode rate is a function of the settings, as in
-  `../Strata/tools/test_calibrate.py`. Cover:
-  - defaults kept when every candidate is flat,
-  - a gain below `MIN_GAIN` is noise and keeps the default,
-  - a real gain in the split target is found,
-  - a real gain in the draft block is found,
-  - the interleaved confirmation rejects a single noisy win.
-- Candidate generation: the candidate list, the dedupe, and the bounds.
-- The pick rule: empty input, a missing default, a tie, and the median.
-- The hardware key: each field changes the key, and an identical machine and
-  model matches.
-- The calibration file: write, read, round trip, a malformed file, a missing
-  file, and an unknown key.
-- A failed run leaves the defaults in place.
-- One device test that confirms a calibrated value equals the default within
-  the per-backend tolerance. Skip cleanly with no device.
-
-## Non-goals
-
-- Do not calibrate the KV cache type. It changes numerics and is a user choice.
-- Do not calibrate the backend. It is fixed at configure time.
-- Do not calibrate sampling parameters. They change the output.
-- Do not store model paths in the calibration file.
-- Do not change the non-speculative baseline.
-
-## Rollout checklist
-
-1. Implement the settings, the module, the CLI command, and the tests.
-2. Both backends build. The full suite passes on both.
-3. State the backend used for the measurement in the report.
-4. Update `docs/PROGRESS.md` and the `README.md` features table.
-5. Move the item here from plan to done with the measured result.
-6. Commit the milestone.
+The file is JSON. It holds one entry per key. A missing file means no calibration yet. A malformed file is rejected. Old files without the `parallel` field still load as `none`.
