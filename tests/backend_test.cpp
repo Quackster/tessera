@@ -357,94 +357,105 @@ TEST(BackendTest, GemmFp8DeviceMatchesRef) {
       << "backend " << backend->Name() << " max_rel " << max_rel;
 }
 
-// Device: MXFP4 GEMM matches the host reference (2 x 32 outputs).
+// Device: MXFP4 GEMM matches the host reference, on both backends. The
+// second shape is the single-row decode case with a partial final
+// workgroup, which covers the subgroup reduction with inactive lanes.
 TEST(BackendTest, GemmMxFp4DeviceMatchesRef) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
-  std::mt19937 rng(2025);
-  constexpr std::size_t kM = 2;
-  constexpr std::size_t kN = 32;
-  constexpr std::size_t kK = 64;
   constexpr float kGrid[8] = {0.0f, 0.5f, 1.0f, 1.5f,
                               2.0f, 3.0f, 4.0f, 6.0f};
-  std::vector<float> a(kM * kK);
-  std::vector<std::byte> w(kN * kK / 2, std::byte{0});
-  std::vector<std::byte> s(kN * kK / 32);
-  for (auto& v : a) {
-    v = DrawValue(rng);
-  }
-  for (std::size_t j = 0; j < kN; ++j) {
-    for (std::size_t b = 0; b < kK / 32; ++b) {
-      s[j * (kK / 32) + b] = static_cast<std::byte>(125 + (j + b) % 5);
-      for (std::size_t l = 0; l < 32; ++l) {
-        const std::size_t t = b * 32 + l;
-        const std::uint8_t nib = core::Fp32ToF4E2M1Nibble(
-            kGrid[(j + t) % 8] * (t % 3 == 0 ? -1.0f : 1.0f));
-        const std::size_t at = (j * kK + t) / 2;
-        std::uint8_t packed = static_cast<std::uint8_t>(w[at]);
-        if (t % 2 == 0) {
-          packed = static_cast<std::uint8_t>((packed & 0xF0) | nib);
-        } else {
-          packed = static_cast<std::uint8_t>((packed & 0x0F) |
-                                             (nib << 4));
+  constexpr std::size_t kShapes[][3] = {{2, 32, 64}, {1, 12, 64}};
+  for (std::size_t shape = 0; shape < 2; ++shape) {
+    const std::size_t kM = kShapes[shape][0];
+    const std::size_t kN = kShapes[shape][1];
+    const std::size_t kK = kShapes[shape][2];
+    std::mt19937 rng(2025 + shape);
+    std::vector<float> a(kM * kK);
+    std::vector<std::byte> w(kN * kK / 2, std::byte{0});
+    std::vector<std::byte> s(kN * kK / 32);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    for (std::size_t j = 0; j < kN; ++j) {
+      for (std::size_t b = 0; b < kK / 32; ++b) {
+        s[j * (kK / 32) + b] = static_cast<std::byte>(125 + (j + b) % 5);
+        for (std::size_t l = 0; l < 32; ++l) {
+          const std::size_t t = b * 32 + l;
+          const std::uint8_t nib = core::Fp32ToF4E2M1Nibble(
+              kGrid[(j + t) % 8] * (t % 3 == 0 ? -1.0f : 1.0f));
+          const std::size_t at = (j * kK + t) / 2;
+          std::uint8_t packed = static_cast<std::uint8_t>(w[at]);
+          if (t % 2 == 0) {
+            packed = static_cast<std::uint8_t>((packed & 0xF0) | nib);
+          } else {
+            packed = static_cast<std::uint8_t>((packed & 0x0F) |
+                                               (nib << 4));
+          }
+          w[at] = static_cast<std::byte>(packed);
         }
-        w[at] = static_cast<std::byte>(packed);
       }
     }
-  }
-  // The device kernel takes the packed weight: blob bytes then scales.
-  std::vector<std::byte> packed = w;
-  packed.insert(packed.end(), s.begin(), s.end());
-  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
-  auto w_buf = backend->AllocateBuffer(packed.size(), MemoryKind::Device);
-  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
-  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
-  const auto upload = [&backend](auto& buf, const auto& data,
-                                 std::size_t elem) {
-    return backend->CopyH2D(
-        **buf, std::span<const std::byte>(
-                   reinterpret_cast<const std::byte*>(data.data()),
-                   data.size() * elem));
-  };
-  ASSERT_TRUE(upload(a_buf, a, 4).has_value());
-  ASSERT_TRUE(upload(w_buf, packed, 1).has_value());
+    // The device kernel takes the packed weight: blob bytes then scales.
+    std::vector<std::byte> packed = w;
+    packed.insert(packed.end(), s.begin(), s.end());
+    auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+    auto w_buf = backend->AllocateBuffer(packed.size(), MemoryKind::Device);
+    auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+    ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value())
+        << "shape " << shape;
+    const auto upload = [&backend](auto& buf, const auto& data,
+                                   std::size_t elem) {
+      return backend->CopyH2D(
+          **buf, std::span<const std::byte>(
+                     reinterpret_cast<const std::byte*>(data.data()),
+                     data.size() * elem));
+    };
+    ASSERT_TRUE(upload(a_buf, a, 4).has_value()) << "shape " << shape;
+    ASSERT_TRUE(upload(w_buf, packed, 1).has_value()) << "shape " << shape;
 
-  auto kernel = backend->LoadKernel("gemm_mxfp4", {});
-  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
-  tessera::KernelLaunch launch;
-  launch.grid_x = tessera::core::detail::GemmGridFor(**kernel, kM, kN);
-  launch.block_x = 256;
-  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
-  launch.scalars = {kM, kN, kK};
-  auto result = backend->LaunchKernel(**kernel, launch);
-  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
-  backend->Synchronize();
+    auto kernel = backend->LoadKernel("gemm_mxfp4", {});
+    ASSERT_TRUE(kernel.has_value())
+        << tessera::ToString(kernel.error()) << " shape " << shape;
+    tessera::KernelLaunch launch;
+    launch.grid_x = tessera::core::detail::GemmGridFor(**kernel, kM, kN);
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+    launch.scalars = {kM, kN, kK};
+    auto result = backend->LaunchKernel(**kernel, launch);
+    ASSERT_TRUE(result.has_value())
+        << tessera::ToString(result.error()) << " shape " << shape;
+    backend->Synchronize();
 
-  std::vector<std::byte> readback(kM * kN * 4);
-  auto download =
-      backend->CopyD2H(**c_buf, readback.data(), readback.size());
-  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
-  std::vector<float> ref(kM * kN);
-  auto ref_status = core::GemmMxFp4Ref(
-      std::span<const float>(a), std::span<const std::byte>(w),
-      std::span<const std::byte>(s), std::span<float>(ref), kM, kN, kK);
-  ASSERT_TRUE(ref_status.has_value())
-      << tessera::ToString(ref_status.error());
-  const auto* device_out = reinterpret_cast<const float*>(readback.data());
-  const FpTolerance tol = FpToleranceFor(backend->Name());
-  float max_abs = 0.0f;
-  float max_rel = 0.0f;
-  for (std::size_t i = 0; i < ref.size(); ++i) {
-    const float e = std::abs(device_out[i] - ref[i]);
-    const float r =
-        std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
-    max_abs = std::max(max_abs, e);
-    max_rel = std::max(max_rel, r);
+    std::vector<std::byte> readback(kM * kN * 4);
+    auto download =
+        backend->CopyD2H(**c_buf, readback.data(), readback.size());
+    ASSERT_TRUE(download.has_value())
+        << tessera::ToString(download.error()) << " shape " << shape;
+    std::vector<float> ref(kM * kN);
+    auto ref_status = core::GemmMxFp4Ref(
+        std::span<const float>(a), std::span<const std::byte>(w),
+        std::span<const std::byte>(s), std::span<float>(ref), kM, kN, kK);
+    ASSERT_TRUE(ref_status.has_value())
+        << tessera::ToString(ref_status.error()) << " shape " << shape;
+    const auto* device_out = reinterpret_cast<const float*>(readback.data());
+    const FpTolerance tol = FpToleranceFor(backend->Name());
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      const float e = std::abs(device_out[i] - ref[i]);
+      const float r =
+          std::abs(device_out[i] - ref[i]) / std::max(1.0f, std::abs(ref[i]));
+      max_abs = std::max(max_abs, e);
+      max_rel = std::max(max_rel, r);
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << "backend " << backend->Name() << " shape " << shape << " max_abs "
+        << max_abs;
+    EXPECT_LE(max_rel, tol.rel)
+        << "backend " << backend->Name() << " shape " << shape << " max_rel "
+        << max_rel;
   }
-  EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
-  EXPECT_LE(max_rel, tol.rel)
-      << "backend " << backend->Name() << " max_rel " << max_rel;
 }
 
 // Device: the small-batch rows GEMV (one warp per weight column, all m rows)

@@ -1,9 +1,12 @@
 #version 450
 
+#extension GL_KHR_shader_subgroup_clustered : require
+
 // One 32-lane warp per output element; lane l sums blocks l, l+32, ... so
 // the activation and weight reads are coalesced across the warp. Eight
 // warps per 256-thread workgroup; the dispatch is ceil(m * n / 8)
-// workgroups via grid_x.
+// workgroups via grid_x. Lane partials reduce with a subgroup shuffle,
+// the same association as the ROCm twin: no shared memory, no barrier.
 layout(local_size_x = 256) in;
 
 // "gemm_mxfp4" contract (tessera API): buffer 0 is A (fp32, m x k),
@@ -28,11 +31,15 @@ layout(set = 0, binding = 2) buffer C {
   float c[];
 };
 
-shared float red[256];
-
 // Byte `offset` of the packed weight buffer viewed as uint words.
 uint wbyte(uint offset) {
   return (w[offset >> 2] >> ((offset & 3) << 3)) & 0xFF;
+}
+
+// 32-lane (warp-equivalent) reduction; every lane of the warp calls it,
+// the lane-0 caller writes the result.
+float reduce32(float v) {
+  return subgroupClusteredAdd(v, 32u);
 }
 
 // OCP MX E2M1 nibble values (port of the core F4E2M1ToFloat). A table
@@ -67,19 +74,14 @@ void main() {
       for (uint q = 0u; q < 4u; ++q) {
         uint bits = w[word + q];
         for (uint j = 0u; j < 8u; ++j) {
-          acc += a[a_base + base + q * 8u + j] * (scale * kE2M1[bits & 15u]);
+          acc = fma(a[a_base + base + q * 8u + j], scale * kE2M1[bits & 15u], acc);
           bits >>= 4;
         }
       }
     }
   }
-  red[lid] = acc;
-  barrier();
+  float sum = reduce32(acc);
   if (lane == 0u && out_idx < total) {
-    float sum = 0.0;
-    for (uint t = 0u; t < 32u; ++t) {
-      sum += red[group * 32u + t];
-    }
     c[out_idx] = sum;
   }
 }
