@@ -119,9 +119,9 @@ Mirror `GatherEmbeddingDevice` and `DeviceRowArgMax`.
 Acceptance: dense paged output is unchanged.
 - [x] Keep MoE dense resident, page only routed experts.
 Acceptance: N=20 runs 14 tok/s on Vulkan and ROCm, same output.
-- [ ] Expert reuse cache across tokens.
-Measured LRU-32 hits 59 percent, worth about 20 tok/s at N=20.
-Needs cache-aware slice math plus tests on both backends.
+- [x] Expert reuse cache across tokens.
+Per-layer LRU-32 device cache with D2D gather into staging, no kernel
+change. N=20 runs 20 tok/s Vulkan and 24 tok/s ROCm, same output.
 - [ ] Keep prefetch deferred while transfers stay bandwidth bound.
 Overlap would hide at most layer compute at about 0.3 ms.
 This file records the profile date and the reason.

@@ -496,12 +496,28 @@ TEST(MoeDecodeTest, PagedMatchesFullUpload) {
       << tessera::ToString(paged_first.error());
   EXPECT_EQ(*paged_first, *full_first);
   auto paged_second = tessera::core::DecodeStep(engine->Owner(), **paged,
-                                                paged_cache, *paged_first);
+                                               paged_cache, *paged_first);
   ASSERT_TRUE(paged_second.has_value())
       << tessera::ToString(paged_second.error());
   EXPECT_EQ(*paged_second, *full_second);
   // The selective staging ran: expert views resolve after generation.
   EXPECT_NE((*paged)->FindDeviceTensor("blk.0.ffn_gate_exps.weight"), nullptr);
+  // Later tokens reuse cached experts through device-side gathers, so a
+  // longer run must still match the full upload token for token.
+  std::uint32_t full_token = *full_second;
+  std::uint32_t paged_token = *paged_second;
+  for (int step = 0; step < 4; ++step) {
+    auto full_next =
+        tessera::core::DecodeStep(engine->Owner(), **full, full_cache, full_token);
+    ASSERT_TRUE(full_next.has_value()) << tessera::ToString(full_next.error());
+    auto paged_next = tessera::core::DecodeStep(engine->Owner(), **paged,
+                                                paged_cache, paged_token);
+    ASSERT_TRUE(paged_next.has_value())
+        << tessera::ToString(paged_next.error());
+    EXPECT_EQ(*paged_next, *full_next) << "step " << step;
+    full_token = *full_next;
+    paged_token = *paged_next;
+  }
 }
 
 // The paged MoE batch path matches the full-upload sequential logits,

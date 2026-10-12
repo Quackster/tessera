@@ -1103,6 +1103,11 @@ bool Model::ExpertsPaged(std::size_t layer) const {
          !paged_expert_by_layer_[layer].empty();
 }
 
+// Cached expert triplets per routed-expert kind: a repeated expert costs
+// one device-side gather instead of a host upload. A tunable; each kind's
+// store holds this many expert slices.
+constexpr std::size_t kExpertCacheEntries = 32;
+
 // One expert's byte size and count from a rank-3 packed expert manifest.
 // MalformedFile when the shape cannot hold experts.
 std::expected<std::pair<std::size_t, std::size_t>, StatusCode> ExpertSpan(
@@ -1174,9 +1179,14 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   // layer: a prefill batch whose rows share experts uploads each one
   // once instead of once per row. The staged bytes are identical either
   // way, so the kernels read the same weights.
+  //
+  // An expert already in the kind's device cache gathers from the store
+  // into the staging view with a device-side copy (ordered with the
+  // kernels on both backends, no host round trip); only cache misses
+  // upload from the host, into a store slot, then gather the same way.
   const std::vector<std::size_t>* rows =
       layer < paged_expert_by_layer_.size() ? &paged_expert_by_layer_[layer]
-                                            : nullptr;
+                                           : nullptr;
   const bool same_layer =
       experts_layer_.has_value() && *experts_layer_ == layer;
   if (rows == nullptr || rows->empty()) {
@@ -1208,11 +1218,27 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   } else {
     missing = wanted;
   }
-  std::vector<Backend::HostCopy> slices;
-  std::vector<std::size_t> slots;
-  slices.reserve(rows->size() * missing.size());
-  slots.reserve(rows->size());
-  for (const std::size_t i : *rows) {
+  // One cache per (layer, kind) row, parallel to the layer's expert
+  // rows and resolved before any upload so a malformed manifest still
+  // reports before bytes move. A null cache bypasses caching and uploads
+  // straight into the staging view.
+  struct KindWork {
+    std::size_t row = 0;
+    std::size_t stage_slot = 0;
+    std::size_t per = 0;
+    ExpertCache* cache = nullptr;
+  };
+  if (expert_cache_by_layer_.size() <= layer) {
+    expert_cache_by_layer_.resize(layer + 1);
+  }
+  std::vector<ExpertCache>& layer_cache = expert_cache_by_layer_[layer];
+  if (layer_cache.size() < rows->size()) {
+    layer_cache.resize(rows->size());
+  }
+  std::vector<KindWork> kinds;
+  kinds.reserve(rows->size());
+  for (std::size_t k = 0; k < rows->size(); ++k) {
+    const std::size_t i = (*rows)[k];
     const PagedTensor& entry = paged_[i];
     auto span = ExpertSpan(entry.manifest);
     if (!span) {
@@ -1227,23 +1253,106 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
     if (slot == nullptr) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    slots.push_back(staged->second);
     for (const std::uint32_t expert : missing) {
       const std::size_t id = expert;
       if (id >= count || per > entry.host.size() ||
           id > (entry.host.size() - per) / per) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      const std::size_t begin = id * per;
-      slices.push_back(Backend::HostCopy{slot, entry.host.subspan(begin, per),
-                                         begin});
+    }
+    ExpertCache* cache = nullptr;
+    ExpertCache& held = layer_cache[k];
+    if (held.store == nullptr) {
+      auto store =
+          backend_.AllocateBuffer(kExpertCacheEntries * per, MemoryKind::Device);
+      if (store) {
+        held.stage_slot = staged->second;
+        held.per_bytes = per;
+        held.store = std::move(*store);
+        held.entries.resize(kExpertCacheEntries);
+      }
+    }
+    if (held.store != nullptr && held.per_bytes == per &&
+        held.entries.size() == kExpertCacheEntries) {
+      cache = &held;
+    }
+    kinds.push_back(KindWork{i, staged->second, per, cache});
+  }
+  // Cache fills upload into store slots; every wanted slice (hit or fill)
+  // then gathers store to staging at the expert offset.
+  struct Gather {
+    Buffer* store = nullptr;
+    std::size_t src_offset = 0;
+    Buffer* stage = nullptr;
+    std::size_t dst_offset = 0;
+    std::size_t bytes = 0;
+  };
+  std::vector<Backend::HostCopy> uploads;
+  std::vector<Gather> gathers;
+  uploads.reserve(rows->size() * missing.size());
+  gathers.reserve(rows->size() * missing.size());
+  std::vector<std::size_t> slots;
+  slots.reserve(rows->size());
+  for (const KindWork& kind : kinds) {
+    const PagedTensor& entry = paged_[kind.row];
+    Buffer* stage = stage_views_[kind.stage_slot].device.get();
+    slots.push_back(kind.stage_slot);
+    for (const std::uint32_t expert : missing) {
+      const std::size_t begin = static_cast<std::size_t>(expert) * kind.per;
+      if (kind.cache == nullptr) {
+        uploads.push_back(Backend::HostCopy{
+            stage, entry.host.subspan(begin, kind.per), begin});
+        continue;
+      }
+      ExpertCache& cache = *kind.cache;
+      std::size_t slot = kExpertCacheEntries;
+      for (std::size_t s = 0; s < cache.entries.size(); ++s) {
+        const ExpertCacheEntry& held = cache.entries[s];
+        if (held.occupied && held.expert == expert) {
+          slot = s;
+          break;
+        }
+      }
+      if (slot < kExpertCacheEntries) {
+        cache.entries[slot].tick = ++expert_cache_tick_;
+      } else {
+        slot = 0;
+        for (std::size_t s = 1; s < cache.entries.size(); ++s) {
+          const ExpertCacheEntry& held = cache.entries[s];
+          const ExpertCacheEntry& victim = cache.entries[slot];
+          if (!held.occupied ||
+              (victim.occupied && held.tick < victim.tick)) {
+            slot = s;
+          }
+        }
+        cache.entries[slot] =
+            ExpertCacheEntry{expert, ++expert_cache_tick_, true};
+        uploads.push_back(Backend::HostCopy{
+            cache.store.get(), entry.host.subspan(begin, kind.per),
+            slot * kind.per});
+      }
+      gathers.push_back(Gather{cache.store.get(), slot * kind.per, stage,
+                               begin, kind.per});
     }
   }
-  if (auto uploaded = backend_.CopyH2DBatch(slices); !uploaded) {
-    return std::unexpected(uploaded.error());
+  if (!uploads.empty()) {
+    if (auto uploaded = backend_.CopyH2DBatch(uploads); !uploaded) {
+      return std::unexpected(uploaded.error());
+    }
   }
-  for (std::size_t k = 0; k < rows->size(); ++k) {
-    stage_views_[slots[k]].manifest = paged_[(*rows)[k]].manifest;
+  // Ordered after the uploads on both backends (Vulkan records into the
+  // pending compute buffer, ROCm onto the same stream), so the kernels
+  // that run next read the gathered bytes.
+  for (const Gather& gather : gathers) {
+    if (auto copied = backend_.CopyD2D(*gather.store, gather.src_offset,
+                                       *gather.stage, gather.dst_offset,
+                                       gather.bytes);
+        !copied) {
+      return std::unexpected(copied.error());
+    }
+  }
+  for (std::size_t k = 0; k < kinds.size(); ++k) {
+    stage_views_[slots[k]].manifest = paged_[kinds[k].row].manifest;
   }
   if (!same_layer) {
     experts_staged_ = wanted;

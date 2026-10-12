@@ -309,6 +309,37 @@ class Model {
   // upload covers every id (see experts_staged_all_). Mutable likewise.
   mutable std::vector<std::uint32_t> experts_staged_;
   mutable bool experts_staged_all_ = false;
+  // One cached expert: the expert id whose bytes a store slot holds,
+  // with an LRU tick for eviction. The layer is implicit in the
+  // store's position (see expert_cache_by_layer_). Mutable: the cache
+  // fills during generation, which is confined to one thread.
+  struct ExpertCacheEntry {
+    std::uint32_t expert = 0;
+    std::uint64_t tick = 0;
+    bool occupied = false;
+  };
+  // Compact device store of cached experts for one (layer, kind) pair.
+  // The store holds one expert slice per entry; a hit gathers the slice
+  // into the kind's staging view at the expert offset with a device-side
+  // copy, so a repeated expert costs no host transfer. A miss uploads the
+  // slice into a store slot first, then gathers it the same way, so the
+  // staging bytes are identical with or without the cache.
+  struct ExpertCache {
+    // Index into stage_views_ of the kind's staging view.
+    std::size_t stage_slot = 0;
+    // Bytes per expert slice; fixed when the store is allocated.
+    std::size_t per_bytes = 0;
+    std::unique_ptr<Buffer> store;
+    std::vector<ExpertCacheEntry> entries;
+  };
+  // Per-layer expert cache, parallel to paged_expert_by_layer_: entry
+  // [l][k] caches slices of paged_[paged_expert_by_layer_[l][k]], so a
+  // layer's working set survives the other layers' staging and hits on
+  // the next token. Mutable for the same reason as the staging views. A
+  // kind whose store fails to allocate bypasses the cache and uploads
+  // straight into the staging view, so a small device still decodes.
+  mutable std::vector<std::vector<ExpertCache>> expert_cache_by_layer_;
+  mutable std::uint64_t expert_cache_tick_ = 0;
   // Lifetime holders for the RAM backing the paged host spans point into:
   // the mapped weight file and any retained owned copies (tensor-parallel
   // slices, converted MXFP4 blobs). The shared_ptr<const void> type erases
