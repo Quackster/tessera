@@ -55,13 +55,11 @@ See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PR
 
 ## Chat UI
 
-Lightweight, dark-mode AI chat UI with a simple sidebar for API keys and conversation management. It supports streamed model responses, collapsible thinking output, retry controls, token limits, and rendering rich content like inline SVGs directly in the chat.
+Lightweight, dark-mode AI chat UI with a simple sidebar for API keys and conversation management. It supports streamed model responses, collapsible thinking output, retry controls, token limits, and rendering rich content like inline SVGs directly in the chat. Accessible via the IP:PORT serve command.
 
-<img width="1575" height="986" alt="image" src="https://github.com/user-attachments/assets/57f9b3a9-31b2-4a66-9489-0f616c00dd4e" />
+Here's an example of an SVG generation:
 
-Here's a pelican generated with the MXFP4 + DFlash2 using default settings (262k context, xhigh thinking):
-
-<img width="800" height="600" alt="image" src="https://github.com/user-attachments/assets/bbca908a-8d06-4042-859d-0c9094a57a8b" />
+<img width="1796" height="1115" alt="image" src="https://github.com/user-attachments/assets/1b60b164-f462-467f-b696-812b27020de2" />
 
 ## Architecture
 
