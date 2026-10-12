@@ -22,10 +22,12 @@ struct SchedulerOptions {
   std::size_t max_concurrent = kDefaultMaxConcurrent;
 };
 
-// True when Scheduler::Submit can drive this request: no speculative
-// strategy on the engine and no thinking budget on the request (those
-// stay on the exclusive RunnerLease path). Prompt-independent, so the
-// serving layer routes before it tokenizes.
+// True when Scheduler::Submit can drive this request: plain greedy or
+// sampled text with no thinking budget on the request (thinking stays
+// on the exclusive RunnerLease path). A speculative strategy on the
+// engine does not block sharing: the scheduler never touches it and
+// runs the turn as plain greedy, which equals the speculative output.
+// Prompt-independent, so the serving layer routes before it tokenizes.
 //
 // Usage:
 //   const bool shared = CanSchedule(pool.At(0).engine(), options);
@@ -57,9 +59,10 @@ class Scheduler {
   // prefill hook on the caller thread. Stops early when on_token
   // returns false or cancelled reports true (Aborted outcome with the
   // tokens produced so far). InvalidArgument for a bad prompt or
-  // sampling setup, UnsupportedFeature for a strategy-backed engine
-  // or a thinking budget, OutOfMemory when one turn alone exceeds
-  // the memory-bound context.
+  // sampling setup, UnsupportedFeature for a thinking budget,
+  // OutOfMemory when one turn alone exceeds the memory-bound context.
+  // A turn on a strategy-backed engine runs as plain greedy (equal
+  // output, no draft speedup) so contended speculative serves share.
   [[nodiscard]] std::expected<GenerateOutcome, StatusCode> Submit(
       const GenerateOptions& options,
       const std::function<bool(std::uint32_t)>& on_token,

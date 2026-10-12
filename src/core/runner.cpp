@@ -82,6 +82,15 @@ void RunnerLease::Release() {
   }
 }
 
+void RunnerLease::YieldFor(std::chrono::milliseconds quantum) {
+  if (runner_ == nullptr || !lock_.owns_lock()) {
+    return;
+  }
+  lock_.unlock();
+  std::this_thread::sleep_for(quantum);
+  lock_.lock();
+}
+
 Runner& RunnerLease::runner() const { return *runner_; }
 
 Engine& RunnerLease::engine() const { return runner_->engine(); }
@@ -107,13 +116,8 @@ std::optional<RunnerLease> RunnerPool::Acquire(
     return std::nullopt;
   }
   for (;;) {
-    // Any idle runner wins; idle runners all have zero load, so the first
-    // free one is the least loaded.
-    for (const auto& runner : runners_) {
-      std::unique_lock<std::mutex> lock(runner->mutex_, std::try_to_lock);
-      if (lock.owns_lock()) {
-        return RunnerLease(*runner, std::move(lock));
-      }
+    if (auto slot = TryAcquire()) {
+      return slot;
     }
     // A peer that disconnects while queued stops waiting instead of
     // holding its place behind a generation it never reads.
@@ -122,6 +126,18 @@ std::optional<RunnerLease> RunnerPool::Acquire(
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kAcquirePollMs));
   }
+}
+
+std::optional<RunnerLease> RunnerPool::TryAcquire() {
+  // Any idle runner wins; idle runners all have zero load, so the first
+  // free one is the least loaded.
+  for (const auto& runner : runners_) {
+    std::unique_lock<std::mutex> lock(runner->mutex_, std::try_to_lock);
+    if (lock.owns_lock()) {
+      return RunnerLease(*runner, std::move(lock));
+    }
+  }
+  return std::nullopt;
 }
 
 std::expected<GenerateOutcome, StatusCode> RunnerPool::SubmitLeastLoaded(

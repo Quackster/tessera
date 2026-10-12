@@ -69,20 +69,16 @@ class SessionHandler {
   private:
   // Shared turn core for chat and retry (see the .cpp for the flow).
   // A null lease runs the turn on the shared scheduler; otherwise the
-  // lease's device runs it exclusively (thinking budgets and
-  // strategy-backed engines).
-  void RunTurn(const RunnerLease* lease, const std::shared_ptr<Session>& session,
+  // lease's device runs it exclusively and yields every few tokens so
+  // queued scheduler turns stream beside it.
+  void RunTurn(RunnerLease* lease, const std::shared_ptr<Session>& session,
                ResponseWriter& writer, const core::Json& request,
                std::size_t max_completion_tokens,
                std::size_t max_thinking_tokens, bool enable_thinking,
                bool stream, std::string_view title) const;
-  // 409 when the session is busy; otherwise take the turn and queue
-  // for an idle device behind running generations. The guard releases it.
-  bool BeginTurn(const std::shared_ptr<Session>& session,
-                 ResponseWriter& writer, RunnerLease& lease,
-                 SessionTurn& guard) const;
   // 409 when the session is busy; otherwise take the turn for the
-  // shared scheduler (no device is held). The guard releases it.
+  // shared scheduler (no device is held). The guard releases it. The
+  // device routes afterwards (see RouteDevice).
   bool BeginTurnShared(const std::shared_ptr<Session>& session,
                        ResponseWriter& writer, SessionTurn& guard) const;
 

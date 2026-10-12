@@ -32,8 +32,12 @@ constexpr std::uint64_t kSchedulerReserveBytes =
 
 bool CanScheduleRequest(const Engine& engine,
                         const GenerateOptions& options) {
-  return engine.Speculative() == nullptr &&
-         options.max_thinking_tokens == 0;
+  // The scheduler drives plain greedy/sampled turns without touching
+  // the attached strategy, so a strategy-backed engine still shares:
+  // the shared output equals the speculative output, only slower per
+  // turn. Thinking budgets stay exclusive (no force-close here).
+  (void)engine;
+  return options.max_thinking_tokens == 0;
 }
 
 // One worker-visible event: a token, a prefill report, or the end.

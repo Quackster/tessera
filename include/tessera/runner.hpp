@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -99,6 +100,14 @@ class RunnerLease {
   [[nodiscard]] const Tokenizer* tokenizer() const;
   // End the hold early (idempotent). The destructor calls this.
   void Release();
+  // Briefly release the device so scheduler turns progress while a
+  // long exclusive turn runs, then hold it again. Call only between
+  // backend operations (the serve on_token hook); the strategy and
+  // cache state sit idle while released. No-op when not held.
+  //
+  // Usage:
+  //   lease.YieldFor(std::chrono::milliseconds(1));
+  void YieldFor(std::chrono::milliseconds quantum);
 
  private:
   friend class RunnerPool;
@@ -135,6 +144,16 @@ class RunnerPool {
   // this thread.
   [[nodiscard]] std::optional<RunnerLease> Acquire(
       const std::function<bool()>& cancelled = {});
+
+  // One non-blocking pass over the runners: a lease on the first free
+  // device, or nullopt when every device is busy (or the pool is
+  // empty). The serve layer uses this for the speculative fast path:
+  // an idle device keeps exclusive drafting, a busy one falls back to
+  // the shared scheduler instead of queueing behind a whole turn.
+  //
+  // Usage:
+  //   if (auto fast = pool.TryAcquire()) { /* exclusive */ }
+  [[nodiscard]] std::optional<RunnerLease> TryAcquire();
 
   // Enqueue a turn on the least-loaded runner (fewest scheduler jobs;
   // ties go to the first) and run it to completion. Extra callers wait

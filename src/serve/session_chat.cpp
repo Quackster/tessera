@@ -9,10 +9,10 @@
 
 #include "core/json.hpp"
 #include "serve/auto_title.hpp"
+#include "serve/openai_shared.hpp"
 #include "serve/render.hpp"
 #include "serve/respond.hpp"
 #include "serve/tools/tool_call.hpp"
-#include "tessera/scheduler.hpp"
 
 namespace tessera::serve {
 
@@ -184,16 +184,6 @@ bool BodyFlag(const Json& body, std::string_view key, bool fallback) {
   return fallback;
 }
 
-// True when this turn can ride the shared scheduler: plain greedy or
-// sampled text with no thinking budget on a strategy-free engine.
-bool UseSharedTurn(RunnerPool& pool, std::size_t max_thinking_tokens) {
-  if (pool.empty() || max_thinking_tokens > 0) {
-    return false;
-  }
-  GenerateOptions probe;
-  return CanSchedule(pool.At(0).engine(), probe);
-}
-
 }  // namespace
 
 SessionHandler::SessionHandler(RunnerPool& pool, const Tokenizer& tokenizer,
@@ -267,7 +257,7 @@ void SessionHandler::HandleRename(ResponseWriter& writer, std::string_view id,
 // with live think/content deltas, persist the assistant message. The
 // stop flag aborts the decode loop (prefill has no token hook and runs
 // to completion); pause blocks it between tokens.
-void SessionHandler::RunTurn(const RunnerLease* lease,
+void SessionHandler::RunTurn(RunnerLease* lease,
                              const std::shared_ptr<Session>& session,
                              ResponseWriter& writer, const Json& request,
                              std::size_t max_completion_tokens,
@@ -314,6 +304,9 @@ void SessionHandler::RunTurn(const RunnerLease* lease,
   bool saw_stop = false;
   TurnStats stats;
   stats.prompt_tokens = ids->size();
+  // Exclusive turns yield the device every few tokens so a queued
+  // scheduler turn streams beside them instead of behind them.
+  int yield_count = 0;
   // One decode step: stop aborts, pause blocks, deltas stream live
   // (buffered mode only accumulates into the totals below).
   auto on_token = [&](std::uint32_t token, bool live) {
@@ -346,10 +339,14 @@ void SessionHandler::RunTurn(const RunnerLease* lease,
         WriteSse(writer, "", SseDelta(std::move(delta), ""), false);
       }
     }
+    if (lease != nullptr) {
+      MaybeYieldExclusive(*lease, yield_count);
+    }
     return true;
   };
   // Shared turns enqueue on the least-loaded device and stream back
-  // on this thread; exclusive turns hold the lease's device outright.
+  // on this thread; exclusive turns hold the lease's device while
+  // yielding every few tokens (see on_token above).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (lease == nullptr) {
       return pool_.SubmitLeastLoaded(
@@ -440,26 +437,6 @@ void SessionHandler::RunTurn(const RunnerLease* lease,
                                    saw_stop, stats, /*created_ms=*/0});
 }
 
-// Acquire the session turn and an idle device: 409 when the session is
-// busy, otherwise wait for a free runner (a closed peer waiting gives up
-// its place). The guard releases the turn; the lease releases the device.
-bool SessionHandler::BeginTurn(const std::shared_ptr<Session>& session,
-                               ResponseWriter& writer, RunnerLease& lease,
-                               SessionTurn& guard) const {
-  if (!session->TryBegin()) {
-    SendError(writer, 409, "session is already generating");
-    return false;
-  }
-  auto slot = pool_.Acquire([&writer] { return writer.IsPeerGone(); });
-  if (!slot) {
-    session->End();
-    return false;
-  }
-  lease = std::move(*slot);
-  guard.session = session;
-  return true;
-}
-
 // Take the session turn for the shared scheduler: 409 when the
 // session is busy. No device is held; the turn enqueues on submit.
 bool SessionHandler::BeginTurnShared(const std::shared_ptr<Session>& session,
@@ -489,21 +466,22 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   session->Append(SessionMessage{"user", message->AsString(), /*reasoning=*/{},
                                  /*tool_calls_json=*/{}, /*tool_call_id=*/{},
                                  false, /*stats=*/{}, /*created_ms=*/0});
+  // The session turn is held first; the device routes shared, fast
+  // exclusive, or queued exclusive (see RouteDevice). A contended
+  // strategy-backed turn shares the scheduler as plain greedy, so a
+  // long answer never blocks other sessions behind the whole turn.
   SessionTurn guard;
   RunnerLease lease;
-  const std::size_t max_thinking = MaxThinkingTokensFrom(body);
-  const bool shared = UseSharedTurn(pool_, max_thinking);
-  const RunnerLease* slot = nullptr;
-  if (shared) {
-    if (!BeginTurnShared(session, writer, guard)) {
-      return;
-    }
-  } else {
-    if (!BeginTurn(session, writer, lease, guard)) {
-      return;
-    }
-    slot = &lease;
+  if (!BeginTurnShared(session, writer, guard)) {
+    return;
   }
+  const std::size_t max_thinking = MaxThinkingTokensFrom(body);
+  RunnerLease* slot = nullptr;
+  if (!RouteDevice(pool_, max_thinking, /*wants_tools=*/false,
+                   [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
+    return;
+  }
+  const bool shared = slot == nullptr;
   // Name a fresh chat before its first answer: the title turn runs
   // first, so the reply streams under the final title.
   if (shared) {
@@ -533,17 +511,14 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
   }
   SessionTurn guard;
   RunnerLease lease;
-  const std::size_t max_thinking = MaxThinkingTokensFrom(body);
-  const bool shared = UseSharedTurn(pool_, max_thinking);
-  const RunnerLease* slot = nullptr;
-  if (shared) {
-    if (!BeginTurnShared(session, writer, guard)) {
-      return;
-    }
-  } else if (!BeginTurn(session, writer, lease, guard)) {
+  if (!BeginTurnShared(session, writer, guard)) {
     return;
-  } else {
-    slot = &lease;
+  }
+  const std::size_t max_thinking = MaxThinkingTokensFrom(body);
+  RunnerLease* slot = nullptr;
+  if (!RouteDevice(pool_, max_thinking, /*wants_tools=*/false,
+                   [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
+    return;
   }
   const std::string title = session->View().title;
   RunTurn(slot, session, writer, body,

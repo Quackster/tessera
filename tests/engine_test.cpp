@@ -10,6 +10,7 @@
 #include <optional>
 #include <random>
 #include <random>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -36,6 +37,7 @@
 #include "tessera/vision.hpp"
 #include "tessera/types.hpp"
 #include "serve/openai.hpp"
+#include "serve/openai_shared.hpp"
 
 using tessera::Engine;
 using tessera::EngineOptions;
@@ -779,6 +781,211 @@ TEST(EngineTest, SchedulerRejectsBadRequests) {
   auto noroute = empty.SubmitLeastLoaded(fine, sink);
   ASSERT_FALSE(noroute.has_value());
   EXPECT_EQ(noroute.error(), StatusCode::InvalidArgument);
+}
+
+namespace {
+
+// Stand-in for a speculative drafter in serve routing tests: never
+// proposes, so the exclusive loop decodes plainly (output equals
+// greedy) while the engine counts as strategy-backed for routing.
+struct NonProposingStrategy : public tessera::SpeculativeStrategy {
+  std::string_view Name() const override { return "non-proposing"; }
+  std::expected<void, tessera::StatusCode> Attach(
+      const tessera::StrategyOptions&) override {
+    return {};
+  }
+  std::expected<void, tessera::StatusCode> Prepare(
+      tessera::Backend&, tessera::Model&) override {
+    return {};
+  }
+  std::size_t DraftBlock() const override { return 4; }
+  std::span<const std::size_t> CaptureLayers() const override { return {}; }
+  std::span<tessera::Buffer* const> CaptureBuffers() override { return {}; }
+  std::expected<void, tessera::StatusCode> AppendPrefill(
+      tessera::Backend&, tessera::Model&, tessera::core::DecodeCache&,
+      std::span<const std::uint32_t>, std::uint64_t,
+      std::span<tessera::Buffer* const>) override {
+    return std::unexpected(tessera::StatusCode::UnsupportedFeature);
+  }
+  std::expected<void, tessera::StatusCode> OnAnchor(
+      tessera::Backend&, tessera::Model&, tessera::core::DecodeCache&,
+      std::uint32_t token, std::uint64_t position,
+      std::span<const float>) override {
+    anchors.emplace_back(token, position);
+    return {};
+  }
+  std::expected<std::size_t, tessera::StatusCode> Draft(
+      tessera::Backend&, tessera::Model&, tessera::core::DecodeCache&,
+      std::span<const float>, std::uint32_t,
+      std::span<std::uint32_t>) override {
+    return 0;
+  }
+  std::expected<void, tessera::StatusCode> Commit(
+      tessera::Backend&, tessera::Model&, tessera::core::DecodeCache&,
+      std::size_t) override {
+    return {};
+  }
+  std::vector<std::pair<std::uint32_t, std::uint64_t>> anchors;
+};
+
+}  // namespace
+
+// A strategy-backed engine still shares the scheduler for plain
+// turns: the gate is the thinking budget, not the strategy.
+TEST(EngineTest, SchedulerAdmitsStrategyBackedTurns) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto strategy = std::make_unique<NonProposingStrategy>();
+  ASSERT_TRUE(engine->AttachSpeculative(std::move(strategy)).has_value());
+  GenerateOptions plain;
+  plain.prompt_tokens = {3};
+  EXPECT_TRUE(tessera::CanSchedule(*engine, plain));
+  GenerateOptions thinking = plain;
+  thinking.max_thinking_tokens = 1;
+  EXPECT_FALSE(tessera::CanSchedule(*engine, thinking));
+}
+
+// TryAcquire skips a busy device instead of queueing behind it.
+TEST(EngineTest, TryAcquireSkipsBusyDevice) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("try_acquire.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  tessera::RunnerPool pool;
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(engine), std::move(*model), TestDeviceIndex()));
+  auto held = pool.Acquire();
+  ASSERT_TRUE(held.has_value());
+  EXPECT_FALSE(pool.TryAcquire().has_value());
+  held->Release();
+  auto fast = pool.TryAcquire();
+  ASSERT_TRUE(fast.has_value());
+}
+
+// YieldFor drops the device lock so a waiter acquires mid-turn.
+TEST(EngineTest, LeaseYieldReleasesDevice) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("lease_yield.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  tessera::RunnerPool pool;
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(engine), std::move(*model), TestDeviceIndex()));
+  auto held = pool.Acquire();
+  ASSERT_TRUE(held.has_value());
+  std::atomic<bool> entered{false};
+  std::thread waiter([&] {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!entered.load() && std::chrono::steady_clock::now() < deadline) {
+      if (auto slot = pool.TryAcquire()) {
+        entered.store(true);
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  held->YieldFor(std::chrono::milliseconds(50));
+  waiter.join();
+  EXPECT_TRUE(entered.load());
+}
+
+// A long exclusive turn on a strategy-backed engine streams beside a
+// second session instead of behind it: the second routes shared and
+// both match solo greedy (the pelican-SVG case).
+TEST(EngineTest, StrategyBackedServeStreamsConcurrentSessions) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("strategy_share.gguf");
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions first_solo_options;
+  first_solo_options.prompt_tokens = {10};
+  first_solo_options.max_completion_tokens = 48;
+  auto first_solo = engine->Generate(**model, first_solo_options);
+  ASSERT_TRUE(first_solo.has_value())
+      << tessera::ToString(first_solo.error());
+  GenerateOptions second_solo_options;
+  second_solo_options.prompt_tokens = {3};
+  second_solo_options.max_completion_tokens = 8;
+  auto second_solo = engine->Generate(**model, second_solo_options);
+  ASSERT_TRUE(second_solo.has_value())
+      << tessera::ToString(second_solo.error());
+  auto strategy = std::make_unique<NonProposingStrategy>();
+  NonProposingStrategy* watched = strategy.get();
+  ASSERT_TRUE(engine->AttachSpeculative(std::move(strategy)).has_value());
+  tessera::RunnerPool pool;
+  pool.Add(std::make_unique<tessera::Runner>(
+      std::move(engine), std::move(*model), TestDeviceIndex()));
+  const auto idle = [] { return false; };
+  // First session arrives on an idle device: exclusive fast path.
+  tessera::RunnerLease first_lease;
+  tessera::RunnerLease* first_slot = nullptr;
+  ASSERT_TRUE(tessera::serve::RouteDevice(pool, 0, false, idle, first_lease,
+                                          &first_slot));
+  ASSERT_NE(first_slot, nullptr);
+  GenerateOptions first_options = first_solo_options;
+  std::vector<std::uint32_t> first_tokens;
+  std::atomic<std::size_t> first_count{0};
+  int first_yield = 0;
+  std::expected<tessera::GenerateOutcome, tessera::StatusCode> first_outcome =
+      std::unexpected(tessera::StatusCode::Ok);
+  std::thread first([&] {
+    first_outcome = first_slot->engine().GenerateStreaming(
+        first_slot->model(), first_options, [&](std::uint32_t token) {
+          first_tokens.push_back(token);
+          first_count.fetch_add(1);
+          tessera::serve::MaybeYieldExclusive(*first_slot, first_yield);
+          return true;
+        });
+  });
+  // Wait for the first turn to produce before routing the second, so
+  // the second must share instead of racing for the fast path.
+  const auto start = std::chrono::steady_clock::now();
+  while (first_count.load() == 0 &&
+         std::chrono::steady_clock::now() - start < std::chrono::seconds(30)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(first_count.load(), 0u);
+  // Second session arrives while the first holds the device: shared.
+  tessera::RunnerLease second_lease;
+  tessera::RunnerLease* second_slot = nullptr;
+  ASSERT_TRUE(tessera::serve::RouteDevice(pool, 0, false, idle, second_lease,
+                                          &second_slot));
+  EXPECT_EQ(second_slot, nullptr);
+  std::atomic<bool> first_done{false};
+  std::atomic<std::size_t> max_active{0};
+  std::thread watcher([&] {
+    while (!first_done.load()) {
+      const std::size_t active = pool.Active()[0];
+      std::size_t seen = max_active.load();
+      while (seen < active &&
+             !max_active.compare_exchange_weak(seen, active)) {
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  });
+  std::vector<std::uint32_t> second_tokens;
+  auto second_outcome = pool.SubmitLeastLoaded(
+      second_solo_options, [&](std::uint32_t token) {
+        second_tokens.push_back(token);
+        return true;
+      });
+  first.join();
+  first_done.store(true);
+  watcher.join();
+  ASSERT_TRUE(first_outcome.has_value())
+      << tessera::ToString(first_outcome.error());
+  ASSERT_TRUE(second_outcome.has_value())
+      << tessera::ToString(second_outcome.error());
+  EXPECT_EQ(first_tokens, *first_solo);
+  EXPECT_EQ(second_tokens, *second_solo);
+  EXPECT_GT(watched->anchors.size(), 0u);
+  // Both turns held the device together; a serial serve never admits
+  // more than one.
+  EXPECT_EQ(max_active.load(), 2u);
 }
 
 // Least-loaded routing splits concurrent turns across runners: with

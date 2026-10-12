@@ -19,7 +19,6 @@
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
 #include "tessera/runner.hpp"
-#include "tessera/scheduler.hpp"
 #include "tessera/tokenizer.hpp"
 
 namespace tessera::serve {
@@ -52,25 +51,19 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     }
     prompt_body = SessionPromptBody(body, view);
   }
-  // Plain chat turns ride the shared scheduler when the engine allows
-  // it; tool calls, thinking budgets and strategy-backed engines stay
-  // on the exclusive path. The runners hold the same model, so render
-  // and metadata read it without holding a device.
+  // Plain turns share the scheduler when contended and keep the
+  // exclusive draft fast path when solo; thinking budgets and tool
+  // calls stay queued exclusive (see RouteDevice).
   const bool wants_tools = !anthropic && WantsTools(prompt_body);
   const std::size_t max_thinking_tokens =
       MaxThinkingTokensFrom(prompt_body);
-  GenerateOptions probe;
-  probe.max_thinking_tokens = max_thinking_tokens;
-  const bool shared = max_thinking_tokens == 0 && !wants_tools &&
-                      CanSchedule(pool.At(0).engine(), probe);
   RunnerLease lease;
-  if (!shared) {
-    auto slot = pool.Acquire([&writer] { return writer.IsPeerGone(); });
-    if (!slot) {
-      return;
-    }
-    lease = std::move(*slot);
+  RunnerLease* slot = nullptr;
+  if (!RouteDevice(pool, max_thinking_tokens, wants_tools,
+                   [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
+    return;
   }
+  const bool shared = slot == nullptr;
   Model& model = shared ? pool.At(0).model() : lease.model();
   if (wants_tools) {
     SessionMessage assistant;
@@ -107,7 +100,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     return;
   }
   // Shared turns enqueue on the least-loaded device and stream back
-  // on this thread; exclusive turns hold the lease's device outright.
+  // on this thread; exclusive turns hold the lease's device while
+  // yielding every few tokens (see MaybeYieldExclusive).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (shared) {
       return pool.SubmitLeastLoaded(
@@ -118,6 +112,9 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   const std::string model_name(model.Name());
   TurnStats stats;
   stats.prompt_tokens = ids->size();
+  // Exclusive turns yield the device every few tokens so a queued
+  // scheduler turn streams beside them instead of behind them.
+  int yield_count = 0;
   // Thinking is on unless the request turns it off. The chat template
   // then opens the <think> block in the prompt, so the model streams
   // reasoning with no opening tag in its output; ThinkExpected tells
@@ -138,6 +135,9 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
           return false;
         }
         produced.push_back(token);
+        if (!shared) {
+          MaybeYieldExclusive(lease, yield_count);
+        }
         return true;
       });
       stats.elapsed_ms = MillisBetween(gen_started,
@@ -217,6 +217,9 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
       text_delta.Set("text", Json::String(piece ? *piece : std::string()));
       delta.Set("delta", std::move(text_delta));
       WriteSse(writer, "content_block_delta", delta, true);
+      if (!shared) {
+        MaybeYieldExclusive(lease, yield_count);
+      }
       return true;
     });
     stats.elapsed_ms = MillisBetween(gen_started,
@@ -255,6 +258,9 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
         return false;
       }
       produced.push_back(token);
+      if (!shared) {
+        MaybeYieldExclusive(lease, yield_count);
+      }
       return true;
     });
     stats.elapsed_ms = MillisBetween(chat_started,
@@ -345,6 +351,9 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     }
     ++count;
     stream_piece(streamer.Push(piece ? *piece : std::string()));
+    if (!shared) {
+      MaybeYieldExclusive(lease, yield_count);
+    }
     return true;
   });
   stream_piece(streamer.Finish());

@@ -11,6 +11,7 @@
 
 #include "core/json.hpp"
 #include "serve/http.hpp"
+#include "serve/openai_shared.hpp"
 #include "serve/render.hpp"
 #include "serve/respond.hpp"
 #include "serve/session_chat.hpp"
@@ -25,6 +26,12 @@ namespace tessera::serve {
 namespace {
 
 using core::Json;
+
+// Exclusive tokens between device yields: frequent enough that a
+// queued scheduler turn starts within a few tokens, rare enough
+// that solo turns keep full speed (about 1 ms per 8 tokens).
+constexpr int kYieldEveryTokens = 8;
+constexpr int kYieldQuantumMs = 1;
 
 // First user text in a history, for naming a new session.
 std::string FirstUserText(const SessionView& view) {
@@ -138,23 +145,18 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   if (pool.empty()) {
     return;
   }
-  // Plain completions ride the shared scheduler when the engine
-  // allows it; thinking budgets and strategy-backed engines stay on
-  // the exclusive path. The runners hold the same model, so render
-  // and metadata read it without holding a device.
+  // Plain turns share the scheduler when contended and keep the
+  // exclusive draft fast path when solo; thinking budgets stay queued
+  // exclusive (see RouteDevice). The runners hold the same model, so
+  // render and metadata read it without holding a device.
   const std::size_t max_thinking_tokens = MaxThinkingTokensFrom(body);
-  GenerateOptions probe;
-  probe.max_thinking_tokens = max_thinking_tokens;
-  const bool shared =
-      max_thinking_tokens == 0 && CanSchedule(pool.At(0).engine(), probe);
   RunnerLease lease;
-  if (!shared) {
-    auto slot = pool.Acquire([&writer] { return writer.IsPeerGone(); });
-    if (!slot) {
-      return;
-    }
-    lease = std::move(*slot);
+  RunnerLease* slot = nullptr;
+  if (!RouteDevice(pool, max_thinking_tokens, /*wants_tools=*/false,
+                   [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
+    return;
   }
+  const bool shared = slot == nullptr;
   Model& model = shared ? pool.At(0).model() : lease.model();
   std::string prompt_text = prompt->AsString();
   if (session != nullptr) {
@@ -190,7 +192,8 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
     return;
   }
   // Shared turns enqueue on the least-loaded device and stream back
-  // on this thread; exclusive turns hold the lease's device outright.
+  // on this thread; exclusive turns hold the lease's device while
+  // yielding every few tokens (see MaybeYieldExclusive).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (shared) {
       return pool.SubmitLeastLoaded(
@@ -200,6 +203,9 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   };
   TurnStats stats;
   stats.prompt_tokens = ids->size();
+  // Exclusive turns yield the device every few tokens so a queued
+  // scheduler turn streams beside them instead of behind them.
+  int yield_count = 0;
   if (!stream) {
     // GenerateStreaming with a liveness hook instead of Generate:
     // identical tokens, but a closed window aborts the turn instead
@@ -211,6 +217,9 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
         return false;
       }
       produced.push_back(token);
+      if (!shared) {
+        MaybeYieldExclusive(lease, yield_count);
+      }
       return true;
     });
     stats.elapsed_ms = MillisBetween(gen_started,
@@ -272,6 +281,9 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
     chunk.Set("choices", std::move(choices));
     WriteSse(writer, "", chunk, false);
     ++count;
+    if (!shared) {
+      MaybeYieldExclusive(lease, yield_count);
+    }
     return true;
   });
   stats.elapsed_ms = MillisBetween(gen_started,
@@ -302,6 +314,57 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   WriteSse(writer, "", done, false);
   (void)writer.Write("data: [DONE]\n\n");
   (void)count;
+}
+
+bool PoolIdle(const RunnerPool& pool) {
+  for (const std::size_t active : pool.Active()) {
+    if (active != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RouteDevice(RunnerPool& pool, std::size_t max_thinking_tokens,
+                 bool wants_tools,
+                 const std::function<bool()>& cancelled, RunnerLease& lease,
+                 RunnerLease** slot) {
+  *slot = nullptr;
+  if (pool.empty()) {
+    return false;
+  }
+  // Thinking budgets and tool calls stay queued exclusive: the
+  // scheduler drives neither, so a contended turn waits its turn.
+  GenerateOptions probe;
+  probe.max_thinking_tokens = max_thinking_tokens;
+  if (wants_tools || !CanSchedule(pool.At(0).engine(), probe)) {
+    auto held = pool.Acquire(cancelled);
+    if (!held) {
+      return false;
+    }
+    lease = std::move(*held);
+    *slot = &lease;
+    return true;
+  }
+  // Plain turns share the scheduler, except a solo turn on a
+  // strategy-backed device keeps the exclusive draft fast path. A
+  // lost try-race falls back to shared instead of queueing behind
+  // the winner's whole generation.
+  if (pool.At(0).engine().Speculative() != nullptr && PoolIdle(pool)) {
+    if (auto fast = pool.TryAcquire()) {
+      lease = std::move(*fast);
+      *slot = &lease;
+    }
+  }
+  return true;
+}
+
+void MaybeYieldExclusive(RunnerLease& lease, int& since_yield) {
+  if (++since_yield < kYieldEveryTokens) {
+    return;
+  }
+  since_yield = 0;
+  lease.YieldFor(std::chrono::milliseconds(kYieldQuantumMs));
 }
 
 
