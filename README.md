@@ -59,6 +59,10 @@ Lightweight, dark-mode AI chat UI with a simple sidebar for API keys and convers
 
 <img width="1575" height="986" alt="image" src="https://github.com/user-attachments/assets/57f9b3a9-31b2-4a66-9489-0f616c00dd4e" />
 
+Here's a pelican generated with the MXFP4 + DFlash2 using default settings (262k context, xhigh thinking):
+
+<img width="800" height="600" alt="image" src="https://github.com/user-attachments/assets/bbca908a-8d06-4042-859d-0c9094a57a8b" />
+
 ## Architecture
 
 Core code is backend agnostic. All device work goes through the `Backend` interface. Only `src/backends/vulkan/` includes Vulkan headers. Only `src/backends/rocm/` includes HIP and ROCm headers. No vendor type crosses the backend boundary.
@@ -111,12 +115,6 @@ CLI examples:
 
 # GGUF target with MTP speculation. The MTP head drafts from the target, so it needs no draft path.
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf --speculate
-
-# MXFP4 target, greedy decode.
-./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8
-
-# MXFP4 target with MTP speculation.
-./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 --speculate
 
 # MXFP4 target with the DFlash2 draft checkpoint.
 ./cmake-build-vulkan/tessera-cli run --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
