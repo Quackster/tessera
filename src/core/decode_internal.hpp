@@ -951,6 +951,24 @@ inline std::expected<void, StatusCode> RmsNormGatedDevice(
   return backend.LaunchKernel(kernel, launch);
 }
 
+// Y = rmsnorm(X, W) * sigmoid(gate) per row on the device, the qwen4exp
+// gated-delta output norm. One workgroup per row.
+inline std::expected<void, StatusCode> GdnOutNormDevice(
+    Backend& backend, const Kernel& kernel, const Buffer& o, const Buffer& z,
+    const Buffer& w, Buffer& y, std::size_t rows, std::size_t cols,
+    double eps) {
+  const float eps_f = static_cast<float>(eps);
+  std::uint32_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(eps_f));
+  std::memcpy(&bits, &eps_f, sizeof(bits));
+  KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>(rows);
+  launch.block_x = 256;
+  launch.buffers = {&o, &z, &w, &y};
+  launch.scalars = {rows, cols, bits};
+  return backend.LaunchKernel(kernel, launch);
+}
+
 // Y = causal depthwise conv1d(X, W) on the device.
 inline std::expected<void, StatusCode> Conv1dDevice(
     Backend& backend, const Kernel& kernel, const Buffer& x, const Buffer& w,
@@ -1118,6 +1136,9 @@ inline std::string_view GemmKernelName(DType dtype) {
     case DType::IQ4_NL: return "gemm_iq4nl";
     case DType::IQ4_XS: return "gemm_iq4xs_vec";
     case DType::IQ3_S: return "gemm_iq3s";
+    case DType::IQ3_XXS: return "gemm_iq3xxs";
+    case DType::IQ2_S: return "gemm_iq2s";
+    case DType::Q2_0: return "gemm_q20";
     case DType::F32: return "gemm_f32";
     case DType::BF16: return "gemm_bf16";
     case DType::F4E2M1: return "gemm_mxfp4";

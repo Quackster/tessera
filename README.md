@@ -89,7 +89,7 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | Format | State | Detail |
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3, single files and `-00001-of-00005` splits. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, Q2_0, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS and IQ2_S. Checks bounds. |
-| Qwen4-Exp split GGUF | Partial | Qwen3.8-Flash-Next GSQ-RCO loads: split shards merge, config parses, the 51B n-gram table streams rows from SSD and never uploads. Decode kernels (QSA indexer, hyper-connection mixer, PLE gather) land next. |
+| Qwen4-Exp split GGUF | Partial | Qwen3.8-Flash-Next GSQ-RCO loads: split shards merge, config parses, the 51B n-gram table streams rows from SSD and never uploads. The QSA indexer, hyper-connection mixer, PLE gather and GDN output-norm kernels are in place on both backends; the architecture module and the layer loop come next. |
 | MXFP4 safetensors | Done | Parses the map and packs the weights. config.json drives the decode config. |
 | NVFP4 MoE | Done | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. |
 | DFlash2 FP8 draft | Done | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. |

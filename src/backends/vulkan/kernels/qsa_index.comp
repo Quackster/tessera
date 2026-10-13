@@ -1,0 +1,48 @@
+#version 450
+
+// One thread per cached cell; the dispatch is ceil(n_kv / 256).
+layout(local_size_x = 256) in;
+
+// "qsa_index" contract: buffer 0 is the pooled block keys (fp32,
+// (n_bid+1) x idx_dim), buffer 1 the indexer query (fp32, idx_n_head x
+// idx_dim), buffer 2 the per-block bias (fp32, n_bid+1), buffer 3 the
+// cell scores (fp32, n_kv). Scalars: idx_n_head (v[0]), idx_dim (v[2]),
+// idx_block (v[4]), n_bid (v[6]), n_kv (v[8]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer P { float pooled[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_idx[]; };
+layout(set = 0, binding = 2) readonly buffer B { float bias[]; };
+layout(set = 0, binding = 3) writeonly buffer S { float scores[]; };
+
+void main() {
+  uint j = gl_GlobalInvocationID.x;
+  uint idx_n_head = pc.v[0];
+  uint idx_dim = pc.v[2];
+  uint idx_block = pc.v[4];
+  uint n_bid = pc.v[6];
+  uint n_kv = pc.v[8];
+  if (j >= n_kv) {
+    return;
+  }
+  uint cb = j / idx_block;
+  if (cb > n_bid) {
+    cb = n_bid;
+  }
+  uint pbase = cb * idx_dim;
+  float score = bias[cb];
+  for (uint h = 0u; h < idx_n_head; ++h) {
+    uint qbase = h * idx_dim;
+    float dot = 0.0;
+    for (uint d = 0u; d < idx_dim; ++d) {
+      dot += pooled[pbase + d] * q_idx[qbase + d];
+    }
+    score += dot > 0.0 ? dot : 0.0;
+  }
+  if (j >= (n_kv / idx_block) * idx_block) {
+    score += 1e9;
+  }
+  scores[j] = score;
+}

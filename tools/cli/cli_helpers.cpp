@@ -133,6 +133,8 @@ void PrintUsage() {
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
                "  --quiet           suppress progress and info logs\n"
+               "  --verbose         enable debug logs (weight transfers, "
+               "cache probes)\n"
                "  --no-chat         do not apply the chat template\n"
                "  --sample          sample instead of greedy decode\n"
                "  --temperature <f> sampling temperature (default 0.6)\n"

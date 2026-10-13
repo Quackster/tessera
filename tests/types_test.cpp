@@ -53,6 +53,11 @@ TEST(DTypeTest, TensorBytesSizesTensors) {
   EXPECT_EQ(*tessera::TensorBytes(DType::IQ4_NL, 32), 18u);
   EXPECT_EQ(*tessera::TensorBytes(DType::IQ4_XS, 256), 136u);
   EXPECT_EQ(*tessera::TensorBytes(DType::IQ3_S, 256), 110u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::IQ3_XXS, 256), 98u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::IQ2_S, 256), 82u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q2_0, 64), 18u);
+  EXPECT_EQ(tessera::TensorBytes(DType::Q2_0, 100).error(),
+            StatusCode::InvalidArgument);
   // No known layout for the K-quant leftover.
   EXPECT_EQ(tessera::TensorBytes(DType::Q2K, 256).error(),
             StatusCode::UnsupportedFeature);

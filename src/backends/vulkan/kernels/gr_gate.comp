@@ -1,0 +1,44 @@
+#version 450
+
+// One thread per output element; the dispatch is ceil(hc_dim / 256).
+layout(local_size_x = 256) in;
+
+// "gr_gate" contract: buffer 0 is lq (fp32, hc_lr), buffer 1 the bf16 up
+// weight (hc*n_embd x hc_lr, two bytes each), buffer 2 the fp32 streams
+// xn (hc*n_embd), buffer 3 the gated output (hc*n_embd). Scalars:
+// hc_dim (v[0]), hc_lr (v[1]).
+// gated[i] = xn[i] * sigmoid(lq @ w_up[i]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer LQ { float lq[]; };
+layout(set = 0, binding = 1) readonly buffer WU { uint wu[]; };
+layout(set = 0, binding = 2) readonly buffer XN { float xn[]; };
+layout(set = 0, binding = 3) writeonly buffer G { float gated[]; };
+
+uint wbyte(uint off) {
+  return (wu[off >> 2] >> ((off & 3) << 3)) & 0xFF;
+}
+
+float bf16_at(uint off) {
+  uint h = wbyte(off) | (wbyte(off + 1) << 8);
+  return uintBitsToFloat(h << 16);
+}
+
+float sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint hc_dim = pc.v[0];
+  uint hc_lr = pc.v[2];
+  if (i >= hc_dim) {
+    return;
+  }
+  uint row = i * hc_lr;
+  float acc = 0.0;
+  for (uint k = 0u; k < hc_lr; ++k) {
+    acc += lq[k] * bf16_at((row + k) * 2u);
+  }
+  gated[i] = xn[i] * sigmoid(acc);
+}

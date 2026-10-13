@@ -35,7 +35,10 @@ bool IsRetainedArrayKey(std::string_view key) {
          key == "tokenizer.ggml.merges";
 }
 constexpr std::uint32_t kMaxGgufRank = 4;
-constexpr std::uint64_t kMaxGgufDim = 1ull << 24;
+// A dim may be large: the qwen4exp per-layer-embedding table is
+// [160, 320001536]. The exact-bytes check against the file is the guard
+// that matters, so the per-dim cap stays generous.
+constexpr std::uint64_t kMaxGgufDim = 1ull << 30;
 // Spec default for the general.alignment metadata key.
 constexpr std::uint32_t kGgufDefaultAlignment = 32;
 
@@ -225,6 +228,9 @@ std::optional<DType> GgmlTypeToDType(std::uint32_t id) {
     case 26: return DType::I32;
     case 27: return DType::I64;
     case 30: return DType::BF16;
+    case 18: return DType::IQ3_XXS;
+    case 22: return DType::IQ2_S;
+    case 42: return DType::Q2_0;
     default: return std::nullopt;
   }
 }

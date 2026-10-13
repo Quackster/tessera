@@ -1,0 +1,56 @@
+#version 450
+
+// One workgroup per residual stream; the dispatch is hc workgroups.
+layout(local_size_x = 256) in;
+
+// "gr_norm" contract: buffer 0 is R (fp32, hc x n_embd), buffer 1 the
+// f32 norm weight (hc*n_embd), buffer 2 the fp32 normalized streams xn,
+// buffer 3 the bf16-rounded streams xq (both hc*n_embd). Scalars: n_embd
+// (v[0]), hc (v[1]), the fp32 epsilon bits (v[2]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer R { float r[]; };
+layout(set = 0, binding = 1) readonly buffer WN { float wn[]; };
+layout(set = 0, binding = 2) writeonly buffer XN { float xn[]; };
+layout(set = 0, binding = 3) writeonly buffer XQ { float xq[]; };
+
+shared float red[256];
+
+float bf16_round(float x) {
+  uint b = floatBitsToUint(x);
+  b += 0x7FFFu + ((b >> 16) & 1u);
+  return uintBitsToFloat(b & 0xFFFF0000u);
+}
+
+void main() {
+  uint c = gl_WorkGroupID.x;
+  uint n_embd = pc.v[0];
+  uint hc = pc.v[2];
+  float eps = uintBitsToFloat(pc.v[4]);
+  if (c >= hc) {
+    return;
+  }
+  uint base = c * n_embd;
+  float ss = 0.0;
+  for (uint d = gl_LocalInvocationID.x; d < n_embd; d += 256u) {
+    float v = r[base + d];
+    ss += v * v;
+  }
+  red[gl_LocalInvocationID.x] = ss;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (gl_LocalInvocationID.x < s) {
+      red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+    }
+    barrier();
+  }
+  float rs = inversesqrt(red[0] / float(n_embd) + eps);
+  for (uint d = gl_LocalInvocationID.x; d < n_embd; d += 256u) {
+    uint i = base + d;
+    float x = r[i] * rs * wn[i];
+    xn[i] = x;
+    xq[i] = bf16_round(x);
+  }
+}

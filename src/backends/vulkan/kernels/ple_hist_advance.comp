@@ -1,0 +1,27 @@
+#version 450
+
+// One thread per channel; the dispatch is ceil(dim / 256).
+layout(local_size_x = 256) in;
+
+// "ple_hist_advance" contract: buffer 0 is the history (fp32, dim x
+// hist rows), buffer 1 the normalized values (fp32, dim). Scalars:
+// dim (v[0]), hist (v[2]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer H { float history[]; };
+layout(set = 0, binding = 1) readonly buffer N { float normalized[]; };
+
+void main() {
+  uint c = gl_GlobalInvocationID.x;
+  uint dim = pc.v[0];
+  uint hist = pc.v[2];
+  if (c >= dim) {
+    return;
+  }
+  for (uint r = 0u; r + 1u < hist; ++r) {
+    history[c * hist + r] = history[c * hist + r + 1u];
+  }
+  history[c * hist + hist - 1u] = normalized[c];
+}

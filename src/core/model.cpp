@@ -243,6 +243,140 @@ ParseRopeSections(const core::GgufFile& gguf, std::string_view architecture,
   return std::optional<std::vector<std::uint64_t>>{sections};
 }
 
+// Read a retained integer array metadata value; nullopt when the key is
+// absent. MalformedFile when any entry is not integral.
+std::expected<std::optional<std::vector<std::uint64_t>>, StatusCode>
+ReadU64Array(const core::GgufFile& gguf, const std::string& key) {
+  const auto it = gguf.small_arrays.find(key);
+  if (it == gguf.small_arrays.end()) {
+    return std::optional<std::vector<std::uint64_t>>{};
+  }
+  std::vector<std::uint64_t> out;
+  out.reserve(it->second.size());
+  for (const auto& entry : it->second) {
+    const auto value = AsU64(entry);
+    if (!value) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    out.push_back(*value);
+  }
+  return std::optional<std::vector<std::uint64_t>>{std::move(out)};
+}
+
+// Gated residual stack dimensions (hyper_connection.count / low_rank).
+// Nullopt when the definition carries none; MalformedFile when partial.
+std::expected<std::optional<HyperConnectionParams>, StatusCode>
+ParseHyperConnection(const core::GgufFile& gguf,
+                     std::string_view architecture) {
+  const std::string prefix = std::string(architecture);
+  const auto* count = gguf.Find(prefix + ".hyper_connection.count");
+  const auto* rank = gguf.Find(prefix + ".hyper_connection.low_rank");
+  if (count == nullptr && rank == nullptr) {
+    return std::optional<HyperConnectionParams>{};
+  }
+  if (count == nullptr || rank == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto c = AsU64(*count);
+  const auto r = AsU64(*rank);
+  if (!c || !r || *c == 0 || *r == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  HyperConnectionParams params;
+  params.count = static_cast<std::size_t>(*c);
+  params.low_rank = static_cast<std::size_t>(*r);
+  return std::optional<HyperConnectionParams>{params};
+}
+
+// Sparse-attention indexer dimensions (attention.indexer.*). Nullopt when
+// the definition carries none; MalformedFile when partial.
+std::expected<std::optional<IndexerParams>, StatusCode> ParseIndexer(
+    const core::GgufFile& gguf, std::string_view architecture) {
+  const std::string prefix = std::string(architecture);
+  const auto* heads = gguf.Find(prefix + ".attention.indexer.head_count");
+  const auto* key = gguf.Find(prefix + ".attention.indexer.key_length");
+  const auto* topk = gguf.Find(prefix + ".attention.indexer.top_k");
+  if (heads == nullptr && key == nullptr && topk == nullptr) {
+    return std::optional<IndexerParams>{};
+  }
+  if (heads == nullptr || key == nullptr || topk == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto h = AsU64(*heads);
+  const auto k = AsU64(*key);
+  const auto t = AsU64(*topk);
+  if (!h || !k || !t || *h == 0 || *k == 0 || *t == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  IndexerParams params;
+  params.heads = static_cast<std::size_t>(*h);
+  params.key_length = static_cast<std::size_t>(*k);
+  params.top_k = static_cast<std::size_t>(*t);
+  return std::optional<IndexerParams>{params};
+}
+
+// Per-layer n-gram embedding dimensions (ple.*). Nullopt when the
+// definition carries no ple.layers array; MalformedFile when any other
+// required key is missing or inconsistent with `hidden_dim`.
+std::expected<std::optional<PleParams>, StatusCode> ParsePle(
+    const core::GgufFile& gguf, std::string_view architecture,
+    std::size_t hidden_dim) {
+  const std::string prefix = std::string(architecture);
+  auto layers = ReadU64Array(gguf, prefix + ".ple.layers");
+  if (!layers) {
+    return std::unexpected(layers.error());
+  }
+  if (!*layers) {
+    return std::optional<PleParams>{};
+  }
+  const auto* ngram = gguf.Find(prefix + ".ple.ngram_size");
+  const auto* hpng = gguf.Find(prefix + ".ple.heads_per_ngram");
+  const auto* conv = gguf.Find(prefix + ".ple.conv_kernel");
+  const auto* embd = gguf.Find(prefix + ".embedding_length_per_layer_input");
+  auto offsets = ReadU64Array(gguf, prefix + ".ple.head_offsets");
+  auto vocabs = ReadU64Array(gguf, prefix + ".ple.head_vocab_sizes");
+  auto mult = ReadU64Array(gguf, prefix + ".ple.layer_multipliers");
+  if (ngram == nullptr || hpng == nullptr || conv == nullptr ||
+      embd == nullptr || !offsets || !vocabs || !mult || !*offsets ||
+      !*vocabs || !*mult) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto n = AsU64(*ngram);
+  const auto p = AsU64(*hpng);
+  const auto c = AsU64(*conv);
+  const auto e = AsU64(*embd);
+  if (!n || !p || !c || !e || *n == 0 || *p == 0 || *c == 0 || *e == 0 ||
+      *e > hidden_dim || (*n - 1) * *p == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (mult->value().size() != *n) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  PleParams params;
+  params.layers = std::move(**layers);
+  params.ngram_size = static_cast<std::size_t>(*n);
+  params.heads_per_ngram = static_cast<std::size_t>(*p);
+  params.conv_kernel = static_cast<std::size_t>(*c);
+  params.embd_per_layer = static_cast<std::size_t>(*e);
+  params.layer_multipliers = std::move(**mult);
+  params.head_offsets = std::move(**offsets);
+  params.head_vocab_sizes = std::move(**vocabs);
+  if (params.head_offsets.size() != params.head_vocab_sizes.size()) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (const auto* image = gguf.Find(prefix + ".ple.image_token_id")) {
+    if (const auto value = AsU64(*image)) {
+      params.image_token_id = static_cast<std::size_t>(*value);
+    }
+  }
+  if (const auto* eos = gguf.Find(prefix + ".ple.eos_token_id")) {
+    if (const auto value = AsU64(*eos)) {
+      params.eos_token_id = static_cast<std::size_t>(*value);
+    }
+  }
+  return std::optional<PleParams>{std::move(params)};
+}
+
 // Build the byte-level BPE tokenizer from the retained tokenizer arrays;
 // nullopt when the file declares no supported tokenizer (not gpt2, or no
 // token array). MalformedFile when the arrays are inconsistent.
@@ -407,6 +541,27 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
   }
   if (sections->has_value()) {
     config.rope_sections = **sections;
+  }
+  auto hc = ParseHyperConnection(gguf, architecture);
+  if (!hc) {
+    return std::unexpected(hc.error());
+  }
+  if (*hc) {
+    config.hyper_connection = **hc;
+  }
+  auto indexer = ParseIndexer(gguf, architecture);
+  if (!indexer) {
+    return std::unexpected(indexer.error());
+  }
+  if (*indexer) {
+    config.indexer = **indexer;
+  }
+  auto ple = ParsePle(gguf, architecture, config.hidden_dim);
+  if (!ple) {
+    return std::unexpected(ple.error());
+  }
+  if (*ple) {
+    config.ple = **ple;
   }
   return std::optional<TransformerConfig>{config};
 }

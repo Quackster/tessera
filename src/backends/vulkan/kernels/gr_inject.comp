@@ -1,0 +1,51 @@
+#version 450
+
+// One workgroup per residual stream; the dispatch is hc workgroups.
+layout(local_size_x = 256) in;
+
+// "gr_inject" contract: buffer 0 is xq (fp32, hc*n_embd), buffer 1 the
+// bf16 inject weight (hc x hc*n_embd, two bytes each), buffer 2 the
+// injection (fp32, hc). Scalars: hc_dim (v[0]), hc (v[1]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer XQ { float xq[]; };
+layout(set = 0, binding = 1) readonly buffer WI { uint wi[]; };
+layout(set = 0, binding = 2) writeonly buffer INJ { float inject[]; };
+
+shared float red[256];
+
+uint wbyte(uint off) {
+  return (wi[off >> 2] >> ((off & 3) << 3)) & 0xFF;
+}
+
+float bf16_at(uint off) {
+  uint h = wbyte(off) | (wbyte(off + 1) << 8);
+  return uintBitsToFloat(h << 16);
+}
+
+void main() {
+  uint c = gl_WorkGroupID.x;
+  uint hc_dim = pc.v[0];
+  uint hc = pc.v[2];
+  if (c >= hc) {
+    return;
+  }
+  uint row = c * hc_dim;
+  float acc = 0.0;
+  for (uint i = gl_LocalInvocationID.x; i < hc_dim; i += 256u) {
+    acc += xq[i] * bf16_at((row + i) * 2u);
+  }
+  red[gl_LocalInvocationID.x] = acc;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (gl_LocalInvocationID.x < s) {
+      red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+    }
+    barrier();
+  }
+  if (gl_LocalInvocationID.x == 0u) {
+    inject[c] = red[0];
+  }
+}

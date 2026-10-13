@@ -38,6 +38,11 @@
 #include "core/numerics/gemm.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
+#include "core/numerics/hyper.hpp"
+#include "core/numerics/ngram.hpp"
+#include "core/numerics/ple.hpp"
+#include "core/numerics/qsa.hpp"
+#include "models/qwen4exp/ple_table.hpp"
 #include "models/qwen3_5/internal.hpp"
 #include "models/qwen3_5/state.hpp"
 #include "test_helpers.hpp"
@@ -1187,7 +1192,1012 @@ TEST(BackendTest, GemmQ80DeviceMatchesRef) {
 
 // Device: the K-quant and IQ GEMM contracts reject bad shapes.
 
+// Device: the hyper-connection read and write kernels match the host
+// reference.
+TEST(BackendTest, HyperConnectionMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(88);
+  constexpr std::size_t kN = 64;
+  constexpr std::size_t kHc = 4;
+  constexpr std::size_t kLr = 16;
+  const std::size_t hc_dim = kN * kHc;
+  const core::HyperConnectionShapes shapes{kN, kHc, kLr};
+  auto bf16_bytes = [&rng](std::size_t count) {
+    std::vector<std::byte> out(count * 2);
+    for (std::size_t i = 0; i < count; ++i) {
+      const float v = DrawValue(rng);
+      std::uint32_t bits = 0;
+      std::memcpy(&bits, &v, sizeof(bits));
+      bits += 0x7FFFu + ((bits >> 16) & 1u);
+      const std::uint16_t h = static_cast<std::uint16_t>(bits >> 16);
+      out[2 * i] = static_cast<std::byte>(h & 0xFFu);
+      out[2 * i + 1] = static_cast<std::byte>(h >> 8);
+    }
+    return out;
+  };
+  std::vector<float> r(hc_dim);
+  std::vector<float> w_norm(hc_dim);
+  for (auto& v : r) {
+    v = DrawValue(rng);
+  }
+  for (auto& v : w_norm) {
+    v = 1.0f + 0.1f * DrawValue(rng);
+  }
+  const std::vector<std::byte> w_down = bf16_bytes(kLr * hc_dim);
+  const std::vector<std::byte> w_up = bf16_bytes(hc_dim * kLr);
+  const std::vector<std::byte> w_inject = bf16_bytes(kHc * hc_dim);
+  std::vector<float> block_out(kN);
+  for (auto& v : block_out) {
+    v = DrawValue(rng);
+  }
+
+  std::vector<float> mixed_ref(kN);
+  std::vector<float> inject_ref(kHc);
+  auto read_status = core::HyperConnectionReadRef(
+      std::span<const float>(r), std::span<const float>(w_norm),
+      std::span<const std::byte>(w_down), std::span<const std::byte>(w_up),
+      std::span<const std::byte>(w_inject), 1e-6, shapes,
+      std::span<float>(mixed_ref), std::span<float>(inject_ref));
+  ASSERT_TRUE(read_status.has_value()) << tessera::ToString(read_status.error());
+  std::vector<float> out_ref(hc_dim);
+  auto write_status = core::HyperConnectionWriteRef(
+      std::span<const float>(r), std::span<const float>(block_out),
+      std::span<const float>(inject_ref), shapes, std::span<float>(out_ref));
+  ASSERT_TRUE(write_status.has_value())
+      << tessera::ToString(write_status.error());
+
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto up = [&backend](auto& buf, const auto& host) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(host.data()),
+        host.size() * sizeof(host[0])));
+  };
+  auto dev_r = alloc(r.size() * 4);
+  auto dev_norm = alloc(w_norm.size() * 4);
+  auto dev_down = alloc(w_down.size());
+  auto dev_up = alloc(w_up.size());
+  auto dev_inject_w = alloc(w_inject.size());
+  auto dev_xn = alloc(hc_dim * 4);
+  auto dev_xq = alloc(hc_dim * 4);
+  auto dev_lq = alloc(kLr * 4);
+  auto dev_gated = alloc(hc_dim * 4);
+  auto dev_mixed = alloc(kN * 4);
+  auto dev_inject = alloc(kHc * 4);
+  auto dev_block = alloc(kN * 4);
+  auto dev_out = alloc(hc_dim * 4);
+  ASSERT_TRUE(dev_r && dev_norm && dev_down && dev_up && dev_inject_w &&
+              dev_xn && dev_xq && dev_lq && dev_gated && dev_mixed &&
+              dev_inject && dev_block && dev_out);
+  ASSERT_TRUE(up(dev_r, r) && up(dev_norm, w_norm) && up(dev_down, w_down) &&
+              up(dev_up, w_up) && up(dev_inject_w, w_inject) &&
+              up(dev_block, block_out));
+
+  std::uint32_t eps_bits = 0;
+  {
+    const float eps = 1e-6f;
+    std::memcpy(&eps_bits, &eps, sizeof(eps_bits));
+  }
+  auto norm_k = backend->LoadKernel("gr_norm", {});
+  auto down_k = backend->LoadKernel("gr_down", {});
+  auto gate_k = backend->LoadKernel("gr_gate", {});
+  auto mean_k = backend->LoadKernel("gr_mean", {});
+  auto inject_k = backend->LoadKernel("gr_inject", {});
+  auto write_k = backend->LoadKernel("gr_write", {});
+  ASSERT_TRUE(norm_k && down_k && gate_k && mean_k && inject_k && write_k);
+
+  auto launch = [&](const tessera::Kernel& k, std::uint32_t grid,
+                    std::initializer_list<const tessera::Buffer*> buffers,
+                    std::initializer_list<std::uint64_t> scalars) {
+    tessera::KernelLaunch l;
+    l.grid_x = grid;
+    l.block_x = 256;
+    l.buffers.assign(buffers.begin(), buffers.end());
+    l.scalars.assign(scalars.begin(), scalars.end());
+    return backend->LaunchKernel(k, l);
+  };
+  ASSERT_TRUE(launch(**norm_k, static_cast<std::uint32_t>(kHc),
+                     {dev_r->get(), dev_norm->get(), dev_xn->get(),
+                      dev_xq->get()},
+                     {kN, kHc, eps_bits}));
+  ASSERT_TRUE(launch(**down_k, static_cast<std::uint32_t>(kLr),
+                     {dev_xq->get(), dev_down->get(), dev_lq->get()},
+                     {hc_dim, kLr, kHc}));
+  ASSERT_TRUE(launch(
+      **gate_k, static_cast<std::uint32_t>((hc_dim + 255) / 256),
+      {dev_lq->get(), dev_up->get(), dev_xn->get(), dev_gated->get()},
+      {hc_dim, kLr}));
+  ASSERT_TRUE(launch(**mean_k, static_cast<std::uint32_t>((kN + 255) / 256),
+                     {dev_gated->get(), dev_mixed->get()}, {kN, kHc}));
+  ASSERT_TRUE(launch(
+      **inject_k, static_cast<std::uint32_t>(kHc),
+      {dev_xq->get(), dev_inject_w->get(), dev_inject->get()}, {hc_dim, kHc}));
+  ASSERT_TRUE(launch(**write_k,
+                     static_cast<std::uint32_t>((hc_dim + 255) / 256),
+                     {dev_r->get(), dev_block->get(), dev_inject->get(),
+                      dev_out->get()},
+                     {kN, kHc}));
+  backend->Synchronize();
+
+  auto read_back = [&backend](auto& buf, auto& host) {
+    return backend->CopyD2H(**buf, reinterpret_cast<std::byte*>(host.data()),
+                            host.size() * sizeof(host[0]));
+  };
+  std::vector<float> mixed(kN);
+  std::vector<float> inject(kHc);
+  std::vector<float> out(hc_dim);
+  ASSERT_TRUE(read_back(dev_mixed, mixed));
+  ASSERT_TRUE(read_back(dev_inject, inject));
+  ASSERT_TRUE(read_back(dev_out, out));
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < mixed.size(); ++i) {
+    EXPECT_LE(std::abs(mixed[i] - mixed_ref[i]), tol.abs)
+        << "mixed " << i << " backend " << backend->Name();
+  }
+  for (std::size_t i = 0; i < inject.size(); ++i) {
+    EXPECT_LE(std::abs(inject[i] - inject_ref[i]), tol.abs)
+        << "inject " << i << " backend " << backend->Name();
+  }
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    EXPECT_LE(std::abs(out[i] - out_ref[i]), tol.abs)
+        << "out " << i << " backend " << backend->Name();
+  }
+}
+
+// Device: the qwen4exp gated-delta output norm matches the host reference.
+TEST(BackendTest, GdnOutNormMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97);
+  constexpr std::size_t kHeads = 8;
+  constexpr std::size_t kDim = 32;
+  std::vector<float> o(kHeads * kDim);
+  std::vector<float> z(kHeads * kDim);
+  std::vector<float> w(kDim);
+  for (auto& v : o) {
+    v = DrawValue(rng);
+  }
+  for (auto& v : z) {
+    v = 4.0f * DrawValue(rng);
+  }
+  for (auto& v : w) {
+    v = 1.0f + 0.1f * DrawValue(rng);
+  }
+  std::vector<float> ref(kHeads * kDim);
+  const float eps = 1e-6f;
+  auto status = core::GdnOutNormRef(std::span<const float>(o),
+                                    std::span<const float>(z),
+                                    std::span<const float>(w),
+                                    std::span<float>(ref), kHeads, kDim, eps);
+  ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
+
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto up = [&backend](auto& buf, const auto& host) {
+    return backend->CopyH2D(
+        **buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(host.data()),
+                   host.size() * sizeof(host[0])));
+  };
+  auto dev_o = alloc(o.size() * 4);
+  auto dev_z = alloc(z.size() * 4);
+  auto dev_w = alloc(w.size() * 4);
+  auto dev_y = alloc(ref.size() * 4);
+  ASSERT_TRUE(dev_o && dev_z && dev_w && dev_y);
+  ASSERT_TRUE(up(dev_o, o) && up(dev_z, z) && up(dev_w, w));
+  auto kernel = backend->LoadKernel("gdn_out_norm", {});
+  ASSERT_TRUE(kernel);
+  auto launched =
+      core::detail::GdnOutNormDevice(*backend, **kernel, *dev_o->get(),
+                                     *dev_z->get(), *dev_w->get(), *dev_y->get(),
+                                     kHeads, kDim, eps);
+  ASSERT_TRUE(launched) << tessera::ToString(launched.error());
+  backend->Synchronize();
+  std::vector<float> out(kHeads * kDim);
+  ASSERT_TRUE(backend->CopyD2H(
+      *dev_y->get(), reinterpret_cast<std::byte*>(out.data()), out.size() * 4));
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    EXPECT_LE(std::abs(out[i] - ref[i]), tol.abs)
+        << "gdn_out_norm " << i << " backend " << backend->Name();
+  }
+}
+
+// Device: the PLE block post-ops match the host reference.
+TEST(BackendTest, PlePostopsMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(91);
+  constexpr std::size_t kEmb = 64;
+  constexpr std::size_t kHc = 4;
+  constexpr std::size_t kHist = 9;
+  constexpr std::size_t kTaps = 4;
+  const std::size_t dim = kEmb * kHc;
+  const core::PlePostopsShapes shapes{kEmb, kHc, kHist, kTaps};
+  std::vector<float> projected(dim), hidden(dim), value(kEmb);
+  std::vector<float> history(dim * kHist);
+  std::vector<float> norm_key(dim), norm_query(dim), norm_conv(dim);
+  for (auto& v : projected) v = DrawValue(rng);
+  for (auto& v : hidden) v = DrawValue(rng);
+  for (auto& v : value) v = DrawValue(rng);
+  for (auto& v : history) v = DrawValue(rng);
+  for (auto& v : norm_key) v = 1.0f + 0.1f * DrawValue(rng);
+  for (auto& v : norm_query) v = 1.0f + 0.1f * DrawValue(rng);
+  for (auto& v : norm_conv) v = 1.0f + 0.1f * DrawValue(rng);
+  std::vector<std::byte> conv1d(dim * kTaps * 2);
+  for (std::size_t i = 0; i < dim * kTaps; ++i) {
+    const std::uint16_t h = static_cast<std::uint16_t>(0x3800u | (rng() & 0x7Fu));
+    conv1d[2 * i] = static_cast<std::byte>(h & 0xFFu);
+    conv1d[2 * i + 1] = static_cast<std::byte>(h >> 8);
+  }
+  std::vector<float> result_ref(dim), gate_ref(kHc), hist_ref(dim * kHist);
+  auto ref = core::PlePostopsRef(
+      projected, hidden, value, history, norm_key, norm_query, norm_conv,
+      std::span<const std::byte>(conv1d), shapes, 1e-6,
+      std::span<float>(result_ref), std::span<float>(gate_ref),
+      std::span<float>(hist_ref));
+  ASSERT_TRUE(ref.has_value()) << tessera::ToString(ref.error());
+
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto up = [&backend](auto& buf, const auto& host) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(host.data()),
+        host.size() * sizeof(host[0])));
+  };
+  auto d_proj = alloc(dim * 4);
+  auto d_hidden = alloc(dim * 4);
+  auto d_value = alloc(kEmb * 4);
+  auto d_hist = alloc(dim * kHist * 4);
+  auto d_nk = alloc(dim * 4);
+  auto d_nq = alloc(dim * 4);
+  auto d_nc = alloc(dim * 4);
+  auto d_c1 = alloc(conv1d.size());
+  auto d_key = alloc(dim * 4);
+  auto d_query = alloc(dim * 4);
+  auto d_gate = alloc(kHc * 4);
+  auto d_gated = alloc(dim * 4);
+  auto d_norm = alloc(dim * 4);
+  auto d_conv = alloc(dim * 4);
+  auto d_result = alloc(dim * 4);
+  ASSERT_TRUE(d_proj && d_hidden && d_value && d_hist && d_nk && d_nq &&
+              d_nc && d_c1 && d_key && d_query && d_gate && d_gated &&
+              d_norm && d_conv && d_result);
+  ASSERT_TRUE(up(d_proj, projected) && up(d_hidden, hidden) &&
+              up(d_value, value) && up(d_hist, history) && up(d_nk, norm_key) &&
+              up(d_nq, norm_query) && up(d_nc, norm_conv) && up(d_c1, conv1d));
+
+  std::uint32_t eps_bits = 0;
+  {
+    const float eps = 1e-6f;
+    std::memcpy(&eps_bits, &eps, sizeof(eps_bits));
+  }
+  auto rr = backend->LoadKernel("rmsnorm_rows", {});
+  auto gate = backend->LoadKernel("ple_gate", {});
+  auto bc = backend->LoadKernel("ple_broadcast", {});
+  auto conv = backend->LoadKernel("ple_conv", {});
+  auto adv = backend->LoadKernel("ple_hist_advance", {});
+  ASSERT_TRUE(rr && gate && bc && conv && adv);
+  auto launch = [&](const tessera::Kernel& k, std::uint32_t grid,
+                    std::initializer_list<const tessera::Buffer*> buffers,
+                    std::initializer_list<std::uint64_t> scalars) {
+    tessera::KernelLaunch l;
+    l.grid_x = grid;
+    l.block_x = 256;
+    l.buffers.assign(buffers.begin(), buffers.end());
+    l.scalars.assign(scalars.begin(), scalars.end());
+    return backend->LaunchKernel(k, l);
+  };
+  ASSERT_TRUE(launch(**rr, static_cast<std::uint32_t>(kHc),
+                     {d_proj->get(), d_nk->get(), d_key->get()},
+                     {kHc, kEmb, eps_bits}));
+  ASSERT_TRUE(launch(**rr, static_cast<std::uint32_t>(kHc),
+                     {d_hidden->get(), d_nq->get(), d_query->get()},
+                     {kHc, kEmb, eps_bits}));
+  ASSERT_TRUE(launch(**gate, static_cast<std::uint32_t>(kHc),
+                     {d_key->get(), d_query->get(), d_gate->get()},
+                     {kEmb, kHc}));
+  ASSERT_TRUE(launch(**bc, static_cast<std::uint32_t>((dim + 255) / 256),
+                     {d_value->get(), d_gate->get(), d_gated->get()},
+                     {dim, kEmb}));
+  ASSERT_TRUE(launch(**rr, static_cast<std::uint32_t>(kHc),
+                     {d_gated->get(), d_nc->get(), d_norm->get()},
+                     {kHc, kEmb, eps_bits}));
+  ASSERT_TRUE(launch(**conv, static_cast<std::uint32_t>((dim + 255) / 256),
+                     {d_hist->get(), d_norm->get(), d_c1->get(), d_hidden->get(),
+                      d_gated->get(), d_conv->get(), d_result->get()},
+                     {dim, kHist, kTaps}));
+  ASSERT_TRUE(launch(**adv, static_cast<std::uint32_t>((dim + 255) / 256),
+                     {d_hist->get(), d_norm->get()}, {dim, kHist}));
+  backend->Synchronize();
+
+  auto read_back = [&backend](auto& buf, auto& host) {
+    return backend->CopyD2H(**buf, reinterpret_cast<std::byte*>(host.data()),
+                            host.size() * sizeof(host[0]));
+  };
+  std::vector<float> result(dim), gate_out(kHc), hist_out(dim * kHist);
+  ASSERT_TRUE(read_back(d_result, result));
+  ASSERT_TRUE(read_back(d_gate, gate_out));
+  ASSERT_TRUE(read_back(d_hist, hist_out));
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < dim; ++i) {
+    EXPECT_LE(std::abs(result[i] - result_ref[i]), tol.abs)
+        << "result " << i << " backend " << backend->Name();
+  }
+  for (std::size_t i = 0; i < kHc; ++i) {
+    EXPECT_LE(std::abs(gate_out[i] - gate_ref[i]), tol.abs)
+        << "gate " << i << " backend " << backend->Name();
+  }
+  for (std::size_t i = 0; i < hist_out.size(); ++i) {
+    EXPECT_LE(std::abs(hist_out[i] - hist_ref[i]), tol.abs)
+        << "history " << i << " backend " << backend->Name();
+  }
+}
+
+// Device: the QSA indexer scoring matches the host reference.
+TEST(BackendTest, QsaIndexMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(94);
+  constexpr std::size_t kHeads = 4;
+  constexpr std::size_t kDim = 8;
+  constexpr std::size_t kBlock = 4;
+  constexpr std::size_t kNBid = 2;
+  constexpr std::size_t kNKv = 10;
+  const core::QsaIndexShapes shapes{kHeads, kDim, kBlock, kNBid, kNKv};
+  std::vector<float> pooled((kNBid + 1) * kDim);
+  std::vector<float> q_idx(kHeads * kDim);
+  std::vector<float> bias(kNBid + 1);
+  for (auto& v : pooled) v = DrawValue(rng);
+  for (auto& v : q_idx) v = DrawValue(rng);
+  for (auto& v : bias) v = DrawValue(rng);
+  std::vector<float> ref(kNKv);
+  auto status = core::QsaIndexRef(pooled, q_idx, bias, shapes, ref);
+  ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
+
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto up = [&backend](auto& buf, const auto& host) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(host.data()),
+        host.size() * sizeof(host[0])));
+  };
+  auto d_pooled = alloc(pooled.size() * 4);
+  auto d_q = alloc(q_idx.size() * 4);
+  auto d_bias = alloc(bias.size() * 4);
+  auto d_scores = alloc(kNKv * 4);
+  ASSERT_TRUE(d_pooled && d_q && d_bias && d_scores);
+  ASSERT_TRUE(up(d_pooled, pooled) && up(d_q, q_idx) && up(d_bias, bias));
+  auto kernel = backend->LoadKernel("qsa_index", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  tessera::KernelLaunch launch;
+  launch.grid_x = static_cast<std::uint32_t>((kNKv + 255) / 256);
+  launch.block_x = 256;
+  launch.buffers = {d_pooled->get(), d_q->get(), d_bias->get(),
+                    d_scores->get()};
+  launch.scalars = {kHeads, kDim, kBlock, kNBid, kNKv};
+  auto result = backend->LaunchKernel(**kernel, launch);
+  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  backend->Synchronize();
+  std::vector<float> got(kNKv);
+  ASSERT_TRUE(backend->CopyD2H(**d_scores,
+                               reinterpret_cast<std::byte*>(got.data()),
+                               got.size() * 4));
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < kNKv; ++i) {
+    EXPECT_LE(std::abs(got[i] - ref[i]), tol.abs)
+        << "score " << i << " backend " << backend->Name();
+  }
+}
+
+// Device: the paged FP16 KV append and the QSA output gate match the host
+// reference (bit exact fp16).
+TEST(BackendTest, KvAppendAndGateMatchRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(95);
+  constexpr std::size_t kKvHeads = 2;
+  constexpr std::size_t kHeadDim = 8;
+  constexpr std::size_t kPageSize = 4;
+  const std::vector<std::int32_t> page_table = {2, 0, 1};
+  const std::size_t cells = kPageSize * page_table.size();
+  const std::size_t pool_elems = cells * kKvHeads * kHeadDim;
+  std::vector<float> kcur(kKvHeads * kHeadDim), vcur(kKvHeads * kHeadDim);
+  for (auto& v : kcur) v = DrawValue(rng);
+  for (auto& v : vcur) v = DrawValue(rng);
+  std::vector<std::uint16_t> k_ref(pool_elems, 0), v_ref(pool_elems, 0);
+  ASSERT_TRUE(core::KvAppendRef(k_ref, v_ref, page_table, 5, kcur, vcur,
+                                kKvHeads, kHeadDim, kPageSize)
+                  .has_value());
+
+  constexpr std::size_t kHeads = 2;
+  std::vector<float> attn(kHeads * kHeadDim), q_full(kHeads * 2 * kHeadDim);
+  for (auto& v : attn) v = DrawValue(rng);
+  for (auto& v : q_full) v = DrawValue(rng);
+  std::vector<std::uint16_t> gate_ref(kHeads * kHeadDim);
+  ASSERT_TRUE(core::QsaGateApplyRef(attn, q_full, kHeads, kHeadDim, gate_ref)
+                  .has_value());
+
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto d_kp = alloc(pool_elems * 2);
+  auto d_vp = alloc(pool_elems * 2);
+  auto d_pt = alloc(page_table.size() * 4);
+  auto d_kc = alloc(kcur.size() * 4);
+  auto d_vc = alloc(vcur.size() * 4);
+  auto d_attn = alloc(attn.size() * 4);
+  auto d_qf = alloc(q_full.size() * 4);
+  auto d_gate = alloc(kHeads * kHeadDim * 2);
+  ASSERT_TRUE(d_kp && d_vp && d_pt && d_kc && d_vc && d_attn && d_qf &&
+              d_gate);
+  auto up = [&backend](auto& buf, const auto& host) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(host.data()),
+        host.size() * sizeof(host[0])));
+  };
+  std::vector<std::uint16_t> zero_pool(pool_elems, 0);
+  ASSERT_TRUE(up(d_kp, zero_pool) && up(d_vp, zero_pool) && up(d_pt, page_table) &&
+              up(d_kc, kcur) && up(d_vc, vcur) && up(d_attn, attn) &&
+              up(d_qf, q_full));
+
+  auto kv = backend->LoadKernel("kv_append", {});
+  auto gate = backend->LoadKernel("qsa_gate_apply", {});
+  ASSERT_TRUE(kv && gate);
+  auto launch = [&](const tessera::Kernel& k, std::uint32_t grid,
+                    std::initializer_list<const tessera::Buffer*> buffers,
+                    std::initializer_list<std::uint64_t> scalars) {
+    tessera::KernelLaunch l;
+    l.grid_x = grid;
+    l.block_x = 256;
+    l.buffers.assign(buffers.begin(), buffers.end());
+    l.scalars.assign(scalars.begin(), scalars.end());
+    return backend->LaunchKernel(k, l);
+  };
+  const std::uint32_t kv_pairs =
+      static_cast<std::uint32_t>((kKvHeads * kHeadDim / 2 + 255) / 256);
+  ASSERT_TRUE(launch(**kv, kv_pairs,
+                     {d_kp->get(), d_vp->get(), d_pt->get(), d_kc->get(),
+                      d_vc->get()},
+                     {5, kKvHeads, kHeadDim, kPageSize}));
+  const std::uint32_t gate_pairs =
+      static_cast<std::uint32_t>((kHeads * kHeadDim / 2 + 255) / 256);
+  ASSERT_TRUE(launch(**gate, gate_pairs,
+                     {d_attn->get(), d_qf->get(), d_gate->get()},
+                     {kHeads, kHeadDim}));
+  backend->Synchronize();
+
+  std::vector<std::uint16_t> k_got(pool_elems), v_got(pool_elems),
+      gate_got(kHeads * kHeadDim);
+  ASSERT_TRUE(backend->CopyD2H(**d_kp, reinterpret_cast<std::byte*>(k_got.data()),
+                               k_got.size() * 2));
+  ASSERT_TRUE(backend->CopyD2H(**d_vp, reinterpret_cast<std::byte*>(v_got.data()),
+                               v_got.size() * 2));
+  ASSERT_TRUE(backend->CopyD2H(**d_gate,
+                               reinterpret_cast<std::byte*>(gate_got.data()),
+                               gate_got.size() * 2));
+  for (std::size_t i = 0; i < pool_elems; ++i) {
+    EXPECT_EQ(k_got[i], k_ref[i]) << "k " << i;
+    EXPECT_EQ(v_got[i], v_ref[i]) << "v " << i;
+  }
+  for (std::size_t i = 0; i < gate_got.size(); ++i) {
+    EXPECT_EQ(gate_got[i], gate_ref[i]) << "gate " << i;
+  }
+}
+
+// Device: the page-table gather and the softmax GQA match the host
+// reference.
+TEST(BackendTest, QsaGatherAttendMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(96);
+  constexpr std::size_t kKvHeads = 2;
+  constexpr std::size_t kHeads = 4;
+  constexpr std::size_t kHeadDim = 8;
+  constexpr std::size_t kPageSize = 4;
+  const std::vector<std::int32_t> page_table = {2, 0, 1};
+  const std::vector<std::int32_t> ids = {1, 5, 9};
+  const std::size_t n_ids = ids.size();
+  const std::size_t cells = kPageSize * page_table.size();
+  const std::size_t pool_elems = cells * kKvHeads * kHeadDim;
+  std::vector<std::uint16_t> k_pool(pool_elems), v_pool(pool_elems);
+  for (auto& v : k_pool) v = core::Fp32ToHalfBits(DrawValue(rng));
+  for (auto& v : v_pool) v = core::Fp32ToHalfBits(DrawValue(rng));
+  std::vector<std::uint16_t> k_ref(n_ids * kKvHeads * kHeadDim);
+  std::vector<std::uint16_t> v_ref(n_ids * kKvHeads * kHeadDim);
+  ASSERT_TRUE(core::KvGatherRef(k_pool, v_pool, page_table, ids, kKvHeads,
+                                kHeadDim, kPageSize, k_ref, v_ref)
+                  .has_value());
+  std::vector<float> q(kHeads * kHeadDim);
+  for (auto& v : q) v = DrawValue(rng);
+  std::vector<float> attn_ref(kHeads * kHeadDim);
+  ASSERT_TRUE(core::QsaAttendRef(q, k_ref, v_ref, n_ids, kHeads, kKvHeads,
+                                 kHeadDim, attn_ref)
+                  .has_value());
+
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto up = [&backend](auto& buf, const auto& host) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(host.data()),
+        host.size() * sizeof(host[0])));
+  };
+  auto d_kp = alloc(pool_elems * 2);
+  auto d_vp = alloc(pool_elems * 2);
+  auto d_pt = alloc(page_table.size() * 4);
+  auto d_ids = alloc(n_ids * 4);
+  auto d_ks = alloc(k_ref.size() * 2);
+  auto d_vs = alloc(v_ref.size() * 2);
+  auto d_q = alloc(q.size() * 4);
+  auto d_attn = alloc(attn_ref.size() * 4);
+  ASSERT_TRUE(d_kp && d_vp && d_pt && d_ids && d_ks && d_vs && d_q && d_attn);
+  ASSERT_TRUE(up(d_kp, k_pool) && up(d_vp, v_pool) && up(d_pt, page_table) &&
+              up(d_ids, ids) && up(d_q, q));
+  auto gather = backend->LoadKernel("kv_gather", {});
+  auto attend = backend->LoadKernel("qsa_attend", {});
+  ASSERT_TRUE(gather && attend);
+  auto launch = [&](const tessera::Kernel& k, std::uint32_t grid,
+                    std::initializer_list<const tessera::Buffer*> buffers,
+                    std::initializer_list<std::uint64_t> scalars) {
+    tessera::KernelLaunch l;
+    l.grid_x = grid;
+    l.block_x = 256;
+    l.buffers.assign(buffers.begin(), buffers.end());
+    l.scalars.assign(scalars.begin(), scalars.end());
+    return backend->LaunchKernel(k, l);
+  };
+  const std::size_t gather_elems = n_ids * kKvHeads * kHeadDim;
+  ASSERT_TRUE(launch(**gather,
+                     static_cast<std::uint32_t>((gather_elems / 2 + 255) / 256),
+                     {d_kp->get(), d_vp->get(), d_pt->get(), d_ids->get(),
+                      d_ks->get(), d_vs->get()},
+                     {n_ids, kKvHeads, kHeadDim, kPageSize}));
+  ASSERT_TRUE(launch(**attend, static_cast<std::uint32_t>(kHeads),
+                     {d_q->get(), d_ks->get(), d_vs->get(), d_attn->get()},
+                     {n_ids, kHeads, kKvHeads, kHeadDim}));
+  backend->Synchronize();
+  std::vector<std::uint16_t> k_got(k_ref.size()), v_got(v_ref.size());
+  std::vector<float> attn_got(attn_ref.size());
+  ASSERT_TRUE(backend->CopyD2H(**d_ks, reinterpret_cast<std::byte*>(k_got.data()),
+                               k_got.size() * 2));
+  ASSERT_TRUE(backend->CopyD2H(**d_vs, reinterpret_cast<std::byte*>(v_got.data()),
+                               v_got.size() * 2));
+  ASSERT_TRUE(backend->CopyD2H(**d_attn,
+                               reinterpret_cast<std::byte*>(attn_got.data()),
+                               attn_got.size() * 4));
+  for (std::size_t i = 0; i < k_ref.size(); ++i) {
+    EXPECT_EQ(k_got[i], k_ref[i]) << "k " << i;
+    EXPECT_EQ(v_got[i], v_ref[i]) << "v " << i;
+  }
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < attn_ref.size(); ++i) {
+    EXPECT_LE(std::abs(attn_got[i] - attn_ref[i]), tol.abs)
+        << "attn " << i << " backend " << backend->Name();
+  }
+}
+
+// Device: the QSA top-k selection matches the host reference.
+TEST(BackendTest, QsaTopKMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  struct Case {
+    std::vector<float> scores;
+    std::size_t width;
+  };
+  const std::vector<Case> cases = {
+      {{0.5f, 0.9f, 0.9f, 0.1f, 0.7f}, 3},
+      {{0.5f, 0.9f, 0.9f, 0.1f, 0.7f}, 1},
+      {{-1.0f, -2.0f, -0.5f, 0.3f}, 2},
+      {{1.0f, 2.0f, 3.0f}, 3},
+      {{4.0f, 3.0f, 2.0f, 1.0f}, 0},
+  };
+  for (const Case& c : cases) {
+    const std::size_t n_kv = c.scores.size();
+    std::vector<std::int32_t> ref(c.width);
+    ASSERT_TRUE(core::QsaTopKRef(c.scores, c.width, ref).has_value());
+    auto s_buf = backend->AllocateBuffer(n_kv * 4, MemoryKind::Device);
+    auto id_buf = backend->AllocateBuffer(
+        (c.width == 0 ? 1 : c.width) * 4, MemoryKind::Device);
+    ASSERT_TRUE(s_buf.has_value() && id_buf.has_value());
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**s_buf,
+                              std::span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(
+                                      c.scores.data()),
+                                  n_kv * 4))
+                    .has_value());
+    auto kernel = backend->LoadKernel("qsa_topk", {});
+    ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+    tessera::KernelLaunch launch;
+    launch.grid_x = 1;
+    launch.block_x = 256;
+    launch.buffers = {(*s_buf).get(), (*id_buf).get()};
+    launch.scalars = {n_kv, c.width};
+    auto result = backend->LaunchKernel(**kernel, launch);
+    ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+    backend->Synchronize();
+    std::vector<std::int32_t> got(c.width);
+    if (c.width > 0) {
+      ASSERT_TRUE(backend
+                      ->CopyD2H(**id_buf,
+                                reinterpret_cast<std::byte*>(got.data()),
+                                c.width * 4)
+                      .has_value());
+    }
+    EXPECT_EQ(got, ref) << "width " << c.width;
+  }
+}
+
+// Device: the indexer key append matches the host reference over a run of
+// tokens (raw tail, pooling, spare slot, rotation).
+TEST(BackendTest, IndexerKeyAppendMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(97);
+  constexpr std::size_t kDim = 8;
+  constexpr std::size_t kBlock = 4;
+  constexpr std::size_t kRot = 4;
+  constexpr std::size_t kTokens = 8;
+  constexpr std::size_t kRows = 6;
+  constexpr std::size_t kHalf = kRot / 2;
+  constexpr std::size_t kMaxPos = 16;
+  std::vector<float> w_k_norm(kDim);
+  std::vector<float> cos_tab(kMaxPos * kHalf), sin_tab(kMaxPos * kHalf);
+  for (auto& v : w_k_norm) v = 1.0f + 0.1f * DrawValue(rng);
+  for (std::size_t p = 0; p < kMaxPos; ++p) {
+    for (std::size_t d = 0; d < kHalf; ++d) {
+      const double angle = 0.1 * static_cast<double>(p) + 0.2 * d;
+      cos_tab[p * kHalf + d] = static_cast<float>(std::cos(angle));
+      sin_tab[p * kHalf + d] = static_cast<float>(std::sin(angle));
+    }
+  }
+  const float eps = 1e-6f;
+  std::vector<float> tail_ref((kBlock - 1) * kDim, 0.0f);
+  std::vector<float> dead_ref(kDim, 0.0f);
+  std::vector<float> pooled_ref(kRows * kDim, 0.0f);
+  std::vector<std::int32_t> bpos_ref(1, 0);
+  std::vector<std::vector<float>> raws(kTokens, std::vector<float>(kDim));
+  for (auto& r : raws) {
+    for (auto& v : r) v = DrawValue(rng);
+  }
+  for (std::size_t pos = 0; pos < kTokens; ++pos) {
+    ASSERT_TRUE(core::IndexerKeyAppendRef(
+                    raws[pos], static_cast<std::int32_t>(pos), 0, w_k_norm, eps,
+                    tail_ref, dead_ref, pooled_ref, bpos_ref, cos_tab, sin_tab,
+                    kDim, kBlock, kRot)
+                    .has_value())
+        << "pos " << pos;
+  }
+
+  auto alloc = [&backend](std::size_t bytes) {
+    return backend->AllocateBuffer(bytes, MemoryKind::Device);
+  };
+  auto up = [&backend](auto& buf, const auto& host) {
+    return backend->CopyH2D(**buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(host.data()),
+        host.size() * sizeof(host[0])));
+  };
+  auto d_raw = alloc(kDim * 4);
+  auto d_pos = alloc(4);
+  auto d_wkn = alloc(kDim * 4);
+  auto d_tail = alloc((kBlock - 1) * kDim * 4);
+  auto d_dead = alloc(kDim * 4);
+  auto d_pooled = alloc(kRows * kDim * 4);
+  auto d_bpos = alloc(4);
+  auto d_cos = alloc(cos_tab.size() * 4);
+  auto d_sin = alloc(sin_tab.size() * 4);
+  ASSERT_TRUE(d_raw && d_pos && d_wkn && d_tail && d_dead && d_pooled &&
+              d_bpos && d_cos && d_sin);
+  ASSERT_TRUE(up(d_wkn, w_k_norm) && up(d_cos, cos_tab) && up(d_sin, sin_tab));
+  {
+    const std::vector<float> zero_tail((kBlock - 1) * kDim, 0.0f);
+    const std::vector<float> zero_dead(kDim, 0.0f);
+    const std::vector<float> zero_pooled(kRows * kDim, 0.0f);
+    ASSERT_TRUE(up(d_tail, zero_tail));
+    ASSERT_TRUE(up(d_dead, zero_dead));
+    ASSERT_TRUE(up(d_pooled, zero_pooled));
+  }
+  std::uint32_t eps_bits = 0;
+  std::memcpy(&eps_bits, &eps, sizeof(eps_bits));
+  auto kernel = backend->LoadKernel("indexer_key_append", {});
+  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+  for (std::size_t pos = 0; pos < kTokens; ++pos) {
+    const std::int32_t p32 = static_cast<std::int32_t>(pos);
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**d_raw, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(
+                                               raws[pos].data()),
+                                           kDim * 4))
+                    .has_value());
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**d_pos, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(
+                                               &p32),
+                                           4))
+                    .has_value());
+    tessera::KernelLaunch launch;
+    launch.grid_x = 1;
+    launch.block_x = 256;
+    launch.buffers = {d_raw->get(), d_pos->get(), d_wkn->get(), d_tail->get(),
+                      d_dead->get(), d_pooled->get(), d_bpos->get(),
+                      d_cos->get(), d_sin->get()};
+    launch.scalars = {0, eps_bits, kDim, kBlock, kRot};
+    auto result = backend->LaunchKernel(**kernel, launch);
+    ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+  }
+  backend->Synchronize();
+  std::vector<float> tail_got((kBlock - 1) * kDim), dead_got(kDim),
+      pooled_got(kRows * kDim);
+  std::vector<std::int32_t> bpos_got(1);
+  auto down = [&backend](auto& buf, auto& host) {
+    return backend->CopyD2H(**buf, reinterpret_cast<std::byte*>(host.data()),
+                            host.size() * sizeof(host[0]));
+  };
+  ASSERT_TRUE(down(d_tail, tail_got));
+  ASSERT_TRUE(down(d_dead, dead_got));
+  ASSERT_TRUE(down(d_pooled, pooled_got));
+  ASSERT_TRUE(down(d_bpos, bpos_got));
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  for (std::size_t i = 0; i < tail_got.size(); ++i) {
+    EXPECT_LE(std::abs(tail_got[i] - tail_ref[i]), tol.abs) << "tail " << i;
+  }
+  for (std::size_t i = 0; i < dead_got.size(); ++i) {
+    EXPECT_LE(std::abs(dead_got[i] - dead_ref[i]), tol.abs) << "dead " << i;
+  }
+  for (std::size_t i = 0; i < pooled_got.size(); ++i) {
+    EXPECT_LE(std::abs(pooled_got[i] - pooled_ref[i]), tol.abs)
+        << "pooled " << i;
+  }
+  EXPECT_EQ(bpos_got[0], bpos_ref[0]);
+}
+
+// Host: the PLE table reader decodes IQ4_NL rows from a GGUF shard.
+TEST(BackendTest, PleTableReadsRows) {
+  std::mt19937 rng(98);
+  constexpr std::size_t kRows = 4;
+  std::vector<std::byte> payload(kRows * tessera::models::qwen4exp::kPleRowBytes);
+  for (auto& b : payload) {
+    b = static_cast<std::byte>(rng() & 0xFFu);
+  }
+  // Each 18-byte IQ4_NL block's first two bytes are an fp16 scale; force
+  // them finite (1.0) so the decode does not produce NaN.
+  for (std::size_t block = 0;
+       block < kRows * tessera::models::qwen4exp::kPleRowBytes / 18; ++block) {
+    payload[block * 18] = std::byte{0x00};
+    payload[block * 18 + 1] = std::byte{0x3C};
+  }
+  tessera::testing::GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 0);
+  builder.Tensor("per_layer_token_embd.weight", 2,
+                 {tessera::models::qwen4exp::kPleRowElements, kRows}, 20, 0);
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u));
+  builder.bytes.insert(builder.bytes.end(), payload.begin(), payload.end());
+  auto dir = tessera::testing::FreshTempDir("tessera_tests_ple_table");
+  auto path = dir / "shard2.gguf";
+  tessera::testing::WriteBytes(path, builder.bytes);
+  auto table = tessera::models::qwen4exp::PleTable::Open(path.string());
+  ASSERT_TRUE(table.has_value())
+      << tessera::ToString(table.error());
+  EXPECT_EQ((*table)->Rows(), kRows);
+  const std::vector<std::uint32_t> rows = {0, 2};
+  std::vector<float> out(rows.size() * tessera::models::qwen4exp::kPleRowElements);
+  ASSERT_TRUE((*table)->Gather(rows, out).has_value());
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    const std::byte* row =
+        payload.data() + rows[i] * tessera::models::qwen4exp::kPleRowBytes;
+    for (std::size_t b = 0; b < 5; ++b) {
+      std::vector<float> block(32);
+      core::DequantizeIQ4NL(std::span<const std::byte>(row + b * 18, 18),
+                            std::span<float>(block));
+      for (std::size_t j = 0; j < 32; ++j) {
+        EXPECT_FLOAT_EQ(
+            out[i * tessera::models::qwen4exp::kPleRowElements + b * 32 + j],
+            block[j]);
+      }
+    }
+  }
+  std::vector<std::uint32_t> bad = {static_cast<std::uint32_t>(kRows)};
+  std::vector<float> tiny(tessera::models::qwen4exp::kPleRowElements);
+  EXPECT_FALSE((*table)->Gather(bad, tiny).has_value());
+}
+
+// Device: the IQ3_XXS, IQ2_S and Q2_0 single-row GEMM kernels match the
+// host reference (2 x 8 outputs).
+TEST(BackendTest, GemmIq3XxsIq2SQ20DeviceMatchRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  struct Case {
+    const char* kernel;
+    DType dtype;
+    std::size_t bytes;
+    std::size_t elements;
+    std::uint32_t seed;
+  };
+  const Case cases[] = {
+      {"gemm_iq3xxs", DType::IQ3_XXS, 98, 256, 71},
+      {"gemm_iq2s", DType::IQ2_S, 82, 256, 72},
+      {"gemm_q20", DType::Q2_0, 18, 64, 73},
+  };
+  for (const Case& c : cases) {
+    std::mt19937 rng(c.seed);
+    constexpr std::size_t kM = 2;
+    constexpr std::size_t kN = 8;
+    const std::size_t kK = c.elements;
+    std::vector<float> a(kM * kK);
+    for (auto& v : a) {
+      v = DrawValue(rng);
+    }
+    std::vector<std::byte> w = RandomBlocks(rng, kN, c.bytes, 0);
+    auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+    auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+    auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+    ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+    auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+    auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+    ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+    auto kernel = backend->LoadKernel(c.kernel, {});
+    ASSERT_TRUE(kernel.has_value())
+        << c.kernel << ": " << tessera::ToString(kernel.error());
+    tessera::KernelLaunch launch;
+    launch.grid_x = (kM * kN + 255) / 256;
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+    launch.scalars = {kM, kN, kK};
+    auto result = backend->LaunchKernel(**kernel, launch);
+    ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+    backend->Synchronize();
+    std::vector<std::byte> readback(kM * kN * 4);
+    auto download = backend->CopyD2H(**c_buf, readback.data(),
+                                     readback.size());
+    ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+    std::vector<float> ref(kM * kN);
+    std::expected<void, StatusCode> ref_status;
+    if (c.dtype == DType::IQ3_XXS) {
+      ref_status = core::GemmIq3XxsRef(std::span<const float>(a),
+                                       std::span<const std::byte>(w),
+                                       std::span<float>(ref), kM, kN, kK);
+    } else if (c.dtype == DType::IQ2_S) {
+      ref_status = core::GemmIq2SRef(std::span<const float>(a),
+                                     std::span<const std::byte>(w),
+                                     std::span<float>(ref), kM, kN, kK);
+    } else {
+      ref_status = core::GemmQ20Ref(std::span<const float>(a),
+                                    std::span<const std::byte>(w),
+                                    std::span<float>(ref), kM, kN, kK);
+    }
+    ASSERT_TRUE(ref_status.has_value()) << tessera::ToString(ref_status.error());
+    const auto* device_out = reinterpret_cast<const float*>(readback.data());
+    const FpTolerance tol = FpToleranceFor(backend->Name());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << c.kernel << " backend " << backend->Name() << " max_abs " << max_abs;
+  }
+}
+
 // Device: the fp GEMM contracts reject bad shapes.
+
+// Host: the PLE n-gram hash produces the row indices the hash specifies.
+TEST(BackendTest, NgramRowsHash) {
+  tessera::PleParams ple;
+  ple.ngram_size = 3;
+  ple.heads_per_ngram = 8;
+  ple.conv_kernel = 4;
+  ple.embd_per_layer = 160;
+  ple.eos_token_id = 248044;
+  ple.layer_multipliers = {2654435761ull, 40503ull, 2246822519ull};
+  ple.head_vocab_sizes.resize(16);
+  ple.head_offsets.resize(16);
+  std::uint64_t off = 0;
+  for (std::size_t h = 0; h < 16; ++h) {
+    ple.head_vocab_sizes[h] = 20000003 + 10 * h;
+    ple.head_offsets[h] = off;
+    off += ple.head_vocab_sizes[h];
+  }
+  auto expected = [&](std::uint64_t mixed, std::size_t h) {
+    return static_cast<std::uint32_t>(mixed % ple.head_vocab_sizes[h] +
+                                      ple.head_offsets[h]);
+  };
+  const std::int64_t eos = static_cast<std::int64_t>(ple.eos_token_id);
+
+  // One token, no predecessors: context = [5, eos, eos].
+  const std::vector<std::int32_t> tokens = {5};
+  const std::vector<std::int32_t> prev_none = {-1, -1};
+  std::vector<std::uint32_t> rows(16);
+  ASSERT_TRUE(core::NgramRows(tokens, prev_none, ple, rows).has_value());
+  const std::int64_t ctx_none2[] = {5, eos};
+  const std::int64_t ctx_none3[] = {5, eos, eos};
+  const std::uint64_t m2 =
+      core::NgramMixed(ctx_none2, ple.layer_multipliers);
+  const std::uint64_t m3 =
+      core::NgramMixed(ctx_none3, ple.layer_multipliers);
+  for (std::size_t h = 0; h < 8; ++h) {
+    EXPECT_EQ(rows[h], expected(m2, h));
+  }
+  for (std::size_t h = 8; h < 16; ++h) {
+    EXPECT_EQ(rows[h], expected(m3, h));
+  }
+
+  // Real predecessors, OLDEST FIRST: the newest is prev[1].
+  const std::vector<std::int32_t> prev = {3, 7};
+  ASSERT_TRUE(core::NgramRows(tokens, prev, ple, rows).has_value());
+  const std::int64_t ctx2[] = {5, 7};
+  const std::int64_t ctx3[] = {5, 7, 3};
+  const std::uint64_t r2 = core::NgramMixed(ctx2, ple.layer_multipliers);
+  const std::uint64_t r3 = core::NgramMixed(ctx3, ple.layer_multipliers);
+  for (std::size_t h = 0; h < 8; ++h) {
+    EXPECT_EQ(rows[h], expected(r2, h));
+  }
+  for (std::size_t h = 8; h < 16; ++h) {
+    EXPECT_EQ(rows[h], expected(r3, h));
+  }
+
+  // An end-of-text predecessor cuts the context forward: [5, eos, eos].
+  const std::vector<std::int32_t> prev_eos = {
+      3, static_cast<std::int32_t>(ple.eos_token_id)};
+  ASSERT_TRUE(core::NgramRows(tokens, prev_eos, ple, rows).has_value());
+  for (std::size_t h = 0; h < 8; ++h) {
+    EXPECT_EQ(rows[h], expected(m2, h));
+  }
+  for (std::size_t h = 8; h < 16; ++h) {
+    EXPECT_EQ(rows[h], expected(m3, h));
+  }
+
+  // Every row lies inside its head's range.
+  for (std::size_t h = 0; h < 16; ++h) {
+    EXPECT_GE(rows[h], ple.head_offsets[h]);
+    EXPECT_LT(rows[h], ple.head_offsets[h] + ple.head_vocab_sizes[h]);
+  }
+
+  // A size mismatch is rejected.
+  std::vector<std::uint32_t> too_small(15);
+  EXPECT_FALSE(core::NgramRows(tokens, prev_none, ple, too_small).has_value());
+}
+
+// Host: the QSA step buffer is derived from the position.
+TEST(BackendTest, QsaStepFillDerivation) {
+  std::vector<std::int32_t> step(core::kQsaStepCount);
+  core::QsaStepFill(step, 5, 4, 8);
+  EXPECT_EQ(step[0], 5);
+  EXPECT_EQ(step[1], 6);
+  EXPECT_EQ(step[2], 1);
+  EXPECT_EQ(step[3], 6);
+  core::QsaStepFill(step, 100, 4, 8);
+  EXPECT_EQ(step[1], 101);
+  EXPECT_EQ(step[2], 25);
+  EXPECT_EQ(step[3], 11);
+}
+
+// Host: the fp16 encode hits known values and round-trips.
+TEST(BackendTest, HalfEncodeKnownValues) {
+  EXPECT_EQ(core::Fp32ToHalfBits(0.0f), 0x0000u);
+  EXPECT_EQ(core::Fp32ToHalfBits(1.0f), 0x3C00u);
+  EXPECT_EQ(core::Fp32ToHalfBits(-1.0f), 0xBC00u);
+  EXPECT_EQ(core::Fp32ToHalfBits(0.5f), 0x3800u);
+  EXPECT_EQ(core::Fp32ToHalfBits(2.0f), 0x4000u);
+  EXPECT_EQ(core::Fp32ToHalfBits(-2.0f), 0xC000u);
+  EXPECT_EQ(core::Fp32ToHalfBits(65504.0f), 0x7BFFu);
+  EXPECT_EQ(core::Fp32ToHalfBits(65520.0f), 0x7C00u);
+  EXPECT_EQ(core::Fp32ToHalfBits(-0.0f), 0x8000u);
+  // Round to nearest even: 1 + 2^-11 is halfway between two fp16 values.
+  EXPECT_EQ(core::Fp32ToHalfBits(1.0f + 0x1p-11f), 0x3C00u);
+  EXPECT_EQ(core::Fp32ToHalfBits(1.0f + 0x3p-11f), 0x3C02u);
+  // Round trip within fp16 precision over a wide range.
+  for (float x : {0.123f, -3.75f, 1024.5f, 1e-3f, -0.54235f, 42.0f}) {
+    const float back = core::Fp16ToFloat(core::Fp32ToHalfBits(x));
+    EXPECT_LE(std::abs(back - x), std::abs(x) * (1.0f / 1024.0f) + 1e-7f)
+        << "x=" << x;
+  }
+}
 
 // Host: the K-quant and IQ dequants hit hand-computed values.
 TEST(BackendTest, QuantDequantsExact) {
@@ -1258,6 +2268,33 @@ TEST(BackendTest, QuantDequantsExact) {
                        std::span<float>(outs3));
   EXPECT_FLOAT_EQ(outs3[0], 1.0f);
   EXPECT_FLOAT_EQ(outs3[7], 1.0f);
+  // IQ3_XXS: d=1, everything else zero (grid[0] bytes 4, dl=0.25).
+  std::vector<std::byte> sxxs(98, std::byte{0});
+  sxxs[1] = std::byte{0x3C};
+  std::vector<float> outxxs(256);
+  core::DequantizeIQ3XXS(std::span<const std::byte>(sxxs),
+                         std::span<float>(outxxs));
+  EXPECT_FLOAT_EQ(outxxs[0], 1.0f);
+  EXPECT_FLOAT_EQ(outxxs[255], 1.0f);
+  // IQ2_S: d=1, everything else zero (grid[0] bytes 8, dl=0.125).
+  std::vector<std::byte> s2s(82, std::byte{0});
+  s2s[1] = std::byte{0x3C};
+  std::vector<float> out2s(256);
+  core::DequantizeIQ2S(std::span<const std::byte>(s2s),
+                       std::span<float>(out2s));
+  EXPECT_FLOAT_EQ(out2s[0], 1.0f);
+  EXPECT_FLOAT_EQ(out2s[255], 1.0f);
+  // Q2_0: d=1, qs[0]=0b00011011 (codes 3,2,1,0 -> +2,+1,0,-1).
+  std::vector<std::byte> s20(18, std::byte{0});
+  s20[1] = std::byte{0x3C};
+  s20[2] = std::byte{0x1B};
+  std::vector<float> out20(64);
+  core::DequantizeQ20(std::span<const std::byte>(s20),
+                      std::span<float>(out20));
+  EXPECT_FLOAT_EQ(out20[0], 2.0f);
+  EXPECT_FLOAT_EQ(out20[1], 1.0f);
+  EXPECT_FLOAT_EQ(out20[2], 0.0f);
+  EXPECT_FLOAT_EQ(out20[3], -1.0f);
   // Q8_0: d=1, q[0]=-128, q[1]=127.
   std::vector<std::byte> q8(34, std::byte{0});
   q8[1] = std::byte{0x3C};

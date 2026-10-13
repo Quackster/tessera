@@ -628,7 +628,7 @@ class VulkanBackend final : public Backend {
       return waited;
     }
     if (diagnostics_ != nullptr) {
-      LogInfo(core::FormatTransferSummary(
+      LogDebug(core::FormatTransferSummary(
           total_bytes, copies.size(),
           core::ElapsedMs(started, core::PhaseClock::now())));
     }

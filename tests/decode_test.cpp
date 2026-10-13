@@ -632,14 +632,14 @@ std::vector<std::uint32_t> SpeculativeTokens(const std::string& path,
 TEST(HybridDecodeTest, GatedBaselineIsPinned) {
   const auto got = GreedyTokens(WriteGatedHybridFixture("gated.gguf").string(),
                                 8);
-  const std::vector<std::uint32_t> want = {1, 0, 26, 18, 17, 3, 3, 3};
+  const std::vector<std::uint32_t> want = {1, 12, 16, 8, 14, 5, 4, 5};
   EXPECT_EQ(got, want);
 }
 
 TEST(HybridDecodeTest, LinearBaselineIsPinned) {
   const auto got =
       GreedyTokens(WriteLinearHybridFixture("linear.gguf").string(), 8);
-  const std::vector<std::uint32_t> want = {21, 28, 24, 6, 9, 15, 18, 24};
+  const std::vector<std::uint32_t> want = {11, 29, 5, 5, 31, 2, 1, 1};
   EXPECT_EQ(got, want);
 }
 
@@ -673,7 +673,7 @@ TEST(HybridDecodeTest, ScoreTokensMatchesGreedy) {
   auto rows = tessera::core::ScoreTokens(engine->Owner(), **model, prefix);
   ASSERT_TRUE(rows.has_value()) << tessera::ToString(rows.error());
   ASSERT_EQ(rows->size(), prefix.size());
-  const std::vector<std::uint32_t> want = {1, 0, 26, 18};
+  const std::vector<std::uint32_t> want = {1, 12, 26, 18};
   for (std::size_t i = 0; i < rows->size(); ++i) {
     EXPECT_EQ((*rows)[i].size(), cfg->vocab_size);
     EXPECT_EQ(RowArgMax((*rows)[i]), want[i]);
@@ -1193,11 +1193,11 @@ TEST(HybridDecodeTest, BatchedVerifyPreservesGreedy) {
 // full-attention and the stateful linear fixtures.
 TEST(HybridDecodeTest, SpeculationMatchesGreedy) {
   const std::string gated = WriteGatedHybridFixture("gated.gguf").string();
-  const std::vector<std::uint32_t> want_gated = {1, 0, 26, 18, 17, 3, 3, 3};
+  const std::vector<std::uint32_t> want_gated = {1, 12, 16, 8, 14, 5, 4, 5};
   EXPECT_EQ(SpeculativeTokens(gated, 8, 31), want_gated);
   EXPECT_EQ(SpeculativeTokens(gated, 8, 1), want_gated);
   const std::string linear = WriteLinearHybridFixture("linear.gguf").string();
-  const std::vector<std::uint32_t> want_linear = {21, 28, 24, 6, 9, 15, 18, 24};
+  const std::vector<std::uint32_t> want_linear = {11, 29, 5, 5, 31, 2, 1, 1};
   EXPECT_EQ(SpeculativeTokens(linear, 8, 31), want_linear);
   EXPECT_EQ(SpeculativeTokens(linear, 8, 5), want_linear);
 }

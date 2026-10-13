@@ -5,12 +5,32 @@ project, the version, the license, and where it is used.
 
 - llama.cpp (MIT License, local checkout at d0b490f25): block
   layouts and dequantization math for Q3_K, Q5_K, Q6_K, IQ4_NL,
-  IQ4_XS, IQ3_S (ggml-common.h structures, ggml-quants.c dequantize
-  functions), the IQ4 codebook (kvalues_iq4nl), the IQ3_S grid
-  (iq3s_grid), and the ggml type ids 20, 21, 23. Ported (not
-  compiled) to src/core/numerics/quant.cpp, the vulkan .comp
-  kernels, and the rocm kernels in src/backends/rocm. Q8_0 follows
-  the public GGUF block layout (fp16 scale plus 32 signed bytes).
+  IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S and Q2_0 (ggml-common.h structures,
+  ggml-quants.c dequantize functions), the IQ4 codebook
+  (kvalues_iq4nl), the IQ3_S, IQ3_XXS and IQ2_S grids (iq3s_grid,
+  iq3xxs_grid, iq2s_grid), the IQ2 sign table (ksigns_iq2xs), and
+  the ggml type ids 18, 20, 21, 22, 23, 42. Ported (not compiled)
+  to src/core/numerics/quant.cpp, the vulkan .comp kernels, and the
+  rocm kernels in src/backends/rocm. Q8_0 follows the public GGUF
+  block layout (fp16 scale plus 32 signed bytes).
+- Strata (MIT License, Copyright (c) 2026 Niko1221 and the Strata
+  contributors, local checkout at 7695859a): the Qwen3.8-Flash-Next
+  (qwen4exp) tensor inventory and layer contracts, the
+  IQ3_XXS/IQ2_S/Q2_0 block geometry and dequantization transcribed
+  from its vendored ggml tables (include/strata/artifact/
+  gguf_reader.hpp, src/kernels/cuda/iq_kernels.cu), and the gated
+  residual ("hyper-connection") read and write kernels
+  (include/strata/kernels/gr.hpp, src/kernels/cuda/gr.cu), and the PLE
+  block post-ops (src/kernels/cuda/native_ple_postops.cu, itself
+  adapted from llama.cpp src/models/qwen4exp.cpp), and the QSA
+  indexer scoring, the top-k selection, the indexer key append, the
+  paged FP16 KV append and gather, the softmax GQA and the output gate
+  (include/strata/kernels/qsa.hpp), and the PLE table row reader
+  (include/strata/kernels/ngram.hpp). Referenced for the qwen4exp config
+  fields in include/tessera/types.hpp and src/core/model.cpp, and
+  ported to src/core/numerics/{quant,hyper,ngram,ple,qsa}.*, the
+  qwen4exp module, and the backend kernels. The quant grids are
+  ultimately llama.cpp's, as the entry above records.
 - llama.cpp src/models/qwen35.cpp (MIT License, same checkout):
   hybrid layer layout (recurrent gated-delta-net layers interleaved
   with full attention every full_attention_interval blocks, MTP

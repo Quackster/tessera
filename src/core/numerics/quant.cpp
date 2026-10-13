@@ -539,6 +539,70 @@ void DequantizeIQ3S(std::span<const std::byte> block, std::span<float> out) {
   }
 }
 
+void DequantizeIQ3XXS(std::span<const std::byte> block,
+                      std::span<float> out) {
+  // d[0..1], qs[2..97]; the 16-bit sign/scale words sit at qs + 64.
+  const float d = Fp16ToFloat(ReadU16(block, 0));
+  std::size_t o = 0;
+  for (std::size_t ib = 0; ib < 8; ++ib) {
+    const std::uint32_t aux32 =
+        ReadU16(block, 2 + 64 + 4 * ib) |
+        (static_cast<std::uint32_t>(ReadU16(block, 2 + 64 + 4 * ib + 2))
+         << 16);
+    const float dl = d * (0.5f + static_cast<float>(aux32 >> 28)) * 0.5f;
+    for (std::size_t il = 0; il < 4; ++il) {
+      const std::uint32_t g1 =
+          kIq3XxsGrid[ReadByte(block, 2 + 8 * ib + 2 * il)];
+      const std::uint32_t g2 =
+          kIq3XxsGrid[ReadByte(block, 2 + 8 * ib + 2 * il + 1)];
+      const std::uint8_t signs = kIq2XsSigns[(aux32 >> (7 * il)) & 127];
+      for (std::size_t j = 0; j < 4; ++j) {
+        const float m1 = (signs & (1u << j)) ? -1.0f : 1.0f;
+        const float m2 = (signs & (1u << (j + 4))) ? -1.0f : 1.0f;
+        out[o + j] = dl * static_cast<float>((g1 >> (8 * j)) & 0xFF) * m1;
+        out[o + 4 + j] = dl * static_cast<float>((g2 >> (8 * j)) & 0xFF) * m2;
+      }
+      o += 8;
+    }
+  }
+}
+
+void DequantizeIQ2S(std::span<const std::byte> block, std::span<float> out) {
+  // d[0..1], qs[2..65], qh[66..73], scales[74..81].
+  const float d = Fp16ToFloat(ReadU16(block, 0));
+  std::size_t o = 0;
+  for (std::size_t ib = 0; ib < 8; ++ib) {
+    const std::uint8_t qh = ReadByte(block, 66 + ib);
+    const std::uint8_t sc = ReadByte(block, 74 + ib);
+    for (std::size_t il = 0; il < 4; ++il) {
+      const std::uint32_t gi =
+          (ReadByte(block, 2 + 4 * ib + il) |
+           ((static_cast<std::uint32_t>(qh) << (8 - 2 * il)) & 0x300)) &
+          0x3FF;
+      const std::uint64_t grid = kIq2SGrid[gi];
+      const float dl =
+          d * (0.5f + static_cast<float>((sc >> (4 * (il / 2))) & 0xF)) *
+          0.25f;
+      const std::uint8_t signs = ReadByte(block, 2 + 32 + 4 * ib + il);
+      for (std::size_t j = 0; j < 8; ++j) {
+        const float m = (signs & (1u << j)) ? -1.0f : 1.0f;
+        out[o + j] = dl * static_cast<float>((grid >> (8 * j)) & 0xFF) * m;
+      }
+      o += 8;
+    }
+  }
+}
+
+void DequantizeQ20(std::span<const std::byte> block, std::span<float> out) {
+  // d[0..1], qs[2..17]; 64 two-bit codes, four per byte, LSB first.
+  const float d = Fp16ToFloat(ReadU16(block, 0));
+  for (std::size_t j = 0; j < 64; ++j) {
+    const std::uint8_t q = ReadByte(block, 2 + j / 4);
+    const int code = (q >> (2 * (j % 4))) & 3;
+    out[j] = static_cast<float>(code - 1) * d;
+  }
+}
+
 std::uint16_t Fp32ToHalfBits(float value) {
   std::uint32_t bits;
   static_assert(sizeof(bits) == sizeof(value));
@@ -573,9 +637,10 @@ std::uint16_t Fp32ToHalfBits(float value) {
     }
     return static_cast<std::uint16_t>((sign << 15) | result);
   }
-  // Normal: reduce the 24-bit significand to 10 mantissa bits.
-  const std::uint32_t significand = mant + (1u << 23);
-  const std::uint32_t mant10 = ShiftRNE(significand, 13);
+  // Normal: round the 23-bit mantissa down to the 10 fp16 mantissa bits.
+  // The implicit leading 1 is NOT part of the mantissa; adding it here (as
+  // this used to) makes the shift always carry and zero the mantissa.
+  const std::uint32_t mant10 = ShiftRNE(mant, 13);
   if (mant10 > 1023) {
     if (exp + 1 > 15) {
       return inf;
@@ -694,6 +759,9 @@ std::expected<QuantBlockLayout, StatusCode> BlockLayout(DType dtype) {
     case DType::IQ4_NL: return QuantBlockLayout{32, 18};
     case DType::IQ4_XS: return QuantBlockLayout{256, 136};
     case DType::IQ3_S: return QuantBlockLayout{256, 110};
+    case DType::IQ3_XXS: return QuantBlockLayout{256, 98};
+    case DType::IQ2_S: return QuantBlockLayout{256, 82};
+    case DType::Q2_0: return QuantBlockLayout{64, 18};
     default: return std::unexpected(StatusCode::UnsupportedFeature);
   }
 }
@@ -758,6 +826,9 @@ std::expected<void, StatusCode> DequantizeBlocks(
     case DType::IQ4_NL: dequant = DequantizeIQ4NL; break;
     case DType::IQ4_XS: dequant = DequantizeIQ4XS; break;
     case DType::IQ3_S: dequant = DequantizeIQ3S; break;
+    case DType::IQ3_XXS: dequant = DequantizeIQ3XXS; break;
+    case DType::IQ2_S: dequant = DequantizeIQ2S; break;
+    case DType::Q2_0: dequant = DequantizeQ20; break;
     default: return std::unexpected(StatusCode::UnsupportedFeature);
   }
   const std::size_t blocks = bytes.size() / layout->bytes;

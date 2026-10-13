@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
   std::string image_path;
   std::uint32_t image_token = 0;
   bool quiet = false;
+  bool verbose = false;
   bool no_chat = false;
   bool enable_thinking = false;
   std::string reasoning_effort;
@@ -167,6 +168,8 @@ int main(int argc, char** argv) {
       image_path = argv[++i];
     } else if (arg == "--quiet") {
       quiet = true;
+    } else if (arg == "--verbose") {
+      verbose = true;
     } else if (arg == "--no-chat") {
       no_chat = true;
     } else if (arg == "--enable-thinking") {
@@ -775,6 +778,11 @@ int main(int argc, char** argv) {
   }
   tessera::Engine& engine = **engine_result;
   auto& log = engine.Diagnostics();
+  if (verbose) {
+    log.SetMinLevel(tessera::log::Level::Debug);
+  } else if (quiet) {
+    log.SetMinLevel(tessera::log::Level::Warn);
+  }
   attach_strategy(engine);
 
   if (gpu_layers != 0) {

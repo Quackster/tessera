@@ -2031,3 +2031,114 @@ TEST(EngineTest, FitGpuLayersJudgesRequestedValue) {
                            tessera::KvCacheType::F32, 1ull << 60, "none", 1)
                   .error() == tessera::StatusCode::FileNotFound);
 }
+
+namespace {
+
+// A minimal qwen4exp (Qwen3.8-Flash-Next) GGUF: the metadata the generic
+// config parser reads, plus an output.weight tensor so the vocabulary is
+// derived from it. No decode; this exercises the config parse only.
+std::filesystem::path WriteFlashNextConfigFixture(const std::string& name) {
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 37);
+  builder.KvString("general.architecture", "qwen4exp");
+  builder.KvString("general.name", "flash-next-test");
+  builder.KvU32("qwen4exp.block_count", 48);
+  builder.KvU32("qwen4exp.embedding_length", 2560);
+  builder.KvU32("qwen4exp.attention.head_count", 24);
+  builder.KvU32("qwen4exp.attention.head_count_kv", 2);
+  builder.KvU32("qwen4exp.attention.key_length", 256);
+  builder.KvU32("qwen4exp.attention.value_length", 256);
+  builder.KvU32("qwen4exp.rope.dimension_count", 64);
+  builder.KvF32("qwen4exp.rope.freq_base", 10000000.0f);
+  builder.KvF32("qwen4exp.attention.layer_norm_rms_epsilon", 1e-6f);
+  builder.KvU32("qwen4exp.expert_count", 512);
+  builder.KvU32("qwen4exp.expert_used_count", 10);
+  builder.KvU32("qwen4exp.expert_feed_forward_length", 640);
+  builder.KvU32("qwen4exp.expert_shared_feed_forward_length", 640);
+  builder.KvU32("qwen4exp.ssm.conv_kernel", 4);
+  builder.KvU32("qwen4exp.ssm.state_size", 128);
+  builder.KvU32("qwen4exp.ssm.group_count", 16);
+  builder.KvU32("qwen4exp.ssm.time_step_rank", 48);
+  builder.KvU32("qwen4exp.ssm.inner_size", 6144);
+  builder.KvU32("qwen4exp.full_attention_interval", 4);
+  builder.KvArrayU32("qwen4exp.rope.dimension_sections", {11, 11, 10, 0});
+  builder.KvU32("qwen4exp.hyper_connection.count", 4);
+  builder.KvU32("qwen4exp.hyper_connection.low_rank", 320);
+  builder.KvU32("qwen4exp.attention.indexer.head_count", 4);
+  builder.KvU32("qwen4exp.attention.indexer.key_length", 128);
+  builder.KvU32("qwen4exp.attention.indexer.top_k", 2048);
+  builder.KvArrayU32("qwen4exp.ple.layers", {1});
+  builder.KvU32("qwen4exp.ple.ngram_size", 3);
+  builder.KvU32("qwen4exp.ple.heads_per_ngram", 8);
+  builder.KvU32("qwen4exp.ple.conv_kernel", 4);
+  builder.KvArrayU32("qwen4exp.ple.layer_multipliers",
+                     {2654435761u, 40503u, 2246822519u});
+  builder.KvU32("qwen4exp.embedding_length_per_layer_input", 160);
+  builder.KvArrayU32(
+      "qwen4exp.ple.head_offsets",
+      {0, 20000003, 40000026, 60000059, 80000106, 100000165, 120000228,
+       140000297, 160000374, 180000455, 200000548, 220000655, 240000802,
+       260000955, 280001114, 300001275});
+  builder.KvArrayU32(
+      "qwen4exp.ple.head_vocab_sizes",
+      {20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069,
+       20000077, 20000081, 20000093, 20000107, 20000147, 20000153, 20000159,
+       20000161, 20000171});
+  builder.KvU32("qwen4exp.ple.image_token_id", 248056);
+  builder.KvU32("qwen4exp.ple.eos_token_id", 248044);
+  const std::uint64_t payload = 2560ull * 32ull * 4ull;
+  builder.Tensor("output.weight", 2, {2560, 32}, 0, 0);
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + payload);
+  auto dir = FreshTempDir("tessera_tests_flash_next_config");
+  auto path = dir / name;
+  WriteBytes(path, builder.bytes);
+  return path;
+}
+
+}  // namespace
+
+TEST(EngineTest, ParsesFlashNextConfig) {
+  auto path = WriteFlashNextConfigFixture("flash-next.gguf");
+  auto config = tessera::Model::ProbeConfig(path.string());
+  ASSERT_TRUE(config.has_value()) << tessera::ToString(config.error());
+  EXPECT_EQ(config->layers, 48u);
+  EXPECT_EQ(config->hidden_dim, 2560u);
+  EXPECT_EQ(config->vocab_size, 32u);
+  EXPECT_TRUE(config->hybrid);
+  EXPECT_EQ(config->full_attention_interval, 4u);
+  EXPECT_EQ(config->attention.heads, 24u);
+  EXPECT_EQ(config->attention.kv_heads, 2u);
+  EXPECT_EQ(config->attention.head_dim, 256u);
+  EXPECT_EQ(config->attention.rope_dim, 64u);
+  ASSERT_TRUE(config->IsMoe());
+  EXPECT_EQ(config->num_experts, 512u);
+  EXPECT_EQ(config->experts_per_tok, 10u);
+  EXPECT_EQ(config->moe_intermediate, 640u);
+  EXPECT_EQ(config->shared_expert_intermediate, 640u);
+  EXPECT_EQ(config->ssm.conv_kernel, 4u);
+  EXPECT_EQ(config->ssm.state_size, 128u);
+  EXPECT_EQ(config->ssm.group_count, 16u);
+  EXPECT_EQ(config->ssm.time_step_rank, 48u);
+  EXPECT_EQ(config->ssm.inner_size, 6144u);
+  EXPECT_EQ(config->hyper_connection.count, 4u);
+  EXPECT_EQ(config->hyper_connection.low_rank, 320u);
+  EXPECT_EQ(config->indexer.heads, 4u);
+  EXPECT_EQ(config->indexer.key_length, 128u);
+  EXPECT_EQ(config->indexer.top_k, 2048u);
+  ASSERT_EQ(config->ple.layers.size(), 1u);
+  EXPECT_EQ(config->ple.layers[0], 1u);
+  EXPECT_EQ(config->ple.ngram_size, 3u);
+  EXPECT_EQ(config->ple.heads_per_ngram, 8u);
+  EXPECT_EQ(config->ple.conv_kernel, 4u);
+  EXPECT_EQ(config->ple.embd_per_layer, 160u);
+  EXPECT_EQ(config->ple.layer_multipliers.size(), 3u);
+  EXPECT_EQ(config->ple.head_offsets.size(), 16u);
+  EXPECT_EQ(config->ple.head_vocab_sizes.size(), 16u);
+  EXPECT_EQ(config->ple.image_token_id, 248056u);
+  EXPECT_EQ(config->ple.eos_token_id, 248044u);
+  // QSA (full attention) layers are every interval-th: l % 4 == 3.
+  EXPECT_FALSE(config->IsFullAttentionLayer(0));
+  EXPECT_FALSE(config->IsFullAttentionLayer(4));
+  EXPECT_TRUE(config->IsFullAttentionLayer(3));
+  EXPECT_TRUE(config->IsFullAttentionLayer(7));
+}

@@ -1,0 +1,89 @@
+#version 450
+
+// One thread per pair of consecutive head dims; the dispatch is
+// ceil(n_head_kv * head_dim / 2 / 256). head_dim is even.
+layout(local_size_x = 256) in;
+
+// "kv_append" contract: buffer 0 is the K pool (fp16,
+// [page][kv_head][page_size][head_dim]), buffer 1 the V pool, buffer 2
+// the page table (i32), buffer 3 kcur (fp32, n_head_kv x head_dim),
+// buffer 4 vcur. Scalars: pos (v[0]), n_head_kv (v[2]), head_dim (v[4]),
+// page_size (v[6]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) buffer KP { uint kp[]; };
+layout(set = 0, binding = 1) buffer VP { uint vp[]; };
+layout(set = 0, binding = 2) readonly buffer PT { uint pt[]; };
+layout(set = 0, binding = 3) readonly buffer KC { float kcur[]; };
+layout(set = 0, binding = 4) readonly buffer VC { float vcur[]; };
+
+uint f16_shift_rne(uint v, int s) {
+  if (s <= 0) {
+    return v;
+  }
+  uint mask = (1u << uint(s)) - 1u;
+  uint halfway = 1u << uint(s - 1);
+  uint rem = v & mask;
+  uint q = v >> uint(s);
+  if (rem > halfway || (rem == halfway && (q & 1u) == 1u)) {
+    q += 1u;
+  }
+  return q;
+}
+
+uint f16_rne(float value) {
+  uint bits = floatBitsToUint(value);
+  uint sign = (bits >> 16) & 0x8000u;
+  uint exp = (bits >> 23) & 0xFFu;
+  uint mant = bits & 0x7FFFFFu;
+  if (exp == 0xFFu) {
+    return sign | 0x7C00u | (mant != 0u ? 0x200u : 0u);
+  }
+  int e = int(exp) - 127;
+  if (e > 15) {
+    return sign | 0x7C00u;
+  }
+  if (e < -14) {
+    uint scaled = mant | 0x800000u;
+    int shift = -e - 1;
+    if (shift >= 32) {
+      return sign;
+    }
+    uint r = f16_shift_rne(scaled, shift);
+    if (r > 1023u) {
+      return sign | 0x0400u;
+    }
+    return sign | r;
+  }
+  uint m10 = f16_shift_rne(mant, 13);
+  if (m10 > 1023u) {
+    if (e + 1 > 15) {
+      return sign | 0x7C00u;
+    }
+    return sign | (uint(e + 1 + 15) << 10);
+  }
+  return sign | (uint(e + 15) << 10) | m10;
+}
+
+
+void main() {
+  uint pos = pc.v[0];
+  uint n_head_kv = pc.v[2];
+  uint head_dim = pc.v[4];
+  uint page_size = pc.v[6];
+  uint pairs = n_head_kv * head_dim / 2u;
+  uint p = gl_GlobalInvocationID.x;
+  if (p >= pairs) {
+    return;
+  }
+  uint e = 2u * p;
+  uint h = e / head_dim;
+  uint d = e % head_dim;
+  uint physical = pt[pos / page_size];
+  uint cell = (physical * n_head_kv + h) * page_size + (pos % page_size);
+  uint off = (cell * head_dim + d) / 2u;
+  kp[off] = f16_rne(kcur[e]) | (f16_rne(kcur[e + 1u]) << 16);
+  vp[off] = f16_rne(vcur[e]) | (f16_rne(vcur[e + 1u]) << 16);
+}

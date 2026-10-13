@@ -150,6 +150,45 @@ std::expected<void, StatusCode> GemmIq3SRef(
   return GemmBlocksRef(a, w, c, m, n, k, kElements, kBytes, DequantizeIQ3S);
 }
 
+std::expected<void, StatusCode> GemmIq3XxsRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k) {
+  constexpr std::size_t kElements = 256;
+  constexpr std::size_t kBytes = 98;
+  if (auto valid = CheckGemmArgs(a.size(), w.size(), c.size(), m, n, k,
+                                 kElements, kBytes);
+      !valid) {
+    return std::unexpected(valid.error());
+  }
+  return GemmBlocksRef(a, w, c, m, n, k, kElements, kBytes, DequantizeIQ3XXS);
+}
+
+std::expected<void, StatusCode> GemmIq2SRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k) {
+  constexpr std::size_t kElements = 256;
+  constexpr std::size_t kBytes = 82;
+  if (auto valid = CheckGemmArgs(a.size(), w.size(), c.size(), m, n, k,
+                                 kElements, kBytes);
+      !valid) {
+    return std::unexpected(valid.error());
+  }
+  return GemmBlocksRef(a, w, c, m, n, k, kElements, kBytes, DequantizeIQ2S);
+}
+
+std::expected<void, StatusCode> GemmQ20Ref(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k) {
+  constexpr std::size_t kElements = 64;
+  constexpr std::size_t kBytes = 18;
+  if (auto valid = CheckGemmArgs(a.size(), w.size(), c.size(), m, n, k,
+                                 kElements, kBytes);
+      !valid) {
+    return std::unexpected(valid.error());
+  }
+  return GemmBlocksRef(a, w, c, m, n, k, kElements, kBytes, DequantizeQ20);
+}
+
 std::expected<void, StatusCode> GemmQ80Ref(
     std::span<const float> a, std::span<const std::byte> w,
     std::span<float> c, std::size_t m, std::size_t n, std::size_t k) {

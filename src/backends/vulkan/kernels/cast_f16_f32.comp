@@ -1,0 +1,31 @@
+#version 450
+
+// The reverse of cast_f32_f16: one thread unpacks two fp16 values from
+// one 32-bit word and writes two fp32. The dispatch is
+// ceil(n / 2 / 256) workgroups.
+layout(local_size_x = 256) in;
+
+// "cast_f16_f32" contract: buffer 0 is the packed fp16 input, buffer 1
+// the fp32 output. Scalar: n v[0] (the fp32 element count).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer IN {
+  uint inb[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer OUT {
+  float outv[];
+};
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint n = pc.v[0];
+  if (idx * 2u >= n) {
+    return;
+  }
+  vec2 h = unpackHalf2x16(inb[idx]);
+  outv[idx * 2u] = h.x;
+  outv[idx * 2u + 1u] = h.y;
+}

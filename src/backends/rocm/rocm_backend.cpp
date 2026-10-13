@@ -99,12 +99,34 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_iq4xs_batched", reinterpret_cast<void*>(&GemmIq4XsBatchedKernel)},
     {"gemm_iq3s", reinterpret_cast<void*>(&GemmIq3SKernel)},
     {"gemm_iq3s_batched", reinterpret_cast<void*>(&GemmIq3SBatchedKernel)},
+    {"gemm_iq3xxs", reinterpret_cast<void*>(&GemmIq3XxsKernel)},
+    {"gemm_iq2s", reinterpret_cast<void*>(&GemmIq2SKernel)},
+    {"gemm_q20", reinterpret_cast<void*>(&GemmQ20Kernel)},
+    {"gr_norm", reinterpret_cast<void*>(&GrNormKernel)},
+    {"gr_down", reinterpret_cast<void*>(&GrDownKernel)},
+    {"gr_gate", reinterpret_cast<void*>(&GrGateKernel)},
+    {"gr_mean", reinterpret_cast<void*>(&GrMeanKernel)},
+    {"gr_inject", reinterpret_cast<void*>(&GrInjectKernel)},
+    {"gr_write", reinterpret_cast<void*>(&GrWriteKernel)},
+    {"ple_gate", reinterpret_cast<void*>(&PleGateKernel)},
+    {"rmsnorm_rows", reinterpret_cast<void*>(&RmsnormRowsKernel)},
+    {"ple_broadcast", reinterpret_cast<void*>(&PleBroadcastKernel)},
+    {"ple_conv", reinterpret_cast<void*>(&PleConvKernel)},
+    {"ple_hist_advance", reinterpret_cast<void*>(&PleHistAdvanceKernel)},
+    {"qsa_index", reinterpret_cast<void*>(&QsaIndexKernel)},
+    {"kv_append", reinterpret_cast<void*>(&KvAppendKernel)},
+    {"qsa_gate_apply", reinterpret_cast<void*>(&QsaGateApplyKernel)},
+    {"kv_gather", reinterpret_cast<void*>(&KvGatherKernel)},
+    {"qsa_attend", reinterpret_cast<void*>(&QsaAttendKernel)},
+    {"qsa_topk", reinterpret_cast<void*>(&QsaTopKKernel)},
+    {"indexer_key_append", reinterpret_cast<void*>(&IndexerKeyAppendKernel)},
     {"gemm_q80", reinterpret_cast<void*>(&GemmQ80Kernel)},
     {"gemm_q80_vec", reinterpret_cast<void*>(&GemmQ80VecKernel)},
     {"rmsnorm", reinterpret_cast<void*>(&RmsnormKernel)},
     {"sigmoid_gate", reinterpret_cast<void*>(&SigmoidGateKernel)},
     {"l2norm", reinterpret_cast<void*>(&L2NormKernel)},
     {"rmsnorm_gated", reinterpret_cast<void*>(&RmsnormGatedKernel)},
+    {"gdn_out_norm", reinterpret_cast<void*>(&GdnOutNormKernel)},
     {"conv1d", reinterpret_cast<void*>(&Conv1dKernel)},
     {"delta_step", reinterpret_cast<void*>(&DeltaStepKernel)},
     {"mrope", reinterpret_cast<void*>(&MropeKernel)},
@@ -118,6 +140,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"top_k_rows", reinterpret_cast<void*>(&TopKRowsKernel)},
     {"concat_features", reinterpret_cast<void*>(&ConcatFeaturesKernel)},
     {"cast_f32_f16", reinterpret_cast<void*>(&CastF32F16Kernel)},
+    {"cast_f16_f32", reinterpret_cast<void*>(&CastF16F32Kernel)},
     {"round_bf16", reinterpret_cast<void*>(&RoundBf16Kernel)},
     {"quantize_q8", reinterpret_cast<void*>(&QuantizeQ8Kernel)},
     {"quantize_fp8", reinterpret_cast<void*>(&QuantizeFp8Kernel)},
@@ -411,7 +434,7 @@ class RocmBackend final : public Backend {
     // The staging window persists for the next batch (the destructor
     // frees it), so a paged token pays no per-batch pinned allocation.
     if (diagnostics_ != nullptr) {
-      LogInfo(core::FormatTransferSummary(
+      LogDebug(core::FormatTransferSummary(
           total_bytes, copies.size(),
           core::ElapsedMs(started, core::PhaseClock::now())));
     }

@@ -1,0 +1,89 @@
+#version 450
+
+// One workgroup; the dispatch is one workgroup.
+layout(local_size_x = 256) in;
+
+// "qsa_topk" contract: buffer 0 is scores (fp32, n_kv), buffer 1 the ids
+// (i32, width). Scalars: n_kv (v[0]), width (v[2]). The largest `width`
+// cells, ascending, ties by ascending index.
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer S { float scores[]; };
+layout(set = 0, binding = 1) writeonly buffer ID { int ids[]; };
+
+shared uint red[256];
+
+uint key_of(float value) {
+  uint b = floatBitsToUint(value);
+  return (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
+}
+
+void main() {
+  uint n_kv = pc.v[0];
+  uint width = pc.v[2];
+  uint lid = gl_LocalInvocationID.x;
+  if (width == 0u) {
+    return;
+  }
+  if (n_kv <= width) {
+    for (uint j = lid; j < n_kv; j += 256u) {
+      ids[j] = int(j);
+    }
+    return;
+  }
+  uint threshold = 0u;
+  for (int bit = 31; bit >= 0; --bit) {
+    uint candidate = threshold | (1u << uint(bit));
+    uint count = 0u;
+    for (uint j = lid; j < n_kv; j += 256u) {
+      if (key_of(scores[j]) >= candidate) {
+        ++count;
+      }
+    }
+    red[lid] = count;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+      if (lid < s) {
+        red[lid] += red[lid + s];
+      }
+      barrier();
+    }
+    if (red[0] >= width) {
+      threshold = candidate;
+    }
+    barrier();
+  }
+  uint above = 0u;
+  for (uint j = lid; j < n_kv; j += 256u) {
+    if (key_of(scores[j]) > threshold) {
+      ++above;
+    }
+  }
+  red[lid] = above;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) {
+      red[lid] += red[lid + s];
+    }
+    barrier();
+  }
+  uint above_total = red[0];
+  barrier();
+  if (lid == 0u) {
+    uint need = width - above_total;
+    uint out_i = 0u;
+    for (uint j = 0u; j < n_kv && out_i < width; ++j) {
+      uint key = key_of(scores[j]);
+      if (key > threshold) {
+        ids[out_i] = int(j);
+        ++out_i;
+      } else if (key == threshold && need > 0u) {
+        ids[out_i] = int(j);
+        ++out_i;
+        --need;
+      }
+    }
+  }
+}

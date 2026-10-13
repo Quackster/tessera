@@ -1,0 +1,25 @@
+#version 450
+
+// One thread per stack element; the dispatch is ceil(dim / 256).
+layout(local_size_x = 256) in;
+
+// "ple_broadcast" contract: buffer 0 is value (fp32, n_embd), buffer 1
+// the gate (fp32, hc), buffer 2 the gated output (fp32, hc*n_embd).
+// Scalars: dim (v[0]), n_embd (v[2]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer V { float value[]; };
+layout(set = 0, binding = 1) readonly buffer G { float gate[]; };
+layout(set = 0, binding = 2) writeonly buffer O { float gated[]; };
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  uint dim = pc.v[0];
+  uint n_embd = pc.v[2];
+  if (i >= dim) {
+    return;
+  }
+  gated[i] = value[i % n_embd] * gate[i / n_embd];
+}
