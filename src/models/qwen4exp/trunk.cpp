@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -179,7 +177,6 @@ std::expected<void, StatusCode> HyperRead(
 // One gated residual write: fold `block_out` back into the stack with the
 // per-stream injection.
 std::expected<void, StatusCode> HyperWrite(Backend& backend, Qwen4ExpState& h,
-                                           const TransformerConfig& cfg,
                                            const Qwen4ExpGeometry& g, Buffer& r,
                                            const Buffer& block_out,
                                            const Buffer& inject) {
@@ -259,38 +256,21 @@ std::expected<void, StatusCode> RunGdnLayer(Backend& backend,
       !SsmGateDevice(backend, *h.ssm_gate, *(*w_a)->device, *(*w_dt)->device,
                      *h.alpha_raw, *h.beta_raw, *h.alpha, *h.beta,
                      g.gdn_num_v_heads)) {
-    if (std::getenv("TESSERA_QWEN4EXP_TRACE")) {
-      std::fprintf(stderr, "  gdn proj/ssmgate FAILED\n");
-    }
     return std::unexpected(StatusCode::DeviceError);
   }
   Qwen4ExpState::GdnLayer& st = h.gdn[layer];
-  if (layer == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-    auto q = DownloadF32(backend, *h.qkv);
-    auto zz = DownloadF32(backend, *h.z);
-    if (q && zz) {
-      std::fprintf(stderr, "q4e dump qkv0: %.5f %.5f %.5f %.5f   z0: %.5f %.5f\n",
-                   (*q)[0], (*q)[1], (*q)[2], (*q)[3], (*zz)[0], (*zz)[1]);
-    }
-  }
-  const auto fail = [](const char* where) -> std::expected<void, StatusCode> {
-    if (std::getenv("TESSERA_QWEN4EXP_TRACE")) {
-      std::fprintf(stderr, "  gdn %s FAILED\n", where);
-    }
-    return std::unexpected(StatusCode::DeviceError);
-  };
   if (!detail::Conv1dStateDevice(backend, *h.conv1d_state, *h.qkv,
                                  *(*w_conv)->device, *st.conv_hist, *h.q_l,
                                  *h.k_l, *h.v_l, g.gdn_conv_dim, g.gdn_width,
                                  g.gdn_key_dim)) {
-    return fail("conv");
+    return std::unexpected(StatusCode::DeviceError);
   }
   if (!L2NormDevice(backend, *h.l2norm, *h.q_l, *h.q_l, g.gdn_num_k_heads,
                     g.gdn_head_k_dim, 1e-6,
                     1.0 / std::sqrt(static_cast<double>(g.gdn_head_k_dim))) ||
       !L2NormDevice(backend, *h.l2norm, *h.k_l, *h.k_l, g.gdn_num_k_heads,
                     g.gdn_head_k_dim, 1e-6)) {
-    return fail("l2norm");
+    return std::unexpected(StatusCode::DeviceError);
   }
   if (!detail::RepeatHeadsDevice(backend, *h.repeat_heads, *h.q_l, *h.q_exp,
                                  g.gdn_num_v_heads, g.gdn_head_k_dim,
@@ -298,40 +278,22 @@ std::expected<void, StatusCode> RunGdnLayer(Backend& backend,
       !detail::RepeatHeadsDevice(backend, *h.repeat_heads, *h.k_l, *h.k_exp,
                                  g.gdn_num_v_heads, g.gdn_head_k_dim,
                                  g.gdn_factor)) {
-    return fail("repeat");
+    return std::unexpected(StatusCode::DeviceError);
   }
   if (!detail::DeltaStepHeadsDevice(backend, *h.delta_step_heads, *st.state,
                                     *h.k_exp, *h.v_l, *h.q_exp, *h.core,
                                     *h.alpha, *h.beta, g.gdn_num_v_heads,
                                     g.gdn_head_k_dim, g.gdn_head_v_dim)) {
-    return fail("delta");
+    return std::unexpected(StatusCode::DeviceError);
   }
   if (!detail::GdnOutNormDevice(backend, *h.gdn_out_norm, *h.core, *h.z,
                                 *(*w_norm)->device, *h.out, g.gdn_num_v_heads,
                                 g.gdn_head_v_dim, cfg.norm_eps)) {
-    return fail("outnorm");
+    return std::unexpected(StatusCode::DeviceError);
   }
   if (!Project(backend, h, (*w_out)->manifest.dtype, *h.out, *(*w_out)->device,
                block_out, 1, g.hidden, g.gdn_value_dim)) {
-    return fail("outproj");
-  }
-  if (layer == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-    auto cr = DownloadF32(backend, *h.core);
-    auto ou = DownloadF32(backend, *h.out);
-    auto al = DownloadF32(backend, *h.alpha);
-    if (cr && ou && al) {
-      auto bt = DownloadF32(backend, *h.beta);
-      auto vl = DownloadF32(backend, *h.v_l);
-      auto kl = DownloadF32(backend, *h.k_l);
-      std::fprintf(stderr, "q4e dump core0: %.5f %.5f %.5f %.5f  out0: %.5f %.5f %.5f %.5f  alpha0: %.5f %.5f\n",
-                   (*cr)[0], (*cr)[1], (*cr)[2], (*cr)[3], (*ou)[0], (*ou)[1],
-                   (*ou)[2], (*ou)[3], (*al)[0], (*al)[1]);
-      if (bt && vl && kl) {
-        std::fprintf(stderr, "q4e dump beta0: %.5f  v0: %.5f %.5f %.5f  k0: %.5f %.5f %.5f\n",
-                     (*bt)[0], (*vl)[0], (*vl)[1], (*vl)[2], (*kl)[0], (*kl)[1],
-                     (*kl)[2]);
-      }
-    }
+    return std::unexpected(StatusCode::DeviceError);
   }
   return {};
 }
@@ -376,9 +338,6 @@ std::expected<void, StatusCode> RunQsaLayer(
                   pos, g.rope_theta) ||
       !RopeDevice(backend, *h.rope, *h.kcur, g.kv_heads, g.head_dim, g.rope_dim,
                   pos, g.rope_theta)) {
-    if (std::getenv("TESSERA_QWEN4EXP_TRACE")) {
-      std::fprintf(stderr, "  qsa proj FAILED\n");
-    }
     return std::unexpected(StatusCode::DeviceError);
   }
   {
@@ -637,19 +596,6 @@ std::expected<void, StatusCode> RunHead(Backend& backend, const Model& model,
       !read) {
     return read;
   }
-  if (std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-    auto hm = DownloadF32(backend, *h.mixed);
-    auto hr = DownloadF32(backend, *h.R);
-    if (hm && hr) {
-      std::fprintf(stderr, "q4e dump headmixed: %.5f %.5f %.5f %.5f\n", (*hm)[0],
-                   (*hm)[1], (*hm)[2], (*hm)[3]);
-      FILE* fp = std::fopen("/tmp/q4e_finalR.bin", "wb");
-      if (fp != nullptr) {
-        std::fwrite(hr->data(), 4, hr->size(), fp);
-        std::fclose(fp);
-      }
-    }
-  }
   return Project(backend, h, (*w_out)->manifest.dtype, *h.mixed,
                  *(*w_out)->device, *h.logits, 1, cfg.vocab_size, g.hidden);
 }
@@ -879,15 +825,8 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
 
   if (!cfg.ple.layers.empty()) {
     const std::string table_path = PleTablePath(model.Path());
-    if (std::getenv("TESSERA_QWEN4EXP_TRACE")) {
-      std::fprintf(stderr, "q4e ple table path: '%s'\n", table_path.c_str());
-    }
     if (!table_path.empty()) {
       auto table = PleTable::Open(table_path);
-      if (!table && std::getenv("TESSERA_QWEN4EXP_TRACE")) {
-        std::fprintf(stderr, "q4e ple table open failed: %d\n",
-                     static_cast<int>(table.error()));
-      }
       if (table) {
         h.ple_table = std::shared_ptr<PleTable>(std::move(*table));
       }
@@ -975,23 +914,6 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
       return std::unexpected(StatusCode::DeviceError);
     }
   }
-  if (std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-    auto e = DownloadF32(backend, *h.x);
-    if (e) {
-      float mn = (*e)[0], mx = (*e)[0];
-      double sum = 0;
-      for (float v : *e) {
-        mn = std::min(mn, v);
-        mx = std::max(mx, v);
-        sum += v;
-      }
-      std::fprintf(stderr, "q4e dump embedding: min %.4f max %.4f mean %.4f e0 %.4f e1 %.4f\n",
-                   mn, mx, sum / e->size(), (*e)[0], (*e)[1]);
-      std::fprintf(stderr, "q4e dump embed tok=%u x0..7 = %.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
-                   token, (*e)[0], (*e)[1], (*e)[2], (*e)[3], (*e)[4], (*e)[5],
-                   (*e)[6], (*e)[7]);
-    }
-  }
   const std::uint64_t pos = h.position;
   bool ple_layer = false;
   for (const std::uint64_t l : cfg.ple.layers) {
@@ -1000,31 +922,13 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
     }
   }
   for (std::size_t l = 0; l < cfg.layers; ++l) {
-    const bool trace = std::getenv("TESSERA_QWEN4EXP_TRACE") != nullptr;
-    if (trace) {
-      std::fprintf(stderr, "q4e layer %zu %s\n", l,
-                   cfg.IsFullAttentionLayer(l) ? "qsa" : "gdn");
-    }
     if (auto ensured = model.EnsureLayerResident(l); !ensured) {
       return std::unexpected(ensured.error());
     }
-    if (ple_layer && l == 1 &&
-        std::getenv("TESSERA_QWEN4EXP_NO_PLE") == nullptr) {
+    if (ple_layer && l == 1) {
       auto ple = RunPleBlock(backend, model, cfg, g, h, token, *h.R);
       if (!ple) {
         return ple;
-      }
-      if (std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-        auto pr = DownloadF32(backend, *h.R);
-        if (pr) {
-          std::fprintf(stderr, "q4e dump Rple first %.5f %.5f %.5f %.5f\n",
-                       (*pr)[0], (*pr)[1], (*pr)[2], (*pr)[3]);
-          FILE* fp = std::fopen("/tmp/q4e_Rple.bin", "wb");
-          if (fp != nullptr) {
-            std::fwrite(pr->data(), 4, pr->size(), fp);
-            std::fclose(fp);
-          }
-        }
       }
     }
     const std::string base = "blk." + std::to_string(l) + ".";
@@ -1040,94 +944,18 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
         !read) {
       return read;
     }
-    if (l == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-      auto mm2 = DownloadF32(backend, *h.mixed);
-      auto ii = DownloadF32(backend, *h.inject);
-      if (mm2 && ii) {
-        std::fprintf(stderr,
-                     "q4e dump mixed0: %.5f %.5f %.5f %.5f   inject0: %.5f %.5f %.5f %.5f\n",
-                     (*mm2)[0], (*mm2)[1], (*mm2)[2], (*mm2)[3], (*ii)[0], (*ii)[1],
-                     (*ii)[2], (*ii)[3]);
-        char nm[64];
-        std::snprintf(nm, sizeof(nm), "/tmp/q4e_mix0_%llu.bin",
-                      static_cast<unsigned long long>(pos));
-        FILE* fp = std::fopen(nm, "wb");
-        if (fp != nullptr) {
-          std::fwrite(mm2->data(), 4, mm2->size(), fp);
-          std::fclose(fp);
-        }
-      }
-    }
     std::expected<void, StatusCode> mixer =
         cfg.IsFullAttentionLayer(l)
             ? RunQsaLayer(backend, model, cfg, g, h, l, pos, *h.mixed,
                           *h.block_out)
             : RunGdnLayer(backend, model, cfg, g, h, l, *h.mixed, *h.block_out);
     if (!mixer) {
-      if (trace) std::fprintf(stderr, "q4e layer %zu mixer FAILED\n", l);
       return mixer;
     }
-    if (trace) std::fprintf(stderr, "q4e layer %zu mixer done\n", l);
-    if (l == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-      auto bo = DownloadF32(backend, *h.block_out);
-      if (bo) {
-        std::fprintf(stderr, "q4e dump blockout0: %.5f %.5f %.5f %.5f\n", (*bo)[0],
-                     (*bo)[1], (*bo)[2], (*bo)[3]);
-        char nm[64];
-        std::snprintf(nm, sizeof(nm), "/tmp/q4e_bo0_%llu.bin",
-                      static_cast<unsigned long long>(pos));
-        FILE* fp = std::fopen(nm, "wb");
-        if (fp != nullptr) {
-          std::fwrite(bo->data(), 4, bo->size(), fp);
-          std::fclose(fp);
-        }
-      }
-    }
-    if (l == 2 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-      auto mi = DownloadF32(backend, *h.mixed);
-      auto bo = DownloadF32(backend, *h.block_out);
-      auto q = DownloadF32(backend, *h.q_attn);
-      auto kk = DownloadF32(backend, *h.kcur);
-      auto vv = DownloadF32(backend, *h.vcur);
-      if (mi && bo && q && kk && vv) {
-        std::fprintf(stderr,
-                     "q4e dump q3 mix %.5f %.5f %.5f   qa %.5f %.5f %.5f   k %.5f %.5f %.5f   v %.5f %.5f %.5f   bo %.5f %.5f\n",
-                     (*mi)[0], (*mi)[1], (*mi)[2], (*q)[0], (*q)[1], (*q)[2],
-                     (*kk)[0], (*kk)[1], (*kk)[2], (*vv)[0], (*vv)[1], (*vv)[2],
-                     (*bo)[0], (*bo)[1]);
-        FILE* fp = std::fopen("/tmp/q4e_q3mix.bin", "wb");
-        if (fp != nullptr) {
-          std::fwrite(mi->data(), 4, mi->size(), fp);
-          std::fclose(fp);
-        }
-        char nm[64];
-        std::snprintf(nm, sizeof(nm), "/tmp/q4e_q3mix_%llu.bin",
-                      static_cast<unsigned long long>(pos));
-        FILE* fp2 = std::fopen(nm, "wb");
-        if (fp2 != nullptr) {
-          std::fwrite(mi->data(), 4, mi->size(), fp2);
-          std::fclose(fp2);
-        }
-      }
-    }
-    if (std::getenv("TESSERA_QWEN4EXP_NO_MIXER") == nullptr) {
-      if (auto write =
-              HyperWrite(backend, h, cfg, g, *h.R, *h.block_out, *h.inject);
-          !write) {
-        return write;
-      }
-    }
-    if (l == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-      auto ra = DownloadF32(backend, *h.R);
-      if (ra) {
-        std::fprintf(stderr, "q4e dump Rattn0 %.5f %.5f %.5f %.5f\n", (*ra)[0],
-                     (*ra)[1], (*ra)[2], (*ra)[3]);
-        FILE* fp = std::fopen("/tmp/q4e_Rattn0.bin", "wb");
-        if (fp != nullptr) {
-          std::fwrite(ra->data(), 4, ra->size(), fp);
-          std::fclose(fp);
-        }
-      }
+    if (auto write =
+            HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject);
+        !write) {
+      return write;
     }
     auto fn = NeedWeight(model, base + "hc_ffn_norm.weight", DType::F32);
     auto fd = NeedWeight(model, base + "hc_ffn_down.weight", DType::BF16);
@@ -1142,64 +970,12 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
       return read;
     }
     if (auto moe = RunMoeFfn(backend, model, cfg, h, l, *h.mixed); !moe) {
-      if (trace) std::fprintf(stderr, "q4e layer %zu moe FAILED\n", l);
       return moe;
     }
-    if (l == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-      auto bo = DownloadF32(backend, *h.block_out);
-      auto wt = DownloadF32(backend, *h.moe_wts);
-      auto lg = DownloadF32(backend, *h.moe_logits);
-      if (bo && wt && lg) {
-        float lmax = (*lg)[0];
-        int lmi = 0;
-        for (int i = 1; i < static_cast<int>(lg->size()); ++i) {
-          if ((*lg)[i] > lmax) { lmax = (*lg)[i]; lmi = i; }
-        }
-        std::fprintf(stderr,
-                     "q4e dump moeout0: %.5f %.5f %.5f %.5f  wts: %.4f %.4f %.4f  routermax idx %d val %.4f\n",
-                     (*bo)[0], (*bo)[1], (*bo)[2], (*bo)[3], (*wt)[0], (*wt)[1],
-                     (*wt)[2], lmi, lmax);
-      }
-    }
-    if (trace) std::fprintf(stderr, "q4e layer %zu moe done\n", l);
-    if (std::getenv("TESSERA_QWEN4EXP_NO_MOE") == nullptr) {
-      if (auto write =
-              HyperWrite(backend, h, cfg, g, *h.R, *h.block_out, *h.inject2);
-          !write) {
-        return write;
-      }
-    }
-    if (std::getenv("TESSERA_QWEN4EXP_DRT")) {
-      auto rr = DownloadF32(backend, *h.R);
-      if (rr) {
-        double ss = 0;
-        for (std::size_t i = 0; i < g.hidden; ++i) {
-          ss += (*rr)[i] * (*rr)[i];
-        }
-        std::fprintf(stderr, "q4e R l=%zu %.5f %.5f %.5f | rms %f\n", l,
-                     (*rr)[0], (*rr)[1], (*rr)[2],
-                     std::sqrt(ss / static_cast<double>(g.hidden)));
-      }
-    }
-    if (l == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-      auto rr = DownloadF32(backend, *h.R);
-      if (rr) {
-        float mn = (*rr)[0], mx = (*rr)[0];
-        double sum = 0;
-        for (std::size_t i = 0; i < g.hidden; ++i) {
-          mn = std::min(mn, (*rr)[i]);
-          mx = std::max(mx, (*rr)[i]);
-          sum += (*rr)[i];
-        }
-        std::fprintf(stderr,
-                     "q4e dump R0 stream0: min %.4f max %.4f mean %.4f first %.5f %.5f %.5f %.5f\n",
-                     mn, mx, sum / g.hidden, (*rr)[0], (*rr)[1], (*rr)[2], (*rr)[3]);
-        FILE* fp = std::fopen("/tmp/q4e_R0.bin", "wb");
-        if (fp != nullptr) {
-          std::fwrite(rr->data(), 4, rr->size(), fp);
-          std::fclose(fp);
-        }
-      }
+    if (auto write =
+            HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject2);
+        !write) {
+      return write;
     }
   }
   if (hidden_out != nullptr) {
@@ -1237,26 +1013,7 @@ std::expected<std::vector<float>, StatusCode> Qwen4ExpArchitecture::Logits(
     return std::unexpected(head.error());
   }
   backend.Synchronize();
-  auto logits = DownloadF32(backend, *h.logits);
-  if (logits && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-    std::vector<std::size_t> idx(logits->size());
-    for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
-                      [&](std::size_t a, std::size_t b) {
-                        return (*logits)[a] > (*logits)[b];
-                      });
-    float mn = (*logits)[0], mx = (*logits)[0];
-    for (float v : *logits) {
-      mn = std::min(mn, v);
-      mx = std::max(mx, v);
-    }
-    std::fprintf(stderr, "q4e dump logits: min %.4f max %.4f", mn, mx);
-    for (int k = 0; k < 5; ++k) {
-      std::fprintf(stderr, "  #%d id=%zu val=%.4f", k, idx[k], (*logits)[idx[k]]);
-    }
-    std::fprintf(stderr, "\n");
-  }
-  return logits;
+  return DownloadF32(backend, *h.logits);
 }
 
 std::expected<void, StatusCode> Qwen4ExpArchitecture::ForwardBatch(

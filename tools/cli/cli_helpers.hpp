@@ -32,6 +32,16 @@ void LogModelSummary(Engine& engine, Model& model);
 // The run/serve usage text (also points at the calibrate command).
 void PrintUsage();
 
+// Fill `*sampling` with the per-architecture recommended sampler for the
+// loaded model and report whether the caller should enable sampling. A
+// thinking model loops under greedy decode, so its architecture (keyed by
+// general.architecture and the thinking mode) supplies a sampler. Does
+// nothing and returns false when the user passed explicit sampling flags
+// or the architecture has no recommendation.
+[[nodiscard]] bool ApplyRecommendedSampling(const Model& model, bool thinking,
+                                            bool explicit_sampling,
+                                            SamplingOptions* sampling);
+
 // Resolve the calibration configuration for a loaded model: build the
 // hardware key, look the entry up in the calibration file, and merge it
 // under the caller's explicit values (an explicit nonzero value wins). A

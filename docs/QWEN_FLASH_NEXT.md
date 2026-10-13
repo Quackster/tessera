@@ -149,13 +149,14 @@ The following is what exists in the tree today and can be reused.
 - Architecture module pattern and registry: `src/models/qwen3_5/` and
   `src/models/registry.cpp`.
 
-Not present in the tree: no `qwen4exp` module, no multi-shard GGUF merge, no
-QSA, no indexer, no hyper-connection mixer, no PLE, no n-gram table loader,
-and no expert cache that streams experts from system RAM to a 32 GB GPU.
+Present in the tree today: the `qwen4exp` module
+(`src/models/qwen4exp/`) with the multi-shard load, the QSA and indexer,
+the hyper-connection mixer, the PLE with its n-gram table reader, and the
+registry entry. `CreateArchitecture("qwen4exp")` returns the module.
 
-`CreateArchitecture("qwen4exp")` returns `nullptr` today. The README model
-table describes the loader as partial. The loader code for the split shards
-and the n-gram stream is not in the tree.
+Still not present: an expert cache that keeps hot experts resident in VRAM
+and streams the misses from system RAM. Without it decode is memory bound
+on the expert reads. This is the M6 item below.
 
 ## 3. What the port needs
 
@@ -286,8 +287,20 @@ architecture rules.
 
 - Reconnaissance: done. The architecture, the tensor inventory and the
   reference layer order are recorded above.
-- 48 tokens per second: not measured, because the model does not decode
-  yet.
+- M1 to M5 (load, GDN, MoE, hyper-connections, QSA, PLE): done. The module
+  loads the two shards, decodes, and produces coherent output.
+- M6 (expert cache and 48 tokens per second): in progress. The current
+  paged path decodes at about 4 to 6 output tokens per second at a short
+  prompt on one R9700. The target is not reached.
+- M7 (MTP): out of scope. No draft file is present.
+
+Correctness evidence: with no completion cap and `--no-chat`, the prompt
+`The capital of France is` produces a reasoning block and the answer
+`The capital of France is **Paris**.` in 115 tokens. Every forward block
+matches an independent NumPy reference on the real weights (the embedding,
+the hyper-connection read and write, the GDN at token 0 and token 1, the
+QSA score, attention and output, the PLE, the full MoE router and experts,
+the head read and the output projection).
 
 ### Progress log
 
@@ -409,15 +422,47 @@ architecture rules.
   were regenerated with the corrected conversion. The Vulkan fp16 packer
   in `kv_append`/`qsa_gate_apply` had copied the same bug and was fixed
   with it.
+- **Module landed and the model decodes (M1 to M5).** `src/models/qwen4exp/`
+  is registered and runs the full 48 layer forward: the hyper-connection
+  reads and writes, the GDN and QSA layers, the PLE block before layer 1,
+  the routed plus shared MoE, and the output head. Both backends build and
+  the suite passes. The forward matches an independent NumPy reference on
+  the real weights at every block, and the model answers a factual prompt
+  correctly.
+- **Debug log level.** Added `log::Level::Debug` and
+  `Diagnostics::SetMinLevel`, and moved the per-transfer `batched H2D
+  upload` summaries to it so they are off by default. The CLI gains
+  `--verbose` to enable them and `--quiet` now also silences info lines.
+- **M6 investigation.** The per-token cost is the routed-expert re-upload.
+  The dense weights stay resident (`PagedMoeDenseResident`), but the hot
+  experts do not. The expert quant type varies per layer, so the expert
+  slice size differs by layer and a shared cache must key by both kind and
+  slice size. A global LRU cache was prototyped and scales the slot count,
+  but its hit rate and throughput do not yet beat the per-(layer, kind)
+  cache that is the default, so the prototype was reverted. The target of
+  48 tokens per second needs a much larger cache (order ten thousand
+  slices), sized to the free device memory, and likely expert streaming of
+  the dense weights to make room. Not reached yet.
+- **Recommended sampling (qwen4exp).** The model card specifies a sampler
+  per thinking mode: thinking on uses temperature 1.0 and top_p 0.95;
+  thinking off uses temperature 0.7, top_p 0.80 and presence penalty 1.5;
+  both use top_k 20, min_p 0.0 and repetition penalty 1.0. Added the
+  per-architecture table to the CLI (`RecommendedSampling` in
+  `tools/cli/cli_helpers.cpp`); it applies when the user passes no
+  sampling flag. With thinking on and the recommended sampler the model
+  answers `The capital of France is` with `The capital of France is
+  **Paris**.` and stops, where greedy decode loops. Two defects remain
+  under investigation: the first generated token is the same in every run
+  (vocab id 0, `!`), and the thinking off path still stops at once.
 
 ### Still required (in order)
 
-1. The qwen4exp architecture module and registry entry. The module cannot
-   land before its decode works, because the `Architecture` interface has
-   no partial form; the generic device decode rejects hybrid configs.
-2. Layer assembly: GDN and MoE blocks wrapped by the hyper-connection
-   mixer, and the QSA block (projections, q/k norm, RoPE, the kernels
-   above, the output projection).
-3. The PLE key and value projections in the block (the reader and the
-   post-ops are done; the projections reuse `gemm_bf16`).
-4. The expert cache and streaming path, then the measurement.
+1. The expert cache and streaming path (M6), then the throughput
+   measurement. The current paged path re-uploads every paged layer each
+   token and does not hold hot experts resident.
+2. Remove the temporary `TESSERA_QWEN4EXP_*` diagnostics from
+   `src/models/qwen4exp/trunk.cpp` and `moe.cpp` before finalizing.
+3. Investigate the two residual output defects: the leading `!\n\n` prefix
+   before the `<think>` block, and the chat template path that emits `!`
+   and stops at once.
+4. MTP (M7), when the draft file is downloaded.

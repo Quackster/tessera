@@ -156,30 +156,6 @@ std::expected<void, StatusCode> RunMoeFfn(
       !top) {
     return std::unexpected(top.error());
   }
-  if (layer == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-    std::vector<std::uint32_t> ids(top_k, 0);
-    std::vector<float> lv(ne, 0.0f);
-    backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
-                    top_k * 4);
-    backend.CopyD2H(*h.moe_logits, reinterpret_cast<std::byte*>(lv.data()),
-                    ne * 4);
-    float m2[4] = {0, 0, 0, 0};
-    backend.CopyD2H(mixed, reinterpret_cast<std::byte*>(m2), 16);
-    std::fprintf(stderr,
-                 "q4e dump moein: %.5f %.5f %.5f %.5f  ids", m2[0], m2[1], m2[2],
-                 m2[3]);
-    for (std::size_t k = 0; k < top_k; ++k) {
-      std::fprintf(stderr, " %u(%.3f)", ids[k], lv[ids[k]]);
-    }
-    std::fprintf(stderr, "\n");
-    std::vector<float> full(hidden, 0.0f);
-    backend.CopyD2H(mixed, reinterpret_cast<std::byte*>(full.data()),
-                    hidden * 4);
-    if (FILE* fp = std::fopen("/tmp/q4e_moein.bin", "wb")) {
-      std::fwrite(full.data(), 4, full.size(), fp);
-      std::fclose(fp);
-    }
-  }
   {
     KernelLaunch gate;
     gate.grid_x = 1;
@@ -275,15 +251,6 @@ std::expected<void, StatusCode> RunMoeFfn(
                    *h.block_out, hidden, 0);
       !combined) {
     return combined;
-  }
-  if (layer == 0 && std::getenv("TESSERA_QWEN4EXP_DUMP")) {
-    std::vector<float> mout(hidden, 0.0f);
-    backend.CopyD2H(*h.block_out, reinterpret_cast<std::byte*>(mout.data()),
-                    hidden * 4);
-    if (FILE* fp = std::fopen("/tmp/q4e_moeout.bin", "wb")) {
-      std::fwrite(mout.data(), 4, mout.size(), fp);
-      std::fclose(fp);
-    }
   }
   return {};
 }
