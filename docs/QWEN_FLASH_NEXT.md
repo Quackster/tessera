@@ -454,6 +454,21 @@ the head read and the output projection).
   **Paris**.` and stops, where greedy decode loops. Two defects remain
   under investigation: the first generated token is the same in every run
   (vocab id 0, `!`), and the thinking off path still stops at once.
+- **Fixed: empty prefill logits.** `Qwen4ExpArchitecture::ForwardBatch`
+  wrote the last row's logits only when `all_logits` was true, so the
+  prefill path (`all_logits == false`) returned an empty vector. The
+  engine sampled the first token from that empty vector and `ArgMax` of an
+  empty span is 0, so the first generated token was always vocab id 0
+  (`!`) and the generation degraded from there. The last row now always
+  reaches `logits_out`. With thinking on the model now produces a coherent
+  reasoning block and the correct answer, and it stops.
+- **Known defect: repetition loop on some prompts.** Even with thinking on
+  and the recommended sampler, some prompts still loop. Example:
+  `The bubonic plague happened in what centuries?` with
+  `--enable-thinking` produces a coherent reasoning block, then degenerates
+  into a run of `!` (vocab id 0) that never ends. This is separate from the
+  empty prefill logits bug above, and it happens with thinking on or off.
+  Under investigation.
 
 ### Still required (in order)
 

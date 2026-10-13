@@ -425,8 +425,8 @@ int main(int argc, char** argv) {
         }
         LogModelSummary(*engine_ptr, **model);
         if (i == 0 && tessera::cli::ApplyRecommendedSampling(
-                          **model, enable_thinking,
-                          sampling_explicit, &sampling)) {
+                          **model, enable_thinking, sampling_explicit,
+                          &sampling)) {
           sample = true;
         }
         attach_strategy(*engine_ptr);
@@ -818,8 +818,7 @@ int main(int argc, char** argv) {
   }
   tessera::Model& loaded = **model;
   LogModelSummary(engine, loaded);
-  // A thinking model loops under greedy decode, so its architecture may
-  // supply a recommended sampler; apply it unless the user set one.
+  // Apply the architecture's recommended sampler unless the user set one.
   const bool thinking = enable_thinking;
   if (tessera::cli::ApplyRecommendedSampling(loaded, thinking,
                                              sampling_explicit, &sampling)) {

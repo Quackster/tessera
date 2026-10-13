@@ -1042,7 +1042,7 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::ForwardBatch(
       if (!logits) {
         return std::unexpected(logits.error());
       }
-      if (logits_out != nullptr && all_logits) {
+      if (logits_out != nullptr) {
         logits_out->insert(logits_out->end(), logits->begin(), logits->end());
       }
     } else {
