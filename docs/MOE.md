@@ -277,10 +277,21 @@ measurement below records what it gives.
 
 ## Measurement
 
-### Ornith CPU+GPU hybrid (applied 2026-10-14)
+### Ornith benchmark (2026-10-14)
 
 Ornith-1.5-35B-A3B Q4_K_M, ROCm on the R9700, `--context 4096`, greedy,
-`--no-chat`, `--gpu-layers 20` (forced paging):
+`--no-chat`, 16 completion tokens. `--gpu-layers N` keeps N trunk layers
+resident and pages the rest; `0` uploads everything.
+
+| `--gpu-layers` | prefill | decode | output |
+| --- | --- | --- | --- |
+| 0 (full VRAM) | 87 tok/s | 87 tok/s (11 ms/token) | `Paris.` |
+| 40 | | 84 tok/s (11 ms/token) | `Paris.` |
+| 30 | | 49 tok/s (20 ms/token) | `Paris.` |
+| 20 | | 36 tok/s (27 ms/token) | `Paris.` |
+| 10 | 13 tok/s | 28 tok/s (34 ms/token) | `Paris.` |
+
+The CPU+GPU hybrid at `--gpu-layers 20`:
 
 | `TESSERA_CPU_MOE` | decode | output |
 | --- | --- | --- |
@@ -288,12 +299,13 @@ Ornith-1.5-35B-A3B Q4_K_M, ROCm on the R9700, `--context 4096`, greedy,
 | 1 | 5 tok/s (169 ms/token) | `Paris.` |
 | 2 | 5 tok/s (180 ms/token) | `Paris.` |
 
-Full VRAM (no paging) is unregressed at 87 tok/s, `Paris.`. The hybrid is
-correct but slower on this host for the same reason as Qwen3.8-Flash-Next:
-the scalar host expert (Q4_K) is far slower than the overlapped GPU
-staging. The paged baseline rose from the 14 tok/s recorded below to 36
-tok/s because the ROCm staging-window overlap (a 4 MB window over an 8-slot
-ring) is in the backend and applies to every model.
+Full VRAM is unregressed at 87 tok/s and every paged case stays coherent
+(`Paris.`). The hybrid is correct but slower on this host for the same
+reason as Qwen3.8-Flash-Next: the scalar host expert (Q4_K) is far slower
+than the overlapped GPU staging. The paged rates rose from the 14 tok/s at
+N=20 recorded in Round 3 below to 36 tok/s because the ROCm staging-window
+overlap (a 4 MB window over an 8-slot ring) is in the backend and applies
+to every model.
 
 Ornith Q4_K_M GGUF, greedy decode, `--gpu-layers 20` (369 tensors
 resident, 11.0 GB on device; 384 tensors paged, 10.7 GB in RAM):
