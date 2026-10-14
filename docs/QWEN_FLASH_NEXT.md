@@ -290,11 +290,12 @@ architecture rules.
 - M1 to M5 (load, GDN, MoE, hyper-connections, QSA, PLE): done. The module
   loads the two shards, decodes, and produces coherent output.
 - M6 (expert cache and 48 tokens per second): in progress. The expert
-  cache is now sized to the free device memory, which lifts decode from
-  about 3.7 to about 6 output tokens per second at a 4K context on one
-  R9700 (gfx1201, 32 GB, fp32 KV, `--gpu-layers 18`). The target is not
-  reached. An intermittent non-finite logits fault remains (see the M6
-  investigation below).
+  cache is now sized to the free device memory and the batched staging
+  is pipelined (the staging ring), which lifts decode from about 3.7 to
+  about 6 output tokens per second at a 4K context on one R9700 (gfx1201,
+  32 GB, fp32 KV, `--gpu-layers 18`). The target is not reached. An
+  intermittent non-finite logits fault remains (see the M6 investigation
+  below).
 - M7 (MTP): out of scope. No draft file is present.
 
 Correctness evidence: with no completion cap and `--no-chat`, the prompt
@@ -467,7 +468,24 @@ the head read and the output projection).
   contention with the GPU and the ROCm runtime during decode, not the
   source layout or huge pages. The 48 tok/s target needs the staging
   overlapped with the kernels, a prefetch or pipelined path, and a fused
-  MoE expert kernel. Not reached yet.
+  MoE expert kernel.
+- **M6: pipelined the batched staging (the staging ring).** The ROCm
+  backend's batched upload now runs through a small ring of pinned
+  windows instead of one buffer, so the host `memcpy` of the next window
+  overlaps the GPU work of the current one instead of blocking on a
+  per-window stream sync. A per-slot event guards reuse: the host waits
+  only when it wraps to a slot whose upload may still be in flight. The
+  ring bounds the pinned set to a few windows, so the source pages stay
+  reclaimable. The decode gain is limited: the per-layer id readback
+  (`CopyD2H`) drains the stream before the staging, so the staged `memcpy`
+  cannot overlap the previous layer's kernels. Measured at a 4K context,
+  fp32 KV, one R9700, `--gpu-layers 18`: the ring decodes at about 345
+  ms/token (about 2 tok/s) versus the baseline's 326 ms/token (about 3
+  tok/s) in the same contended window, so the ring is the pipelined path
+  but the 48 tok/s target still needs the fused MoE expert kernel and/or
+  removing the per-layer readback sync. The gain is masked by the
+  intermittent non-finite logits fault (below), which stops roughly half
+  the loads.
 - **M6 open: intermittent non-finite logits.** About half of the model
   loads fail during prefill with `non-finite logits`, and the guard stops
   the run. The committed baseline at `97e7af6` fails the same way, so the
@@ -475,8 +493,11 @@ the head read and the output projection).
   failure is nondeterministic across runs of one binary. The earlier
   finding was that buffered reads of the file returned different bytes on
   each read, so the system-RAM copy made at load can inherit those bytes.
-  The next step is to read the shards with direct I/O, or verify them, so
-  the RAM copy is stable.
+  The trigger is the memory pressure during the load: the 31 GB paged
+  copy plus the file's page cache exceeds the 60 GB host, which evicts
+  and re-faults the file pages and returns stale bytes, so the RAM copy
+  and the device upload inherit them. The next step is to read the shards
+  with direct I/O, or a non-mapping read, so the copy is stable.
 - **Recommended sampling (qwen4exp).** The model card specifies a sampler
   per thinking mode: thinking on uses temperature 1.0 and top_p 0.95;
   thinking off uses temperature 0.7, top_p 0.80 and presence penalty 1.5;
@@ -520,12 +541,13 @@ the head read and the output projection).
 
 ### Still required (in order)
 
-1. M6 follow-ups: overlap the expert staging with the kernels (a
-   prefetch or pipelined path) and add a fused MoE expert kernel, then
-   reach the 48 tok/s target. The cache is already sized to the free
-   device memory.
-2. Fix the intermittent non-finite logits: read the shards with direct
-   I/O so the system-RAM copy is stable.
+ 1. M6 follow-ups: add a fused MoE expert kernel and remove (or overlap)
+    the per-layer id readback sync, then reach the 48 tok/s target. The
+    cache is sized to the free device memory and the batched staging is
+    pipelined (the staging ring).
+ 2. Fix the intermittent non-finite logits: read the shards with direct
+    I/O (or a non-mapping read) so the system-RAM copy is stable. The
+    fault is triggered by the load's memory pressure.
 3. MTP (M7), when the draft file is downloaded.
 
 ### Memory note

@@ -104,7 +104,7 @@ Model weights live outside the repo. Each variant uses one flat directory. Model
 | `~/models/Ornith-1.5-35B-A3B-GGUF/` | `Ornith-1.5-35B-Q4_K_M.gguf`, `mmproj-Ornith-1.5-35B-BF16.gguf` | MoE GGUF target. | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) |
 | `~/models/Ornith-1.5-35B-A3B-MXFP4-GGUF/` | MoE MXFP4 GGUF weights | Not yet supported. | [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) |
 | `~/models/Ornith-1.5-35B-A3B-BF16/` | bf16 safetensors | Not yet supported. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
-| `~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S/*-00001-of-00002.gguf` (compute shard plus n-gram shard), `mmproj-Qwen3.8-Flash-Next-BF16.gguf` | Flash-Next decode target. The expert cache is sized to the free device memory; the 48 tok/s target and the intermittent non-finite fault are open. | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
+ | `~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S/*-00001-of-00002.gguf` (compute shard plus n-gram shard), `mmproj-Qwen3.8-Flash-Next-BF16.gguf` | Flash-Next decode target. The expert cache is sized to the free device memory and the batched staging is pipelined (the staging ring); the 48 tok/s target and the intermittent non-finite fault are open. | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
 
 ### MXFP4 Qwen checkpoint preparation
 
