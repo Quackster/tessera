@@ -586,14 +586,22 @@ the head read and the output projection).
 
 ### Still required (in order)
 
- 1. M6 follow-ups: add a fused MoE expert kernel and remove (or overlap)
-    the per-layer id readback sync, then reach the 48 tok/s target. The
-    cache is sized to the free device memory and the batched staging is
-    pipelined (the staging ring).
- 2. Fix the intermittent non-finite logits: read the shards with direct
-    I/O (or a non-mapping read) so the system-RAM copy is stable. The
-    fault is triggered by the load's memory pressure.
-3. MTP (M7), when the draft file is downloaded.
+ 1. **CPU+GPU hybrid MoE (the path to the target).** The reference for this
+    model (Strata) does not stream the missing experts to the GPU. It keeps
+    every expert in pinned RAM and has the CPU compute the experts the VRAM
+    cache does not hold, concurrently with the GPU computing the cached ones
+    (`docs/HOW_IT_WORKS.md`: "your processor works on it, at the same time as
+    the graphics card, so neither waits for the other"). Tessera instead
+    streams every selected expert over PCIe, which blocks the token loop.
+    This is the dominant cost: the GPU kernels are about 9.5 ms per forward,
+    the expert staging about 19 ms at `--gpu-layers 8`, and the per-layer
+    readback and host issue the rest. Routing has no temporal locality (the
+    cache hit rate equals the capacity ratio), so prefetch does not help.
+    Port the hybrid: a CPU forward for the cache-missing experts (SIMD IQ
+    GEMV), the hit experts on the GPU, and the two overlapped.
+ 2. Batched prefill (up to a few thousand tokens per forward) with the next
+    layer's expert work overlapped with the current layer's attention.
+ 3. MTP (M7), when the draft file is downloaded.
 
 ### Memory note
 
