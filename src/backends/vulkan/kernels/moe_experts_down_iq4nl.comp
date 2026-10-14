@@ -1,0 +1,99 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+
+// Fused routed-expert down: out[j] = sum_slot wts[slot] * (D_e phi[slot])[j]
+// with e = ids[slot], each slice read straight from the staging tensor.
+// Scalars: hidden (v0), inter (v2), top_k (v4), down_stride (v6),
+// accumulate (v8).
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[12];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer PHI {
+  float phi[];
+};
+
+layout(set = 0, binding = 1) readonly buffer W {
+  uint8_t w[];
+};
+
+layout(set = 0, binding = 2) readonly buffer IDS {
+  uint ids[];
+};
+
+layout(set = 0, binding = 3) readonly buffer WTS {
+  float wts[];
+};
+
+layout(set = 0, binding = 4) buffer OutBuf {
+  float outbuf[];
+};
+
+const int kValues[16] =
+    int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53,
+             69, 89, 113);
+
+// Byte `offset` of the weight buffer (little-endian extraction).
+
+uint wbyte(uint offset) {
+  return uint(w[offset]);
+}
+
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+float reduce32(float v) {
+  return subgroupClusteredAdd(v, 32u);
+}
+
+
+void main() {
+  uint hidden = pc.v[0];
+  uint inter = pc.v[2];
+  uint top_k = pc.v[4];
+  uint down_stride = pc.v[6];
+  uint accumulate = pc.v[8];
+  uint warps = gl_WorkGroupSize.x / 32u;
+  uint idx = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
+  if (idx >= hidden) {
+    return;
+  }
+  uint lane = gl_LocalInvocationID.x % 32u;
+  uint blocks = inter / 32u;
+  float acc = 0.0;
+  for (uint slot = 0u; slot < top_k; ++slot) {
+    uint expert = ids[slot];
+    uint wb0 = expert * down_stride + idx * blocks * 18u;
+    uint abase = slot * inter;
+    float dot = 0.0;
+    for (uint b = 0; b < blocks; ++b) {
+      uint wb = wb0 + b * 18u;
+      float d = fp16_at(wb);
+    uint j0 = lane & 15u;
+    uint high = lane >> 4u;
+    uint q = wbyte(wb + 2u + j0);
+    uint nib = high > 0u ? (q >> 4u) : (q & 15u);
+    dot += phi[abase + b * 32u + lane] * (d * float(kValues[nib]));
+    }
+    acc += wts[slot] * reduce32(dot);
+  }
+  if ((gl_SubgroupInvocationID % 32u) == 0u) {
+    outbuf[idx] = accumulate != 0u ? outbuf[idx] + acc : acc;
+  }
+}

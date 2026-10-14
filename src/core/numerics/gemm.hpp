@@ -47,6 +47,15 @@ namespace tessera::core {
 [[nodiscard]] std::expected<void, StatusCode> GemmIq3SRef(
     std::span<const float> a, std::span<const std::byte> w,
     std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmIq3XxsRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmIq2SRef(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
+[[nodiscard]] std::expected<void, StatusCode> GemmQ20Ref(
+    std::span<const float> a, std::span<const std::byte> w,
+    std::span<float> c, std::size_t m, std::size_t n, std::size_t k);
 [[nodiscard]] std::expected<void, StatusCode> GemmQ80Ref(
     std::span<const float> a, std::span<const std::byte> w,
     std::span<float> c, std::size_t m, std::size_t n, std::size_t k);

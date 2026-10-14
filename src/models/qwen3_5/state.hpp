@@ -165,6 +165,10 @@ struct Qwen35State final : core::ArchState {
   std::unique_ptr<Buffer> moe_down_out;    // hidden fp32
   std::unique_ptr<Buffer> moe_shared;      // hidden fp32
   std::unique_ptr<Buffer> moe_phi;         // experts_per_tok * moe_intermediate fp32
+  std::unique_ptr<Buffer> moe_cpu_acc;     // hidden fp32 (CPU hybrid misses)
+  // Host scratch for the CPU+GPU hybrid MoE: the activation and the weighted
+  // sum of the CPU-computed experts.
+  std::vector<float> cpu_x, cpu_acc;
   std::unique_ptr<Buffer> moe_row_in;      // hidden fp32 (batch row staging)
   std::unique_ptr<Buffer> moe_row_out;     // hidden fp32 (batch row staging)
   bool moe_ready = false;

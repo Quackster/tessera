@@ -1,0 +1,61 @@
+#version 450
+
+// One workgroup per value head (shared-memory sum reduction); the
+// dispatch is `heads` workgroups of 256 via grid_x.
+layout(local_size_x = 256) in;
+
+// "gdn_out_norm" contract: buffer 0 is O (heads x dim), buffer 1 the
+// gate Z (heads x dim), buffer 2 the norm weight W (dim), buffer 3 the
+// output Y. Scalars: heads v[0], dim v[2], epsilon fp32 bits v[4].
+// Y = O * rsqrt(mean(O^2) + eps) * W * sigmoid(Z). The gate is a
+// sigmoid, not the SiLU of "rmsnorm_gated".
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer O {
+  float o[];
+};
+
+layout(set = 0, binding = 1) readonly buffer Z {
+  float z[];
+};
+
+layout(set = 0, binding = 2) readonly buffer W {
+  float w[];
+};
+
+layout(set = 0, binding = 3) writeonly buffer Y {
+  float y[];
+};
+
+shared float red[256];
+
+void main() {
+  uint h = gl_WorkGroupID.x;
+  uint heads = pc.v[0];
+  if (h >= heads) {
+    return;
+  }
+  uint dim = pc.v[2];
+  float eps = uintBitsToFloat(pc.v[4]);
+  uint tid = gl_LocalInvocationID.x;
+  uint base = h * dim;
+  float sum = 0.0;
+  for (uint i = tid; i < dim; i += 256u) {
+    sum = fma(o[base + i], o[base + i], sum);
+  }
+  red[tid] = sum;
+  barrier();
+  for (uint st = 128u; st > 0u; st >>= 1u) {
+    if (tid < st) {
+      red[tid] += red[tid + st];
+    }
+    barrier();
+  }
+  float inv = inversesqrt(red[0] / float(dim) + eps);
+  for (uint i = tid; i < dim; i += 256u) {
+    float sig = 1.0 / (1.0 + exp(-z[base + i]));
+    y[base + i] = o[base + i] * inv * w[i] * sig;
+  }
+}

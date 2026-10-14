@@ -221,7 +221,91 @@ in the fit check alike. Full suite passes on Vulkan and ROCm
   so one token stages a layer's slices in one round trip instead of
   one per expert.
 
+## Qwen3.8-Flash-Next MoE work (and what applies to Ornith)
+
+The `qwen4exp` port (see `docs/QWEN_FLASH_NEXT.md`) added a set of MoE
+optimizations. This section records each one and whether it applies to
+Ornith (`qwen35moe`).
+
+1. **Warp-per-output IQ expert GEMVs.** The Qwen3.8-Flash-Next experts use
+   IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS (gate/up) and IQ4_NL, Q2_0 (down). The
+   engine only had one-thread-per-output column GEMVs for those dtypes,
+   measured at 10 to 15 GB/s and 66 percent of GPU time. New `_vec` GEMVs
+   give one 32-lane group per output and stream the weights at the memory
+   rate, on both backends. Ornith does not need this: its Q4_K and Q6_K
+   experts already use the `_vec` family.
+2. **Fused routed-expert MoE.** Two launches per layer (gate/up with the
+   silu product, down with the weighted slot sum), each reading its slice
+   from the staging tensor at `ids[slot]*stride`, so no per-expert copy.
+   Ornith already had this (`moe_experts_gate_up_q4k`,
+   `moe_experts_down_q4k`/`_q6k`); the qwen4exp work only extended it to the
+   IQ formats.
+3. **Staging-window overlap (ROCm).** The per-batch staging ring used one
+   256 MB window, so a layer's batch fit one window and its host memcpy ran
+   to completion before the upload. A 4 MB window over an 8-slot ring splits
+   a layer's batch into several windows, so the memcpy of the next window
+   overlaps the asynchronous upload of the current one. This is in the
+   backend and applies to every model, Ornith included.
+4. **Shared expert before the routed staging.** The shared expert reads only
+   the activation, so running it before the routed staging overlaps its GPU
+   work with the host staging copy. Ornith runs the shared expert after the
+   fused routed path; the reorder applies there too.
+5. **Cache the BF16 shared-expert gate.** The qwen4exp shared-expert gate is
+   bf16 and was converted to fp32 with a device-host round trip on every
+   layer of every token. Convert once per layer and reuse. Ornith's gate is
+   already fp32, so this does not apply.
+6. **Pass the QSA position as a scalar.** qwen4exp-specific; the indexer took
+   the token position through a per-layer device buffer that the host
+   uploaded each layer. Ornith has no QSA.
+7. **CPU+GPU hybrid MoE.** The reference for a model larger than VRAM (the
+   Strata engine, `docs/HOW_IT_WORKS.md`) does not stream every expert to the
+   GPU. It keeps every expert in RAM and has the CPU compute the experts the
+   VRAM cache does not hold, concurrently with the GPU computing the cached
+   ones. The engine now has `CpuMoeExpertForward` / `CpuMoeExpertsForward`
+   (host, multi-threaded) plus the `Model::ExpertCached` and
+   `Model::PagedTensorHost` accessors, and the qwen4exp MoE uses them behind
+   `TESSERA_CPU_MOE=<n>`. This is the transferable piece; the section below
+   applies it to Ornith.
+
+The host CPU limits the hybrid. On this workstation (Intel i7-8700K, 6
+cores, AVX2, no AVX-512) the scalar host expert is 8.2 ms against about
+0.073 ms for the overlapped GPU staging, so the CPU is roughly a hundred
+times slower per expert and any offload slows the token on
+Qwen3.8-Flash-Next. Ornith is smaller (about 3B active) and its expert
+slices are Q4_K, so the host cost per expert is different; the Ornith
+measurement below records what it gives.
+
 ## Measurement
+
+### Ornith benchmark (2026-10-14)
+
+Ornith-1.5-35B-A3B Q4_K_M, ROCm on the R9700, `--context 4096`, greedy,
+`--no-chat`, 16 completion tokens. `--gpu-layers N` keeps N trunk layers
+resident and pages the rest; `0` uploads everything.
+
+| `--gpu-layers` | prefill | decode | output |
+| --- | --- | --- | --- |
+| 0 (full VRAM) | 87 tok/s | 87 tok/s (11 ms/token) | `Paris.` |
+| 40 | | 84 tok/s (11 ms/token) | `Paris.` |
+| 30 | | 49 tok/s (20 ms/token) | `Paris.` |
+| 20 | | 36 tok/s (27 ms/token) | `Paris.` |
+| 10 | 13 tok/s | 28 tok/s (34 ms/token) | `Paris.` |
+
+The CPU+GPU hybrid at `--gpu-layers 20`:
+
+| `TESSERA_CPU_MOE` | decode | output |
+| --- | --- | --- |
+| off (GPU only) | 36 tok/s (27 ms/token) | `Paris.` |
+| 1 | 5 tok/s (169 ms/token) | `Paris.` |
+| 2 | 5 tok/s (180 ms/token) | `Paris.` |
+
+Full VRAM is unregressed at 87 tok/s and every paged case stays coherent
+(`Paris.`). The hybrid is correct but slower on this host for the same
+reason as Qwen3.8-Flash-Next: the scalar host expert (Q4_K) is far slower
+than the overlapped GPU staging. The paged rates rose from the 14 tok/s at
+N=20 recorded in Round 3 below to 36 tok/s because the ROCm staging-window
+overlap (a 4 MB window over an 8-slot ring) is in the backend and applies
+to every model.
 
 Ornith Q4_K_M GGUF, greedy decode, `--gpu-layers 20` (369 tensors
 resident, 11.0 GB on device; 384 tensors paged, 10.7 GB in RAM):

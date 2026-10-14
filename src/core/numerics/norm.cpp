@@ -164,6 +164,35 @@ std::expected<void, StatusCode> RmsNormGatedRef(
   return {};
 }
 
+std::expected<void, StatusCode> GdnOutNormRef(
+    std::span<const float> o, std::span<const float> z,
+    std::span<const float> w, std::span<float> y, std::size_t rows,
+    std::size_t cols, float eps) {
+  if (rows == 0 || cols == 0 || eps < 0.0f) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (o.size() != rows * cols || z.size() != rows * cols || w.size() != cols ||
+      y.size() != rows * cols) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (std::size_t r = 0; r < rows; ++r) {
+    const float* o_row = o.data() + r * cols;
+    const float* z_row = z.data() + r * cols;
+    float mean = 0.0f;
+    for (std::size_t c = 0; c < cols; ++c) {
+      mean = std::fma(o_row[c], o_row[c], mean);
+    }
+    mean /= static_cast<float>(cols);
+    const float gain = 1.0f / std::sqrt(mean + eps);
+    float* y_row = y.data() + r * cols;
+    for (std::size_t c = 0; c < cols; ++c) {
+      const float sig = 1.0f / (1.0f + std::exp(-z_row[c]));
+      y_row[c] = o_row[c] * gain * w[c] * sig;
+    }
+  }
+  return {};
+}
+
 std::expected<void, StatusCode> AddRef(std::span<const float> a,
                                        std::span<const float> b,
                                        std::span<float> out, std::size_t n) {

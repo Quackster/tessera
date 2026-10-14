@@ -243,6 +243,140 @@ ParseRopeSections(const core::GgufFile& gguf, std::string_view architecture,
   return std::optional<std::vector<std::uint64_t>>{sections};
 }
 
+// Read a retained integer array metadata value; nullopt when the key is
+// absent. MalformedFile when any entry is not integral.
+std::expected<std::optional<std::vector<std::uint64_t>>, StatusCode>
+ReadU64Array(const core::GgufFile& gguf, const std::string& key) {
+  const auto it = gguf.small_arrays.find(key);
+  if (it == gguf.small_arrays.end()) {
+    return std::optional<std::vector<std::uint64_t>>{};
+  }
+  std::vector<std::uint64_t> out;
+  out.reserve(it->second.size());
+  for (const auto& entry : it->second) {
+    const auto value = AsU64(entry);
+    if (!value) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    out.push_back(*value);
+  }
+  return std::optional<std::vector<std::uint64_t>>{std::move(out)};
+}
+
+// Gated residual stack dimensions (hyper_connection.count / low_rank).
+// Nullopt when the definition carries none; MalformedFile when partial.
+std::expected<std::optional<HyperConnectionParams>, StatusCode>
+ParseHyperConnection(const core::GgufFile& gguf,
+                     std::string_view architecture) {
+  const std::string prefix = std::string(architecture);
+  const auto* count = gguf.Find(prefix + ".hyper_connection.count");
+  const auto* rank = gguf.Find(prefix + ".hyper_connection.low_rank");
+  if (count == nullptr && rank == nullptr) {
+    return std::optional<HyperConnectionParams>{};
+  }
+  if (count == nullptr || rank == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto c = AsU64(*count);
+  const auto r = AsU64(*rank);
+  if (!c || !r || *c == 0 || *r == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  HyperConnectionParams params;
+  params.count = static_cast<std::size_t>(*c);
+  params.low_rank = static_cast<std::size_t>(*r);
+  return std::optional<HyperConnectionParams>{params};
+}
+
+// Sparse-attention indexer dimensions (attention.indexer.*). Nullopt when
+// the definition carries none; MalformedFile when partial.
+std::expected<std::optional<IndexerParams>, StatusCode> ParseIndexer(
+    const core::GgufFile& gguf, std::string_view architecture) {
+  const std::string prefix = std::string(architecture);
+  const auto* heads = gguf.Find(prefix + ".attention.indexer.head_count");
+  const auto* key = gguf.Find(prefix + ".attention.indexer.key_length");
+  const auto* topk = gguf.Find(prefix + ".attention.indexer.top_k");
+  if (heads == nullptr && key == nullptr && topk == nullptr) {
+    return std::optional<IndexerParams>{};
+  }
+  if (heads == nullptr || key == nullptr || topk == nullptr) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto h = AsU64(*heads);
+  const auto k = AsU64(*key);
+  const auto t = AsU64(*topk);
+  if (!h || !k || !t || *h == 0 || *k == 0 || *t == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  IndexerParams params;
+  params.heads = static_cast<std::size_t>(*h);
+  params.key_length = static_cast<std::size_t>(*k);
+  params.top_k = static_cast<std::size_t>(*t);
+  return std::optional<IndexerParams>{params};
+}
+
+// Per-layer n-gram embedding dimensions (ple.*). Nullopt when the
+// definition carries no ple.layers array; MalformedFile when any other
+// required key is missing or inconsistent with `hidden_dim`.
+std::expected<std::optional<PleParams>, StatusCode> ParsePle(
+    const core::GgufFile& gguf, std::string_view architecture,
+    std::size_t hidden_dim) {
+  const std::string prefix = std::string(architecture);
+  auto layers = ReadU64Array(gguf, prefix + ".ple.layers");
+  if (!layers) {
+    return std::unexpected(layers.error());
+  }
+  if (!*layers) {
+    return std::optional<PleParams>{};
+  }
+  const auto* ngram = gguf.Find(prefix + ".ple.ngram_size");
+  const auto* hpng = gguf.Find(prefix + ".ple.heads_per_ngram");
+  const auto* conv = gguf.Find(prefix + ".ple.conv_kernel");
+  const auto* embd = gguf.Find(prefix + ".embedding_length_per_layer_input");
+  auto offsets = ReadU64Array(gguf, prefix + ".ple.head_offsets");
+  auto vocabs = ReadU64Array(gguf, prefix + ".ple.head_vocab_sizes");
+  auto mult = ReadU64Array(gguf, prefix + ".ple.layer_multipliers");
+  if (ngram == nullptr || hpng == nullptr || conv == nullptr ||
+      embd == nullptr || !offsets || !vocabs || !mult || !*offsets ||
+      !*vocabs || !*mult) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto n = AsU64(*ngram);
+  const auto p = AsU64(*hpng);
+  const auto c = AsU64(*conv);
+  const auto e = AsU64(*embd);
+  if (!n || !p || !c || !e || *n == 0 || *p == 0 || *c == 0 || *e == 0 ||
+      *e > hidden_dim || (*n - 1) * *p == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (mult->value().size() != *n) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  PleParams params;
+  params.layers = std::move(**layers);
+  params.ngram_size = static_cast<std::size_t>(*n);
+  params.heads_per_ngram = static_cast<std::size_t>(*p);
+  params.conv_kernel = static_cast<std::size_t>(*c);
+  params.embd_per_layer = static_cast<std::size_t>(*e);
+  params.layer_multipliers = std::move(**mult);
+  params.head_offsets = std::move(**offsets);
+  params.head_vocab_sizes = std::move(**vocabs);
+  if (params.head_offsets.size() != params.head_vocab_sizes.size()) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (const auto* image = gguf.Find(prefix + ".ple.image_token_id")) {
+    if (const auto value = AsU64(*image)) {
+      params.image_token_id = static_cast<std::size_t>(*value);
+    }
+  }
+  if (const auto* eos = gguf.Find(prefix + ".ple.eos_token_id")) {
+    if (const auto value = AsU64(*eos)) {
+      params.eos_token_id = static_cast<std::size_t>(*value);
+    }
+  }
+  return std::optional<PleParams>{std::move(params)};
+}
+
 // Build the byte-level BPE tokenizer from the retained tokenizer arrays;
 // nullopt when the file declares no supported tokenizer (not gpt2, or no
 // token array). MalformedFile when the arrays are inconsistent.
@@ -408,6 +542,27 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
   if (sections->has_value()) {
     config.rope_sections = **sections;
   }
+  auto hc = ParseHyperConnection(gguf, architecture);
+  if (!hc) {
+    return std::unexpected(hc.error());
+  }
+  if (*hc) {
+    config.hyper_connection = **hc;
+  }
+  auto indexer = ParseIndexer(gguf, architecture);
+  if (!indexer) {
+    return std::unexpected(indexer.error());
+  }
+  if (*indexer) {
+    config.indexer = **indexer;
+  }
+  auto ple = ParsePle(gguf, architecture, config.hidden_dim);
+  if (!ple) {
+    return std::unexpected(ple.error());
+  }
+  if (*ple) {
+    config.ple = **ple;
+  }
   return std::optional<TransformerConfig>{config};
 }
 
@@ -473,13 +628,15 @@ const ModelShard& Model::Shard() const { return options_.shard; }
 
 const TensorShard& Model::Tensor() const { return options_.tensor; }
 
-// Upload every manifest tensor to a device buffer. `bytes` is the
-// whole file; offsets come from the parsed manifest. `log` receives one
-// phase line per upload stage (allocation, transfer) so a slow load is
-// traceable to a stage; it may be null. Under `--gpu-layers` paging only
-// the resident tensors are uploaded; the rest return as RAM-backed paged
-// entries with spans into `bytes` (or the returned sliced copies), and
-// stage_sizes carries one staging size per paged tensor kind.
+// Upload every manifest tensor to a device buffer. `reader` is a pread
+// reader over the file; offsets come from the parsed manifest and each
+// tensor is read into a bounded buffer instead of a whole-file mapping, so
+// the load does not fill the page cache with file pages that memory
+// pressure evicts and re-faults. `log` receives one phase line per upload
+// stage (allocation, transfer) so a slow load is traceable to a stage; it
+// may be null. Under `--gpu-layers` paging only the resident tensors are
+// uploaded; the rest return as RAM-backed paged entries, and stage_sizes
+// carries one staging size per paged tensor kind.
 struct SplitUpload {
   std::vector<DeviceTensor> resident;
   std::vector<PagedTensor> paged;
@@ -490,7 +647,7 @@ struct SplitUpload {
 std::expected<SplitUpload, StatusCode> UploadWeights(
     Backend& backend, const std::vector<TensorEntry>& tensors,
     const std::vector<std::uint64_t>& offsets, std::uint64_t data_start,
-    std::span<const std::byte> bytes, const log::Diagnostics* log,
+    const core::FileReader& reader, const log::Diagnostics* log,
     const ModelShard& shard, std::size_t trunk_layers,
     const TensorShard& tensor, const Architecture* module,
     std::size_t gpu_layers, bool has_moe) {
@@ -498,11 +655,36 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
   out.resident.reserve(tensors.size());
   std::vector<Backend::HostCopy> copies;
   copies.reserve(tensors.size());
-  // Sliced tensor bytes must outlive the batched upload below, so keep them
-  // in one stable vector (moving the inner vectors preserves their data).
+  // Sliced tensor bytes and paged RAM copies must outlive the upload, so
+  // keep them in one stable vector (moving the inner vectors preserves
+  // their data).
   std::vector<std::vector<std::byte>> sliced_storage;
+  // Read buffers for the current upload chunk (the HostCopy spans point
+  // into them); they are freed after the chunk is uploaded, so the load
+  // does not hold every resident tensor's bytes at once and its peak stays
+  // under the host's available memory.
+  std::vector<std::vector<std::byte>> chunk_buffers;
+  chunk_buffers.reserve(tensors.size());
+  std::size_t chunk_bytes = 0;
   std::unordered_map<std::string, std::size_t> stage_max;
   std::uint64_t total_bytes = 0;
+  // Upload the resident tensors in bounded chunks so the read buffers are
+  // freed as each chunk uploads; 2 GiB keeps the peak far under a 60 GB
+  // host that already holds the 31 GiB paged copy.
+  const std::size_t kUploadChunkBytes = 2u * 1024u * 1024u * 1024u;
+  auto flush_chunk = [&backend, &copies, &chunk_buffers, &chunk_bytes]()
+      -> std::expected<void, StatusCode> {
+    if (chunk_bytes == 0) {
+      return {};
+    }
+    if (auto uploaded = backend.CopyH2DBatch(copies); !uploaded) {
+      return std::unexpected(uploaded.error());
+    }
+    copies.clear();
+    chunk_buffers.clear();
+    chunk_bytes = 0;
+    return {};
+  };
   {
     core::PhaseTimer timer(log, "model", "allocate device buffers");
     for (std::size_t i = 0; i < tensors.size(); ++i) {
@@ -516,12 +698,18 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
       }
       const std::size_t count = *sized;
       const std::uint64_t begin = data_start + offsets[i];
-      if (begin > bytes.size() ||
-          static_cast<std::uint64_t>(count) > bytes.size() - begin) {
+      if (begin > reader.size() ||
+          static_cast<std::uint64_t>(count) > reader.size() - begin) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      std::span<const std::byte> payload =
-          bytes.subspan(static_cast<std::size_t>(begin), count);
+      auto raw = reader.ReadRange(begin, count);
+      if (!raw) {
+        return std::unexpected(raw.error());
+      }
+      std::span<const std::byte> payload(raw->data(), raw->size());
+      // Set when the slicing below consumes `raw` into sliced_storage, so
+      // the paged/resident handling does not move it a second time.
+      bool raw_consumed = false;
       if (tensor.enabled && module != nullptr &&
           (entry.shape.rank == 2 || entry.shape.rank == 3)) {
         const ParallelKind kind = module->TensorParallelKind(entry.name);
@@ -540,6 +728,7 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
           entry.shape.dims[2] = sliced->experts;
           sliced_storage.push_back(std::move(sliced->bytes));
           payload = sliced_storage.back();
+          raw_consumed = true;
         } else if (kind != ParallelKind::Replicated &&
                    entry.shape.rank == 2) {
           // GGUF dims are [row_length, rows] (ne[0] fastest); the slicer
@@ -554,6 +743,7 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
           entry.shape.dims[0] = sliced->cols;
           sliced_storage.push_back(std::move(sliced->bytes));
           payload = sliced_storage.back();
+          raw_consumed = true;
         }
       }
       // Under paging the early trunk blocks stay RAM-backed: no device
@@ -584,9 +774,26 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
         } else if (staged->second < payload.size()) {
           staged->second = payload.size();
         }
-        out.paged.push_back(PagedTensor{std::move(entry), payload, layer,
-                                        std::move(block_kind)});
+        // Hold the paged bytes in system RAM. The decode loop re-reads
+        // them every token; a private copy keeps those reads stable when
+        // the file's page cache is reclaimed, or returns stale bytes under
+        // memory pressure. `sliced_storage` keeps the copies alive and its
+        // inner vectors do not move their data on reallocation.
+        if (!raw_consumed) {
+          // Move the read buffer into the paged RAM copy (no extra copy).
+          sliced_storage.push_back(std::move(*raw));
+          payload = std::span(sliced_storage.back());
+        }
+        out.paged.push_back(PagedTensor{std::move(entry),
+                                         sliced_storage.back(), layer,
+                                         std::move(block_kind)});
         continue;
+      }
+      if (!raw_consumed) {
+        // Hold the read buffer in the current upload chunk (freed after
+        // the chunk uploads); paged read buffers are in sliced_storage.
+        chunk_buffers.push_back(std::move(*raw));
+        payload = std::span(chunk_buffers.back());
       }
       auto buffer = backend.AllocateBuffer(payload.size(), MemoryKind::Device);
       if (!buffer) {
@@ -597,18 +804,26 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
           DeviceTensor{std::move(entry), std::move(*buffer)});
       copies.push_back(Backend::HostCopy{out.resident.back().device.get(),
                                          payload});
+      chunk_bytes += payload.size();
+      if (chunk_bytes >= kUploadChunkBytes) {
+        if (auto flushed = flush_chunk(); !flushed) {
+          return std::unexpected(flushed.error());
+        }
+      }
     }
     timer.Stop(std::to_string(tensors.size()) + " tensors");
   }
-  // One batched upload: backends pipeline the copies and synchronize once
-  // per chunk instead of a round trip per tensor.
+  // Flush the final partial chunk; the earlier chunks were uploaded (and
+  // their read buffers freed) inside the loop as each reached the bound, so
+  // the load's peak stays under the host's available memory instead of
+  // holding every resident tensor at once.
   {
     core::PhaseTimer timer(log, "model", "upload weights to device");
-    if (auto uploaded = backend.CopyH2DBatch(copies); !uploaded) {
-      return std::unexpected(uploaded.error());
+    if (auto flushed = flush_chunk(); !flushed) {
+      return std::unexpected(flushed.error());
     }
     timer.Stop(std::to_string(total_bytes) + " bytes in " +
-               std::to_string(copies.size()) + " copies");
+               std::to_string(out.resident.size()) + " copies");
   }
   for (const auto& staged : stage_max) {
     out.stage_sizes.emplace_back(staged.first, staged.second);
@@ -758,9 +973,17 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     // so the loader can slice it; a null module loads every tensor whole.
     std::unique_ptr<Architecture> module = CreateArchitecture(architecture);
     const bool has_moe = config->has_value() && (*config)->IsMoe();
+    // Read the tensor data with a bounded pread read instead of the whole-
+    // file mapping above: a multi-gigabyte load would otherwise fill the
+    // page cache with file pages that memory pressure evicts and re-faults,
+    // returning stale bytes to the paged copy and the device upload.
+    auto reader = core::FileReader::Open(path);
+    if (!reader) {
+      return std::unexpected(reader.error());
+    }
     auto uploaded =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
-                      gguf->tensor_data_start, bytes, log, options.shard,
+                      gguf->tensor_data_start, *reader, log, options.shard,
                       config->has_value() ? (*config)->layers : 0,
                       options.tensor, module.get(), options.gpu_layers,
                       has_moe);
@@ -768,19 +991,19 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       return std::unexpected(uploaded.error());
     }
     // One staging slot per paged tensor kind; the decode loop reuses them
-    // for every paged layer. The mapped file stays alive in the model so
-    // the paged host spans outlive the load.
+    // for every paged layer.
     auto staged = AllocateStaging(backend, uploaded->stage_sizes);
     if (!staged) {
       return std::unexpected(staged.error());
     }
-    auto file_backing = uploaded->paged.empty()
-                              ? std::shared_ptr<const void>{}
-                              : std::make_shared<core::MappedFile>(
-                                    std::move(*mapped));
-    // Retained slices back paged tensors under tensor parallelism; without
-    // paging the resident slices are already uploaded and dropped as
-    // before, so the default path keeps its memory behavior.
+    // The upload copies every paged tensor into RAM (`retained_backing`),
+    // so no file mapping is retained and the file's page cache is released
+    // once the load returns.
+    std::shared_ptr<const void> file_backing{};
+    // `sliced` owns the paged tensors' RAM copies and any tensor-parallel
+    // slices those spans point into. It is retained whenever paging is on;
+    // without paging the resident bytes are already on the device, so the
+    // default path keeps its memory behavior.
     std::shared_ptr<const void> retained_backing =
         uploaded->paged.empty() || uploaded->sliced.empty()
             ? nullptr
@@ -921,8 +1144,14 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     }
     // Map offsets count from the file start, so the base is zero.
     // A raw directory has no trunk count, so every tensor stays resident;
-    // the backing is still retained for uniformity.
-    auto uploaded = UploadWeights(backend, tensors, offsets, 0, file_bytes,
+    // the backing is still retained for uniformity. Read the tensor data
+    // with a bounded pread read (see the GGUF path above) so the load does
+    // not fill the page cache with stale-able file pages.
+    auto reader = core::FileReader::Open(layout->weights_path);
+    if (!reader) {
+      return std::unexpected(reader.error());
+    }
+    auto uploaded = UploadWeights(backend, tensors, offsets, 0, *reader,
                                   log, options.shard, 0, options.tensor,
                                   nullptr, options.gpu_layers,
                                   /*has_moe=*/false);
@@ -1045,6 +1274,15 @@ const DeviceTensor* Model::FindDeviceTensor(std::string_view name) const {
                                       : &stage_views_[staged->second];
 }
 
+std::optional<DType> Model::TensorDType(std::string_view name) const {
+  for (const TensorEntry& entry : tensors_) {
+    if (entry.name == name) {
+      return entry.dtype;
+    }
+  }
+  return std::nullopt;
+}
+
 const Buffer* Model::FindWeight(std::string_view name) const {
   const DeviceTensor* found = FindDeviceTensor(name);
   return found == nullptr ? nullptr : found->device.get();
@@ -1103,11 +1341,6 @@ bool Model::ExpertsPaged(std::size_t layer) const {
          !paged_expert_by_layer_[layer].empty();
 }
 
-// Cached expert triplets per routed-expert kind: a repeated expert costs
-// one device-side gather instead of a host upload. A tunable; each kind's
-// store holds this many expert slices.
-constexpr std::size_t kExpertCacheEntries = 32;
-
 // One expert's byte size and count from a rank-3 packed expert manifest.
 // MalformedFile when the shape cannot hold experts.
 std::expected<std::pair<std::size_t, std::size_t>, StatusCode> ExpertSpan(
@@ -1121,6 +1354,31 @@ std::expected<std::pair<std::size_t, std::size_t>, StatusCode> ExpertSpan(
     return std::unexpected(per ? StatusCode::MalformedFile : per.error());
   }
   return std::make_pair(*per, count);
+}
+
+// A repeated expert costs one device-side gather instead of a host upload,
+// so a larger store means fewer per-token uploads. The slot count trades
+// the free device memory against the reserve (see ExpertCacheSlots).
+std::size_t Model::ExpertCacheEntries() const {
+  if (expert_cache_entries_ != 0) {
+    return expert_cache_entries_;
+  }
+  // Every paged (layer, kind) pair gets the same slot count, so the cache
+  // spends one slot-set per pair: entries = budget / total_per, where
+  // total_per sums the per-expert slice bytes over every pair.
+  std::size_t total_per = 0;
+  for (const PagedTensor& entry : paged_) {
+    if (!core::IsRoutedExpertKind(entry.kind)) {
+      continue;
+    }
+    auto span = ExpertSpan(entry.manifest);
+    if (span) {
+      total_per += span->first;
+    }
+  }
+  expert_cache_entries_ =
+      core::ExpertCacheSlots(backend_.MemoryInfo().free_bytes, total_per);
+  return expert_cache_entries_;
 }
 
 std::expected<void, StatusCode> Model::EnsureLayerExperts(
@@ -1235,6 +1493,7 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   if (layer_cache.size() < rows->size()) {
     layer_cache.resize(rows->size());
   }
+  const std::size_t cache_entries = ExpertCacheEntries();
   std::vector<KindWork> kinds;
   kinds.reserve(rows->size());
   for (std::size_t k = 0; k < rows->size(); ++k) {
@@ -1264,16 +1523,16 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
     ExpertCache& held = layer_cache[k];
     if (held.store == nullptr) {
       auto store =
-          backend_.AllocateBuffer(kExpertCacheEntries * per, MemoryKind::Device);
+          backend_.AllocateBuffer(cache_entries * per, MemoryKind::Device);
       if (store) {
         held.stage_slot = staged->second;
         held.per_bytes = per;
         held.store = std::move(*store);
-        held.entries.resize(kExpertCacheEntries);
+        held.entries.resize(cache_entries);
       }
     }
     if (held.store != nullptr && held.per_bytes == per &&
-        held.entries.size() == kExpertCacheEntries) {
+        held.entries.size() == cache_entries) {
       cache = &held;
     }
     kinds.push_back(KindWork{i, staged->second, per, cache});
@@ -1305,7 +1564,7 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
         continue;
       }
       ExpertCache& cache = *kind.cache;
-      std::size_t slot = kExpertCacheEntries;
+      std::size_t slot = cache_entries;
       for (std::size_t s = 0; s < cache.entries.size(); ++s) {
         const ExpertCacheEntry& held = cache.entries[s];
         if (held.occupied && held.expert == expert) {
@@ -1313,7 +1572,7 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
           break;
         }
       }
-      if (slot < kExpertCacheEntries) {
+      if (slot < cache_entries) {
         cache.entries[slot].tick = ++expert_cache_tick_;
       } else {
         slot = 0;
@@ -1363,6 +1622,73 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   }
   experts_layer_ = layer;
   return {};
+}
+
+bool Model::ExpertCached(std::size_t layer, std::uint32_t expert) const {
+  if (layer >= paged_expert_by_layer_.size()) {
+    return true;  // resident layer (or no paging)
+  }
+  const std::vector<std::size_t>& rows = paged_expert_by_layer_[layer];
+  if (rows.empty()) {
+    return true;
+  }
+  if (layer >= expert_cache_by_layer_.size()) {
+    return false;
+  }
+  const std::vector<ExpertCache>& layer_cache = expert_cache_by_layer_[layer];
+  if (layer_cache.size() < rows.size()) {
+    return false;
+  }
+  // An expert counts as cached only when every kind holds it: the GPU needs
+  // gate, up and down together to compute it without a transfer.
+  for (std::size_t k = 0; k < rows.size(); ++k) {
+    const ExpertCache& cache = layer_cache[k];
+    if (cache.store == nullptr) {
+      return false;
+    }
+    bool found = false;
+    for (const ExpertCacheEntry& held : cache.entries) {
+      if (held.occupied && held.expert == expert) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::span<const std::byte> Model::PagedExpertHost(
+    std::string_view tensor_name, std::uint32_t expert) const {
+  const auto it = paged_index_.find(tensor_name);
+  if (it == paged_index_.end()) {
+    return {};
+  }
+  const PagedTensor& entry = paged_[it->second];
+  auto span = ExpertSpan(entry.manifest);
+  if (!span) {
+    return {};
+  }
+  const std::size_t per = span->first;
+  if (expert >= span->second) {
+    return {};
+  }
+  const std::size_t begin = static_cast<std::size_t>(expert) * per;
+  if (begin > entry.host.size() || per > entry.host.size() - begin) {
+    return {};
+  }
+  return entry.host.subspan(begin, per);
+}
+
+std::span<const std::byte> Model::PagedTensorHost(
+    std::string_view tensor_name) const {
+  const auto it = paged_index_.find(tensor_name);
+  if (it == paged_index_.end()) {
+    return {};
+  }
+  return paged_[it->second].host;
 }
 
 const std::string& Model::Path() const {

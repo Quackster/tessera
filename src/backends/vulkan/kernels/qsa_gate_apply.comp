@@ -1,0 +1,84 @@
+#version 450
+
+// One thread per pair of head dims; the dispatch is
+// ceil(n_head * head_dim / 2 / 256). head_dim is even.
+layout(local_size_x = 256) in;
+
+// "qsa_gate_apply" contract: buffer 0 is attn (fp32, n_head x head_dim),
+// buffer 1 q_full (fp32, n_head x 2*head_dim), buffer 2 the fp16 output
+// (n_head x head_dim). Scalars: n_head (v[0]), head_dim (v[2]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer A { float attn[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float q_full[]; };
+layout(set = 0, binding = 2) writeonly buffer O { uint outb[]; };
+
+uint f16_shift_rne(uint v, int s) {
+  if (s <= 0) {
+    return v;
+  }
+  uint mask = (1u << uint(s)) - 1u;
+  uint halfway = 1u << uint(s - 1);
+  uint rem = v & mask;
+  uint q = v >> uint(s);
+  if (rem > halfway || (rem == halfway && (q & 1u) == 1u)) {
+    q += 1u;
+  }
+  return q;
+}
+
+uint f16_rne(float value) {
+  uint bits = floatBitsToUint(value);
+  uint sign = (bits >> 16) & 0x8000u;
+  uint exp = (bits >> 23) & 0xFFu;
+  uint mant = bits & 0x7FFFFFu;
+  if (exp == 0xFFu) {
+    return sign | 0x7C00u | (mant != 0u ? 0x200u : 0u);
+  }
+  int e = int(exp) - 127;
+  if (e > 15) {
+    return sign | 0x7C00u;
+  }
+  if (e < -14) {
+    uint scaled = mant | 0x800000u;
+    int shift = -e - 1;
+    if (shift >= 32) {
+      return sign;
+    }
+    uint r = f16_shift_rne(scaled, shift);
+    if (r > 1023u) {
+      return sign | 0x0400u;
+    }
+    return sign | r;
+  }
+  uint m10 = f16_shift_rne(mant, 13);
+  if (m10 > 1023u) {
+    if (e + 1 > 15) {
+      return sign | 0x7C00u;
+    }
+    return sign | (uint(e + 1 + 15) << 10);
+  }
+  return sign | (uint(e + 15) << 10) | m10;
+}
+
+
+void main() {
+  uint n_head = pc.v[0];
+  uint head_dim = pc.v[2];
+  uint pairs = n_head * head_dim / 2u;
+  uint p = gl_GlobalInvocationID.x;
+  if (p >= pairs) {
+    return;
+  }
+  uint e = 2u * p;
+  uint h = e / head_dim;
+  uint d = e % head_dim;
+  uint idx = h * head_dim + d;
+  float g0 = q_full[h * 2u * head_dim + head_dim + d];
+  float g1 = q_full[h * 2u * head_dim + head_dim + d + 1u];
+  float v0 = attn[idx] / (1.0 + exp(-g0));
+  float v1 = attn[idx + 1u] / (1.0 + exp(-g1));
+  outb[idx / 2u] = f16_rne(v0) | (f16_rne(v1) << 16);
+}

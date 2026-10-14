@@ -123,4 +123,73 @@ std::expected<MappedFile, StatusCode> MappedFile::Open(
   return result;
 }
 
+FileReader::FileReader(FileReader&& other) noexcept
+    : fd_(other.fd_), size_(other.size_) {
+  other.fd_ = -1;
+  other.size_ = 0;
+}
+
+FileReader& FileReader::operator=(FileReader&& other) noexcept {
+  if (this != &other) {
+    Reset();
+    fd_ = other.fd_;
+    size_ = other.size_;
+    other.fd_ = -1;
+    other.size_ = 0;
+  }
+  return *this;
+}
+
+FileReader::~FileReader() { Reset(); }
+
+void FileReader::Reset() {
+  if (fd_ >= 0) {
+    ::close(fd_);
+    fd_ = -1;
+  }
+  size_ = 0;
+}
+
+std::expected<FileReader, StatusCode> FileReader::Open(
+    const std::filesystem::path& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    if (errno == ENOENT) {
+      return std::unexpected(StatusCode::FileNotFound);
+    }
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  struct stat info {};
+  if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+    ::close(fd);
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  FileReader reader;
+  reader.fd_ = fd;
+  reader.size_ = static_cast<std::size_t>(info.st_size);
+  return reader;
+}
+
+std::expected<std::vector<std::byte>, StatusCode> FileReader::ReadRange(
+    std::uint64_t offset, std::size_t count) const {
+  std::vector<std::byte> buffer(count);
+  std::size_t read_total = 0;
+  while (read_total < count) {
+    const long n =
+        ::pread(fd_, buffer.data() + read_total, count - read_total,
+                static_cast<off_t>(offset) + static_cast<off_t>(read_total));
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    if (n == 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    read_total += static_cast<std::size_t>(n);
+  }
+  return buffer;
+}
+
 }  // namespace tessera::core

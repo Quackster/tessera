@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -17,11 +18,13 @@ namespace tessera::backends::rocm {
 
 namespace {
 
-// Host-visible staging window for a batched upload, the same bound the
-// vulkan backend uses. A large checkpoint is copied through one reusable
-// pinned buffer of this size, so pinned host memory stays bounded
-// regardless of the total weight bytes.
-constexpr std::size_t kUploadStagingBytes = 256ull << 20;
+// Host-visible staging window for a batched upload. A checkpoint is copied
+// through a ring of pinned windows of this size. A small window lets a
+// per-layer expert batch split into several windows, so the host memcpy of
+// the next window overlaps the asynchronous upload of the current one; one
+// large window would serialize the memcpy before the upload. The window
+// bounds the pinned host memory regardless of the total weight bytes.
+constexpr std::size_t kUploadStagingBytes = 4ull << 20;
 
 StatusCode FromHip(hipError_t error) {
   switch (error) {
@@ -99,12 +102,39 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"gemm_iq4xs_batched", reinterpret_cast<void*>(&GemmIq4XsBatchedKernel)},
     {"gemm_iq3s", reinterpret_cast<void*>(&GemmIq3SKernel)},
     {"gemm_iq3s_batched", reinterpret_cast<void*>(&GemmIq3SBatchedKernel)},
+    {"gemm_iq3xxs", reinterpret_cast<void*>(&GemmIq3XxsKernel)},
+    {"gemm_iq2s", reinterpret_cast<void*>(&GemmIq2SKernel)},
+    {"gemm_q20", reinterpret_cast<void*>(&GemmQ20Kernel)},
+    {"gemm_iq4nl_vec", reinterpret_cast<void*>(&GemmIq4NlVecKernel)},
+    {"gemm_iq2s_vec", reinterpret_cast<void*>(&GemmIq2SVecKernel)},
+    {"gemm_iq3xxs_vec", reinterpret_cast<void*>(&GemmIq3XxsVecKernel)},
+    {"gemm_iq3s_vec", reinterpret_cast<void*>(&GemmIq3SVecKernel)},
+    {"gemm_q20_vec", reinterpret_cast<void*>(&GemmQ20VecKernel)},
+    {"gr_norm", reinterpret_cast<void*>(&GrNormKernel)},
+    {"gr_down", reinterpret_cast<void*>(&GrDownKernel)},
+    {"gr_gate", reinterpret_cast<void*>(&GrGateKernel)},
+    {"gr_mean", reinterpret_cast<void*>(&GrMeanKernel)},
+    {"gr_inject", reinterpret_cast<void*>(&GrInjectKernel)},
+    {"gr_write", reinterpret_cast<void*>(&GrWriteKernel)},
+    {"ple_gate", reinterpret_cast<void*>(&PleGateKernel)},
+    {"rmsnorm_rows", reinterpret_cast<void*>(&RmsnormRowsKernel)},
+    {"ple_broadcast", reinterpret_cast<void*>(&PleBroadcastKernel)},
+    {"ple_conv", reinterpret_cast<void*>(&PleConvKernel)},
+    {"ple_hist_advance", reinterpret_cast<void*>(&PleHistAdvanceKernel)},
+    {"qsa_index", reinterpret_cast<void*>(&QsaIndexKernel)},
+    {"kv_append", reinterpret_cast<void*>(&KvAppendKernel)},
+    {"qsa_gate_apply", reinterpret_cast<void*>(&QsaGateApplyKernel)},
+    {"kv_gather", reinterpret_cast<void*>(&KvGatherKernel)},
+    {"qsa_attend", reinterpret_cast<void*>(&QsaAttendKernel)},
+    {"qsa_topk", reinterpret_cast<void*>(&QsaTopKKernel)},
+    {"indexer_key_append", reinterpret_cast<void*>(&IndexerKeyAppendKernel)},
     {"gemm_q80", reinterpret_cast<void*>(&GemmQ80Kernel)},
     {"gemm_q80_vec", reinterpret_cast<void*>(&GemmQ80VecKernel)},
     {"rmsnorm", reinterpret_cast<void*>(&RmsnormKernel)},
     {"sigmoid_gate", reinterpret_cast<void*>(&SigmoidGateKernel)},
     {"l2norm", reinterpret_cast<void*>(&L2NormKernel)},
     {"rmsnorm_gated", reinterpret_cast<void*>(&RmsnormGatedKernel)},
+    {"gdn_out_norm", reinterpret_cast<void*>(&GdnOutNormKernel)},
     {"conv1d", reinterpret_cast<void*>(&Conv1dKernel)},
     {"delta_step", reinterpret_cast<void*>(&DeltaStepKernel)},
     {"mrope", reinterpret_cast<void*>(&MropeKernel)},
@@ -118,6 +148,7 @@ const BuiltInKernel kBuiltInKernels[] = {
     {"top_k_rows", reinterpret_cast<void*>(&TopKRowsKernel)},
     {"concat_features", reinterpret_cast<void*>(&ConcatFeaturesKernel)},
     {"cast_f32_f16", reinterpret_cast<void*>(&CastF32F16Kernel)},
+    {"cast_f16_f32", reinterpret_cast<void*>(&CastF16F32Kernel)},
     {"round_bf16", reinterpret_cast<void*>(&RoundBf16Kernel)},
     {"quantize_q8", reinterpret_cast<void*>(&QuantizeQ8Kernel)},
     {"quantize_fp8", reinterpret_cast<void*>(&QuantizeFp8Kernel)},
@@ -151,6 +182,18 @@ const BuiltInKernel kBuiltInKernels[] = {
      reinterpret_cast<void*>(&MoeExpertsGateUpQ4KKernel)},
     {"moe_experts_down_q4k", reinterpret_cast<void*>(&MoeExpertsDownQ4KKernel)},
     {"moe_experts_down_q6k", reinterpret_cast<void*>(&MoeExpertsDownQ6KKernel)},
+    {"moe_experts_gate_up_iq2s",
+     reinterpret_cast<void*>(&MoeExpertsGateUpIq2SKernel)},
+    {"moe_experts_gate_up_iq3xxs",
+     reinterpret_cast<void*>(&MoeExpertsGateUpIq3XxsKernel)},
+    {"moe_experts_gate_up_iq3s",
+     reinterpret_cast<void*>(&MoeExpertsGateUpIq3SKernel)},
+    {"moe_experts_gate_up_iq4xs",
+     reinterpret_cast<void*>(&MoeExpertsGateUpIq4XsKernel)},
+    {"moe_experts_down_iq4nl",
+     reinterpret_cast<void*>(&MoeExpertsDownIq4NlKernel)},
+    {"moe_experts_down_q20",
+     reinterpret_cast<void*>(&MoeExpertsDownQ20Kernel)},
     {"embedding_f32", reinterpret_cast<void*>(&EmbeddingF32Kernel)},
     {"embedding_bf16", reinterpret_cast<void*>(&EmbeddingBf16Kernel)},
     {"embedding_q4k", reinterpret_cast<void*>(&EmbeddingQ4KKernel)},
@@ -171,6 +214,11 @@ int LookupBuiltIn(std::string_view name) {
 class RocmBackend final : public Backend {
  public:
   ~RocmBackend() override {
+    // Drain in-flight copies before the ring and stream go away.
+    if (stream_ != nullptr) {
+      (void)hipStreamSynchronize(stream_);
+    }
+    ReleaseStagingRing();
     ReleaseStaging();
     if (stream_ != nullptr) {
       auto error = hipStreamDestroy(stream_);
@@ -353,11 +401,11 @@ class RocmBackend final : public Backend {
         return std::unexpected(StatusCode::InvalidArgument);
       }
     }
-    // Drain the batch through one bounded pinned staging window at a time,
-    // then release it. Handing hipMemcpyAsync the pageable weight bytes (the
-    // mapped model file) directly grows the runtime's pinned set to the whole
-    // checkpoint; a 16 GB load stalled past 5 minutes. A bounded window keeps
-    // the pinned set at one window and leaves the source pages reclaimable.
+    // Drain the batch through a small ring of bounded pinned windows. The
+    // slot's event guards reuse, so the host memcpy of the next window
+    // overlaps the GPU work of the current one instead of blocking on a
+    // per-window sync. The stream still orders each upload ahead of the
+    // gathers and kernels that read it.
     const auto started = core::PhaseClock::now();
     std::size_t total_bytes = 0;
     std::size_t index = 0;
@@ -373,7 +421,9 @@ class RocmBackend final : public Backend {
         staging_size = copies[index].src.size();
         end = index + 1;
       }
-      auto staging = EnsureStaging(staging_size);
+      const std::size_t slot = staging_ring_next_ % kStagingSlots;
+      ++staging_ring_next_;
+      auto staging = AcquireStagingSlot(slot, staging_size);
       if (!staging) {
         return std::unexpected(staging.error());
       }
@@ -399,19 +449,15 @@ class RocmBackend final : public Backend {
         total_bytes += copies[i].src.size();
         offset += copies[i].src.size();
       }
-      auto error = hipStreamSynchronize(stream_);
-      if (error != hipSuccess) {
-        LogError(
-            std::string("hipStreamSynchronize after batch upload failed (") +
-            HipErrorName(error) + ")");
-        return std::unexpected(FromHip(error));
+      if (auto ready = MarkStagingSlotReady(slot); !ready) {
+        return std::unexpected(ready.error());
       }
       index = end;
     }
     // The staging window persists for the next batch (the destructor
     // frees it), so a paged token pays no per-batch pinned allocation.
     if (diagnostics_ != nullptr) {
-      LogInfo(core::FormatTransferSummary(
+      LogDebug(core::FormatTransferSummary(
           total_bytes, copies.size(),
           core::ElapsedMs(started, core::PhaseClock::now())));
     }
@@ -679,12 +725,118 @@ class RocmBackend final : public Backend {
     staging_bytes_ = 0;
   }
 
+  // Batched uploads run through a small ring of pinned windows, not one
+  // buffer. The host memcpy of the next window then overlaps the GPU work of
+  // the current one instead of blocking on a per-window stream sync. A
+  // per-slot event guards reuse: the host waits only when it wraps to a slot
+  // whose upload may still be in flight. The ring bounds the pinned set to a
+  // few windows, so the source pages stay reclaimable; handing the runtime a
+  // pageable window at a time stalled a 16 GB load past 5 minutes.
+  static constexpr std::size_t kStagingSlots = 8;
+
+  struct StagingSlot {
+    std::byte* data = nullptr;
+    std::size_t bytes = 0;
+    hipEvent_t ready = nullptr;
+  };
+
+  // Wait for `slot`'s previous upload, grow it to `bytes`, return its buffer.
+  std::expected<std::byte*, StatusCode> AcquireStagingSlot(std::size_t slot,
+                                                           std::size_t bytes) {
+    if (bytes == 0) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    StagingSlot& held = staging_ring_[slot];
+    if (held.ready != nullptr) {
+      auto error = hipEventSynchronize(held.ready);
+      if (error != hipSuccess) {
+        LogError(std::string("hipEventSynchronize on staging slot ") +
+                 std::to_string(slot) + " failed (" + HipErrorName(error) +
+                 ")");
+        return std::unexpected(FromHip(error));
+      }
+    }
+    if (held.data != nullptr && held.bytes >= bytes) {
+      return held.data;
+    }
+    if (held.data != nullptr) {
+      auto freed = hipHostFree(held.data);
+      if (freed != hipSuccess) {
+        LogError(std::string("hipHostFree of staging slot ") +
+                 std::to_string(slot) + " failed (" + HipErrorName(freed) +
+                 "); the memory may leak");
+      }
+      held.data = nullptr;
+      held.bytes = 0;
+    }
+    void* pinned = nullptr;
+    auto error = hipHostMalloc(&pinned, bytes, hipHostMallocDefault);
+    if (error != hipSuccess) {
+      LogError(std::string("hipHostMalloc failed for the ") +
+               std::to_string(bytes) + " byte staging slot " +
+               std::to_string(slot) + " (" + HipErrorName(error) + ")");
+      return std::unexpected(FromHip(error));
+    }
+    held.data = static_cast<std::byte*>(pinned);
+    held.bytes = bytes;
+    return held.data;
+  }
+
+  // Record `slot`'s event after its uploads so the next AcquireStagingSlot
+  // of the slot waits for them.
+  std::expected<void, StatusCode> MarkStagingSlotReady(std::size_t slot) {
+    StagingSlot& held = staging_ring_[slot];
+    if (held.ready == nullptr) {
+      auto created =
+          hipEventCreateWithFlags(&held.ready, hipEventDisableTiming);
+      if (created != hipSuccess) {
+        LogError(std::string("hipEventCreateWithFlags for staging slot ") +
+                 std::to_string(slot) + " failed (" + HipErrorName(created) +
+                 ")");
+        return std::unexpected(FromHip(created));
+      }
+    }
+    auto error = hipEventRecord(held.ready, stream_);
+    if (error != hipSuccess) {
+      LogError(std::string("hipEventRecord on staging slot ") +
+               std::to_string(slot) + " failed (" + HipErrorName(error) + ")");
+      return std::unexpected(FromHip(error));
+    }
+    return {};
+  }
+
+  // Free every ring slot and its event (destructor path).
+  void ReleaseStagingRing() {
+    for (StagingSlot& held : staging_ring_) {
+      if (held.ready != nullptr) {
+        auto destroyed = hipEventDestroy(held.ready);
+        if (destroyed != hipSuccess) {
+          LogError(std::string("hipEventDestroy of a staging slot failed (") +
+                   HipErrorName(destroyed) + "); the event may leak");
+        }
+        held.ready = nullptr;
+      }
+      if (held.data != nullptr) {
+        auto freed = hipHostFree(held.data);
+        if (freed != hipSuccess) {
+          LogError(std::string("hipHostFree of a staging slot failed (") +
+                   HipErrorName(freed) + "); the memory may leak");
+        }
+        held.data = nullptr;
+        held.bytes = 0;
+      }
+    }
+  }
+
   std::string device_name_;
   // The stream every kernel and copy uses; carries the blocking sync policy.
   hipStream_t stream_ = nullptr;
   // Pinned host staging for device<->host copies (see EnsureStaging).
   std::byte* staging_ = nullptr;
   std::size_t staging_bytes_ = 0;
+  // Ring of pinned windows for batched uploads (see AcquireStagingSlot).
+  std::array<StagingSlot, kStagingSlots> staging_ring_{};
+  std::size_t staging_ring_next_ = 0;
   bool initialized_ = false;
 };
 

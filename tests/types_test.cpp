@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <iterator>
 
+#include "core/files.hpp"
+#include "test_helpers.hpp"
 #include "tessera/types.hpp"
 
 using tessera::DType;
@@ -53,6 +56,11 @@ TEST(DTypeTest, TensorBytesSizesTensors) {
   EXPECT_EQ(*tessera::TensorBytes(DType::IQ4_NL, 32), 18u);
   EXPECT_EQ(*tessera::TensorBytes(DType::IQ4_XS, 256), 136u);
   EXPECT_EQ(*tessera::TensorBytes(DType::IQ3_S, 256), 110u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::IQ3_XXS, 256), 98u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::IQ2_S, 256), 82u);
+  EXPECT_EQ(*tessera::TensorBytes(DType::Q2_0, 64), 18u);
+  EXPECT_EQ(tessera::TensorBytes(DType::Q2_0, 100).error(),
+            StatusCode::InvalidArgument);
   // No known layout for the K-quant leftover.
   EXPECT_EQ(tessera::TensorBytes(DType::Q2K, 256).error(),
             StatusCode::UnsupportedFeature);
@@ -62,5 +70,69 @@ TEST(DTypeTest, TensorBytesSizesTensors) {
             StatusCode::InvalidArgument);
   EXPECT_EQ(tessera::TensorBytes(DType::F4E2M1, 3).error(),
             StatusCode::InvalidArgument);
+}
+
+TEST(FileReaderTest, ReadsRangeAndWholeFile) {
+  using tessera::testing::FreshTempDir;
+  using tessera::testing::WriteBytes;
+  // A known 100-byte file (byte i is i).
+  std::vector<std::byte> expected(100);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    expected[i] = static_cast<std::byte>(i);
+  }
+  auto dir = FreshTempDir("tessera_tests_file_reader");
+  auto path = dir / "data.bin";
+  WriteBytes(path, expected);
+
+  auto reader = tessera::core::FileReader::Open(path);
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_EQ(reader->size(), expected.size());
+
+  // A mid-file range.
+  auto range = reader->ReadRange(10, 20);
+  ASSERT_TRUE(range.has_value());
+  ASSERT_EQ(range->size(), 20u);
+  for (std::size_t i = 0; i < range->size(); ++i) {
+    EXPECT_EQ((*range)[i], expected[10 + i]);
+  }
+
+  // The whole file.
+  auto whole = reader->ReadRange(0, expected.size());
+  ASSERT_TRUE(whole.has_value());
+  ASSERT_EQ(whole->size(), expected.size());
+  for (std::size_t i = 0; i < whole->size(); ++i) {
+    EXPECT_EQ((*whole)[i], expected[i]);
+  }
+
+  // A zero-length read is empty.
+  auto empty = reader->ReadRange(5, 0);
+  ASSERT_TRUE(empty.has_value());
+  EXPECT_EQ(empty->size(), 0u);
+}
+
+TEST(FileReaderTest, RejectsMissingAndNonRegularFiles) {
+  using tessera::testing::FreshTempDir;
+  auto dir = FreshTempDir("tessera_tests_file_reader_reject");
+  auto missing = tessera::core::FileReader::Open(dir / "nope.bin");
+  EXPECT_EQ(missing.error(), StatusCode::FileNotFound);
+  auto non_regular = tessera::core::FileReader::Open(dir);  // a directory
+  EXPECT_EQ(non_regular.error(), StatusCode::MalformedFile);
+}
+
+TEST(FileReaderTest, RejectsOutOfBoundsRange) {
+  using tessera::testing::FreshTempDir;
+  using tessera::testing::WriteBytes;
+  std::vector<std::byte> expected(64);
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    expected[i] = static_cast<std::byte>(i);
+  }
+  auto dir = FreshTempDir("tessera_tests_file_reader_oob");
+  auto path = dir / "data.bin";
+  WriteBytes(path, expected);
+  auto reader = tessera::core::FileReader::Open(path);
+  ASSERT_TRUE(reader.has_value());
+  // The count overruns the 64-byte file; the short read is rejected.
+  auto overrun = reader->ReadRange(60, 10);
+  EXPECT_EQ(overrun.error(), StatusCode::MalformedFile);
 }
 

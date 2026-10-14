@@ -3,6 +3,7 @@
 #include <string_view>
 
 #include "models/qwen3_5/architecture.hpp"
+#include "models/qwen4exp/architecture.hpp"
 
 namespace tessera {
 
@@ -21,6 +22,9 @@ std::unique_ptr<Architecture> CreateArchitecture(std::string_view arch) {
   if (arch == "qwen35moe" || arch == "qwen3_5_moe" ||
       arch == "Qwen3_5MoeForConditionalGeneration") {
     return models::qwen3_5::MakeQwen35Architecture();
+  }
+  if (arch == "qwen4exp") {
+    return models::qwen4exp::MakeQwen4ExpArchitecture();
   }
   return nullptr;
 }

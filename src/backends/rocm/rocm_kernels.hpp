@@ -228,6 +228,26 @@ __global__ void GemmQ80VecKernel(const float* a, const unsigned char* w,
                                  float* c, unsigned long long m,
                                  unsigned long long n, unsigned long long k,
                                  unsigned long long split);
+__global__ void GemmIq4NlVecKernel(const float* a, const unsigned char* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n, unsigned long long k,
+                                   unsigned long long split);
+__global__ void GemmIq2SVecKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k,
+                                  unsigned long long split);
+__global__ void GemmIq3XxsVecKernel(const float* a, const unsigned char* w,
+                                    float* c, unsigned long long m,
+                                    unsigned long long n, unsigned long long k,
+                                    unsigned long long split);
+__global__ void GemmIq3SVecKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k,
+                                  unsigned long long split);
+__global__ void GemmQ20VecKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k,
+                                 unsigned long long split);
 __global__ void GemmVecReduceKernel(const float* part, float* c,
                                     unsigned long long total,
                                     unsigned long long split);
@@ -295,6 +315,15 @@ __global__ void GemmIq3SBatchedKernel(const float* a, const unsigned char* w,
                                       float* c, unsigned long long m,
                                       unsigned long long n,
                                       unsigned long long k);
+__global__ void GemmIq3XxsKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k);
+__global__ void GemmIq2SKernel(const float* a, const unsigned char* w,
+                               float* c, unsigned long long m,
+                               unsigned long long n, unsigned long long k);
+__global__ void GemmQ20Kernel(const float* a, const unsigned char* w,
+                              float* c, unsigned long long m,
+                              unsigned long long n, unsigned long long k);
 __global__ void GemmQ80Kernel(const float* a, const unsigned char* w,
                               float* c, unsigned long long m,
                               unsigned long long n, unsigned long long k);
@@ -314,6 +343,14 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
                                    unsigned long long ybase);
 __global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
                                   unsigned long long n);
+// Built-in "gdn_out_norm": the gated-delta output norm for qwen4exp, one
+// block per value head over `dim` fp32: y = o * rsqrt(mean(o^2) + eps) *
+// w * sigmoid(z). sigmoid, not the SiLU of "rmsnorm_gated".
+__global__ void GdnOutNormKernel(const float* o, const float* z,
+                                 const float* w, float* y,
+                                 unsigned long long heads,
+                                 unsigned long long dim,
+                                 unsigned long long eps_bits);
 __global__ void Conv1dKernel(const float* x, const float* w, float* y,
                              unsigned long long channels,
                              unsigned long long length,
@@ -448,6 +485,10 @@ __global__ void AttentionQ4SplitKernel(const float* q, const unsigned char* k,
                                        unsigned long long split);
 __global__ void CastF32F16Kernel(const float* in, unsigned int* out,
                                  unsigned long long n);
+// Built-in "cast_f16_f32": the reverse of cast_f32_f16; n packed fp16
+// values (two per unsigned int) to n fp32.
+__global__ void CastF16F32Kernel(const unsigned int* in, float* out,
+                                 unsigned long long n);
 __global__ void ConcatFeaturesKernel(const float* in, float* out,
                                      unsigned long long n,
                                      unsigned long long rows,
@@ -546,6 +587,40 @@ __global__ void MoeExpertsDownQ6KKernel(
     const float* wts, float* out, unsigned long long hidden,
     unsigned long long inter, unsigned long long top_k,
     unsigned long long down_stride, unsigned long long accumulate);
+// Built-in "moe_experts_gate_up_iq2s"/"_iq3xxs"/"_iq3s": the same contract
+// as moe_experts_gate_up_q4k for the IQ gate/up expert formats.
+__global__ void MoeExpertsGateUpIq2SKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+__global__ void MoeExpertsGateUpIq3XxsKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+__global__ void MoeExpertsGateUpIq3SKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+__global__ void MoeExpertsGateUpIq4XsKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+// Built-in "moe_experts_down_iq4nl"/"_q20": the same contract as
+// moe_experts_down_q4k for the IQ down expert formats.
+__global__ void MoeExpertsDownIq4NlKernel(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate);
+__global__ void MoeExpertsDownQ20Kernel(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate);
 // Built-in "embedding_f32"/"embedding_bf16"/"embedding_q4k": buffer 0
 // token ids (u32, rows), buffer 1 the embedding table (vocab x cols),
 // buffer 2 the fp32 output (rows x cols); scalars are rows, cols, vocab.
@@ -570,5 +645,94 @@ __global__ void EmbeddingQ4KKernel(const unsigned int* ids,
 // 2 bf16 round trip (f32), 3 byte gather (u32). Grid 1, block 32.
 __global__ void DeviceProbeKernel(const float* in, float* swap, float* bf16,
                                   unsigned int* gather);
+
+// Gated residual stack ("hyper-connection") kernels; see
+// rocm_kernels_hyper.cpp for the contracts.
+__global__ void GrNormKernel(const float* r, const float* w_norm, float* xn,
+                             float* xq, unsigned long long n_embd,
+                             unsigned long long hc,
+                             unsigned long long eps_bits);
+__global__ void GrDownKernel(const float* xq, const unsigned short* w_down,
+                             float* lq, unsigned long long hc_dim,
+                             unsigned long long hc_lr,
+                             unsigned long long hc);
+__global__ void GrGateKernel(const float* lq, const unsigned short* w_up,
+                             const float* xn, float* gated,
+                             unsigned long long hc_dim,
+                             unsigned long long hc_lr);
+__global__ void GrMeanKernel(const float* gated, float* mixed,
+                             unsigned long long n_embd, unsigned long long hc);
+__global__ void GrInjectKernel(const float* xq,
+                               const unsigned short* w_inject, float* inject,
+                               unsigned long long hc_dim,
+                               unsigned long long hc);
+__global__ void GrWriteKernel(const float* r, const float* block_out,
+                              const float* inject, float* out,
+                              unsigned long long n_embd,
+                              unsigned long long hc);
+
+// PLE block post-ops; see rocm_kernels_ple.cpp.
+__global__ void RmsnormRowsKernel(const float* x, const float* w, float* y,
+                                  unsigned long long rows,
+                                  unsigned long long cols,
+                                  unsigned long long eps_bits);
+__global__ void PleGateKernel(const float* key, const float* query,
+                              float* gate, unsigned long long n_embd,
+                              unsigned long long hc);
+__global__ void PleBroadcastKernel(const float* value, const float* gate,
+                                   float* gated, unsigned long long dim,
+                                   unsigned long long n_embd);
+__global__ void PleConvKernel(const float* history, const float* normalized,
+                              const unsigned short* conv1d, const float* hidden,
+                              const float* gated, float* conv, float* result,
+                              unsigned long long dim, unsigned long long hist,
+                              unsigned long long taps);
+__global__ void PleHistAdvanceKernel(float* history, const float* normalized,
+                                     unsigned long long dim,
+                                     unsigned long long hist);
+
+// QSA indexer scoring; see rocm_kernels_qsa.cpp.
+__global__ void QsaIndexKernel(const float* pooled, const float* q_idx,
+                               const float* bias, float* scores,
+                               unsigned long long idx_n_head,
+                               unsigned long long idx_dim,
+                               unsigned long long idx_block,
+                               unsigned long long n_bid,
+                               unsigned long long n_kv);
+__global__ void KvAppendKernel(unsigned short* k_pool, unsigned short* v_pool,
+                               const int* page_table, const float* kcur,
+                               const float* vcur, unsigned long long pos,
+                               unsigned long long n_head_kv,
+                               unsigned long long head_dim,
+                               unsigned long long page_size);
+__global__ void QsaGateApplyKernel(const float* attn, const float* q_full,
+                                   unsigned short* out,
+                                   unsigned long long n_head,
+                                   unsigned long long head_dim);
+__global__ void KvGatherKernel(const unsigned short* k_pool,
+                               const unsigned short* v_pool,
+                               const int* page_table, const int* ids,
+                               unsigned short* k_scratch,
+                               unsigned short* v_scratch,
+                               unsigned long long n_ids,
+                               unsigned long long n_head_kv,
+                               unsigned long long head_dim,
+                               unsigned long long page_size);
+__global__ void QsaAttendKernel(const float* q,
+                                const unsigned short* k_scratch,
+                                const unsigned short* v_scratch, float* attn,
+                                unsigned long long n_ids,
+                                unsigned long long n_head,
+                                unsigned long long n_head_kv,
+                                unsigned long long head_dim);
+__global__ void QsaTopKKernel(const float* scores, int* ids,
+                              unsigned long long n_kv,
+                              unsigned long long width);
+__global__ void IndexerKeyAppendKernel(
+    const float* raw, const float* w_k_norm, float* tail, float* dead,
+    float* pooled, int* block_pos, const float* cos_tab,
+    const float* sin_tab, long long pos_base, unsigned long long eps_bits,
+    unsigned long long idx_dim, unsigned long long r,
+    unsigned long long n_rot, long long pos_in);
 
 }  // namespace tessera::backends::rocm

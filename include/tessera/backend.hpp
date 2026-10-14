@@ -973,6 +973,7 @@ class Backend {
   virtual void Synchronize() = 0;
 
  protected:
+  void LogDebug(std::string_view message) const;
   void LogInfo(std::string_view message) const;
   void LogWarn(std::string_view message) const;
   void LogError(std::string_view message) const;

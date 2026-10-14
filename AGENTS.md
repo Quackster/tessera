@@ -325,6 +325,11 @@ Repository-specific constraints on top of the hard rules:
     cmake --build cmake-build-vulkan -j
     ctest --test-dir cmake-build-vulkan --output-on-failure
 
+Before every test run, reconfigure and rebuild the target backend in one
+step, so a stale build directory never tests old code:
+
+    cmake -B cmake-build-rocm -DTESSERA_BACKEND=rocm && cmake --build cmake-build-rocm -j
+
 Do not create new CMake test executables or new top-level test files. All
 runtime coverage goes into the single test target; add test functions to the
 `tests/*.cpp` sources compiled into it. New suites only fragment ctest output

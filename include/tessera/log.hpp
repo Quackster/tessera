@@ -8,8 +8,10 @@
 
 namespace tessera::log {
 
-// Severity of a diagnostic line.
+// Severity of a diagnostic line. Debug is below the default threshold, so
+// it is dropped unless SetMinLevel(Debug) raises the verbosity.
 enum class Level : int {
+  Debug = -1,
   Info = 0,
   Warn = 1,
   Error = 2,
@@ -38,6 +40,17 @@ class Diagnostics {
     sink_ = std::move(sink);
   }
 
+  // Drop every line below `level` before it reaches the sink. Defaults to
+  // Info, so Debug diagnostics (per-transfer summaries, cache probes) stay
+  // off unless a front-end asks for them.
+  void SetMinLevel(Level level) {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    min_level_ = level;
+  }
+
+  void Debug(std::string_view prefix, std::string_view message) const {
+    Emit(Level::Debug, prefix, message);
+  }
   void Info(std::string_view prefix, std::string_view message) const {
     Emit(Level::Info, prefix, message);
   }
@@ -52,16 +65,21 @@ class Diagnostics {
   void Emit(Level level, std::string_view prefix,
             std::string_view message) const {
     std::lock_guard<std::mutex> lock(*mutex_);
+    if (static_cast<int>(level) < static_cast<int>(min_level_)) {
+      return;
+    }
     sink_(level, prefix, message);
   }
 
   // Shared across copies: a copied channel stays one channel.
   mutable std::shared_ptr<std::mutex> mutex_ =
       std::make_shared<std::mutex>();
+  Level min_level_ = Level::Info;
   Sink sink_ = [](Level level, std::string_view prefix,
                   std::string_view message) {
     const char* level_name = "info";
     switch (level) {
+      case Level::Debug: level_name = "debug"; break;
       case Level::Warn: level_name = "warn"; break;
       case Level::Error: level_name = "error"; break;
       default: break;

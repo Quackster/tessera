@@ -1,0 +1,61 @@
+#version 450
+
+// One thread per stack element; the dispatch is ceil(dim / 256).
+layout(local_size_x = 256) in;
+
+// "ple_conv" contract: buffer 0 is the history (fp32, hc x hist rows),
+// buffer 1 the normalized values (fp32, hc*n_embd), buffer 2 the f16
+// convolution taps (hc*n_embd x conv_taps), buffer 3 hidden (fp32,
+// hc*n_embd), buffer 4 gated (fp32, hc*n_embd), buffer 5 the activation
+// output (fp32, hc*n_embd), buffer 6 the result (fp32, hc*n_embd).
+// Scalars: dim (v[0]), hist (v[2]), taps (v[4]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer H { float history[]; };
+layout(set = 0, binding = 1) readonly buffer N { float normalized[]; };
+layout(set = 0, binding = 2) readonly buffer W { uint conv1d[]; };
+layout(set = 0, binding = 3) readonly buffer HD { float hidden[]; };
+layout(set = 0, binding = 4) readonly buffer GD { float gated[]; };
+layout(set = 0, binding = 5) writeonly buffer C { float conv[]; };
+layout(set = 0, binding = 6) writeonly buffer R { float result[]; };
+
+uint wbyte(uint off) {
+  return (conv1d[off >> 2] >> ((off & 3) << 3)) & 0xFF;
+}
+
+float fp16_at(uint off) {
+  uint h = wbyte(off) | (wbyte(off + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint man = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(man) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = man > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(man) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+void main() {
+  uint c = gl_GlobalInvocationID.x;
+  uint dim = pc.v[0];
+  uint hist = pc.v[2];
+  uint taps = pc.v[4];
+  if (c >= dim) {
+    return;
+  }
+  uint stride = taps - 1u;
+  float sum = 0.0;
+  for (uint k = 0u; k < taps; ++k) {
+    float x = (k == taps - 1u) ? normalized[c] : history[c * hist + stride * k];
+    float term = x * fp16_at((c * taps + k) * 2u);
+    sum = (k == 0u) ? term : sum + term;
+  }
+  float activation = sum / (1.0 + exp(-sum));
+  conv[c] = activation;
+  result[c] = hidden[c] + (gated[c] + activation);
+}

@@ -1,0 +1,46 @@
+#version 450
+
+// One workgroup per row; the dispatch is `rows` workgroups.
+layout(local_size_x = 256) in;
+
+// "rmsnorm_rows" contract: buffer 0 is X (fp32, rows x cols), buffer 1
+// the per-row weight W (fp32, rows*cols, row r at r*cols), buffer 2 the
+// output Y (fp32, rows x cols). Scalars: rows (v[0]), cols (v[2]), the
+// fp32 epsilon bits (v[4]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+shared float red[256];
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  uint rows = pc.v[0];
+  uint cols = pc.v[2];
+  float eps = uintBitsToFloat(pc.v[4]);
+  if (row >= rows) {
+    return;
+  }
+  uint base = row * cols;
+  float ss = 0.0;
+  for (uint d = gl_LocalInvocationID.x; d < cols; d += 256u) {
+    float v = x[base + d];
+    ss += v * v;
+  }
+  red[gl_LocalInvocationID.x] = ss;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (gl_LocalInvocationID.x < s) {
+      red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+    }
+    barrier();
+  }
+  float scale = inversesqrt(red[0] / float(cols) + eps);
+  for (uint d = gl_LocalInvocationID.x; d < cols; d += 256u) {
+    y[base + d] = scale * x[base + d] * w[base + d];
+  }
+}

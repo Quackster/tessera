@@ -1,0 +1,37 @@
+#version 450
+
+// One thread per stack element; the dispatch is ceil(hc*n_embd / 256).
+layout(local_size_x = 256) in;
+
+// "gr_write" contract: buffer 0 is R (fp32, hc*n_embd), buffer 1 the
+// block output (fp32, n_embd), buffer 2 the injection (fp32, hc),
+// buffer 3 the output (fp32, hc*n_embd). Scalars: n_embd (v[0]),
+// hc (v[1]). out[i] = R[i] + block_out[d] * 2*sigmoid(inject[c] / hc).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer R { float r[]; };
+layout(set = 0, binding = 1) readonly buffer BO { float bo[]; };
+layout(set = 0, binding = 2) readonly buffer INJ { float inject[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float outb[]; };
+
+shared float w[32];
+
+float sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+  uint n_embd = pc.v[0];
+  uint hc = pc.v[2];
+  if (gl_LocalInvocationID.x < hc && gl_LocalInvocationID.x < 32u) {
+    w[gl_LocalInvocationID.x] = 2.0 * sigmoid(inject[gl_LocalInvocationID.x] / float(hc));
+  }
+  barrier();
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= hc * n_embd) {
+    return;
+  }
+  uint c = i / n_embd;
+  uint d = i % n_embd;
+  outb[i] = r[i] + bo[d] * w[c];
+}

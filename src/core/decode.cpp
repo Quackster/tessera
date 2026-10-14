@@ -70,14 +70,19 @@ std::expected<std::vector<float>, StatusCode> DecodeLogits(
     return std::unexpected(config.error());
   }
   const Architecture* arch = model.Arch();
+  std::expected<std::vector<float>, StatusCode> logits;
   if (arch != nullptr) {
-    return arch->Logits(backend, model, cache, token, hidden, capture_layers,
-                        capture, embedding);
-  }
-  if (embedding != nullptr) {
+    logits = arch->Logits(backend, model, cache, token, hidden, capture_layers,
+                          capture, embedding);
+  } else if (embedding != nullptr) {
     return std::unexpected(StatusCode::UnsupportedFeature);
+  } else {
+    logits = DecodeStepDeviceLogits(backend, model, cache, token, hidden);
   }
-  return DecodeStepDeviceLogits(backend, model, cache, token, hidden);
+  if (!logits) {
+    return std::unexpected(logits.error());
+  }
+  return detail::RejectNonFinite(std::move(*logits));
 }
 
 std::expected<std::uint32_t, StatusCode> DecodeToken(
@@ -156,7 +161,7 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
       if (progress != nullptr) {
         (*progress)(tokens.size(), tokens.size());
       }
-      return logits;
+      return detail::RejectNonFinite(std::move(logits));
     }
     // Long prompt, bounded scratch and bounded launches: one forward
     // per chunk, the head on the last chunk's last row only. The cache
@@ -203,7 +208,7 @@ std::expected<std::vector<float>, StatusCode> PrefillTokens(
         (*progress)(off, tokens.size());
       }
     }
-    return logits;
+    return detail::RejectNonFinite(std::move(logits));
   }
   const auto seq_started = PhaseClock::now();
   for (std::size_t i = 0; i + 1 < tokens.size(); ++i) {
@@ -323,6 +328,10 @@ std::expected<std::uint32_t, StatusCode> Architecture::GreedyToken(
              embedding);
   if (!logits) {
     return std::unexpected(logits.error());
+  }
+  // A non-finite row degenerates to token 0; stop instead of looping.
+  if (!core::detail::AllFinite(*logits)) {
+    return std::unexpected(StatusCode::NonFinite);
   }
   return core::detail::ArgMax(*logits);
 }

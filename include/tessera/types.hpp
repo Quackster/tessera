@@ -41,6 +41,7 @@ enum class StatusCode : int {
   UnsupportedFeature = 4,
   OutOfMemory = 5,
   DeviceError = 6,
+  NonFinite = 7,
 };
 
 // Human-readable name of a status code, for diagnostics and messages.
@@ -57,6 +58,7 @@ enum class StatusCode : int {
     case StatusCode::UnsupportedFeature: return "unsupported_feature";
     case StatusCode::OutOfMemory: return "out_of_memory";
     case StatusCode::DeviceError: return "device_error";
+    case StatusCode::NonFinite: return "non_finite_logits";
   }
   return "unknown";
 }
@@ -101,6 +103,9 @@ enum class DType : int {
   IQ4_NL = 17,  // 4-bit codebook blocks (ggml 2026 numbering)
   IQ4_XS = 18,  // 4-bit fine-scale blocks
   IQ3_S = 19,   // 3-bit grid blocks
+  IQ3_XXS = 20, // 3-bit grid blocks, extra-small scales
+  IQ2_S = 21,   // 2-bit grid blocks, small
+  Q2_0 = 22,    // 2-bit sign/magnitude blocks (64 elements, 18 bytes)
 };
 
 // Bytes per element of a plain (non-block) dtype.
@@ -150,7 +155,10 @@ constexpr std::size_t kQ4KBlockElements = 256;
     case DType::Q8K:
     case DType::IQ4_NL:
     case DType::IQ4_XS:
-    case DType::IQ3_S: {
+    case DType::IQ3_S:
+    case DType::IQ3_XXS:
+    case DType::IQ2_S:
+    case DType::Q2_0: {
       std::size_t elements = 0;
       std::size_t bytes = 0;
       switch (dtype) {
@@ -163,6 +171,9 @@ constexpr std::size_t kQ4KBlockElements = 256;
         case DType::IQ4_NL: elements = 32; bytes = 18; break;
         case DType::IQ4_XS: elements = 256; bytes = 136; break;
         case DType::IQ3_S: elements = 256; bytes = 110; break;
+        case DType::IQ3_XXS: elements = 256; bytes = 98; break;
+        case DType::IQ2_S: elements = 256; bytes = 82; break;
+        case DType::Q2_0: elements = 64; bytes = 18; break;
         default: elements = 256; bytes = 258; break;  // Q8K
       }
       if (numel % elements != 0 || numel / elements > kMax / bytes) {
@@ -219,6 +230,41 @@ struct SsmParams {
   std::size_t inner_size = 0;      // fused qkv/gate projection width
 };
 
+// Hyper-connection dimensions of a definition that carries a gated
+// residual stack instead of one residual stream. `count` is the number
+// of streams; `low_rank` is the mixer bottleneck width. count == 0 means
+// the definition has no hyper-connections.
+struct HyperConnectionParams {
+  std::size_t count = 0;
+  std::size_t low_rank = 0;
+};
+
+// Per-layer-embedding (PLE) dimensions of a definition whose token
+// embedding is augmented by an n-gram table. `layers` names the trunk
+// layers that carry the PLE weights; the table itself is not a weight
+// tensor that uploads whole. All fields come from model data.
+struct PleParams {
+  std::vector<std::uint64_t> layers;
+  std::size_t ngram_size = 0;
+  std::size_t heads_per_ngram = 0;
+  std::size_t conv_kernel = 0;
+  std::size_t embd_per_layer = 0;  // width of one gathered row
+  std::size_t image_token_id = 0;
+  std::size_t eos_token_id = 0;
+  std::vector<std::uint64_t> layer_multipliers;
+  std::vector<std::uint64_t> head_offsets;
+  std::vector<std::uint64_t> head_vocab_sizes;
+};
+
+// Sparse-attention indexer dimensions of a definition that selects a
+// subset of the key/value cells before attention. heads == 0 means the
+// definition has no indexer.
+struct IndexerParams {
+  std::size_t heads = 0;
+  std::size_t key_length = 0;
+  std::size_t top_k = 0;
+};
+
 // Transformer hyper-parameters from the model definition. The decode
 // loop sizes every launch from these; no code branches on the
 // architecture.
@@ -268,6 +314,12 @@ struct TransformerConfig {
   // hybrid definitions require it (the mrope built-in takes the counts
   // as launch scalars).
   std::vector<std::uint64_t> rope_sections;
+  // Gated residual stack (hyper-connections). count == 0 when absent.
+  HyperConnectionParams hyper_connection;
+  // Per-layer n-gram embedding. layers empty when absent.
+  PleParams ple;
+  // Sparse-attention indexer. heads == 0 when absent.
+  IndexerParams indexer;
 };
 
 // Dense tensor shape, at most 4 dimensions, row-major.

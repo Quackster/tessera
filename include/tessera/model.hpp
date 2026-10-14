@@ -142,6 +142,10 @@ class Model {
   // a scan over every tensor.
   [[nodiscard]] const DeviceTensor* FindDeviceTensor(
       std::string_view name) const;
+  // The dtype of the tensor named `name` from the manifest, or nullopt when
+  // the model has no such tensor. This resolves before staging, unlike
+  // FindDeviceTensor, which needs the paged staging view resolved first.
+  [[nodiscard]] std::optional<DType> TensorDType(std::string_view name) const;
   // Device buffer for the tensor with this name; nullptr when absent.
   [[nodiscard]] const Buffer* FindWeight(std::string_view name) const;
   // Upload the paged tensors of trunk layer `layer` into the staging
@@ -180,6 +184,30 @@ class Model {
   //   if (auto staged = model.EnsureLayerExperts(l, ids); !staged) return staged.error();
   [[nodiscard]] std::expected<void, StatusCode> EnsureLayerExperts(
       std::size_t layer, std::span<const std::uint32_t> experts) const;
+  // True when routed expert `expert` of trunk `layer` is held by the device
+  // expert cache for every expert kind, so the GPU can compute it without a
+  // transfer. True for a resident layer and without paging.
+  //
+  // Usage:
+  //   if (model.ExpertCached(l, id)) gpu.push_back(id); else cpu.push_back(id);
+  [[nodiscard]] bool ExpertCached(std::size_t layer,
+                                  std::uint32_t expert) const;
+  // Host span of one routed expert slice for the paged tensor named
+  // `tensor_name` (the full `blk.N.<kind>` name), or an empty span when the
+  // tensor is not paged or `expert` is out of range. This is the RAM copy
+  // the CPU+GPU hybrid MoE computes from.
+  //
+  // Usage:
+  //   auto span = model.PagedExpertHost(name, id);
+  [[nodiscard]] std::span<const std::byte> PagedExpertHost(
+      std::string_view tensor_name, std::uint32_t expert) const;
+  // Host span of the whole paged tensor named `tensor_name`, or an empty span
+  // when it is not paged.
+  //
+  // Usage:
+  //   auto span = model.PagedTensorHost(name);
+  [[nodiscard]] std::span<const std::byte> PagedTensorHost(
+      std::string_view tensor_name) const;
   [[nodiscard]] const std::string& Path() const;
   [[nodiscard]] std::size_t MaxContextLength() const;
   // New tokens to generate for `requested` after a prompt of
@@ -273,6 +301,12 @@ class Model {
         std::vector<std::pair<std::string, std::unique_ptr<Buffer>>> staged,
         std::shared_ptr<const void> file_backing,
         std::shared_ptr<const void> retained_backing);
+  // Expert-cache slots per (layer, kind) pair: the largest count whose
+  // stores fit the free device memory after a reserve for activations,
+  // the KV cache and the staging window. Computed once on first use and
+  // reused, so every pair gets the same slot count. Mutable for the same
+  // reason as expert_cache_by_layer_.
+  [[nodiscard]] std::size_t ExpertCacheEntries() const;
   Backend& backend_;
   ModelOptions options_;
   ModelFormat format_;
@@ -346,6 +380,9 @@ class Model {
   // straight into the staging view, so a small device still decodes.
   mutable std::vector<std::vector<ExpertCache>> expert_cache_by_layer_;
   mutable std::uint64_t expert_cache_tick_ = 0;
+  // Slots per (layer, kind) store, sized to the free device memory on
+  // first use (see ExpertCacheEntries); 0 until then.
+  mutable std::size_t expert_cache_entries_ = 0;
   // Lifetime holders for the RAM backing the paged host spans point into:
   // the mapped weight file and any retained owned copies (tensor-parallel
   // slices, converted MXFP4 blobs). The shared_ptr<const void> type erases

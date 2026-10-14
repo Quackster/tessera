@@ -1,0 +1,91 @@
+#version 450
+
+// One workgroup; the dispatch is one workgroup.
+layout(local_size_x = 256) in;
+
+// "indexer_key_append" contract: buffer 0 raw (fp32, idx_dim), buffer 1
+// w_k_norm (fp32, idx_dim), buffer 2 tail (fp32, (idx_block-1) x idx_dim),
+// buffer 3 dead (fp32, idx_dim), buffer 4 pooled (fp32), buffer 5 block_pos
+// (i32, 1), buffer 6 cos_tab, buffer 7 sin_tab. Scalars: pos_base (v[0]),
+// the fp32 eps bits (v[2]), idx_dim (v[4]), idx_block (v[6]), n_rot (v[8]),
+// the token position pos (v[10]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer RAW { float raw[]; };
+layout(set = 0, binding = 1) readonly buffer WKN { float wkn[]; };
+layout(set = 0, binding = 2) buffer TAIL { float tail[]; };
+layout(set = 0, binding = 3) buffer DEAD { float dead[]; };
+layout(set = 0, binding = 4) buffer POOLED { float pooled[]; };
+layout(set = 0, binding = 5) buffer BPOS { int bpos[]; };
+layout(set = 0, binding = 6) readonly buffer COS { float cos_tab[]; };
+layout(set = 0, binding = 7) readonly buffer SIN { float sin_tab[]; };
+
+shared float s_mean[256];
+
+void main() {
+  int pos_base = int(pc.v[0]);
+  float eps = uintBitsToFloat(pc.v[2]);
+  uint idx_dim = pc.v[4];
+  uint r = pc.v[6];
+  uint n_rot = pc.v[8];
+  uint d = gl_LocalInvocationID.x;
+  int pos = int(pc.v[10]);
+  uint slot = uint(pos) % r;
+  uint b = uint(pos) / r;
+  if (d < idx_dim && slot < r - 1u) {
+    tail[slot * idx_dim + d] = raw[d];
+  }
+  if (pos == 0) {
+    for (uint dd = d; dd < idx_dim; dd += 256u) {
+      float ss = 0.0;
+      for (uint i = 0u; i < idx_dim; ++i) {
+        float v = raw[i];
+        ss += v * v;
+      }
+      float inv = inversesqrt(ss / float(idx_dim) + eps);
+      float y = raw[dd] * inv * wkn[dd];
+      if (dd < n_rot) {
+        y *= cos_tab[dd % (n_rot / 2u)];
+      }
+      dead[dd] = y;
+      pooled[dd] = y;
+    }
+  }
+  if (slot != r - 1u) {
+    return;
+  }
+  barrier();
+  for (uint dd = d; dd < idx_dim; dd += 256u) {
+    float m = 0.0;
+    for (uint j = 0u; j + 1u < r; ++j) {
+      m += tail[j * idx_dim + dd];
+    }
+    m += raw[dd];
+    s_mean[dd] = m / float(r);
+  }
+  barrier();
+  for (uint dd = d; dd < idx_dim; dd += 256u) {
+    float ss = 0.0;
+    for (uint i = 0u; i < idx_dim; ++i) {
+      float v = s_mean[i];
+      ss += v * v;
+    }
+    float inv = inversesqrt(ss / float(idx_dim) + eps);
+    pooled[b * idx_dim + dd] = s_mean[dd] * inv * wkn[dd];
+    pooled[(b + 1u) * idx_dim + dd] = dead[dd];
+  }
+  if (d == 0u) {
+    bpos[0] = pos_base + int(b * r);
+  }
+  barrier();
+  uint n_half = n_rot / 2u;
+  for (uint dd = d; dd < n_half; dd += 256u) {
+    uint toff = uint(pos_base + int(b * r)) * n_half + dd;
+    float a = pooled[b * idx_dim + dd];
+    float c = pooled[b * idx_dim + n_half + dd];
+    pooled[b * idx_dim + dd] = a * cos_tab[toff] - c * sin_tab[toff];
+    pooled[b * idx_dim + n_half + dd] = a * sin_tab[toff] + c * cos_tab[toff];
+  }
+}

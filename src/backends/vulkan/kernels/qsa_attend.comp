@@ -1,0 +1,107 @@
+#version 450
+
+// One workgroup per query head; the dispatch is n_head workgroups.
+layout(local_size_x = 256) in;
+
+// "qsa_attend" contract: buffer 0 is q (fp32, n_head x head_dim),
+// buffer 1 the K scratch (fp16 packed two per uint, n_ids x n_head_kv x
+// head_dim), buffer 2 the V scratch, buffer 3 the attention output
+// (fp32, n_head x head_dim). Scalars: n_ids (v[0]), n_head (v[2]),
+// n_head_kv (v[4]), head_dim (v[6]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KS { uint ks[]; };
+layout(set = 0, binding = 2) readonly buffer VS { uint vs[]; };
+layout(set = 0, binding = 3) writeonly buffer A { float attn[]; };
+
+const uint kMaxIds = 4096u;
+shared float scores[kMaxIds];
+shared float red[256];
+
+float f16_word(uint word, uint elem) {
+  uint h = (word >> ((elem & 1u) << 4)) & 0xFFFFu;
+  uint exp = (h >> 10) & 31u;
+  uint man = h & 1023u;
+  float value;
+  if (exp == 0u) {
+    value = float(man) * exp2(-24.0);
+  } else if (exp == 31u) {
+    value = man > 0u ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(man) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768u) > 0u ? -value : value;
+}
+
+float ks16(uint elem) { return f16_word(ks[elem >> 1], elem); }
+float vs16(uint elem) { return f16_word(vs[elem >> 1], elem); }
+
+void main() {
+  uint n_ids = pc.v[0];
+  uint n_head = pc.v[2];
+  uint n_head_kv = pc.v[4];
+  uint head_dim = pc.v[6];
+  uint h = gl_WorkGroupID.x;
+  uint lid = gl_LocalInvocationID.x;
+  if (h >= n_head) {
+    return;
+  }
+  uint ratio = n_head / n_head_kv;
+  uint kv = h / ratio;
+  float scale = inversesqrt(float(head_dim));
+  if (n_ids == 0u || n_ids > kMaxIds) {
+    for (uint d = lid; d < head_dim; d += 256u) {
+      attn[h * head_dim + d] = 0.0;
+    }
+    return;
+  }
+  for (uint j = lid; j < n_ids; j += 256u) {
+    uint kbase = (j * n_head_kv + kv) * head_dim;
+    float dot = 0.0;
+    for (uint d = 0u; d < head_dim; ++d) {
+      dot += q[h * head_dim + d] * ks16(kbase + d);
+    }
+    scores[j] = dot * scale;
+  }
+  barrier();
+  float local_max = -3.0e38;
+  for (uint j = lid; j < n_ids; j += 256u) {
+    local_max = max(local_max, scores[j]);
+  }
+  red[lid] = local_max;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) {
+      red[lid] = max(red[lid], red[lid + s]);
+    }
+    barrier();
+  }
+  float best = red[0];
+  float local_sum = 0.0;
+  for (uint j = lid; j < n_ids; j += 256u) {
+    local_sum += exp(scores[j] - best);
+  }
+  red[lid] = local_sum;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) {
+      red[lid] += red[lid + s];
+    }
+    barrier();
+  }
+  float total = red[0];
+  for (uint j = lid; j < n_ids; j += 256u) {
+    scores[j] = exp(scores[j] - best) / total;
+  }
+  barrier();
+  for (uint d = lid; d < head_dim; d += 256u) {
+    float acc = 0.0;
+    for (uint j = 0u; j < n_ids; ++j) {
+      acc += scores[j] * vs16((j * n_head_kv + kv) * head_dim + d);
+    }
+    attn[h * head_dim + d] = acc;
+  }
+}

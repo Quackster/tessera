@@ -46,4 +46,34 @@ class MappedFile {
   std::size_t size_ = 0;
 };
 
+// A read-only pread-based file reader. It reads bounded ranges into fresh
+// buffers instead of mapping the whole file, so a multi-gigabyte load does
+// not fill the page cache with file pages that memory pressure evicts and
+// re-faults, returning stale bytes. Move-only; the descriptor stays open
+// until destruction.
+class FileReader {
+ public:
+  FileReader() = default;
+  FileReader(const FileReader&) = delete;
+  FileReader& operator=(const FileReader&) = delete;
+  FileReader(FileReader&& other) noexcept;
+  FileReader& operator=(FileReader&& other) noexcept;
+  ~FileReader();
+
+  [[nodiscard]] static std::expected<FileReader, StatusCode> Open(
+      const std::filesystem::path& path);
+
+  [[nodiscard]] std::size_t size() const { return size_; }
+
+  // Reads [offset, offset + count) into a fresh buffer via pread.
+  // Returns MalformedFile on a short read or an I/O error.
+  [[nodiscard]] std::expected<std::vector<std::byte>, StatusCode> ReadRange(
+      std::uint64_t offset, std::size_t count) const;
+
+ private:
+  void Reset();
+  int fd_ = -1;
+  std::size_t size_ = 0;
+};
+
 }  // namespace tessera::core

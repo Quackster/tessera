@@ -83,6 +83,20 @@ namespace tessera::core {
     std::span<const float> gate, std::span<float> y, std::size_t rows,
     std::size_t cols, float eps);
 
+// Host reference for the "gdn_out_norm" built-in: the qwen4exp gated-delta
+// output norm over rows x cols fp32 (y = x / sqrt(mean(x^2) + eps) * w *
+// sigmoid(gate)). It differs from "rmsnorm_gated" only in the gate
+// activation, a sigmoid here and a SiLU there. Rows and cols must be
+// nonzero, eps must not be negative, and the spans must hold rows*cols
+// (x, gate) and cols (w); else InvalidArgument.
+//
+// Usage:
+//   auto status = GdnOutNormRef(o, z, w, y, heads, dim, 1e-6f);
+[[nodiscard]] std::expected<void, StatusCode> GdnOutNormRef(
+    std::span<const float> o, std::span<const float> z,
+    std::span<const float> w, std::span<float> y, std::size_t rows,
+    std::size_t cols, float eps);
+
 // Host reference for the "add" built-in: elementwise a + b over n fp32.
 // Residual connections use this on the device. n must be nonzero and
 // every span must hold n elements; else InvalidArgument.

@@ -36,6 +36,12 @@ Block BlockOf(DType dtype) {
       return {256, 136};
     case DType::IQ3_S:
       return {256, 110};
+    case DType::IQ3_XXS:
+      return {256, 98};
+    case DType::IQ2_S:
+      return {256, 82};
+    case DType::Q2_0:
+      return {64, 18};
     default:
       return {1, static_cast<std::size_t>(ElementBytes(dtype))};
   }

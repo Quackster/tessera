@@ -1,0 +1,44 @@
+#version 450
+
+// One workgroup per residual stream; the dispatch is hc workgroups.
+layout(local_size_x = 256) in;
+
+// "ple_gate" contract: buffer 0 is the normalized key (fp32, hc*n_embd),
+// buffer 1 the normalized query (fp32, hc*n_embd), buffer 2 the gate
+// (fp32, hc). Scalars: n_embd (v[0]), hc (v[2]).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer K { float key[]; };
+layout(set = 0, binding = 1) readonly buffer Q { float query[]; };
+layout(set = 0, binding = 2) writeonly buffer G { float gate[]; };
+
+shared float red[256];
+
+void main() {
+  uint c = gl_WorkGroupID.x;
+  uint n_embd = pc.v[0];
+  uint hc = pc.v[2];
+  if (c >= hc) {
+    return;
+  }
+  float acc = 0.0;
+  for (uint d = gl_LocalInvocationID.x; d < n_embd; d += 256u) {
+    acc += key[c * n_embd + d] * query[c * n_embd + d];
+  }
+  red[gl_LocalInvocationID.x] = acc;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (gl_LocalInvocationID.x < s) {
+      red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+    }
+    barrier();
+  }
+  if (gl_LocalInvocationID.x == 0u) {
+    float value = red[0] / sqrt(float(n_embd));
+    float mag = sqrt(max(abs(value), 1e-6));
+    float sign = float(value > 0.0) - float(value < 0.0);
+    gate[c] = 1.0 / (1.0 + exp(-sign * mag));
+  }
+}

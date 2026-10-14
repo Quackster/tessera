@@ -89,7 +89,7 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | Format | State | Detail |
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3, single files and `-00001-of-00005` splits. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, Q2_0, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS and IQ2_S. Checks bounds. |
-| Qwen4-Exp split GGUF | Partial | Qwen3.8-Flash-Next GSQ-RCO loads: split shards merge, config parses, the 51B n-gram table streams rows from SSD and never uploads. Decode kernels (QSA indexer, hyper-connection mixer, PLE gather) land next. |
+| Qwen4-Exp split GGUF | Partial | Qwen3.8-Flash-Next GSQ-RCO loads and decodes: split shards merge, config parses, and the 51B n-gram table streams rows from SSD. The QSA indexer, hyper-connection mixer, PLE gather and GDN output-norm kernels run on both backends. Paged weights are held in system RAM. The expert cache is sized to the free device memory and lifts decode from about 3.7 to about 6 tok/s on one R9700 at a 4K context. The 48 tok/s target is not reached. The engine stops on non-finite logits instead of looping on `!`; that intermittent fault is still open. |
 | MXFP4 safetensors | Done | Parses the map and packs the weights. config.json drives the decode config. |
 | NVFP4 MoE | Done | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. |
 | DFlash2 FP8 draft | Done | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. |
@@ -104,7 +104,7 @@ Model weights live outside the repo. Each variant uses one flat directory. Model
 | `~/models/Ornith-1.5-35B-A3B-GGUF/` | `Ornith-1.5-35B-Q4_K_M.gguf`, `mmproj-Ornith-1.5-35B-BF16.gguf` | MoE GGUF target. | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) |
 | `~/models/Ornith-1.5-35B-A3B-MXFP4-GGUF/` | MoE MXFP4 GGUF weights | Not yet supported. | [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) |
 | `~/models/Ornith-1.5-35B-A3B-BF16/` | bf16 safetensors | Not yet supported. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
-| `~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S/*-00001-of-00002.gguf` (compute shard plus n-gram shard), `mmproj-Qwen3.8-Flash-Next-BF16.gguf` | Flash-Next loader and n-gram streaming target. Decode is a follow-up. | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
+ | `~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S/*-00001-of-00002.gguf` (compute shard plus n-gram shard), `mmproj-Qwen3.8-Flash-Next-BF16.gguf` | Flash-Next decode target. The expert cache is sized to the free device memory and the batched staging is pipelined (the staging ring); the 48 tok/s target and the intermittent non-finite fault are open. | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
 
 ### MXFP4 Qwen checkpoint preparation
 

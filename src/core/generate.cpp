@@ -27,6 +27,17 @@ namespace {
 // Milliseconds per second, for prompt tok/s from fractional timers.
 constexpr double kMillisPerSecond = 1000.0;
 
+// Describe a logits or token step error. A non-finite logit means a corrupt
+// weight read or device buffer, not a generic step failure, so the message
+// names the condition and the next action.
+std::string StepError(StatusCode code) {
+  if (code == StatusCode::NonFinite) {
+    return "non-finite logits (corrupt model weights or device memory); "
+           "stopping generation";
+  }
+  return std::string(ToString(code));
+}
+
 }  // namespace
 
 std::expected<std::vector<std::uint32_t>, StatusCode> Engine::GenerateDraft(
@@ -197,7 +208,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
                                       progress_ptr, &compute_ms);
     if (!prefilled) {
       diagnostics_.Warn("engine", std::string("prefill failed: ") +
-                                      std::string(ToString(prefilled.error())));
+                                      StepError(prefilled.error()));
       return std::unexpected(prefilled.error());
     }
   } else {
@@ -206,7 +217,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
                                       &compute_ms);
     if (!logits) {
       diagnostics_.Warn("engine", std::string("prefill failed: ") +
-                                      std::string(ToString(logits.error())));
+                                      StepError(logits.error()));
       return std::unexpected(logits.error());
     }
     first_logits = std::move(*logits);
@@ -308,7 +319,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
       }
       if (!logits) {
         diagnostics_.Warn("engine", std::string("think force-close failed: ") +
-                                        std::string(ToString(logits.error())));
+                                        StepError(logits.error()));
         return std::unexpected(logits.error());
       }
       if (strategy != nullptr && block > 0) {
@@ -485,7 +496,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
       if (!token) {
         diagnostics_.Warn(
             "engine", std::string("generation step failed: ") +
-                          std::string(ToString(token.error())));
+                          StepError(token.error()));
         return std::unexpected(token.error());
       }
       next = *token;
@@ -505,7 +516,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     if (!logits) {
       diagnostics_.Warn(
           "engine", std::string("generation step failed: ") +
-                        std::string(ToString(logits.error())));
+                        StepError(logits.error()));
       return std::unexpected(logits.error());
     }
     if (strategy != nullptr && block > 0) {

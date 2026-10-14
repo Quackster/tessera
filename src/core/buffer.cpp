@@ -161,6 +161,12 @@ std::expected<void, StatusCode> Backend::CopyPeerFrom(Buffer& dst,
   return CopyH2DAt(dst, 0, std::span<const std::byte>(stage.data(), bytes));
 }
 
+void Backend::LogDebug(std::string_view message) const {
+  if (diagnostics_ != nullptr) {
+    diagnostics_->Debug("backend", message);
+  }
+}
+
 void Backend::LogInfo(std::string_view message) const {
   if (diagnostics_ != nullptr) {
     diagnostics_->Info("backend", message);

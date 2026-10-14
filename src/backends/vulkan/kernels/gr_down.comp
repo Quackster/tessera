@@ -1,0 +1,61 @@
+#version 450
+
+// One workgroup per bottleneck row; the dispatch is hc_lr workgroups.
+layout(local_size_x = 256) in;
+
+// "gr_down" contract: buffer 0 is xq (fp32, hc*n_embd), buffer 1 the
+// bf16 down weight (hc_lr x hc*n_embd, two bytes each), buffer 2 the
+// bf16-rounded bottleneck lq (fp32, hc_lr). Scalars: hc_dim (v[0]),
+// hc_lr (v[1]), hc (v[2]). lq[k] = bf16(silu((xq @ w_down[k]) / hc)).
+layout(push_constant) uniform PushConstants {
+  uint v[16];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer XQ { float xq[]; };
+layout(set = 0, binding = 1) readonly buffer WD { uint wd[]; };
+layout(set = 0, binding = 2) writeonly buffer LQ { float lq[]; };
+
+shared float red[256];
+
+uint wbyte(uint off) {
+  return (wd[off >> 2] >> ((off & 3) << 3)) & 0xFF;
+}
+
+float bf16_at(uint off) {
+  uint h = wbyte(off) | (wbyte(off + 1) << 8);
+  return uintBitsToFloat(h << 16);
+}
+
+float bf16_round(float x) {
+  uint b = floatBitsToUint(x);
+  b += 0x7FFFu + ((b >> 16) & 1u);
+  return uintBitsToFloat(b & 0xFFFF0000u);
+}
+
+float silu(float x) { return x / (1.0 + exp(-x)); }
+
+void main() {
+  uint k = gl_WorkGroupID.x;
+  uint hc_dim = pc.v[0];
+  uint hc_lr = pc.v[2];
+  uint hc = pc.v[4];
+  if (k >= hc_lr) {
+    return;
+  }
+  uint row = k * hc_dim;
+  float acc = 0.0;
+  for (uint i = gl_LocalInvocationID.x; i < hc_dim; i += 256u) {
+    acc += xq[i] * bf16_at((row + i) * 2u);
+  }
+  red[gl_LocalInvocationID.x] = acc;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (gl_LocalInvocationID.x < s) {
+      red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
+    }
+    barrier();
+  }
+  if (gl_LocalInvocationID.x == 0u) {
+    lq[k] = bf16_round(silu(red[0] / float(hc)));
+  }
+}

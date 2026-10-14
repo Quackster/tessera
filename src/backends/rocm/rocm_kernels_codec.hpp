@@ -192,5 +192,41 @@ struct Q80Codec {
   }
 };
 
+// Shared body of the warp-per-output family: grid covers m*n 32-lane
+// outputs, eight per 256-thread workgroup, five shuffles to reduce.
+// grid_y selects the split-K chunk when split > 1. The block decode is
+// the codec's Dot; every quant/plain codec reuses this body.
+template <typename Codec>
+__device__ __forceinline__ void GemvVecBody(const float* a,
+                                            const unsigned char* w, float* c,
+                                            unsigned long long m,
+                                            unsigned long long n,
+                                            unsigned long long k,
+                                            unsigned long long split) {
+  const unsigned long long warps = blockDim.x >> 5;
+  const unsigned long long total = m * n;
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * warps + (threadIdx.x >> 5);
+  if (idx >= total) {
+    return;
+  }
+  const unsigned long long blocks = k / Codec::kBlockElements;
+  const unsigned long long per = blocks / split;
+  const unsigned long long b0 =
+      static_cast<unsigned long long>(blockIdx.y) * per;
+  const unsigned int lane = threadIdx.x & 31u;
+  const float* av = a + (idx / n) * k + b0 * Codec::kBlockElements;
+  const unsigned char* wr =
+      w + (idx % n) * blocks * Codec::kBlockBytes + b0 * Codec::kBlockBytes;
+  float acc = Codec::Dot(av, wr, per, lane);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(~0ull, acc, off, 32);
+  }
+  if (lane == 0u) {
+    c[static_cast<unsigned long long>(blockIdx.y) * total + idx] = acc;
+  }
+}
+
 }  // namespace detail
 }  // namespace tessera::backends::rocm

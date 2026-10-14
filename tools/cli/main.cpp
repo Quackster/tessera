@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
   std::string image_path;
   std::uint32_t image_token = 0;
   bool quiet = false;
+  bool verbose = false;
   bool no_chat = false;
   bool enable_thinking = false;
   std::string reasoning_effort;
@@ -136,6 +137,7 @@ int main(int argc, char** argv) {
   std::size_t dp_groups = 1;
   tessera::SamplingOptions sampling;
   bool sample = false;
+  bool sampling_explicit = false;
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   std::uint64_t seed = 0;
   std::uint16_t port = 8080;
@@ -167,6 +169,8 @@ int main(int argc, char** argv) {
       image_path = argv[++i];
     } else if (arg == "--quiet") {
       quiet = true;
+    } else if (arg == "--verbose") {
+      verbose = true;
     } else if (arg == "--no-chat") {
       no_chat = true;
     } else if (arg == "--enable-thinking") {
@@ -240,16 +244,22 @@ int main(int argc, char** argv) {
       // handled by MatchKvType
     } else if (arg == "--temperature" && i + 1 < argc) {
       sampling.temperature = std::stof(argv[++i]);
+      sampling_explicit = true;
     } else if (arg == "--top-p" && i + 1 < argc) {
       sampling.top_p = std::stof(argv[++i]);
+      sampling_explicit = true;
     } else if (arg == "--top-k" && i + 1 < argc) {
       sampling.top_k = std::stoi(argv[++i]);
+      sampling_explicit = true;
     } else if (arg == "--min-p" && i + 1 < argc) {
       sampling.min_p = std::stof(argv[++i]);
+      sampling_explicit = true;
     } else if (arg == "--presence-penalty" && i + 1 < argc) {
       sampling.presence_penalty = std::stof(argv[++i]);
+      sampling_explicit = true;
     } else if (arg == "--repetition-penalty" && i + 1 < argc) {
       sampling.repetition_penalty = std::stof(argv[++i]);
+      sampling_explicit = true;
     } else if (arg == "--seed" && i + 1 < argc) {
       seed = std::stoull(argv[++i]);
     } else if (arg == "--max-completion-tokens" && i + 1 < argc) {
@@ -414,6 +424,11 @@ int main(int argc, char** argv) {
           return std::unexpected(model.error());
         }
         LogModelSummary(*engine_ptr, **model);
+        if (i == 0 && tessera::cli::ApplyRecommendedSampling(
+                          **model, enable_thinking, sampling_explicit,
+                          &sampling)) {
+          sample = true;
+        }
         attach_strategy(*engine_ptr);
         if (!calibration_path.empty() && i == 0) {
           // The calibration key depends on the model; resolve it on the
@@ -775,6 +790,11 @@ int main(int argc, char** argv) {
   }
   tessera::Engine& engine = **engine_result;
   auto& log = engine.Diagnostics();
+  if (verbose) {
+    log.SetMinLevel(tessera::log::Level::Debug);
+  } else if (quiet) {
+    log.SetMinLevel(tessera::log::Level::Warn);
+  }
   attach_strategy(engine);
 
   if (gpu_layers != 0) {
@@ -798,6 +818,16 @@ int main(int argc, char** argv) {
   }
   tessera::Model& loaded = **model;
   LogModelSummary(engine, loaded);
+  // Apply the architecture's recommended sampler unless the user set one.
+  const bool thinking = enable_thinking;
+  if (tessera::cli::ApplyRecommendedSampling(loaded, thinking,
+                                             sampling_explicit, &sampling)) {
+    sample = true;
+    if (!quiet) {
+      log.Info("cli", "sampling: architecture default (thinking " +
+                         std::string(thinking ? "on" : "off") + ")");
+    }
+  }
   // Resolve any saved calibration (explicit CLI values win) before building
   // the request options.
   tessera::CalibrationConfig applied;

@@ -1414,6 +1414,46 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
     y[ybase + base + c] = x[base + c] * gain * w[c] * silu;
   }
 }
+// Built-in "gdn_out_norm": the qwen4exp gated-delta output norm. One block
+// per value head over `dim` fp32, block-reduced: y = o * rsqrt(mean(o^2)
+// + eps) * w * sigmoid(z). The gate is a sigmoid, not the SiLU of
+// "rmsnorm_gated".
+__global__ void GdnOutNormKernel(const float* o, const float* z,
+                                 const float* w, float* y,
+                                 unsigned long long heads,
+                                 unsigned long long dim,
+                                 unsigned long long eps_bits) {
+  __shared__ float red[256];
+  const unsigned long long h = static_cast<unsigned long long>(blockIdx.x);
+  if (h >= heads) {
+    return;
+  }
+  const unsigned long long tid = threadIdx.x;
+  const unsigned long long base = h * dim;
+  float eps = 0.0f;
+  static_assert(sizeof(eps) == 4);
+  const std::uint32_t bits = static_cast<std::uint32_t>(eps_bits);
+  std::memcpy(&eps, &bits, 4);
+  float sum = 0.0f;
+  for (unsigned long long i = tid; i < dim; i += blockDim.x) {
+    sum = fmaf(o[base + i], o[base + i], sum);
+  }
+  red[tid] = sum;
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    LdsBarrier();
+    if (tid < s) {
+      red[tid] += red[tid + s];
+    }
+  }
+  LdsBarrier();
+  const float inv = rsqrtf(red[0] / static_cast<float>(dim) + eps);
+  for (unsigned long long i = tid; i < dim; i += blockDim.x) {
+    const float zz = z[base + i];
+    const float sig = 1.0f / (1.0f + expf(-zz));
+    y[base + i] = o[base + i] * inv * w[i] * sig;
+  }
+}
+
 // Built-in "conv1d": causal depthwise convolution over channels x
 // length fp32. One thread per output element, sequential accumulation.
 __global__ void Conv1dKernel(const float* x, const float* w, float* y,
@@ -2461,6 +2501,20 @@ __global__ void CastF32F16Kernel(const float* in, unsigned int* out,
   const std::uint16_t hi = FloatToFp16Dev(in[idx * 2 + 1]);
   out[idx] = static_cast<unsigned int>(lo) |
              (static_cast<unsigned int>(hi) << 16);
+}
+
+// Built-in "cast_f16_f32": the reverse of cast_f32_f16. n packed fp16
+// values (two per unsigned int) become n fp32.
+__global__ void CastF16F32Kernel(const unsigned int* in, float* out,
+                                 unsigned long long n) {
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx * 2 >= n) {
+    return;
+  }
+  const std::uint32_t packed = in[idx];
+  out[idx * 2] = Fp16ToFloatDev(static_cast<std::uint16_t>(packed & 0xFFFFu));
+  out[idx * 2 + 1] = Fp16ToFloatDev(static_cast<std::uint16_t>(packed >> 16));
 }
 
 // Built-in "concat_features": stack n tensors of rows x features along

@@ -6,6 +6,7 @@
 #include <expected>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,7 +29,50 @@ namespace {
 // How many tensor names to print when summarizing a model.
 constexpr std::size_t kPrintedTensorNames = 5;
 
+// The sampler a model's card recommends, keyed by general.architecture and
+// the thinking mode. nullopt when the architecture has no recommendation,
+// so greedy stays the default. A thinking model loops under greedy decode,
+// which is why qwen4exp supplies one.
+std::optional<SamplingOptions> RecommendedSampling(std::string_view arch,
+                                                   bool thinking) {
+  if (arch == "qwen4exp") {
+    SamplingOptions s;
+    s.top_k = 20;
+    s.min_p = 0.0f;
+    s.repetition_penalty = 1.0f;
+    if (thinking) {
+      s.temperature = 1.0f;
+      s.top_p = 0.95f;
+      s.presence_penalty = 0.0f;
+    } else {
+      s.temperature = 0.7f;
+      s.top_p = 0.80f;
+      s.presence_penalty = 1.5f;
+    }
+    return s;
+  }
+  return std::nullopt;
+}
+
 }  // namespace
+
+bool ApplyRecommendedSampling(const Model& model, bool thinking,
+                              bool explicit_sampling,
+                              SamplingOptions* sampling) {
+  if (explicit_sampling) {
+    return false;
+  }
+  const Architecture* arch = model.Arch();
+  if (arch == nullptr) {
+    return false;
+  }
+  auto recommended = RecommendedSampling(arch->Name(), thinking);
+  if (!recommended) {
+    return false;
+  }
+  *sampling = *recommended;
+  return true;
+}
 
 void LogModelSummary(Engine& engine, Model& model) {
   const auto& tensors = model.Tensors();
@@ -133,6 +177,8 @@ void PrintUsage() {
                "  --mmproj <path>   vision projector (mmproj) GGUF\n"
                "  --image <path>    image (binary PPM) to prepend as tokens\n"
                "  --quiet           suppress progress and info logs\n"
+               "  --verbose         enable debug logs (weight transfers, "
+               "cache probes)\n"
                "  --no-chat         do not apply the chat template\n"
                "  --sample          sample instead of greedy decode\n"
                "  --temperature <f> sampling temperature (default 0.6)\n"
