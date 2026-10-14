@@ -628,13 +628,15 @@ const ModelShard& Model::Shard() const { return options_.shard; }
 
 const TensorShard& Model::Tensor() const { return options_.tensor; }
 
-// Upload every manifest tensor to a device buffer. `bytes` is the
-// whole file; offsets come from the parsed manifest. `log` receives one
-// phase line per upload stage (allocation, transfer) so a slow load is
-// traceable to a stage; it may be null. Under `--gpu-layers` paging only
-// the resident tensors are uploaded; the rest return as RAM-backed paged
-// entries with spans into `bytes` (or the returned sliced copies), and
-// stage_sizes carries one staging size per paged tensor kind.
+// Upload every manifest tensor to a device buffer. `reader` is a pread
+// reader over the file; offsets come from the parsed manifest and each
+// tensor is read into a bounded buffer instead of a whole-file mapping, so
+// the load does not fill the page cache with file pages that memory
+// pressure evicts and re-faults. `log` receives one phase line per upload
+// stage (allocation, transfer) so a slow load is traceable to a stage; it
+// may be null. Under `--gpu-layers` paging only the resident tensors are
+// uploaded; the rest return as RAM-backed paged entries, and stage_sizes
+// carries one staging size per paged tensor kind.
 struct SplitUpload {
   std::vector<DeviceTensor> resident;
   std::vector<PagedTensor> paged;
@@ -645,7 +647,7 @@ struct SplitUpload {
 std::expected<SplitUpload, StatusCode> UploadWeights(
     Backend& backend, const std::vector<TensorEntry>& tensors,
     const std::vector<std::uint64_t>& offsets, std::uint64_t data_start,
-    std::span<const std::byte> bytes, const log::Diagnostics* log,
+    const core::FileReader& reader, const log::Diagnostics* log,
     const ModelShard& shard, std::size_t trunk_layers,
     const TensorShard& tensor, const Architecture* module,
     std::size_t gpu_layers, bool has_moe) {
@@ -653,11 +655,36 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
   out.resident.reserve(tensors.size());
   std::vector<Backend::HostCopy> copies;
   copies.reserve(tensors.size());
-  // Sliced tensor bytes must outlive the batched upload below, so keep them
-  // in one stable vector (moving the inner vectors preserves their data).
+  // Sliced tensor bytes and paged RAM copies must outlive the upload, so
+  // keep them in one stable vector (moving the inner vectors preserves
+  // their data).
   std::vector<std::vector<std::byte>> sliced_storage;
+  // Read buffers for the current upload chunk (the HostCopy spans point
+  // into them); they are freed after the chunk is uploaded, so the load
+  // does not hold every resident tensor's bytes at once and its peak stays
+  // under the host's available memory.
+  std::vector<std::vector<std::byte>> chunk_buffers;
+  chunk_buffers.reserve(tensors.size());
+  std::size_t chunk_bytes = 0;
   std::unordered_map<std::string, std::size_t> stage_max;
   std::uint64_t total_bytes = 0;
+  // Upload the resident tensors in bounded chunks so the read buffers are
+  // freed as each chunk uploads; 2 GiB keeps the peak far under a 60 GB
+  // host that already holds the 31 GiB paged copy.
+  const std::size_t kUploadChunkBytes = 2u * 1024u * 1024u * 1024u;
+  auto flush_chunk = [&backend, &copies, &chunk_buffers, &chunk_bytes]()
+      -> std::expected<void, StatusCode> {
+    if (chunk_bytes == 0) {
+      return {};
+    }
+    if (auto uploaded = backend.CopyH2DBatch(copies); !uploaded) {
+      return std::unexpected(uploaded.error());
+    }
+    copies.clear();
+    chunk_buffers.clear();
+    chunk_bytes = 0;
+    return {};
+  };
   {
     core::PhaseTimer timer(log, "model", "allocate device buffers");
     for (std::size_t i = 0; i < tensors.size(); ++i) {
@@ -671,12 +698,18 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
       }
       const std::size_t count = *sized;
       const std::uint64_t begin = data_start + offsets[i];
-      if (begin > bytes.size() ||
-          static_cast<std::uint64_t>(count) > bytes.size() - begin) {
+      if (begin > reader.size() ||
+          static_cast<std::uint64_t>(count) > reader.size() - begin) {
         return std::unexpected(StatusCode::MalformedFile);
       }
-      std::span<const std::byte> payload =
-          bytes.subspan(static_cast<std::size_t>(begin), count);
+      auto raw = reader.ReadRange(begin, count);
+      if (!raw) {
+        return std::unexpected(raw.error());
+      }
+      std::span<const std::byte> payload(raw->data(), raw->size());
+      // Set when the slicing below consumes `raw` into sliced_storage, so
+      // the paged/resident handling does not move it a second time.
+      bool raw_consumed = false;
       if (tensor.enabled && module != nullptr &&
           (entry.shape.rank == 2 || entry.shape.rank == 3)) {
         const ParallelKind kind = module->TensorParallelKind(entry.name);
@@ -695,6 +728,7 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
           entry.shape.dims[2] = sliced->experts;
           sliced_storage.push_back(std::move(sliced->bytes));
           payload = sliced_storage.back();
+          raw_consumed = true;
         } else if (kind != ParallelKind::Replicated &&
                    entry.shape.rank == 2) {
           // GGUF dims are [row_length, rows] (ne[0] fastest); the slicer
@@ -709,6 +743,7 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
           entry.shape.dims[0] = sliced->cols;
           sliced_storage.push_back(std::move(sliced->bytes));
           payload = sliced_storage.back();
+          raw_consumed = true;
         }
       }
       // Under paging the early trunk blocks stay RAM-backed: no device
@@ -744,12 +779,21 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
         // the file's page cache is reclaimed, or returns stale bytes under
         // memory pressure. `sliced_storage` keeps the copies alive and its
         // inner vectors do not move their data on reallocation.
-        sliced_storage.push_back(
-            std::vector<std::byte>(payload.begin(), payload.end()));
+        if (!raw_consumed) {
+          // Move the read buffer into the paged RAM copy (no extra copy).
+          sliced_storage.push_back(std::move(*raw));
+          payload = std::span(sliced_storage.back());
+        }
         out.paged.push_back(PagedTensor{std::move(entry),
-                                        sliced_storage.back(), layer,
-                                        std::move(block_kind)});
+                                         sliced_storage.back(), layer,
+                                         std::move(block_kind)});
         continue;
+      }
+      if (!raw_consumed) {
+        // Hold the read buffer in the current upload chunk (freed after
+        // the chunk uploads); paged read buffers are in sliced_storage.
+        chunk_buffers.push_back(std::move(*raw));
+        payload = std::span(chunk_buffers.back());
       }
       auto buffer = backend.AllocateBuffer(payload.size(), MemoryKind::Device);
       if (!buffer) {
@@ -760,18 +804,26 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
           DeviceTensor{std::move(entry), std::move(*buffer)});
       copies.push_back(Backend::HostCopy{out.resident.back().device.get(),
                                          payload});
+      chunk_bytes += payload.size();
+      if (chunk_bytes >= kUploadChunkBytes) {
+        if (auto flushed = flush_chunk(); !flushed) {
+          return std::unexpected(flushed.error());
+        }
+      }
     }
     timer.Stop(std::to_string(tensors.size()) + " tensors");
   }
-  // One batched upload: backends pipeline the copies and synchronize once
-  // per chunk instead of a round trip per tensor.
+  // Flush the final partial chunk; the earlier chunks were uploaded (and
+  // their read buffers freed) inside the loop as each reached the bound, so
+  // the load's peak stays under the host's available memory instead of
+  // holding every resident tensor at once.
   {
     core::PhaseTimer timer(log, "model", "upload weights to device");
-    if (auto uploaded = backend.CopyH2DBatch(copies); !uploaded) {
-      return std::unexpected(uploaded.error());
+    if (auto flushed = flush_chunk(); !flushed) {
+      return std::unexpected(flushed.error());
     }
     timer.Stop(std::to_string(total_bytes) + " bytes in " +
-               std::to_string(copies.size()) + " copies");
+               std::to_string(out.resident.size()) + " copies");
   }
   for (const auto& staged : stage_max) {
     out.stage_sizes.emplace_back(staged.first, staged.second);
@@ -921,9 +973,17 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     // so the loader can slice it; a null module loads every tensor whole.
     std::unique_ptr<Architecture> module = CreateArchitecture(architecture);
     const bool has_moe = config->has_value() && (*config)->IsMoe();
+    // Read the tensor data with a bounded pread read instead of the whole-
+    // file mapping above: a multi-gigabyte load would otherwise fill the
+    // page cache with file pages that memory pressure evicts and re-faults,
+    // returning stale bytes to the paged copy and the device upload.
+    auto reader = core::FileReader::Open(path);
+    if (!reader) {
+      return std::unexpected(reader.error());
+    }
     auto uploaded =
         UploadWeights(backend, gguf->tensors, gguf->tensor_offsets,
-                      gguf->tensor_data_start, bytes, log, options.shard,
+                      gguf->tensor_data_start, *reader, log, options.shard,
                       config->has_value() ? (*config)->layers : 0,
                       options.tensor, module.get(), options.gpu_layers,
                       has_moe);
@@ -1084,8 +1144,14 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     }
     // Map offsets count from the file start, so the base is zero.
     // A raw directory has no trunk count, so every tensor stays resident;
-    // the backing is still retained for uniformity.
-    auto uploaded = UploadWeights(backend, tensors, offsets, 0, file_bytes,
+    // the backing is still retained for uniformity. Read the tensor data
+    // with a bounded pread read (see the GGUF path above) so the load does
+    // not fill the page cache with stale-able file pages.
+    auto reader = core::FileReader::Open(layout->weights_path);
+    if (!reader) {
+      return std::unexpected(reader.error());
+    }
+    auto uploaded = UploadWeights(backend, tensors, offsets, 0, *reader,
                                   log, options.shard, 0, options.tensor,
                                   nullptr, options.gpu_layers,
                                   /*has_moe=*/false);

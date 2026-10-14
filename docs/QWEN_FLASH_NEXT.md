@@ -496,8 +496,13 @@ the head read and the output projection).
   The trigger is the memory pressure during the load: the 31 GB paged
   copy plus the file's page cache exceeds the 60 GB host, which evicts
   and re-faults the file pages and returns stale bytes, so the RAM copy
-  and the device upload inherit them. The next step is to read the shards
-  with direct I/O, or a non-mapping read, so the copy is stable.
+  and the device upload inherit them. The fix is a read-path change: read
+  the shards with a bounded pread (or direct I/O) instead of the whole-file
+  mmap, so the load's peak memory drops from about 85 GB (the file's page
+  cache plus the 31 GB paged copy) to about 54 GB (the read buffers plus
+  the paged copy), which is under the 60 GB host and avoids the pressure
+  that triggers the stale re-fault. It is not blocked; it is a larger
+  change that is hard to confirm because the fault is intermittent.
 - **Recommended sampling (qwen4exp).** The model card specifies a sampler
   per thinking mode: thinking on uses temperature 1.0 and top_p 0.95;
   thinking off uses temperature 0.7, top_p 0.80 and presence penalty 1.5;
