@@ -201,44 +201,57 @@ std::expected<void, StatusCode> RunMoeFfn(
   std::size_t n_gpu = top_k;
   if (model.ExpertsPaged(layer)) {
     std::vector<std::uint32_t> ids(top_k, 0);
-    std::vector<float> wts(top_k, 0.0f);
     if (!backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
-                         top_k * 4) ||
-        !backend.CopyD2H(*h.moe_wts, reinterpret_cast<std::byte*>(wts.data()),
                          top_k * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }
     // Keep at least one expert on the GPU so the staging views stay resolved.
     const std::size_t cpu_target =
         std::min(kCpuMoeExpertsPerLayer, top_k > 0 ? top_k - 1 : 0);
-    std::vector<std::uint32_t> gpu;
-    std::vector<float> gpu_wts;
-    for (std::size_t s = 0; s < top_k; ++s) {
-      if (model.ExpertCached(layer, ids[s]) || cpu_ids.size() >= cpu_target) {
-        gpu.push_back(ids[s]);
-        gpu_wts.push_back(wts[s]);
-      } else {
-        cpu_ids.push_back(ids[s]);
-        cpu_wts.push_back(wts[s]);
+    if (cpu_target == 0) {
+      // GPU-only: stage the whole selection in place, no weight readback.
+      if (auto staged = model.EnsureLayerExperts(
+              layer, std::span<const std::uint32_t>(ids));
+          !staged) {
+        return std::unexpected(staged.error());
       }
-    }
-    n_gpu = gpu.size();
-    if (auto staged = model.EnsureLayerExperts(
-            layer, std::span<const std::uint32_t>(gpu));
-        !staged) {
-      return std::unexpected(staged.error());
-    }
-    if (!backend.CopyH2D(
-            *h.moe_ids,
-            std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(gpu.data()),
-                gpu.size() * 4)) ||
-        !backend.CopyH2D(
-            *h.moe_wts,
-            std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(gpu_wts.data()),
-                gpu_wts.size() * 4))) {
-      return std::unexpected(StatusCode::DeviceError);
+    } else {
+      std::vector<float> wts(top_k, 0.0f);
+      if (!backend.CopyD2H(*h.moe_wts,
+                           reinterpret_cast<std::byte*>(wts.data()),
+                           top_k * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      std::vector<std::uint32_t> gpu;
+      std::vector<float> gpu_wts;
+      for (std::size_t s = 0; s < top_k; ++s) {
+        if (model.ExpertCached(layer, ids[s]) ||
+            cpu_ids.size() >= cpu_target) {
+          gpu.push_back(ids[s]);
+          gpu_wts.push_back(wts[s]);
+        } else {
+          cpu_ids.push_back(ids[s]);
+          cpu_wts.push_back(wts[s]);
+        }
+      }
+      n_gpu = gpu.size();
+      if (auto staged = model.EnsureLayerExperts(
+              layer, std::span<const std::uint32_t>(gpu));
+          !staged) {
+        return std::unexpected(staged.error());
+      }
+      if (!backend.CopyH2D(
+              *h.moe_ids,
+              std::span<const std::byte>(
+                  reinterpret_cast<const std::byte*>(gpu.data()),
+                  gpu.size() * 4)) ||
+          !backend.CopyH2D(
+              *h.moe_wts,
+              std::span<const std::byte>(
+                  reinterpret_cast<const std::byte*>(gpu_wts.data()),
+                  gpu_wts.size() * 4))) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
     }
   }
   // The staging above resolved the paged tensors, so the slice geometry and
