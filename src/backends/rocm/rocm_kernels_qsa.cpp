@@ -251,10 +251,11 @@ __global__ void QsaAttendKernel(const float* q, const unsigned short* k_scratch,
 // the pooled row NeoX-wise at the block's first-cell position. The spare
 // slot (row b+1) is rewritten with the constant cell-0 key.
 __global__ void IndexerKeyAppendKernel(
-    const float* raw, const int* pos_dev, const float* w_k_norm, float* tail,
+    const float* raw, const float* w_k_norm, float* tail,
     float* dead, float* pooled, int* block_pos, const float* cos_tab,
     const float* sin_tab, long long pos_base, unsigned long long eps_bits,
-    unsigned long long idx_dim, unsigned long long r, unsigned long long n_rot) {
+    unsigned long long idx_dim, unsigned long long r, unsigned long long n_rot,
+    long long pos_in) {
   __shared__ double s_mean[256];
   std::uint32_t eps_raw = static_cast<std::uint32_t>(eps_bits);
   float eps_f = 0.0f;
@@ -262,7 +263,7 @@ __global__ void IndexerKeyAppendKernel(
   const double eps = static_cast<double>(eps_f);
   const int base_i = static_cast<int>(pos_base);
   const unsigned long long d = threadIdx.x;
-  const int pos = pos_dev[0];
+  const int pos = static_cast<int>(pos_in);
   const unsigned long long slot = static_cast<unsigned long long>(pos) % r;
   const unsigned long long b = static_cast<unsigned long long>(pos) / r;
   if (d < idx_dim && slot < r - 1) {

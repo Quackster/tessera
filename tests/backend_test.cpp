@@ -1942,7 +1942,6 @@ TEST(BackendTest, IndexerKeyAppendMatchesRef) {
         host.size() * sizeof(host[0])));
   };
   auto d_raw = alloc(kDim * 4);
-  auto d_pos = alloc(4);
   auto d_wkn = alloc(kDim * 4);
   auto d_tail = alloc((kBlock - 1) * kDim * 4);
   auto d_dead = alloc(kDim * 4);
@@ -1950,7 +1949,7 @@ TEST(BackendTest, IndexerKeyAppendMatchesRef) {
   auto d_bpos = alloc(4);
   auto d_cos = alloc(cos_tab.size() * 4);
   auto d_sin = alloc(sin_tab.size() * 4);
-  ASSERT_TRUE(d_raw && d_pos && d_wkn && d_tail && d_dead && d_pooled &&
+  ASSERT_TRUE(d_raw && d_wkn && d_tail && d_dead && d_pooled &&
               d_bpos && d_cos && d_sin);
   ASSERT_TRUE(up(d_wkn, w_k_norm) && up(d_cos, cos_tab) && up(d_sin, sin_tab));
   {
@@ -1973,19 +1972,18 @@ TEST(BackendTest, IndexerKeyAppendMatchesRef) {
                                                raws[pos].data()),
                                            kDim * 4))
                     .has_value());
-    ASSERT_TRUE(backend
-                    ->CopyH2D(**d_pos, std::span<const std::byte>(
-                                           reinterpret_cast<const std::byte*>(
-                                               &p32),
-                                           4))
-                    .has_value());
     tessera::KernelLaunch launch;
     launch.grid_x = 1;
     launch.block_x = 256;
-    launch.buffers = {d_raw->get(), d_pos->get(), d_wkn->get(), d_tail->get(),
+    launch.buffers = {d_raw->get(), d_wkn->get(), d_tail->get(),
                       d_dead->get(), d_pooled->get(), d_bpos->get(),
                       d_cos->get(), d_sin->get()};
-    launch.scalars = {0, eps_bits, kDim, kBlock, kRot};
+    launch.scalars = {0,
+                      eps_bits,
+                      kDim,
+                      kBlock,
+                      kRot,
+                      static_cast<std::uint64_t>(p32)};
     auto result = backend->LaunchKernel(**kernel, launch);
     ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   }

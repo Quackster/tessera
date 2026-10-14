@@ -365,23 +365,20 @@ std::expected<void, StatusCode> RunQsaLayer(
     return std::unexpected(StatusCode::DeviceError);
   }
   const std::int32_t pos_i = static_cast<std::int32_t>(pos);
-  if (!backend.CopyH2D(*h.step_dev,
-                       std::span<const std::byte>(
-                           reinterpret_cast<const std::byte*>(&pos_i),
-                           sizeof(pos_i)))) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
   {
     KernelLaunch idx;
     idx.grid_x = 1;
     idx.block_x = 256;
-    idx.buffers = {h.idx_raw.get(),        h.step_dev.get(),
-                   (*w_ikn)->device.get(), st.idx_tail.get(),
-                   st.idx_dead.get(),      st.idx_pooled.get(),
-                   st.block_pos.get(),     st.idx_cos.get(),
-                   st.idx_sin.get()};
-    idx.scalars = {0, EpsBits(cfg.norm_eps), g.idx_dim, kQsaIdxBlock,
-                   kQsaNRot};
+    idx.buffers = {h.idx_raw.get(),        (*w_ikn)->device.get(),
+                   st.idx_tail.get(),      st.idx_dead.get(),
+                   st.idx_pooled.get(),    st.block_pos.get(),
+                   st.idx_cos.get(),       st.idx_sin.get()};
+    idx.scalars = {0,
+                   EpsBits(cfg.norm_eps),
+                   g.idx_dim,
+                   kQsaIdxBlock,
+                   kQsaNRot,
+                   static_cast<std::uint64_t>(pos_i)};
     if (!backend.LaunchKernel(*h.indexer_key_append, idx)) {
       return std::unexpected(StatusCode::DeviceError);
     }
@@ -750,7 +747,6 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
       !make(h.cell_scores, kQsaCells * f) || !make(h.ids, id_cap * f) ||
       !make(h.k_scratch, id_cap * g.kv_heads * g.head_dim * 2) ||
       !make(h.v_scratch, id_cap * g.kv_heads * g.head_dim * 2) ||
-      !make(h.step_dev, 4 * 4) ||
       !make(h.idx_bias, (kQsaCells / kQsaIdxBlock + 2) * f) ||
       !make(h.attn_f16, q_dim * 2) || !make(h.attn_in, q_dim * f) ||
       !make(h.embed_ids, 4)) {

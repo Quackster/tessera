@@ -729,10 +729,10 @@ __global__ void QsaTopKKernel(const float* scores, int* ids,
                               unsigned long long n_kv,
                               unsigned long long width);
 __global__ void IndexerKeyAppendKernel(
-    const float* raw, const int* pos_dev, const float* w_k_norm, float* tail,
-    float* dead, float* pooled, int* block_pos, const float* cos_tab,
+    const float* raw, const float* w_k_norm, float* tail, float* dead,
+    float* pooled, int* block_pos, const float* cos_tab,
     const float* sin_tab, long long pos_base, unsigned long long eps_bits,
     unsigned long long idx_dim, unsigned long long r,
-    unsigned long long n_rot);
+    unsigned long long n_rot, long long pos_in);
 
 }  // namespace tessera::backends::rocm

@@ -109,29 +109,40 @@ std::expected<void, StatusCode> RunMoeFfn(
       !Grow(backend, h.moe_shared, hidden * 4) ||
       !Grow(backend, h.moe_gate_out, inter * 4) ||
       !Grow(backend, h.moe_up_out, inter * 4) ||
-      !Grow(backend, h.moe_inter, inter * 4) ||
-      !Grow(backend, h.moe_shexp_w, hidden * 4)) {
+      !Grow(backend, h.moe_inter, inter * 4)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
-  // The moe_gate kernel reads the shared-expert gate as fp32; the
-  // checkpoint stores it bf16, so stage a converted copy in that case.
+  // The moe_gate kernel reads the shared-expert gate as fp32; the checkpoint
+  // stores it bf16, so convert it once per layer and reuse the copy. Doing
+  // this every token cost a device-to-host and host-to-device round trip per
+  // layer, which dominated the MoE host time.
   Buffer* shexp_w = (*shexp_gate)->device.get();
   if ((*shexp_gate)->manifest.dtype == DType::BF16) {
-    std::vector<std::byte> raw(hidden * 2);
-    if (!backend.CopyD2H(*(*shexp_gate)->device, raw.data(), raw.size())) {
-      return std::unexpected(StatusCode::DeviceError);
+    if (h.moe_shexp_w.size() <= layer) {
+      h.moe_shexp_w.resize(layer + 1);
     }
-    std::vector<float> conv(hidden);
-    for (std::size_t i = 0; i < hidden; ++i) {
-      std::uint16_t half = 0;
-      std::memcpy(&half, raw.data() + i * 2, 2);
-      const std::uint32_t bits = static_cast<std::uint32_t>(half) << 16;
-      std::memcpy(&conv[i], &bits, sizeof(conv[i]));
+    if (h.moe_shexp_w[layer] == nullptr) {
+      auto buf = backend.AllocateBuffer(hidden * 4, MemoryKind::Device);
+      if (!buf) {
+        return std::unexpected(StatusCode::OutOfMemory);
+      }
+      std::vector<std::byte> raw(hidden * 2);
+      if (!backend.CopyD2H(*(*shexp_gate)->device, raw.data(), raw.size())) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      std::vector<float> conv(hidden);
+      for (std::size_t i = 0; i < hidden; ++i) {
+        std::uint16_t half = 0;
+        std::memcpy(&half, raw.data() + i * 2, 2);
+        const std::uint32_t bits = static_cast<std::uint32_t>(half) << 16;
+        std::memcpy(&conv[i], &bits, sizeof(conv[i]));
+      }
+      h.moe_shexp_w[layer] = std::move(*buf);
+      if (!detail::UploadF32(backend, *h.moe_shexp_w[layer], conv)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
     }
-    if (!detail::UploadF32(backend, *h.moe_shexp_w, conv)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-    shexp_w = h.moe_shexp_w.get();
+    shexp_w = h.moe_shexp_w[layer].get();
   }
   if (!Project(backend, h, (*router)->manifest.dtype, mixed,
                *(*router)->device, *h.moe_logits, 1, ne, hidden)) {

@@ -4,24 +4,23 @@
 layout(local_size_x = 256) in;
 
 // "indexer_key_append" contract: buffer 0 raw (fp32, idx_dim), buffer 1
-// pos_dev (i32, 1), buffer 2 w_k_norm (fp32, idx_dim), buffer 3 tail
-// (fp32, (idx_block-1) x idx_dim), buffer 4 dead (fp32, idx_dim), buffer 5
-// pooled (fp32), buffer 6 block_pos (i32, 1), buffer 7 cos_tab, buffer 8
-// sin_tab. Scalars: pos_base (v[0]), the fp32 eps bits (v[2]), idx_dim
-// (v[4]), idx_block (v[6]), n_rot (v[8]).
+// w_k_norm (fp32, idx_dim), buffer 2 tail (fp32, (idx_block-1) x idx_dim),
+// buffer 3 dead (fp32, idx_dim), buffer 4 pooled (fp32), buffer 5 block_pos
+// (i32, 1), buffer 6 cos_tab, buffer 7 sin_tab. Scalars: pos_base (v[0]),
+// the fp32 eps bits (v[2]), idx_dim (v[4]), idx_block (v[6]), n_rot (v[8]),
+// the token position pos (v[10]).
 layout(push_constant) uniform PushConstants {
   uint v[16];
 } pc;
 
 layout(set = 0, binding = 0) readonly buffer RAW { float raw[]; };
-layout(set = 0, binding = 1) readonly buffer POS { int pos_dev[]; };
-layout(set = 0, binding = 2) readonly buffer WKN { float wkn[]; };
-layout(set = 0, binding = 3) buffer TAIL { float tail[]; };
-layout(set = 0, binding = 4) buffer DEAD { float dead[]; };
-layout(set = 0, binding = 5) buffer POOLED { float pooled[]; };
-layout(set = 0, binding = 6) buffer BPOS { int bpos[]; };
-layout(set = 0, binding = 7) readonly buffer COS { float cos_tab[]; };
-layout(set = 0, binding = 8) readonly buffer SIN { float sin_tab[]; };
+layout(set = 0, binding = 1) readonly buffer WKN { float wkn[]; };
+layout(set = 0, binding = 2) buffer TAIL { float tail[]; };
+layout(set = 0, binding = 3) buffer DEAD { float dead[]; };
+layout(set = 0, binding = 4) buffer POOLED { float pooled[]; };
+layout(set = 0, binding = 5) buffer BPOS { int bpos[]; };
+layout(set = 0, binding = 6) readonly buffer COS { float cos_tab[]; };
+layout(set = 0, binding = 7) readonly buffer SIN { float sin_tab[]; };
 
 shared float s_mean[256];
 
@@ -32,7 +31,7 @@ void main() {
   uint r = pc.v[6];
   uint n_rot = pc.v[8];
   uint d = gl_LocalInvocationID.x;
-  int pos = pos_dev[0];
+  int pos = int(pc.v[10]);
   uint slot = uint(pos) % r;
   uint b = uint(pos) / r;
   if (d < idx_dim && slot < r - 1u) {

@@ -52,12 +52,14 @@ struct Qwen4ExpState final : core::ArchState {
       q_exp, k_exp, v_l, core, out;
   // QSA scratch.
   std::unique_ptr<Buffer> q_full, q_attn, gate_buf, kcur, vcur, idx_raw, q_idx,
-      cell_scores, ids, k_scratch, v_scratch, step_dev, idx_bias, attn_f16,
+      cell_scores, ids, k_scratch, v_scratch, idx_bias, attn_f16,
       attn_in;
   // Router / expert scratch.
   std::unique_ptr<Buffer> moe_logits, moe_ids, moe_vals, moe_wts, moe_acc,
-      moe_sig, moe_gate_out, moe_up_out, moe_inter, moe_shared, moe_shexp_w,
-      moe_phi;
+      moe_sig, moe_gate_out, moe_up_out, moe_inter, moe_shared, moe_phi;
+  // Per-layer fp32 copy of the shared-expert gate weight, converted from the
+  // checkpoint's bf16 once and reused (indexed by trunk layer).
+  std::vector<std::unique_ptr<Buffer>> moe_shexp_w;
   // PLE scratch and history.
   std::shared_ptr<PleTable> ple_table;
   std::unique_ptr<Buffer> ple_hist, ple_key, ple_query, ple_value, ple_gated,
