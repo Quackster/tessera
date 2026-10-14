@@ -18,11 +18,13 @@ namespace tessera::backends::rocm {
 
 namespace {
 
-// Host-visible staging window for a batched upload, the same bound the
-// vulkan backend uses. A large checkpoint is copied through one reusable
-// pinned buffer of this size, so pinned host memory stays bounded
-// regardless of the total weight bytes.
-constexpr std::size_t kUploadStagingBytes = 256ull << 20;
+// Host-visible staging window for a batched upload. A checkpoint is copied
+// through a ring of pinned windows of this size. A small window lets a
+// per-layer expert batch split into several windows, so the host memcpy of
+// the next window overlaps the asynchronous upload of the current one; one
+// large window would serialize the memcpy before the upload. The window
+// bounds the pinned host memory regardless of the total weight bytes.
+constexpr std::size_t kUploadStagingBytes = 4ull << 20;
 
 StatusCode FromHip(hipError_t error) {
   switch (error) {
@@ -730,7 +732,7 @@ class RocmBackend final : public Backend {
   // whose upload may still be in flight. The ring bounds the pinned set to a
   // few windows, so the source pages stay reclaimable; handing the runtime a
   // pageable window at a time stalled a 16 GB load past 5 minutes.
-  static constexpr std::size_t kStagingSlots = 4;
+  static constexpr std::size_t kStagingSlots = 8;
 
   struct StagingSlot {
     std::byte* data = nullptr;

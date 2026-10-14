@@ -567,6 +567,18 @@ the head read and the output projection).
   18`: decode fell from about 84 to 61 to 76 ms/token (about 13 to 16
   tok/s). The output stays coherent.
 
+- **M6: overlap the expert staging with the upload.** A per-layer host
+  profile showed the MoE is 93 percent of the forward host time, and the
+  expert staging (`EnsureLayerExperts`) is 1.5 to 2.2 ms per paged layer:
+  the cache holds 117 of 512 slots per (layer, kind), so about 20 MB per
+  layer is re-read from RAM. The staging ring used one 256 MB window, so the
+  host memcpy of a layer's batch ran before its upload. The ROCm window is
+  now 4 MB over an 8-slot ring, so a layer's batch splits into several
+  windows and the memcpy of the next overlaps the asynchronous upload of
+  the current one. On one R9700, 4K context, fp32 KV, `--gpu-layers 18`:
+  decode fell from about 70 to 57 to 67 ms/token (about 15 to 17 tok/s).
+  The Vulkan path keeps its single-window staging.
+
 ### Still required (in order)
 
  1. M6 follow-ups: add a fused MoE expert kernel and remove (or overlap)
