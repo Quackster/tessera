@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
   }
   std::string model_path;
   std::string draft_path;
+  std::string mtp_path;
   std::vector<std::string> prompt_texts;
   std::string calibration_path;
   std::string mmproj_path;
@@ -165,6 +166,8 @@ int main(int argc, char** argv) {
       model_path = argv[++i];
     } else if (arg == "--draft" && i + 1 < argc) {
       draft_path = argv[++i];
+    } else if (arg == "--mtp" && i + 1 < argc) {
+      mtp_path = argv[++i];
     } else if (arg == "--prompt-text" && i + 1 < argc) {
       prompt_texts.emplace_back(argv[++i]);
     } else if (arg == "--mmproj" && i + 1 < argc) {
@@ -423,6 +426,7 @@ int main(int argc, char** argv) {
         }
         tessera::ModelOptions model_options{model_path, context};
         model_options.gpu_layers = gpu_layers;
+        model_options.mtp_path = mtp_path;
         auto model = engine_ptr->LoadModel(model_options);
         if (!model) {
           return std::unexpected(model.error());
@@ -814,6 +818,7 @@ int main(int argc, char** argv) {
   }
   tessera::ModelOptions model_options{model_path, context};
   model_options.gpu_layers = gpu_layers;
+  model_options.mtp_path = mtp_path;
   auto model = engine.LoadModel(model_options);
   if (!model) {
     std::fprintf(stderr, "cli: model load failed (%s)\n",

@@ -301,7 +301,17 @@ architecture rules.
   serial token per forward, so it tracks decode; 100 tok/s needs a batched
   trunk. An intermittent non-finite logits fault remains (see the M6
   investigation below).
-- M7 (MTP): out of scope. No draft file is present.
+- M7 (MTP): in progress. The head is fetched over HTTP (the C++ port of
+  Strata's tools/mtp_fetch.py: `tessera-cli fetch-mtp --out DIR
+  [inventory|fetch|verify]`, with the pinned revision and per-tensor
+  SHA256, resumable and progress-logged). The module loads the fetched
+  tensors (`src/models/qwen4exp/mtp_weights.*`) and runs the draft block
+  (`src/models/qwen4exp/mtp.*`): the two input branches, the attention and
+  MLP hyper-connections, the dense QSA attention over the MTP's own FP16
+  cache, the routed plus shared MoE, the final mixer and the shared head.
+  `ModelOptions::mtp_path` carries the fetch directory; the CLI `--mtp DIR`
+  sets it. The loader is covered by `MtpWeightsTest`. The end-to-end draft
+  needs the downloaded tensors and is not yet measured.
 
 Correctness evidence: with no completion cap and `--no-chat`, the prompt
 `The capital of France is` produces a reasoning block and the answer

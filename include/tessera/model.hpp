@@ -59,6 +59,11 @@ struct ModelOptions {
   // does not read it is attached. The MXFP4 directory loader honors the
   // flag; the GGUF loader loads every tensor in the file. Default true.
   bool load_mtp_head = true;
+  // Directory holding the MTP head fetched from the BF16 checkpoint (see
+  // tessera/mtp_fetch.hpp). A model whose GGUF ships no MTP head (the
+  // qwen4exp target) reads its draft weights here; the architecture module
+  // loads them on first use. Empty when there is no separate MTP head.
+  std::string mtp_path;
   // Layer shard for a multi-device load; disabled loads the whole model.
   ModelShard shard;
   // Tensor-parallel shard; disabled loads the whole model.
@@ -205,6 +210,9 @@ class Model {
   [[nodiscard]] std::span<const std::byte> PagedTensorHost(
       std::string_view tensor_name) const;
   [[nodiscard]] const std::string& Path() const;
+  // Directory holding a separately fetched MTP head, or empty. The
+  // architecture module reads the draft weights from it on first use.
+  [[nodiscard]] const std::string& MtpPath() const { return options_.mtp_path; }
   [[nodiscard]] std::size_t MaxContextLength() const;
   // New tokens to generate for `requested` after a prompt of
   // `prompt_size` tokens. An explicit count passes through unchanged.

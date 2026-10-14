@@ -132,6 +132,7 @@ void PrintUsage() {
                "  --list-gpus       list the GPUs the backend sees and exit\n"
                "  --model <path>    a .gguf file or an MXFP4 model directory\n"
                "  --draft <dir>     DFlash2 draft checkpoint directory\n"
+               "  --mtp <dir>       MTP head directory (tessera-cli fetch-mtp)\n"
                 "  --context <n>     maximum context length (default %zu)\n"
                 "  --gpu <n>         GPU index to use (default 0, the first)\n"
                 "  --gpu-layers <n|all> layers kept in VRAM (0 uploads all, "

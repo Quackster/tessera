@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "models/qwen4exp/mtp_weights.hpp"
 #include "models/qwen4exp/ple_table.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/log.hpp"
@@ -94,6 +95,16 @@ struct Qwen4ExpState final : core::ArchState {
   std::vector<QsaLayer> qsa;
   std::size_t position = 0;
   bool ready = false;
+
+  // MTP draft head: the fetched weights (loaded lazily on first draft), its
+  // own paged FP16 QSA cache, dense-attention scratch and expert scratch.
+  std::unique_ptr<MtpWeights> mtp_weights;
+  std::unique_ptr<Buffer> mtp_k_pool, mtp_v_pool, mtp_page_table, mtp_ids,
+      mtp_k_scratch, mtp_v_scratch, mtp_expert_scratch, mtp_hidden_branch,
+      mtp_streams;
+  std::uint64_t mtp_rows = 0;
+  std::uint64_t mtp_position = 0;
+  bool mtp_ready = false;
   // Opt-in decode phase profiler (TESSERA_PROFILE), mirrored from the cache
   // each forward. Null disables timing.
   core::Profile* profile = nullptr;

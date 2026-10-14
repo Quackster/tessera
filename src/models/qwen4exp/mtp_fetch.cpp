@@ -313,15 +313,19 @@ std::uint64_t FileSize(const std::filesystem::path& path) {
 
 // Append one tensor's bytes, resuming from the on-disk size. The download
 // is a sequence of bounded range reads, so a tensor larger than the
-// available memory still completes.
-std::expected<void, StatusCode> DownloadTensor(const std::filesystem::path& out,
+// available memory still completes. Each chunk is flushed, so an interrupted
+// run resumes from exactly the bytes on disk.
+std::expected<void, StatusCode> DownloadTensor(const MtpFetchOptions& options,
                                                const InventoryRow& row) {
-  const std::filesystem::path path = TensorPath(out, row.name);
+  const std::filesystem::path path = TensorPath(options.out, row.name);
   const std::string url = Repo() + row.shard;
   std::uint64_t have = FileSize(path);
   if (have > row.bytes) {
     std::filesystem::remove(path);
     have = 0;
+  }
+  if (options.progress) {
+    options.progress(row.name, have, row.bytes);
   }
   std::ofstream file(path, std::ios::binary | std::ios::app);
   if (!file) {
@@ -336,10 +340,14 @@ std::expected<void, StatusCode> DownloadTensor(const std::filesystem::path& out,
     }
     file.write(reinterpret_cast<const char*>(chunk->data()),
                static_cast<std::streamsize>(chunk->size()));
+    file.flush();
     if (!file) {
       return std::unexpected(StatusCode::MalformedFile);
     }
     pos = stop + 1;
+    if (options.progress) {
+      options.progress(row.name, pos - row.start, row.bytes);
+    }
   }
   file.close();
   if (FileSize(path) != row.bytes) {
@@ -508,7 +516,7 @@ std::expected<void, StatusCode> MtpFetch(const MtpFetchOptions& options) {
     }
     std::string got;
     for (int attempt = 0; attempt < 2; ++attempt) {
-      auto downloaded = DownloadTensor(options.out, row);
+      auto downloaded = DownloadTensor(options, row);
       if (!downloaded) {
         return std::unexpected(downloaded.error());
       }

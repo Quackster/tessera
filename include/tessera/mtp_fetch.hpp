@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -44,6 +45,12 @@ struct MtpFetchOptions {
   std::filesystem::path out;
   // Only tensors whose name contains this substring; empty means all.
   std::string only;
+  // Optional progress sink for `fetch`: called with the tensor name and the
+  // bytes downloaded and expected after each chunk (and once with `done` at
+  // the resume point before the first chunk). A null sink logs nothing.
+  std::function<void(std::string_view name, std::uint64_t done,
+                     std::uint64_t total)>
+      progress;
 };
 
 // Read `model.safetensors.index.json` and each MTP shard's header over
