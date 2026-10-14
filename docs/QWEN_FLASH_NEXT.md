@@ -289,13 +289,18 @@ architecture rules.
   reference layer order are recorded above.
 - M1 to M5 (load, GDN, MoE, hyper-connections, QSA, PLE): done. The module
   loads the two shards, decodes, and produces coherent output.
-- M6 (expert cache and 48 tokens per second): in progress. The expert
-  cache is now sized to the free device memory and the batched staging
-  is pipelined (the staging ring), which lifts decode from about 3.7 to
-  about 6 output tokens per second at a 4K context on one R9700 (gfx1201,
-  32 GB, fp32 KV, `--gpu-layers 18`). The target is not reached. An
-  intermittent non-finite logits fault remains (see the M6 investigation
-  below).
+- M6 (expert cache and 48 tokens per second): in progress. The IQ expert
+  GEMVs are warp-per-output, the routed MoE is fused into two launches per
+  layer, and the ROCm staging ring overlaps the host memcpy with the upload.
+  Best measured on one R9700 (gfx1201, 32 GB, fp32 KV, 4K context,
+  `--gpu-layers 8`): decode about 58 ms per token (17 tok/s) and prefill
+  about 13 tok/s, up from about 7/7. The remaining decode cost is the expert
+  staging traffic: the cache holds 117 of 512 slots per (layer, kind), so
+  about 500 MB per token is re-read from system RAM, and the model does not
+  fit the 32 GB card. The 48 tok/s target is not reached. Prefill runs one
+  serial token per forward, so it tracks decode; 100 tok/s needs a batched
+  trunk. An intermittent non-finite logits fault remains (see the M6
+  investigation below).
 - M7 (MTP): out of scope. No draft file is present.
 
 Correctness evidence: with no completion cap and `--no-chat`, the prompt

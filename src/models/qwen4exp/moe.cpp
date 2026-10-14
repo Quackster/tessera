@@ -164,6 +164,19 @@ std::expected<void, StatusCode> RunMoeFfn(
       return std::unexpected(StatusCode::DeviceError);
     }
   }
+  // The shared expert reads only the activation, so run it before the routed
+  // staging: its GPU work overlaps the host staging copy and upload below.
+  const std::size_t shared = cfg.shared_expert_intermediate;
+  if (!Project(backend, h, (*gate_sh)->manifest.dtype, mixed,
+               *(*gate_sh)->device, *h.moe_gate_out, 1, shared, hidden) ||
+      !Project(backend, h, (*up_sh)->manifest.dtype, mixed, *(*up_sh)->device,
+               *h.moe_up_out, 1, shared, hidden) ||
+      !SiluMulDevice(backend, *h.silu_mul, *h.moe_gate_out, *h.moe_up_out,
+                     *h.moe_inter, shared) ||
+      !Project(backend, h, (*down_sh)->manifest.dtype, *h.moe_inter,
+               *(*down_sh)->device, *h.moe_shared, 1, hidden, shared)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
 
   // Paged experts: make the routed selection resident before the fused
   // kernels read it. The ids are read back once per layer only when the
@@ -241,17 +254,6 @@ std::expected<void, StatusCode> RunMoeFfn(
     }
   }
 
-  const std::size_t shared = cfg.shared_expert_intermediate;
-  if (!Project(backend, h, (*gate_sh)->manifest.dtype, mixed,
-               *(*gate_sh)->device, *h.moe_gate_out, 1, shared, hidden) ||
-      !Project(backend, h, (*up_sh)->manifest.dtype, mixed, *(*up_sh)->device,
-               *h.moe_up_out, 1, shared, hidden) ||
-      !SiluMulDevice(backend, *h.silu_mul, *h.moe_gate_out, *h.moe_up_out,
-                     *h.moe_inter, shared) ||
-      !Project(backend, h, (*down_sh)->manifest.dtype, *h.moe_inter,
-               *(*down_sh)->device, *h.moe_shared, 1, hidden, shared)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
   if (auto combined =
           ScaleAdd(backend, h, *h.moe_acc, *h.moe_shared, *h.moe_sig,
                    *h.block_out, hidden, 0);
