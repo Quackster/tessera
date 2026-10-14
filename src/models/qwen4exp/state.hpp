@@ -56,7 +56,11 @@ struct Qwen4ExpState final : core::ArchState {
       attn_in;
   // Router / expert scratch.
   std::unique_ptr<Buffer> moe_logits, moe_ids, moe_vals, moe_wts, moe_acc,
-      moe_sig, moe_gate_out, moe_up_out, moe_inter, moe_shared, moe_phi;
+      moe_sig, moe_gate_out, moe_up_out, moe_inter, moe_shared, moe_phi,
+      moe_cpu_acc;
+  // Host scratch for the CPU+GPU hybrid MoE: the activation and the weighted
+  // sum of the CPU-computed experts.
+  std::vector<float> cpu_x, cpu_acc;
   // Per-layer fp32 copy of the shared-expert gate weight, converted from the
   // checkpoint's bf16 once and reused (indexed by trunk layer).
   std::vector<std::unique_ptr<Buffer>> moe_shexp_w;

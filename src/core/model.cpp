@@ -1615,6 +1615,73 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   return {};
 }
 
+bool Model::ExpertCached(std::size_t layer, std::uint32_t expert) const {
+  if (layer >= paged_expert_by_layer_.size()) {
+    return true;  // resident layer (or no paging)
+  }
+  const std::vector<std::size_t>& rows = paged_expert_by_layer_[layer];
+  if (rows.empty()) {
+    return true;
+  }
+  if (layer >= expert_cache_by_layer_.size()) {
+    return false;
+  }
+  const std::vector<ExpertCache>& layer_cache = expert_cache_by_layer_[layer];
+  if (layer_cache.size() < rows.size()) {
+    return false;
+  }
+  // An expert counts as cached only when every kind holds it: the GPU needs
+  // gate, up and down together to compute it without a transfer.
+  for (std::size_t k = 0; k < rows.size(); ++k) {
+    const ExpertCache& cache = layer_cache[k];
+    if (cache.store == nullptr) {
+      return false;
+    }
+    bool found = false;
+    for (const ExpertCacheEntry& held : cache.entries) {
+      if (held.occupied && held.expert == expert) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::span<const std::byte> Model::PagedExpertHost(
+    std::string_view tensor_name, std::uint32_t expert) const {
+  const auto it = paged_index_.find(tensor_name);
+  if (it == paged_index_.end()) {
+    return {};
+  }
+  const PagedTensor& entry = paged_[it->second];
+  auto span = ExpertSpan(entry.manifest);
+  if (!span) {
+    return {};
+  }
+  const std::size_t per = span->first;
+  if (expert >= span->second) {
+    return {};
+  }
+  const std::size_t begin = static_cast<std::size_t>(expert) * per;
+  if (begin > entry.host.size() || per > entry.host.size() - begin) {
+    return {};
+  }
+  return entry.host.subspan(begin, per);
+}
+
+std::span<const std::byte> Model::PagedTensorHost(
+    std::string_view tensor_name) const {
+  const auto it = paged_index_.find(tensor_name);
+  if (it == paged_index_.end()) {
+    return {};
+  }
+  return paged_[it->second].host;
+}
+
 const std::string& Model::Path() const {
   return options_.path;
 }

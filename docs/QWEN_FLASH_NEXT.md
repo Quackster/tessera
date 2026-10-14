@@ -599,6 +599,18 @@ the head read and the output projection).
     cache hit rate equals the capacity ratio), so prefetch does not help.
     Port the hybrid: a CPU forward for the cache-missing experts (SIMD IQ
     GEMV), the hit experts on the GPU, and the two overlapped.
+    **Implemented and measured (opt-in `TESSERA_CPU_MOE=<n>`)**: the CPU
+    computes up to n uncached experts per layer with `CpuMoeExpertsForward`
+    (multi-threaded) while the GPU streams the rest. The result is correct
+    (the factual prompt answers `Paris` and stops) but far slower on this
+    host: one or two CPU experts per layer give 0.8 to 0.9 s/token against
+    62 ms/token for the GPU-only path. The host CPU is an i7-8700K (6 cores,
+    AVX2, no AVX-512) and the scalar reference is 8.2 ms per expert against
+    about 0.073 ms per expert for the overlapped PCIe staging, so the CPU is
+    roughly a hundred times slower per expert and any offload slows the
+    token. The reference's 45 tok/s was measured on a Ryzen 9 7900X
+    (AVX-512, 12 cores). A fast AVX2 IQ dequant and dot is the prerequisite;
+    without it the hybrid cannot help on this machine.
  2. Batched prefill (up to a few thousand tokens per forward) with the next
     layer's expert work overlapped with the current layer's attention.
  3. MTP (M7), when the draft file is downloaded.

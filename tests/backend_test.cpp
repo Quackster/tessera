@@ -8141,3 +8141,57 @@ TEST(BackendTest, CpuMoeExpertForwardMatchesRef) {
     EXPECT_FLOAT_EQ(got[i], expected[i]);
   }
 }
+
+// Host: the multi-threaded CPU expert batch equals the single-expert path.
+TEST(BackendTest, CpuMoeExpertsForwardMatchesSingle) {
+  std::mt19937 rng(92);
+  constexpr std::size_t kHidden = 256;
+  constexpr std::size_t kInter = 64;
+  constexpr std::size_t kExperts = 4;
+  const std::size_t gate_blocks = kHidden * kInter / 256;
+  const std::size_t gate_per = gate_blocks * 98;
+  const std::size_t down_blocks = kHidden * (kInter / 32);
+  const std::size_t down_per = down_blocks * 18;
+  std::vector<std::byte> gate = RandomBlocks(rng, kExperts * gate_blocks, 98, 0);
+  std::vector<std::byte> up = RandomBlocks(rng, kExperts * gate_blocks, 98, 0);
+  std::vector<std::byte> down = RandomBlocks(rng, kExperts * down_blocks, 18, 0);
+  std::vector<float> x(kHidden);
+  for (auto& v : x) {
+    v = DrawValue(rng);
+  }
+  const std::vector<std::uint32_t> ids = {0, 2, 3};
+  const std::vector<float> wts = {0.5f, 0.3f, 0.2f};
+
+  std::vector<float> expected(kHidden, 0.0f);
+  std::vector<float> one(kHidden);
+  for (std::size_t c = 0; c < ids.size(); ++c) {
+    const std::size_t e = ids[c];
+    ASSERT_TRUE(core::CpuMoeExpertForward(
+                    std::span<const float>(x), DType::IQ3_XXS,
+                    std::span<const std::byte>(gate.data() + e * gate_per,
+                                               gate_per),
+                    DType::IQ3_XXS,
+                    std::span<const std::byte>(up.data() + e * gate_per,
+                                               gate_per),
+                    DType::IQ4_NL,
+                    std::span<const std::byte>(down.data() + e * down_per,
+                                               down_per),
+                    kHidden, kInter, std::span<float>(one))
+                    .has_value());
+    for (std::size_t j = 0; j < kHidden; ++j) {
+      expected[j] += wts[c] * one[j];
+    }
+  }
+  std::vector<float> got(kHidden, 0.0f);
+  auto status = core::CpuMoeExpertsForward(
+      std::span<const float>(x), std::span<const std::uint32_t>(ids),
+      std::span<const float>(wts), DType::IQ3_XXS,
+      std::span<const std::byte>(gate), gate_per, DType::IQ3_XXS,
+      std::span<const std::byte>(up), gate_per, DType::IQ4_NL,
+      std::span<const std::byte>(down), down_per, kHidden, kInter,
+      std::span<float>(got));
+  ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
+  for (std::size_t j = 0; j < kHidden; ++j) {
+    EXPECT_FLOAT_EQ(got[j], expected[j]);
+  }
+}

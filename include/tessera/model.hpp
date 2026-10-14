@@ -180,6 +180,30 @@ class Model {
   //   if (auto staged = model.EnsureLayerExperts(l, ids); !staged) return staged.error();
   [[nodiscard]] std::expected<void, StatusCode> EnsureLayerExperts(
       std::size_t layer, std::span<const std::uint32_t> experts) const;
+  // True when routed expert `expert` of trunk `layer` is held by the device
+  // expert cache for every expert kind, so the GPU can compute it without a
+  // transfer. True for a resident layer and without paging.
+  //
+  // Usage:
+  //   if (model.ExpertCached(l, id)) gpu.push_back(id); else cpu.push_back(id);
+  [[nodiscard]] bool ExpertCached(std::size_t layer,
+                                  std::uint32_t expert) const;
+  // Host span of one routed expert slice for the paged tensor named
+  // `tensor_name` (the full `blk.N.<kind>` name), or an empty span when the
+  // tensor is not paged or `expert` is out of range. This is the RAM copy
+  // the CPU+GPU hybrid MoE computes from.
+  //
+  // Usage:
+  //   auto span = model.PagedExpertHost(name, id);
+  [[nodiscard]] std::span<const std::byte> PagedExpertHost(
+      std::string_view tensor_name, std::uint32_t expert) const;
+  // Host span of the whole paged tensor named `tensor_name`, or an empty span
+  // when it is not paged.
+  //
+  // Usage:
+  //   auto span = model.PagedTensorHost(name);
+  [[nodiscard]] std::span<const std::byte> PagedTensorHost(
+      std::string_view tensor_name) const;
   [[nodiscard]] const std::string& Path() const;
   [[nodiscard]] std::size_t MaxContextLength() const;
   // New tokens to generate for `requested` after a prompt of
