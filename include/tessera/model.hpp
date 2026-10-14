@@ -142,6 +142,10 @@ class Model {
   // a scan over every tensor.
   [[nodiscard]] const DeviceTensor* FindDeviceTensor(
       std::string_view name) const;
+  // The dtype of the tensor named `name` from the manifest, or nullopt when
+  // the model has no such tensor. This resolves before staging, unlike
+  // FindDeviceTensor, which needs the paged staging view resolved first.
+  [[nodiscard]] std::optional<DType> TensorDType(std::string_view name) const;
   // Device buffer for the tensor with this name; nullptr when absent.
   [[nodiscard]] const Buffer* FindWeight(std::string_view name) const;
   // Upload the paged tensors of trunk layer `layer` into the staging

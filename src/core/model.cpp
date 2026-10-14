@@ -1274,6 +1274,15 @@ const DeviceTensor* Model::FindDeviceTensor(std::string_view name) const {
                                       : &stage_views_[staged->second];
 }
 
+std::optional<DType> Model::TensorDType(std::string_view name) const {
+  for (const TensorEntry& entry : tensors_) {
+    if (entry.name == name) {
+      return entry.dtype;
+    }
+  }
+  return std::nullopt;
+}
+
 const Buffer* Model::FindWeight(std::string_view name) const {
   const DeviceTensor* found = FindDeviceTensor(name);
   return found == nullptr ? nullptr : found->device.get();
