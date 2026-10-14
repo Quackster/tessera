@@ -41,6 +41,7 @@ enum class StatusCode : int {
   UnsupportedFeature = 4,
   OutOfMemory = 5,
   DeviceError = 6,
+  NonFinite = 7,
 };
 
 // Human-readable name of a status code, for diagnostics and messages.
@@ -57,6 +58,7 @@ enum class StatusCode : int {
     case StatusCode::UnsupportedFeature: return "unsupported_feature";
     case StatusCode::OutOfMemory: return "out_of_memory";
     case StatusCode::DeviceError: return "device_error";
+    case StatusCode::NonFinite: return "non_finite_logits";
   }
   return "unknown";
 }

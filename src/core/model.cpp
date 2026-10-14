@@ -739,7 +739,15 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
         } else if (staged->second < payload.size()) {
           staged->second = payload.size();
         }
-        out.paged.push_back(PagedTensor{std::move(entry), payload, layer,
+        // Hold the paged bytes in system RAM. The decode loop re-reads
+        // them every token; a private copy keeps those reads stable when
+        // the file's page cache is reclaimed, or returns stale bytes under
+        // memory pressure. `sliced_storage` keeps the copies alive and its
+        // inner vectors do not move their data on reallocation.
+        sliced_storage.push_back(
+            std::vector<std::byte>(payload.begin(), payload.end()));
+        out.paged.push_back(PagedTensor{std::move(entry),
+                                        sliced_storage.back(), layer,
                                         std::move(block_kind)});
         continue;
       }
@@ -923,19 +931,19 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       return std::unexpected(uploaded.error());
     }
     // One staging slot per paged tensor kind; the decode loop reuses them
-    // for every paged layer. The mapped file stays alive in the model so
-    // the paged host spans outlive the load.
+    // for every paged layer.
     auto staged = AllocateStaging(backend, uploaded->stage_sizes);
     if (!staged) {
       return std::unexpected(staged.error());
     }
-    auto file_backing = uploaded->paged.empty()
-                              ? std::shared_ptr<const void>{}
-                              : std::make_shared<core::MappedFile>(
-                                    std::move(*mapped));
-    // Retained slices back paged tensors under tensor parallelism; without
-    // paging the resident slices are already uploaded and dropped as
-    // before, so the default path keeps its memory behavior.
+    // The upload copies every paged tensor into RAM (`retained_backing`),
+    // so no file mapping is retained and the file's page cache is released
+    // once the load returns.
+    std::shared_ptr<const void> file_backing{};
+    // `sliced` owns the paged tensors' RAM copies and any tensor-parallel
+    // slices those spans point into. It is retained whenever paging is on;
+    // without paging the resident bytes are already on the device, so the
+    // default path keeps its memory behavior.
     std::shared_ptr<const void> retained_backing =
         uploaded->paged.empty() || uploaded->sliced.empty()
             ? nullptr

@@ -451,9 +451,9 @@ the head read and the output projection).
   `tools/cli/cli_helpers.cpp`); it applies when the user passes no
   sampling flag. With thinking on and the recommended sampler the model
   answers `The capital of France is` with `The capital of France is
-  **Paris**.` and stops, where greedy decode loops. Two defects remain
-  under investigation: the first generated token is the same in every run
-  (vocab id 0, `!`), and the thinking off path still stops at once.
+  **Paris**.` and stops, where greedy decode loops. The first generated
+  token was still wrong at this point; the empty prefill logits entry
+  below fixes it.
 - **Fixed: empty prefill logits.** `Qwen4ExpArchitecture::ForwardBatch`
   wrote the last row's logits only when `all_logits` was true, so the
   prefill path (`all_logits == false`) returned an empty vector. The
@@ -462,22 +462,38 @@ the head read and the output projection).
   (`!`) and the generation degraded from there. The last row now always
   reaches `logits_out`. With thinking on the model now produces a coherent
   reasoning block and the correct answer, and it stops.
-- **Known defect: repetition loop on some prompts.** Even with thinking on
-  and the recommended sampler, some prompts still loop. Example:
-  `The bubonic plague happened in what centuries?` with
-  `--enable-thinking` produces a coherent reasoning block, then degenerates
-  into a run of `!` (vocab id 0) that never ends. This is separate from the
-  empty prefill logits bug above, and it happens with thinking on or off.
-  Under investigation.
+- **Root-caused and fixed: the garbage output and the `!` loop.** The model
+  garbled on both backends, and the same binary produced different output
+  on identical runs, so the forward read different weights each run. The
+  paged tensors (about 31 GB) were only mmap-backed. The decode loop
+  re-read them from the file's page cache every token, and under memory
+  pressure the page cache returned wrong bytes, so a corrupt weight
+  reached the GPU. The file on disk is intact: a direct I/O sha256 of
+  shard 1 equals the Hugging Face LFS hash, and direct reads are stable,
+  while buffered reads returned different bytes on each read. The fix
+  copies every paged tensor into a private system RAM buffer at load and
+  drops the file mapping (`src/core/model.cpp`), so the decode loop reads
+  stable bytes. Covered by `EngineTest.PagedWeightsAreIndependentOfTheFile`,
+  which overwrites the source file after load and still generates the
+  full-upload tokens.
+- **Guard: the engine stops on non-finite logits.** Added
+  `core::detail::AllFinite` and `core::detail::RejectNonFinite`, and the
+  status code `StatusCode::NonFinite`. `DecodeLogits`, `PrefillTokens` and
+  `Architecture::GreedyToken` reject a non-finite row, so a corrupt weight
+  read stops the run with a clear diagnostic instead of looping on `!`.
+  Covered by `EngineTest.RejectsNonFiniteLogits` and
+  `EngineTest.StopsOnNonFiniteLogits`.
 
 ### Still required (in order)
 
 1. The expert cache and streaming path (M6), then the throughput
    measurement. The current paged path re-uploads every paged layer each
    token and does not hold hot experts resident.
-2. Remove the temporary `TESSERA_QWEN4EXP_*` diagnostics from
-   `src/models/qwen4exp/trunk.cpp` and `moe.cpp` before finalizing.
-3. Investigate the two residual output defects: the leading `!\n\n` prefix
-   before the `<think>` block, and the chat template path that emits `!`
-   and stops at once.
-4. MTP (M7), when the draft file is downloaded.
+2. MTP (M7), when the draft file is downloaded.
+
+### Memory note
+
+The paged weights are held in system RAM, not the file mapping. The
+Qwen3.8-Flash-Next paged set is about 31 GB and fits the 60 GB host. A
+model whose paged set exceeds the host RAM will not load, so size
+`--gpu-layers` to keep the paged set within the host budget.

@@ -3,8 +3,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 
 #include <optional>
@@ -78,7 +80,8 @@ std::filesystem::path WriteGgufFixture(const std::string& name) {
 // F32, tensor names follow the llama.cpp convention. `layers` repeats
 // the block specs as blk.0 through blk.(layers - 1).
 std::filesystem::path WriteTinyModelFixture(const std::string& name,
-                                            std::size_t layers = 1) {
+                                            std::size_t layers = 1,
+                                            bool nonfinite_output = false) {
   std::mt19937 rng(7);
   struct Spec {
     const char* tensor;
@@ -128,7 +131,10 @@ std::filesystem::path WriteTinyModelFixture(const std::string& name,
     }
   }
   specs.push_back({"output_norm.weight", 0, {256}, 0, 0});
-  specs.push_back({"output.weight", 12, {256, 32}, 32, 256});
+  // A non-finite output tensor drives the logits non-finite, to exercise
+  // the decode guard that stops instead of sampling token 0.
+  specs.push_back({"output.weight", nonfinite_output ? 0u : 12u, {256, 32},
+                   nonfinite_output ? 0u : 32u, nonfinite_output ? 0u : 256u});
   GgufBuilder builder;
   builder.Header(0x46554747, 3, specs.size(), 10);
   builder.KvString("general.name", "tiny-vanilla");
@@ -172,8 +178,12 @@ std::filesystem::path WriteTinyModelFixture(const std::string& name,
       }
       const bool is_norm =
           std::string(spec.tensor).find("norm") != std::string::npos;
+      const bool is_inf_output =
+          nonfinite_output && std::string(spec.tensor) == "output.weight";
       for (std::size_t i = 0; i < numel; ++i) {
-        builder.PushF32(is_norm ? 1.0f : DrawValue(rng));
+        builder.PushF32(is_inf_output
+                            ? std::numeric_limits<float>::infinity()
+                            : (is_norm ? 1.0f : DrawValue(rng)));
       }
     } else {
       std::vector<float> values(spec.rows * spec.cols);
@@ -364,6 +374,35 @@ TEST(EngineTest, PagedModelMatchesFullUpload) {
   auto ensured = (*paged)->EnsureLayerResident(0);
   ASSERT_TRUE(ensured.has_value()) << tessera::ToString(ensured.error());
   EXPECT_NE((*paged)->FindDeviceTensor("blk.0.attn_q.weight"), nullptr);
+  auto paged_ids = engine->Generate(**paged, GenerateOptions{4, 0});
+  ASSERT_TRUE(paged_ids.has_value()) << tessera::ToString(paged_ids.error());
+  EXPECT_EQ(*paged_ids, *full_ids);
+}
+
+// The paged weights are held in system RAM, not the file mapping: after the
+// load, overwriting the source file must not change the paged tensors or the
+// generated tokens. A file-backed span would read the overwritten bytes.
+TEST(EngineTest, PagedWeightsAreIndependentOfTheFile) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path = WriteTinyModelFixture("paged_ram.gguf", 2);
+  auto full = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(full.has_value()) << tessera::ToString(full.error());
+  auto full_ids = engine->Generate(**full, GenerateOptions{4, 0});
+  ASSERT_TRUE(full_ids.has_value()) << tessera::ToString(full_ids.error());
+
+  ModelOptions paged_options{path.string(), 1024};
+  paged_options.gpu_layers = 2;
+  auto paged = engine->LoadModel(paged_options);
+  ASSERT_TRUE(paged.has_value()) << tessera::ToString(paged.error());
+  ASSERT_FALSE((*paged)->Paged().empty());
+
+  const std::size_t size =
+      static_cast<std::size_t>(std::filesystem::file_size(path));
+  WriteBytes(path, std::vector<std::byte>(size));
+
+  auto ensured = (*paged)->EnsureLayerResident(0);
+  ASSERT_TRUE(ensured.has_value()) << tessera::ToString(ensured.error());
   auto paged_ids = engine->Generate(**paged, GenerateOptions{4, 0});
   ASSERT_TRUE(paged_ids.has_value()) << tessera::ToString(paged_ids.error());
   EXPECT_EQ(*paged_ids, *full_ids);
@@ -1705,6 +1744,47 @@ TEST(EngineTest, SampleTokenFilters) {
   EXPECT_EQ(tessera::core::SampleToken(std::span<const float>(pair), penalty,
                                        history, rng3),
             1u);
+}
+
+// A logits row with a non-finite value is rejected. Argmax and sampling
+// both fall back to token 0 on such a row, which is the `!` repetition
+// defect, so the decode paths must refuse it instead of looping.
+TEST(EngineTest, RejectsNonFiniteLogits) {
+  using tessera::core::detail::AllFinite;
+  using tessera::core::detail::RejectNonFinite;
+  const std::vector<float> good = {1.0f, -2.0f, 0.0f};
+  EXPECT_TRUE(AllFinite(std::span<const float>(good)));
+  auto kept = RejectNonFinite(good);
+  ASSERT_TRUE(kept.has_value());
+  EXPECT_EQ(*kept, good);
+
+  EXPECT_TRUE(AllFinite(std::span<const float>()));
+
+  const std::vector<float> nan_row = {1.0f, std::nanf(""), 0.0f};
+  EXPECT_FALSE(AllFinite(std::span<const float>(nan_row)));
+  EXPECT_EQ(RejectNonFinite(nan_row).error(), tessera::StatusCode::NonFinite);
+
+  const std::vector<float> inf_row = {
+      std::numeric_limits<float>::infinity()};
+  EXPECT_FALSE(AllFinite(std::span<const float>(inf_row)));
+  EXPECT_EQ(RejectNonFinite(inf_row).error(), tessera::StatusCode::NonFinite);
+}
+
+// A model whose logits come out non-finite stops generation with
+// NonFinite instead of looping on token 0. The tiny fixture's output
+// tensor is set to infinity for this test.
+TEST(EngineTest, StopsOnNonFiniteLogits) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  auto path =
+      WriteTinyModelFixture("nonfinite.gguf", 1, /*nonfinite_output=*/true);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions options;
+  options.max_completion_tokens = 4;
+  auto produced = engine->Generate(**model, options);
+  ASSERT_FALSE(produced.has_value());
+  EXPECT_EQ(produced.error(), StatusCode::NonFinite);
 }
 
 // Sampling through the engine is reproducible for a fixed seed, and

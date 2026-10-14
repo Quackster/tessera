@@ -636,6 +636,31 @@ inline std::uint32_t ArgMax(std::span<const float> logits) {
   return best;
 }
 
+// True when every logit is finite. A non-finite (NaN or infinite) logit
+// means the model produced an invalid distribution, usually because a
+// weight read or device buffer is corrupt. Argmax and sampling both
+// degenerate to token 0 on such a row, so the engine treats it as an
+// error and stops instead of looping on garbage. An empty row is finite.
+inline bool AllFinite(std::span<const float> logits) {
+  for (const float value : logits) {
+    if (!std::isfinite(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Wrap a logits row: Ok when every value is finite, NonFinite otherwise.
+// The decode paths call this so a corrupt row (a bad weight read or device
+// buffer) stops the run instead of sampling token 0 from it forever.
+[[nodiscard]] inline std::expected<std::vector<float>, StatusCode>
+RejectNonFinite(std::vector<float> logits) {
+  if (!AllFinite(logits)) {
+    return std::unexpected(StatusCode::NonFinite);
+  }
+  return logits;
+}
+
 // True when `token` is in a stop set. A stop token ends generation and is
 // not emitted (the tokens before it are the answer).
 inline bool IsStopToken(std::uint32_t token,
