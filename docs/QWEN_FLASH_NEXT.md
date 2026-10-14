@@ -555,6 +555,18 @@ the head read and the output projection).
   from 6 to 11 prompt tok/s. The output stays coherent. The qwen4exp trunk
   also gained the decode phase profiler qwen3_5 already had.
 
+- **M6: fused routed-expert kernels.** The per-expert loop copied each
+  selected expert slice device to device and ran a separate GEMV, about
+  90 launches and 30 copies per layer. New fused kernels compute the whole
+  routed selection in two launches per layer: gate/up with the silu
+  product and down with the weighted slot sum, each reading its slice
+  straight from the staging tensor at `ids[slot]*stride`. They cover the
+  five expert formats the pack uses (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS gate/up;
+  IQ4_NL, Q2_0 down) on both backends. The host id readback now happens
+  only for paged layers. On one R9700, 4K context, fp32 KV, `--gpu-layers
+  18`: decode fell from about 84 to 61 to 76 ms/token (about 13 to 16
+  tok/s). The output stays coherent.
+
 ### Still required (in order)
 
  1. M6 follow-ups: add a fused MoE expert kernel and remove (or overlap)

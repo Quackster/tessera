@@ -33,7 +33,10 @@ struct Qwen4ExpState final : core::ArchState {
   // PLE post-ops.
   std::unique_ptr<Kernel> ple_gate, ple_broadcast, ple_conv, ple_hist_advance;
   // Router / expert feed-forward.
-  std::unique_ptr<Kernel> moe_gate, moe_scale_add, moe_topk, moe_fill;
+  std::unique_ptr<Kernel> moe_gate, moe_scale_add, moe_topk;
+  // Fused routed-expert kernels, one per expert format the pack uses.
+  std::unique_ptr<Kernel> moe_gate_up_iq2s, moe_gate_up_iq3xxs,
+      moe_gate_up_iq3s, moe_gate_up_iq4xs, moe_down_iq4nl, moe_down_q20;
   core::KernelCache gemms, embed_kernels;
   std::unique_ptr<Buffer> embed_ids;
 
@@ -53,8 +56,8 @@ struct Qwen4ExpState final : core::ArchState {
       attn_in;
   // Router / expert scratch.
   std::unique_ptr<Buffer> moe_logits, moe_ids, moe_vals, moe_wts, moe_acc,
-      moe_sig, moe_shared_ids, moe_gate_out, moe_up_out, moe_inter, moe_down_out,
-      moe_shared, moe_gate_w, moe_up_w, moe_down_w, moe_shexp_w;
+      moe_sig, moe_gate_out, moe_up_out, moe_inter, moe_shared, moe_shexp_w,
+      moe_phi;
   // PLE scratch and history.
   std::shared_ptr<PleTable> ple_table;
   std::unique_ptr<Buffer> ple_hist, ple_key, ple_query, ple_value, ple_gated,

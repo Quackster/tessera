@@ -587,6 +587,40 @@ __global__ void MoeExpertsDownQ6KKernel(
     const float* wts, float* out, unsigned long long hidden,
     unsigned long long inter, unsigned long long top_k,
     unsigned long long down_stride, unsigned long long accumulate);
+// Built-in "moe_experts_gate_up_iq2s"/"_iq3xxs"/"_iq3s": the same contract
+// as moe_experts_gate_up_q4k for the IQ gate/up expert formats.
+__global__ void MoeExpertsGateUpIq2SKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+__global__ void MoeExpertsGateUpIq3XxsKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+__global__ void MoeExpertsGateUpIq3SKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+__global__ void MoeExpertsGateUpIq4XsKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride);
+// Built-in "moe_experts_down_iq4nl"/"_q20": the same contract as
+// moe_experts_down_q4k for the IQ down expert formats.
+__global__ void MoeExpertsDownIq4NlKernel(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate);
+__global__ void MoeExpertsDownQ20Kernel(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate);
 // Built-in "embedding_f32"/"embedding_bf16"/"embedding_q4k": buffer 0
 // token ids (u32, rows), buffer 1 the embedding table (vocab x cols),
 // buffer 2 the fp32 output (rows x cols); scalars are rows, cols, vocab.

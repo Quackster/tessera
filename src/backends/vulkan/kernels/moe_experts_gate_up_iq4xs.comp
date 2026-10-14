@@ -1,0 +1,161 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_8bit_storage : require
+
+// Fused routed-expert gate/up: one warp per (slot, output); each warp
+// reads its expert slice straight from the staging tensor at ids[slot]*
+// stride, so the routed experts need no per-expert copy. Scalars: hidden
+// (v0), inter (v2), top_k (v4), gate_stride (v6), up_stride (v8).
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+  uint v[12];
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer X {
+  float x[];
+};
+
+layout(set = 0, binding = 1) readonly buffer W {
+  uint8_t w[];
+};
+
+layout(set = 0, binding = 2) readonly buffer W2 {
+  uint8_t w2[];
+};
+
+layout(set = 0, binding = 3) readonly buffer IDS {
+  uint ids[];
+};
+
+layout(set = 0, binding = 4) writeonly buffer PHI {
+  float phi[];
+};
+
+const int kValues[16] =
+    int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53,
+             69, 89, 113);
+
+uint wbyte(uint offset) {
+  return uint(w[offset]);
+}
+
+uint wbyte2(uint offset) {
+  return uint(w2[offset]);
+}
+
+float fp16_at2(uint offset) {
+  uint h = wbyte2(offset) | (wbyte2(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+float fp16_at(uint offset) {
+  uint h = wbyte(offset) | (wbyte(offset + 1) << 8);
+  uint exp = (h >> 10) & 31;
+  uint mant = h & 1023;
+  float value;
+  if (exp == 0) {
+    value = float(mant) * exp2(-24.0);
+  } else if (exp == 31) {
+    value = mant > 0 ? 0.0 / 0.0 : 1.0 / 0.0;
+  } else {
+    value = (1.0 + float(mant) / 1024.0) * exp2(float(exp) - 15.0);
+  }
+  return (h & 32768) > 0 ? -value : value;
+}
+
+float reduce32(float v) {
+  return subgroupClusteredAdd(v, 32u);
+}
+
+
+void main() {
+  uint hidden = pc.v[0];
+  uint inter = pc.v[2];
+  uint top_k = pc.v[4];
+  uint gate_stride = pc.v[6];
+  uint up_stride = pc.v[8];
+  uint warps = gl_WorkGroupSize.x / 32u;
+  uint idx = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
+  if (idx >= inter * top_k) {
+    return;
+  }
+  uint lane = gl_LocalInvocationID.x % 32u;
+  uint j = idx % inter;
+  uint slot = idx / inter;
+  uint expert = ids[slot];
+  uint blocks = hidden / 256u;
+  uint g_base = expert * gate_stride + j * blocks * 136u;
+  uint u_base = expert * up_stride + j * blocks * 136u;
+  float gate_acc = 0.0;
+  float up_acc = 0.0;
+  uint abase = 0u;
+  for (uint b = 0; b < blocks; ++b) {
+    uint wb = g_base + b * 136u;
+    float d = fp16_at(wb);
+    {
+    uint ib = lane / 4u;
+    uint jj = (lane & 3u) * 4u;
+    uint scales_h = wbyte(wb + 2u) | (wbyte(wb + 3u) << 8);
+    uint packed = wbyte(wb + 4u + ib / 2u);
+    int ls = int((packed >> (4u * (ib & 1u))) & 15u) |
+             (int((scales_h >> (2u * ib)) & 3u) << 4);
+    float dl = d * float(ls - 32);
+    uint w0 = wbyte(wb + 8u + ib * 16u + jj);
+    uint w1 = wbyte(wb + 9u + ib * 16u + jj);
+    uint w2 = wbyte(wb + 10u + ib * 16u + jj);
+    uint w3 = wbyte(wb + 11u + ib * 16u + jj);
+    uint word = w0 | (w1 << 8) | (w2 << 16) | (w3 << 24);
+    uint t = ib * 32u + jj;
+    gate_acc += x[abase + b * 256u + t] * (dl * float(kValues[word & 15u]));
+    gate_acc += x[abase + b * 256u + t + 1u] * (dl * float(kValues[(word >> 8) & 15u]));
+    gate_acc += x[abase + b * 256u + t + 2u] * (dl * float(kValues[(word >> 16) & 15u]));
+    gate_acc += x[abase + b * 256u + t + 3u] * (dl * float(kValues[(word >> 24) & 15u]));
+    gate_acc += x[abase + b * 256u + t + 16u] * (dl * float(kValues[(word >> 4) & 15u]));
+    gate_acc += x[abase + b * 256u + t + 17u] * (dl * float(kValues[(word >> 12) & 15u]));
+    gate_acc += x[abase + b * 256u + t + 18u] * (dl * float(kValues[(word >> 20) & 15u]));
+    gate_acc += x[abase + b * 256u + t + 19u] * (dl * float(kValues[(word >> 28) & 15u]));
+    }
+    wb = u_base + b * 136u;
+    d = fp16_at2(wb);
+    {
+    uint ib = lane / 4u;
+    uint jj = (lane & 3u) * 4u;
+    uint scales_h = wbyte2(wb + 2u) | (wbyte2(wb + 3u) << 8);
+    uint packed = wbyte2(wb + 4u + ib / 2u);
+    int ls = int((packed >> (4u * (ib & 1u))) & 15u) |
+             (int((scales_h >> (2u * ib)) & 3u) << 4);
+    float dl = d * float(ls - 32);
+    uint w0 = wbyte2(wb + 8u + ib * 16u + jj);
+    uint w1 = wbyte2(wb + 9u + ib * 16u + jj);
+    uint w2 = wbyte2(wb + 10u + ib * 16u + jj);
+    uint w3 = wbyte2(wb + 11u + ib * 16u + jj);
+    uint word = w0 | (w1 << 8) | (w2 << 16) | (w3 << 24);
+    uint t = ib * 32u + jj;
+    up_acc += x[abase + b * 256u + t] * (dl * float(kValues[word & 15u]));
+    up_acc += x[abase + b * 256u + t + 1u] * (dl * float(kValues[(word >> 8) & 15u]));
+    up_acc += x[abase + b * 256u + t + 2u] * (dl * float(kValues[(word >> 16) & 15u]));
+    up_acc += x[abase + b * 256u + t + 3u] * (dl * float(kValues[(word >> 24) & 15u]));
+    up_acc += x[abase + b * 256u + t + 16u] * (dl * float(kValues[(word >> 4) & 15u]));
+    up_acc += x[abase + b * 256u + t + 17u] * (dl * float(kValues[(word >> 12) & 15u]));
+    up_acc += x[abase + b * 256u + t + 18u] * (dl * float(kValues[(word >> 20) & 15u]));
+    up_acc += x[abase + b * 256u + t + 19u] * (dl * float(kValues[(word >> 28) & 15u]));
+    }
+  }
+  float gs = reduce32(gate_acc);
+  float us = reduce32(up_acc);
+  if ((gl_SubgroupInvocationID % 32u) == 0u) {
+    phi[slot * inter + j] = (gs / (1.0 + exp(-gs))) * us;
+  }
+}

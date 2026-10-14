@@ -66,19 +66,6 @@ std::expected<std::size_t, StatusCode> ExpertSliceBytes(
   return TensorBytes(weight.manifest.dtype, per);
 }
 
-std::expected<void, StatusCode> ZeroBuffer(Backend& backend, Qwen4ExpState& h,
-                                           Buffer& buffer, std::size_t n) {
-  KernelLaunch zero;
-  zero.grid_x = MoeGrid(n);
-  zero.block_x = kMoeThreads;
-  zero.buffers = {&buffer};
-  zero.scalars = {0, n};
-  if (!backend.LaunchKernel(*h.moe_fill, zero)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  return {};
-}
-
 std::expected<void, StatusCode> ScaleAdd(Backend& backend, Qwen4ExpState& h,
                                          const Buffer& a, const Buffer& b,
                                          const Buffer& weight, Buffer& out,
@@ -123,7 +110,6 @@ std::expected<void, StatusCode> RunMoeFfn(
       !Grow(backend, h.moe_gate_out, inter * 4) ||
       !Grow(backend, h.moe_up_out, inter * 4) ||
       !Grow(backend, h.moe_inter, inter * 4) ||
-      !Grow(backend, h.moe_down_out, hidden * 4) ||
       !Grow(backend, h.moe_shexp_w, hidden * 4)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
@@ -168,14 +154,15 @@ std::expected<void, StatusCode> RunMoeFfn(
     }
   }
 
-  std::vector<std::uint32_t> ids(top_k, 0);
-  if (!backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
-                       top_k * 4)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  // Paged experts: make the routed selection resident before the slices
-  // are resolved. The shared expert is dense and stays resident.
+  // Paged experts: make the routed selection resident before the fused
+  // kernels read it. The ids are read back once per layer only when the
+  // layer's experts page; a resident layer needs no host round trip.
   if (model.ExpertsPaged(layer)) {
+    std::vector<std::uint32_t> ids(top_k, 0);
+    if (!backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
+                         top_k * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
     if (auto staged = model.EnsureLayerExperts(
             layer, std::span<const std::uint32_t>(ids));
         !staged) {
@@ -197,41 +184,49 @@ std::expected<void, StatusCode> RunMoeFfn(
   if (!gate_bytes || !up_bytes || !down_bytes) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  const DType gate_dt = gate_exps->manifest.dtype;
-  const DType up_dt = up_exps->manifest.dtype;
-  const DType down_dt = down_exps->manifest.dtype;
-  if (!Grow(backend, h.moe_gate_w, *gate_bytes) ||
-      !Grow(backend, h.moe_up_w, *up_bytes) ||
-      !Grow(backend, h.moe_down_w, *down_bytes) ||
-      !ZeroBuffer(backend, h, *h.moe_acc, hidden)) {
-    return std::unexpected(StatusCode::OutOfMemory);
+  // The fused routed-expert kernels read each slice straight from the
+  // staging tensor at ids[slot]*stride, so no per-expert copy is made.
+  const Kernel* gate_up = nullptr;
+  switch (gate_exps->manifest.dtype) {
+  case DType::IQ2_S: gate_up = h.moe_gate_up_iq2s.get(); break;
+  case DType::IQ3_XXS: gate_up = h.moe_gate_up_iq3xxs.get(); break;
+  case DType::IQ3_S: gate_up = h.moe_gate_up_iq3s.get(); break;
+  case DType::IQ4_XS: gate_up = h.moe_gate_up_iq4xs.get(); break;
+  default: break;
+  }
+  const Kernel* down = nullptr;
+  switch (down_exps->manifest.dtype) {
+  case DType::IQ4_NL: down = h.moe_down_iq4nl.get(); break;
+  case DType::Q2_0: down = h.moe_down_q20.get(); break;
+  default: break;
+  }
+  if (gate_up == nullptr || down == nullptr) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
   }
   const std::size_t routed_inter = cfg.moe_intermediate;
-  for (std::size_t k = 0; k < top_k; ++k) {
-    const std::uint32_t expert = ids[k];
-    if (expert >= ne) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    if (!backend.CopyD2D(*gate_exps->device, expert * *gate_bytes,
-                         *h.moe_gate_w, 0, *gate_bytes) ||
-        !backend.CopyD2D(*up_exps->device, expert * *up_bytes, *h.moe_up_w, 0,
-                         *up_bytes) ||
-        !Project(backend, h, gate_dt, mixed, *h.moe_gate_w, *h.moe_gate_out, 1,
-                 routed_inter, hidden) ||
-        !Project(backend, h, up_dt, mixed, *h.moe_up_w, *h.moe_up_out, 1,
-                 routed_inter, hidden) ||
-        !SiluMulDevice(backend, *h.silu_mul, *h.moe_gate_out, *h.moe_up_out,
-                       *h.moe_inter, routed_inter) ||
-        !backend.CopyD2D(*down_exps->device, expert * *down_bytes,
-                         *h.moe_down_w, 0, *down_bytes) ||
-        !Project(backend, h, down_dt, *h.moe_inter, *h.moe_down_w,
-                 *h.moe_down_out, 1, hidden, routed_inter)) {
+  if (!Grow(backend, h.moe_phi, top_k * routed_inter * 4)) {
+    return std::unexpected(StatusCode::OutOfMemory);
+  }
+  {
+    KernelLaunch gu;
+    gu.grid_x = static_cast<std::uint32_t>((routed_inter * top_k + 7) / 8);
+    gu.block_x = kMoeThreads;
+    gu.buffers = {&mixed, gate_exps->device.get(), up_exps->device.get(),
+                  h.moe_ids.get(), h.moe_phi.get()};
+    gu.scalars = {hidden, routed_inter, top_k, *gate_bytes, *up_bytes};
+    if (!backend.LaunchKernel(*gate_up, gu)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    if (auto scaled = ScaleAdd(backend, h, *h.moe_acc, *h.moe_down_out,
-                               *h.moe_wts, *h.moe_acc, hidden, k);
-        !scaled) {
-      return scaled;
+  }
+  {
+    KernelLaunch dn;
+    dn.grid_x = static_cast<std::uint32_t>((hidden + 7) / 8);
+    dn.block_x = kMoeThreads;
+    dn.buffers = {h.moe_phi.get(), down_exps->device.get(), h.moe_ids.get(),
+                  h.moe_wts.get(), h.moe_acc.get()};
+    dn.scalars = {hidden, routed_inter, top_k, *down_bytes, 0};
+    if (!backend.LaunchKernel(*down, dn)) {
+      return std::unexpected(StatusCode::DeviceError);
     }
   }
 

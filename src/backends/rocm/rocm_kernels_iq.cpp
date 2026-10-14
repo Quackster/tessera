@@ -1235,6 +1235,60 @@ struct Iq3SCodec {
   }
 };
 
+// IQ4_XS (136 bytes per 256): lane l -> ib=l/4, jj=(l%4)*4 owns elements
+// ib*32+jj..+3 (low nibbles) and +16 (high nibbles) with the 6-bit
+// sub-block scale. Matches the gemm_iq4xs_vec lane mapping.
+struct Iq4XsCodec {
+  static constexpr unsigned kBlockElements = 256;
+  static constexpr unsigned kBlockBytes = 136;
+
+  __device__ __forceinline__ static float Dot(const float* av,
+                                              const unsigned char* wr,
+                                              unsigned long long blocks,
+                                              unsigned int lane) {
+    const unsigned int ib = lane >> 2;
+    const unsigned int jj = (lane & 3u) * 4u;
+    float acc = 0.0f;
+    for (unsigned long long b = 0; b < blocks; ++b) {
+      const unsigned char* base = wr + b * kBlockBytes;
+      const float d = Fp16ToFloatDev(LoadU16(base));
+      const std::uint16_t scales_h = LoadU16(base + 2);
+      const unsigned char packed = base[4 + ib / 2];
+      const int ls = ((packed >> (4 * (ib % 2))) & 15) |
+                     ((static_cast<int>(scales_h >> (2 * ib)) & 3) << 4);
+      const float dl = d * static_cast<float>(ls - 32);
+      unsigned int word = 0;
+      std::memcpy(&word, base + 8 + ib * 16 + jj, 4);
+      const float* e0 = av + b * kBlockElements + ib * 32 + jj;
+      float4 v0;
+      float4 v1;
+      std::memcpy(&v0, e0, 16);
+      std::memcpy(&v1, e0 + 16, 16);
+      acc = fmaf(v0.x, dl * static_cast<float>(kIq4NlValuesDev[word & 15u]), acc);
+      acc = fmaf(v0.y, dl * static_cast<float>(kIq4NlValuesDev[(word >> 8) & 15u]),
+                 acc);
+      acc = fmaf(v0.z,
+                 dl * static_cast<float>(kIq4NlValuesDev[(word >> 16) & 15u]),
+                 acc);
+      acc = fmaf(v0.w,
+                 dl * static_cast<float>(kIq4NlValuesDev[(word >> 24) & 15u]),
+                 acc);
+      acc = fmaf(v1.x, dl * static_cast<float>(kIq4NlValuesDev[(word >> 4) & 15u]),
+                 acc);
+      acc = fmaf(v1.y,
+                 dl * static_cast<float>(kIq4NlValuesDev[(word >> 12) & 15u]),
+                 acc);
+      acc = fmaf(v1.z,
+                 dl * static_cast<float>(kIq4NlValuesDev[(word >> 20) & 15u]),
+                 acc);
+      acc = fmaf(v1.w,
+                 dl * static_cast<float>(kIq4NlValuesDev[(word >> 28) & 15u]),
+                 acc);
+    }
+    return acc;
+  }
+};
+
 }  // namespace detail
 
 // Built-in "gemm_iq4nl_vec": warp-per-output IQ4_NL GEMV.
@@ -1275,6 +1329,137 @@ __global__ void GemmQ20VecKernel(const float* a, const unsigned char* w,
                                  unsigned long long n, unsigned long long k,
                                  unsigned long long split) {
   detail::GemvVecBody<detail::Q20Codec>(a, w, c, m, n, k, split);
+}
+
+// Fused routed-expert gate/up: one warp per (slot, output); every warp reads
+// its expert slice straight from the staging tensor at ids[slot]*stride, so
+// the routed experts need no per-expert copy and run in one launch. The
+// codec supplies the IQ block decode.
+template <typename Codec>
+__device__ __forceinline__ void MoeExpertsGateUpIqBody(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride) {
+  const unsigned long long warps = blockDim.x >> 5;
+  const unsigned long long total = inter * top_k;
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * warps + (threadIdx.x >> 5);
+  if (idx >= total) {
+    return;
+  }
+  const unsigned int lane = threadIdx.x & 31u;
+  const unsigned long long j = idx % inter;
+  const unsigned long long slot = idx / inter;
+  const unsigned long long expert = ids[slot];
+  const unsigned long long blocks = hidden / Codec::kBlockElements;
+  const unsigned char* g_row =
+      gate + expert * gate_stride + j * blocks * Codec::kBlockBytes;
+  const unsigned char* u_row =
+      up + expert * up_stride + j * blocks * Codec::kBlockBytes;
+  float gate_acc = Codec::Dot(x, g_row, blocks, lane);
+  float up_acc = Codec::Dot(x, u_row, blocks, lane);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    gate_acc += __shfl_down_sync(~0ull, gate_acc, off, 32);
+    up_acc += __shfl_down_sync(~0ull, up_acc, off, 32);
+  }
+  if (lane == 0u) {
+    phi[slot * inter + j] = (gate_acc / (1.0f + expf(-gate_acc))) * up_acc;
+  }
+}
+
+// Fused routed-expert down: out[j] = sum_slot wts[slot] * (D_e phi[slot])[j]
+// with e = ids[slot], each slice read straight from the staging tensor.
+template <typename Codec>
+__device__ __forceinline__ void MoeExpertsDownIqBody(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate) {
+  const unsigned long long warps = blockDim.x >> 5;
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * warps + (threadIdx.x >> 5);
+  if (idx >= hidden) {
+    return;
+  }
+  const unsigned int lane = threadIdx.x & 31u;
+  const unsigned long long blocks = inter / Codec::kBlockElements;
+  float acc = 0.0f;
+  for (unsigned long long slot = 0; slot < top_k; ++slot) {
+    const unsigned long long expert = ids[slot];
+    const unsigned char* d_row =
+        down + expert * down_stride + idx * blocks * Codec::kBlockBytes;
+    float dot = Codec::Dot(phi + slot * inter, d_row, blocks, lane);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      dot += __shfl_down_sync(~0ull, dot, off, 32);
+    }
+    acc += wts[slot] * dot;
+  }
+  if (lane == 0u) {
+    out[idx] = accumulate != 0ull ? out[idx] + acc : acc;
+  }
+}
+
+__global__ void MoeExpertsGateUpIq2SKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride) {
+  MoeExpertsGateUpIqBody<detail::Iq2SCodec>(x, gate, up, ids, phi, hidden,
+                                              inter, top_k, gate_stride,
+                                              up_stride);
+}
+
+__global__ void MoeExpertsGateUpIq3XxsKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride) {
+  MoeExpertsGateUpIqBody<detail::Iq3XxsCodec>(x, gate, up, ids, phi, hidden,
+                                                inter, top_k, gate_stride,
+                                                up_stride);
+}
+
+__global__ void MoeExpertsGateUpIq3SKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride) {
+  MoeExpertsGateUpIqBody<detail::Iq3SCodec>(x, gate, up, ids, phi, hidden,
+                                            inter, top_k, gate_stride,
+                                            up_stride);
+}
+
+__global__ void MoeExpertsGateUpIq4XsKernel(
+    const float* x, const unsigned char* gate, const unsigned char* up,
+    const unsigned int* ids, float* phi, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long gate_stride, unsigned long long up_stride) {
+  MoeExpertsGateUpIqBody<detail::Iq4XsCodec>(x, gate, up, ids, phi, hidden,
+                                             inter, top_k, gate_stride,
+                                             up_stride);
+}
+
+__global__ void MoeExpertsDownIq4NlKernel(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate) {
+  MoeExpertsDownIqBody<detail::Iq4NlCodec>(phi, down, ids, wts, out, hidden,
+                                             inter, top_k, down_stride,
+                                             accumulate);
+}
+
+__global__ void MoeExpertsDownQ20Kernel(
+    const float* phi, const unsigned char* down, const unsigned int* ids,
+    const float* wts, float* out, unsigned long long hidden,
+    unsigned long long inter, unsigned long long top_k,
+    unsigned long long down_stride, unsigned long long accumulate) {
+  MoeExpertsDownIqBody<detail::Q20Codec>(phi, down, ids, wts, out, hidden,
+                                           inter, top_k, down_stride,
+                                           accumulate);
 }
 
 }  // namespace tessera::backends::rocm

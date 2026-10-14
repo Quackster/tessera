@@ -1156,34 +1156,38 @@ TEST(BackendTest, GemmIq4XsDeviceMatchesRef) {
       reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
   auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
   ASSERT_TRUE(up_a.has_value() && up_w.has_value());
-  auto kernel = backend->LoadKernel("gemm_iq4xs", {});
-  ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
-  tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kN + 255) / 256;
-  launch.block_x = 256;
-  launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
-  launch.scalars = {kM, kN, kK};
-  auto result = backend->LaunchKernel(**kernel, launch);
-  ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
-  backend->Synchronize();
-  std::vector<std::byte> readback(kM * kN * 4);
-  auto download =
-      backend->CopyD2H(**c_buf, readback.data(), readback.size());
-  ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
   std::vector<float> ref(kM * kN);
   auto ref_status = core::GemmIq4XsRef(
       std::span<const float>(a), std::span<const std::byte>(w),
       std::span<float>(ref), kM, kN, kK);
   ASSERT_TRUE(ref_status.has_value())
       << tessera::ToString(ref_status.error());
-  const auto* device_out = reinterpret_cast<const float*>(readback.data());
   const FpTolerance tol = FpToleranceFor(backend->Name());
-  float max_abs = 0.0f;
-  for (std::size_t i = 0; i < ref.size(); ++i) {
-    max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+  for (const char* name : {"gemm_iq4xs", "gemm_iq4xs_vec"}) {
+    auto kernel = backend->LoadKernel(name, {});
+    ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+    const bool vec = std::string_view(name).ends_with("_vec");
+    tessera::KernelLaunch launch;
+    launch.grid_x = vec ? (kM * kN + 7) / 8 : (kM * kN + 255) / 256;
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+    launch.scalars = vec ? std::vector<std::uint64_t>{kM, kN, kK, 1}
+                         : std::vector<std::uint64_t>{kM, kN, kK};
+    auto result = backend->LaunchKernel(**kernel, launch);
+    ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+    backend->Synchronize();
+    std::vector<std::byte> readback(kM * kN * 4);
+    auto download =
+        backend->CopyD2H(**c_buf, readback.data(), readback.size());
+    ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+    const auto* device_out = reinterpret_cast<const float*>(readback.data());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << name << " backend " << backend->Name() << " max_abs " << max_abs;
   }
-  EXPECT_LE(max_abs, tol.abs)
-      << "backend " << backend->Name() << " max_abs " << max_abs;
 }
 
 // Device: the tiled batched IQ4_XS GEMM (weight blocks dequantized once
@@ -7745,3 +7749,348 @@ TEST(BackendTest, GemmIq4XsRows5MatchesRef) {
                             core::GemmIq4XsRef);
 }
 
+
+// Device: the fused routed-expert gate/up and down kernels match a host
+// reference built from the per-expert GEMM references.
+TEST(BackendTest, MoeFusedIqMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(75);
+  constexpr std::size_t kHidden = 256;
+  constexpr std::size_t kInter = 64;
+  constexpr std::size_t kTopK = 2;
+  constexpr std::size_t kExperts = 4;
+  const std::uint32_t ids_host[kTopK] = {1, 3};
+  const float wts_host[kTopK] = {0.4f, 0.6f};
+
+  const std::size_t gate_blocks = kHidden * kInter / 256;
+  const std::size_t gate_per_bytes = gate_blocks * 98;
+  std::vector<std::byte> gate =
+      RandomBlocks(rng, kExperts * gate_blocks, 98, 0);
+  std::vector<std::byte> up = RandomBlocks(rng, kExperts * gate_blocks, 98, 0);
+  const std::size_t down_blocks = kHidden * (kInter / 32);
+  const std::size_t down_per_bytes = down_blocks * 18;
+  std::vector<std::byte> down =
+      RandomBlocks(rng, kExperts * down_blocks, 18, 0);
+  std::vector<float> x(kHidden);
+  for (auto& v : x) {
+    v = DrawValue(rng);
+  }
+
+  std::vector<float> phi(kTopK * kInter);
+  for (std::size_t s = 0; s < kTopK; ++s) {
+    const std::size_t e = ids_host[s];
+    std::vector<float> gout(kInter);
+    std::vector<float> uout(kInter);
+    std::span<const std::byte> gslice(gate.data() + e * gate_per_bytes,
+                                      gate_per_bytes);
+    std::span<const std::byte> uslice(up.data() + e * gate_per_bytes,
+                                      gate_per_bytes);
+    ASSERT_TRUE(core::GemmIq3XxsRef(std::span<const float>(x), gslice,
+                                    std::span<float>(gout), 1, kInter, kHidden)
+                    .has_value());
+    ASSERT_TRUE(core::GemmIq3XxsRef(std::span<const float>(x), uslice,
+                                    std::span<float>(uout), 1, kInter, kHidden)
+                    .has_value());
+    for (std::size_t j = 0; j < kInter; ++j) {
+      const float g = gout[j];
+      phi[s * kInter + j] = (g / (1.0f + std::exp(-g))) * uout[j];
+    }
+  }
+  std::vector<float> expected(kHidden, 0.0f);
+  for (std::size_t s = 0; s < kTopK; ++s) {
+    const std::size_t e = ids_host[s];
+    std::vector<float> dout(kHidden);
+    std::span<const std::byte> dslice(down.data() + e * down_per_bytes,
+                                      down_per_bytes);
+    ASSERT_TRUE(core::GemmIq4NlRef(
+                    std::span<const float>(phi.data() + s * kInter, kInter),
+                    dslice, std::span<float>(dout), 1, kHidden, kInter)
+                    .has_value());
+    for (std::size_t j = 0; j < kHidden; ++j) {
+      expected[j] += wts_host[s] * dout[j];
+    }
+  }
+
+  auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+  auto g_buf = backend->AllocateBuffer(gate.size(), MemoryKind::Device);
+  auto u_buf = backend->AllocateBuffer(up.size(), MemoryKind::Device);
+  auto d_buf = backend->AllocateBuffer(down.size(), MemoryKind::Device);
+  auto id_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+  auto wt_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+  auto phi_buf = backend->AllocateBuffer(kTopK * kInter * 4, MemoryKind::Device);
+  auto out_buf = backend->AllocateBuffer(kHidden * 4, MemoryKind::Device);
+  ASSERT_TRUE(x_buf && g_buf && u_buf && d_buf && id_buf && wt_buf && phi_buf &&
+              out_buf);
+  auto up_x = backend->CopyH2D(
+      **x_buf, std::span<const std::byte>(
+                   reinterpret_cast<const std::byte*>(x.data()), x.size() * 4));
+  auto up_g = backend->CopyH2D(**g_buf, std::span<const std::byte>(gate));
+  auto up_u = backend->CopyH2D(**u_buf, std::span<const std::byte>(up));
+  auto up_d = backend->CopyH2D(**d_buf, std::span<const std::byte>(down));
+  auto up_id = backend->CopyH2D(
+      **id_buf, std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(ids_host), kTopK * 4));
+  auto up_wt = backend->CopyH2D(
+      **wt_buf, std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(wts_host), kTopK * 4));
+  ASSERT_TRUE(up_x && up_g && up_u && up_d && up_id && up_wt);
+
+  auto gu = backend->LoadKernel("moe_experts_gate_up_iq3xxs", {});
+  auto dn = backend->LoadKernel("moe_experts_down_iq4nl", {});
+  ASSERT_TRUE(gu.has_value()) << tessera::ToString(gu.error());
+  ASSERT_TRUE(dn.has_value()) << tessera::ToString(dn.error());
+  tessera::KernelLaunch gu_launch;
+  gu_launch.grid_x = (kInter * kTopK + 7) / 8;
+  gu_launch.block_x = 256;
+  gu_launch.buffers = {(*x_buf).get(), (*g_buf).get(), (*u_buf).get(),
+                       (*id_buf).get(), (*phi_buf).get()};
+  gu_launch.scalars = {kHidden, kInter, kTopK, gate_per_bytes, gate_per_bytes};
+  ASSERT_TRUE(backend->LaunchKernel(**gu, gu_launch).has_value());
+  tessera::KernelLaunch dn_launch;
+  dn_launch.grid_x = (kHidden + 7) / 8;
+  dn_launch.block_x = 256;
+  dn_launch.buffers = {(*phi_buf).get(), (*d_buf).get(), (*id_buf).get(),
+                       (*wt_buf).get(), (*out_buf).get()};
+  dn_launch.scalars = {kHidden, kInter, kTopK, down_per_bytes, 0};
+  ASSERT_TRUE(backend->LaunchKernel(**dn, dn_launch).has_value());
+  backend->Synchronize();
+  std::vector<std::byte> readback(kHidden * 4);
+  ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                  .has_value());
+  const auto* got = reinterpret_cast<const float*>(readback.data());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  float max_abs = 0.0f;
+  float peak = 0.0f;
+  for (std::size_t j = 0; j < kHidden; ++j) {
+    max_abs = std::max(max_abs, std::abs(got[j] - expected[j]));
+    peak = std::max(peak, std::abs(expected[j]));
+  }
+  EXPECT_LE(max_abs, tol.abs + tol.rel * peak)
+      << "backend " << backend->Name() << " max_abs " << max_abs;
+}
+
+// Device: every fused routed-expert gate/up format matches its per-expert
+// host reference (the phi product silu(G x) * U x).
+TEST(BackendTest, MoeFusedGateUpFormatsMatchRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  struct Case {
+    const char* kernel;
+    const char* fmt;
+    std::size_t bytes;
+    std::size_t gate_elems;
+    std::size_t up_elems;
+    std::uint32_t seed;
+  };
+  const Case cases[] = {
+      {"moe_experts_gate_up_iq2s", "IQ2_S", 82, 256, 256, 81},
+      {"moe_experts_gate_up_iq3xxs", "IQ3_XXS", 98, 256, 256, 82},
+      {"moe_experts_gate_up_iq3s", "IQ3_S", 110, 256, 256, 83},
+      {"moe_experts_gate_up_iq4xs", "IQ4_XS", 136, 256, 256, 84},
+  };
+  constexpr std::size_t kHidden = 256;
+  constexpr std::size_t kInter = 64;
+  constexpr std::size_t kTopK = 2;
+  constexpr std::size_t kExperts = 4;
+  const std::uint32_t ids_host[kTopK] = {1, 3};
+  for (const Case& c : cases) {
+    std::mt19937 rng(c.seed);
+    const std::size_t blocks = kHidden * kInter / c.gate_elems;
+    const std::size_t per_bytes = blocks * c.bytes;
+    std::vector<std::byte> gate = RandomBlocks(rng, kExperts * blocks, c.bytes, 0);
+    std::vector<std::byte> up = RandomBlocks(rng, kExperts * blocks, c.bytes, 0);
+    std::vector<float> x(kHidden);
+    for (auto& v : x) {
+      v = DrawValue(rng);
+    }
+    std::vector<float> phi(kTopK * kInter);
+    for (std::size_t s = 0; s < kTopK; ++s) {
+      const std::size_t e = ids_host[s];
+      std::vector<float> gout(kInter);
+      std::vector<float> uout(kInter);
+      std::span<const std::byte> gs(gate.data() + e * per_bytes, per_bytes);
+      std::span<const std::byte> us(up.data() + e * per_bytes, per_bytes);
+      std::expected<void, StatusCode> r1;
+      if (std::string_view(c.fmt) == "IQ2_S") {
+        r1 = core::GemmIq2SRef(std::span<const float>(x), gs,
+                               std::span<float>(gout), 1, kInter, kHidden);
+        ASSERT_TRUE(core::GemmIq2SRef(std::span<const float>(x), us,
+                                      std::span<float>(uout), 1, kInter, kHidden)
+                        .has_value());
+      } else if (std::string_view(c.fmt) == "IQ3_XXS") {
+        r1 = core::GemmIq3XxsRef(std::span<const float>(x), gs,
+                                 std::span<float>(gout), 1, kInter, kHidden);
+        ASSERT_TRUE(core::GemmIq3XxsRef(std::span<const float>(x), us,
+                                        std::span<float>(uout), 1, kInter, kHidden)
+                        .has_value());
+      } else if (std::string_view(c.fmt) == "IQ3_S") {
+        r1 = core::GemmIq3SRef(std::span<const float>(x), gs,
+                               std::span<float>(gout), 1, kInter, kHidden);
+        ASSERT_TRUE(core::GemmIq3SRef(std::span<const float>(x), us,
+                                      std::span<float>(uout), 1, kInter, kHidden)
+                        .has_value());
+      } else {
+        r1 = core::GemmIq4XsRef(std::span<const float>(x), gs,
+                                std::span<float>(gout), 1, kInter, kHidden);
+        ASSERT_TRUE(core::GemmIq4XsRef(std::span<const float>(x), us,
+                                       std::span<float>(uout), 1, kInter, kHidden)
+                        .has_value());
+      }
+      ASSERT_TRUE(r1.has_value());
+      for (std::size_t j = 0; j < kInter; ++j) {
+        const float g = gout[j];
+        phi[s * kInter + j] = (g / (1.0f + std::exp(-g))) * uout[j];
+      }
+    }
+    auto x_buf = backend->AllocateBuffer(x.size() * 4, MemoryKind::Device);
+    auto g_buf = backend->AllocateBuffer(gate.size(), MemoryKind::Device);
+    auto u_buf = backend->AllocateBuffer(up.size(), MemoryKind::Device);
+    auto id_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+    auto phi_buf = backend->AllocateBuffer(kTopK * kInter * 4, MemoryKind::Device);
+    ASSERT_TRUE(x_buf && g_buf && u_buf && id_buf && phi_buf);
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**x_buf, std::span<const std::byte>(
+                                           reinterpret_cast<const std::byte*>(
+                                               x.data()),
+                                           x.size() * 4))
+                    .has_value());
+    ASSERT_TRUE(backend->CopyH2D(**g_buf, std::span<const std::byte>(gate))
+                    .has_value());
+    ASSERT_TRUE(backend->CopyH2D(**u_buf, std::span<const std::byte>(up))
+                    .has_value());
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**id_buf,
+                              std::span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(ids_host),
+                                  kTopK * 4))
+                    .has_value());
+    auto kernel = backend->LoadKernel(c.kernel, {});
+    ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+    tessera::KernelLaunch launch;
+    launch.grid_x = (kInter * kTopK + 7) / 8;
+    launch.block_x = 256;
+    launch.buffers = {(*x_buf).get(), (*g_buf).get(), (*u_buf).get(),
+                      (*id_buf).get(), (*phi_buf).get()};
+    launch.scalars = {kHidden, kInter, kTopK, per_bytes, per_bytes};
+    ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+    backend->Synchronize();
+    std::vector<std::byte> readback(kTopK * kInter * 4);
+    ASSERT_TRUE(backend->CopyD2H(**phi_buf, readback.data(), readback.size())
+                    .has_value());
+    const auto* got = reinterpret_cast<const float*>(readback.data());
+    const FpTolerance tol = FpToleranceFor(backend->Name());
+    float max_abs = 0.0f;
+    float peak = 0.0f;
+    for (std::size_t i = 0; i < phi.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(got[i] - phi[i]));
+      peak = std::max(peak, std::abs(phi[i]));
+    }
+    EXPECT_LE(max_abs, tol.abs + tol.rel * peak)
+        << c.kernel << " backend " << backend->Name() << " max_abs " << max_abs;
+  }
+}
+
+// Device: every fused routed-expert down format matches its per-expert host
+// reference (the weighted sum over slots).
+TEST(BackendTest, MoeFusedDownFormatsMatchRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  struct Case {
+    const char* kernel;
+    const char* fmt;
+    std::size_t elems;
+    std::size_t bytes;
+    std::uint32_t seed;
+  };
+  const Case cases[] = {
+      {"moe_experts_down_iq4nl", "IQ4_NL", 32, 18, 85},
+      {"moe_experts_down_q20", "Q2_0", 64, 18, 86},
+  };
+  constexpr std::size_t kHidden = 256;
+  constexpr std::size_t kInter = 64;
+  constexpr std::size_t kTopK = 2;
+  constexpr std::size_t kExperts = 4;
+  const std::uint32_t ids_host[kTopK] = {1, 3};
+  const float wts_host[kTopK] = {0.4f, 0.6f};
+  for (const Case& c : cases) {
+    std::mt19937 rng(c.seed);
+    const std::size_t blocks = kInter / c.elems;
+    const std::size_t per_bytes = kHidden * blocks * c.bytes;
+    std::vector<std::byte> down = RandomBlocks(rng, kExperts * kHidden * blocks,
+                                               c.bytes, 0);
+    std::vector<float> phi(kTopK * kInter);
+    for (auto& v : phi) {
+      v = DrawValue(rng);
+    }
+    std::vector<float> expected(kHidden, 0.0f);
+    for (std::size_t s = 0; s < kTopK; ++s) {
+      const std::size_t e = ids_host[s];
+      std::vector<float> dout(kHidden);
+      std::span<const std::byte> ds(down.data() + e * per_bytes, per_bytes);
+      std::expected<void, StatusCode> r;
+      if (std::string_view(c.fmt) == "IQ4_NL") {
+        r = core::GemmIq4NlRef(
+            std::span<const float>(phi.data() + s * kInter, kInter), ds,
+            std::span<float>(dout), 1, kHidden, kInter);
+      } else {
+        r = core::GemmQ20Ref(
+            std::span<const float>(phi.data() + s * kInter, kInter), ds,
+            std::span<float>(dout), 1, kHidden, kInter);
+      }
+      ASSERT_TRUE(r.has_value());
+      for (std::size_t j = 0; j < kHidden; ++j) {
+        expected[j] += wts_host[s] * dout[j];
+      }
+    }
+    auto d_buf = backend->AllocateBuffer(down.size(), MemoryKind::Device);
+    auto id_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+    auto wt_buf = backend->AllocateBuffer(kTopK * 4, MemoryKind::Device);
+    auto phi_buf = backend->AllocateBuffer(kTopK * kInter * 4, MemoryKind::Device);
+    auto out_buf = backend->AllocateBuffer(kHidden * 4, MemoryKind::Device);
+    ASSERT_TRUE(d_buf && id_buf && wt_buf && phi_buf && out_buf);
+    ASSERT_TRUE(backend->CopyH2D(**d_buf, std::span<const std::byte>(down))
+                    .has_value());
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**id_buf,
+                              std::span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(ids_host),
+                                  kTopK * 4))
+                    .has_value());
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**wt_buf,
+                              std::span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(wts_host),
+                                  kTopK * 4))
+                    .has_value());
+    ASSERT_TRUE(backend
+                    ->CopyH2D(**phi_buf,
+                              std::span<const std::byte>(
+                                  reinterpret_cast<const std::byte*>(phi.data()),
+                                  phi.size() * 4))
+                    .has_value());
+    auto kernel = backend->LoadKernel(c.kernel, {});
+    ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+    tessera::KernelLaunch launch;
+    launch.grid_x = (kHidden + 7) / 8;
+    launch.block_x = 256;
+    launch.buffers = {(*phi_buf).get(), (*d_buf).get(), (*id_buf).get(),
+                      (*wt_buf).get(), (*out_buf).get()};
+    launch.scalars = {kHidden, kInter, kTopK, per_bytes, 0};
+    ASSERT_TRUE(backend->LaunchKernel(**kernel, launch).has_value());
+    backend->Synchronize();
+    std::vector<std::byte> readback(kHidden * 4);
+    ASSERT_TRUE(backend->CopyD2H(**out_buf, readback.data(), readback.size())
+                    .has_value());
+    const auto* got = reinterpret_cast<const float*>(readback.data());
+    const FpTolerance tol = FpToleranceFor(backend->Name());
+    float max_abs = 0.0f;
+    float peak = 0.0f;
+    for (std::size_t j = 0; j < kHidden; ++j) {
+      max_abs = std::max(max_abs, std::abs(got[j] - expected[j]));
+      peak = std::max(peak, std::abs(expected[j]));
+    }
+    EXPECT_LE(max_abs, tol.abs + tol.rel * peak)
+        << c.kernel << " backend " << backend->Name() << " max_abs " << max_abs;
+  }
+}

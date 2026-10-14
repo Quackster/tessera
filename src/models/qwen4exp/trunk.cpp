@@ -706,7 +706,18 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
   if (auto r = LoadKernel(backend, h.moe_scale_add, "moe_scale_add"); !r)
     return std::unexpected(r.error());
   if (auto r = LoadKernel(backend, h.moe_topk, "top_k_rows"); !r) return std::unexpected(r.error());
-  if (auto r = LoadKernel(backend, h.moe_fill, "fill"); !r) return std::unexpected(r.error());
+  if (auto r = LoadKernel(backend, h.moe_gate_up_iq2s, "moe_experts_gate_up_iq2s");
+      !r) return std::unexpected(r.error());
+  if (auto r = LoadKernel(backend, h.moe_gate_up_iq3xxs, "moe_experts_gate_up_iq3xxs");
+      !r) return std::unexpected(r.error());
+  if (auto r = LoadKernel(backend, h.moe_gate_up_iq3s, "moe_experts_gate_up_iq3s");
+      !r) return std::unexpected(r.error());
+  if (auto r = LoadKernel(backend, h.moe_gate_up_iq4xs, "moe_experts_gate_up_iq4xs");
+      !r) return std::unexpected(r.error());
+  if (auto r = LoadKernel(backend, h.moe_down_iq4nl, "moe_experts_down_iq4nl");
+      !r) return std::unexpected(r.error());
+  if (auto r = LoadKernel(backend, h.moe_down_q20, "moe_experts_down_q20");
+      !r) return std::unexpected(r.error());
 
   const std::size_t f = 4;
   auto make = [&](std::unique_ptr<Buffer>& slot,
