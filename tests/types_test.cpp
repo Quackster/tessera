@@ -1,9 +1,15 @@
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <set>
+#include <string>
+#include <vector>
 
 #include "core/files.hpp"
+#include "core/sha256.hpp"
+#include "tessera/mtp_fetch.hpp"
 #include "test_helpers.hpp"
 #include "tessera/types.hpp"
 
@@ -134,5 +140,52 @@ TEST(FileReaderTest, RejectsOutOfBoundsRange) {
   // The count overruns the 64-byte file; the short read is rejected.
   auto overrun = reader->ReadRange(60, 10);
   EXPECT_EQ(overrun.error(), StatusCode::MalformedFile);
+}
+
+TEST(Sha256Test, KnownVectors) {
+  auto hex = [](std::string_view text) {
+    return tessera::core::Sha256::Hex(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(text.data()), text.size()));
+  };
+  EXPECT_EQ(hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  EXPECT_EQ(hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  EXPECT_EQ(
+      hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+      "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+TEST(Sha256Test, StreamedFileMatchesInMemory) {
+  using tessera::testing::FreshTempDir;
+  using tessera::testing::WriteBytes;
+  std::string text;
+  for (int i = 0; i < 5000; ++i) {
+    text += "the quick brown fox jumps over the lazy dog ";
+  }
+  auto dir = FreshTempDir("tessera_tests_sha256_file");
+  auto path = dir / "blob.bin";
+  std::vector<std::byte> bytes(text.size());
+  std::memcpy(bytes.data(), text.data(), text.size());
+  WriteBytes(path, bytes);
+  auto from_file = tessera::core::Sha256File(path);
+  ASSERT_TRUE(from_file.has_value());
+  EXPECT_EQ(*from_file, tessera::core::Sha256::Hex(std::span<const std::byte>(
+                            reinterpret_cast<const std::byte*>(text.data()),
+                            text.size())));
+  auto missing = tessera::core::Sha256File(dir / "absent.bin");
+  EXPECT_EQ(missing.error(), StatusCode::FileNotFound);
+}
+
+TEST(MtpFetchTest, DigestsCoverEveryTensorOnce) {
+  const auto digests = tessera::MtpTensorDigests();
+  EXPECT_EQ(digests.size(), 31u);
+  std::set<std::string> names;
+  for (const auto& digest : digests) {
+    const std::string name(digest.name);
+    EXPECT_EQ(name.rfind("mtp.", 0), 0u);
+    EXPECT_EQ(digest.sha256.size(), 64u);
+    EXPECT_TRUE(names.insert(name).second) << "duplicate " << name;
+  }
 }
 

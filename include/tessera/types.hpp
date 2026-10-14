@@ -42,6 +42,7 @@ enum class StatusCode : int {
   OutOfMemory = 5,
   DeviceError = 6,
   NonFinite = 7,
+  NetworkError = 8,
 };
 
 // Human-readable name of a status code, for diagnostics and messages.
@@ -59,6 +60,7 @@ enum class StatusCode : int {
     case StatusCode::OutOfMemory: return "out_of_memory";
     case StatusCode::DeviceError: return "device_error";
     case StatusCode::NonFinite: return "non_finite_logits";
+    case StatusCode::NetworkError: return "network_error";
   }
   return "unknown";
 }
