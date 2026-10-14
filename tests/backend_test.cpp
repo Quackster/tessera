@@ -1051,22 +1051,76 @@ TEST(BackendTest, GemmIq4NlDeviceMatchesRef) {
       reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
   auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
   ASSERT_TRUE(up_a.has_value() && up_w.has_value());
-  auto kernel = backend->LoadKernel("gemm_iq4nl", {});
+  std::vector<float> ref(kM * kN);
+  auto ref_status = core::GemmIq4NlRef(
+      std::span<const float>(a), std::span<const std::byte>(w),
+      std::span<float>(ref), kM, kN, kK);
+  ASSERT_TRUE(ref_status.has_value())
+      << tessera::ToString(ref_status.error());
+  const FpTolerance tol = FpToleranceFor(backend->Name());
+  for (const char* name : {"gemm_iq4nl", "gemm_iq4nl_vec"}) {
+    auto kernel = backend->LoadKernel(name, {});
+    ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
+    const bool vec = std::string_view(name).ends_with("_vec");
+    tessera::KernelLaunch launch;
+    launch.grid_x = vec ? (kM * kN + 7) / 8 : (kM * kN + 255) / 256;
+    launch.block_x = 256;
+    launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+    launch.scalars = vec ? std::vector<std::uint64_t>{kM, kN, kK, 1}
+                         : std::vector<std::uint64_t>{kM, kN, kK};
+    auto result = backend->LaunchKernel(**kernel, launch);
+    ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
+    backend->Synchronize();
+    std::vector<std::byte> readback(kM * kN * 4);
+    auto download =
+        backend->CopyD2H(**c_buf, readback.data(), readback.size());
+    ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
+    const auto* device_out = reinterpret_cast<const float*>(readback.data());
+    float max_abs = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+      max_abs = std::max(max_abs, std::abs(device_out[i] - ref[i]));
+    }
+    EXPECT_LE(max_abs, tol.abs)
+        << name << " backend " << backend->Name() << " max_abs " << max_abs;
+  }
+}
+
+// Device: the IQ3_S warp-per-output GEMV matches the host reference.
+TEST(BackendTest, GemmIq3SVecMatchesRef) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  std::mt19937 rng(74);
+  constexpr std::size_t kM = 2;
+  constexpr std::size_t kN = 8;
+  constexpr std::size_t kK = 256;
+  std::vector<float> a(kM * kK);
+  for (auto& v : a) {
+    v = DrawValue(rng);
+  }
+  std::vector<std::byte> w = RandomBlocks(rng, kN, 110, 0);
+  auto a_buf = backend->AllocateBuffer(a.size() * 4, MemoryKind::Device);
+  auto w_buf = backend->AllocateBuffer(w.size(), MemoryKind::Device);
+  auto c_buf = backend->AllocateBuffer(kM * kN * 4, MemoryKind::Device);
+  ASSERT_TRUE(a_buf.has_value() && w_buf.has_value() && c_buf.has_value());
+  auto up_a = backend->CopyH2D(**a_buf, std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(a.data()), a.size() * 4));
+  auto up_w = backend->CopyH2D(**w_buf, std::span<const std::byte>(w));
+  ASSERT_TRUE(up_a.has_value() && up_w.has_value());
+  auto kernel = backend->LoadKernel("gemm_iq3s_vec", {});
   ASSERT_TRUE(kernel.has_value()) << tessera::ToString(kernel.error());
   tessera::KernelLaunch launch;
-  launch.grid_x = (kM * kN + 255) / 256;
+  launch.grid_x = (kM * kN + 7) / 8;
   launch.block_x = 256;
   launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
-  launch.scalars = {kM, kN, kK};
+  launch.scalars = {kM, kN, kK, 1};
   auto result = backend->LaunchKernel(**kernel, launch);
   ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
   backend->Synchronize();
   std::vector<std::byte> readback(kM * kN * 4);
-  auto download =
-      backend->CopyD2H(**c_buf, readback.data(), readback.size());
+  auto download = backend->CopyD2H(**c_buf, readback.data(), readback.size());
   ASSERT_TRUE(download.has_value()) << tessera::ToString(download.error());
   std::vector<float> ref(kM * kN);
-  auto ref_status = core::GemmIq4NlRef(
+  auto ref_status = core::GemmIq3SRef(
       std::span<const float>(a), std::span<const std::byte>(w),
       std::span<float>(ref), kM, kN, kK);
   ASSERT_TRUE(ref_status.has_value())
@@ -2024,7 +2078,12 @@ TEST(BackendTest, GemmIq3XxsIq2SQ20DeviceMatchRef) {
       {"gemm_iq2s", DType::IQ2_S, 82, 256, 72},
       {"gemm_q20", DType::Q2_0, 18, 64, 73},
   };
-  for (const Case& c : cases) {
+  const Case vec_cases[] = {
+      {"gemm_iq3xxs_vec", DType::IQ3_XXS, 98, 256, 71},
+      {"gemm_iq2s_vec", DType::IQ2_S, 82, 256, 72},
+      {"gemm_q20_vec", DType::Q2_0, 18, 64, 73},
+  };
+  auto run_case = [&](const Case& c, bool vec) {
     std::mt19937 rng(c.seed);
     constexpr std::size_t kM = 2;
     constexpr std::size_t kN = 8;
@@ -2046,10 +2105,17 @@ TEST(BackendTest, GemmIq3XxsIq2SQ20DeviceMatchRef) {
     ASSERT_TRUE(kernel.has_value())
         << c.kernel << ": " << tessera::ToString(kernel.error());
     tessera::KernelLaunch launch;
-    launch.grid_x = (kM * kN + 255) / 256;
-    launch.block_x = 256;
-    launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
-    launch.scalars = {kM, kN, kK};
+    if (vec) {
+      launch.grid_x = (kM * kN + 7) / 8;
+      launch.block_x = 256;
+      launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+      launch.scalars = {kM, kN, kK, 1};
+    } else {
+      launch.grid_x = (kM * kN + 255) / 256;
+      launch.block_x = 256;
+      launch.buffers = {(*a_buf).get(), (*w_buf).get(), (*c_buf).get()};
+      launch.scalars = {kM, kN, kK};
+    }
     auto result = backend->LaunchKernel(**kernel, launch);
     ASSERT_TRUE(result.has_value()) << tessera::ToString(result.error());
     backend->Synchronize();
@@ -2081,6 +2147,12 @@ TEST(BackendTest, GemmIq3XxsIq2SQ20DeviceMatchRef) {
     }
     EXPECT_LE(max_abs, tol.abs)
         << c.kernel << " backend " << backend->Name() << " max_abs " << max_abs;
+  };
+  for (const Case& c : cases) {
+    run_case(c, false);
+  }
+  for (const Case& c : vec_cases) {
+    run_case(c, true);
   }
 }
 

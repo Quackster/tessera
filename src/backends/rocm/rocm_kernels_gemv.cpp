@@ -10,45 +10,7 @@ using detail::Q4KCodec;
 using detail::Q5KCodec;
 using detail::Q6KCodec;
 using detail::Q80Codec;
-
-// Shared body of the warp-per-output family: grid covers m*n 32-lane
-// outputs, eight per 256-thread workgroup, five shuffles to reduce.
-// grid_y selects the split-K chunk when split > 1: each chunk covers
-// k/split elements and writes its partial to its own region of `c` (the
-// caller passes the partial buffer); split == 1 writes the output
-// directly at chunk 0. Small projections (n = 5120 is under one wave)
-// use the split so enough workgroups exist to saturate memory.
-template <typename Codec>
-__device__ __forceinline__ void GemvVecBody(const float* a,
-                                            const unsigned char* w, float* c,
-                                            unsigned long long m,
-                                            unsigned long long n,
-                                            unsigned long long k,
-                                            unsigned long long split) {
-  const unsigned long long warps = blockDim.x >> 5;
-  const unsigned long long total = m * n;
-  const unsigned long long idx =
-      static_cast<unsigned long long>(blockIdx.x) * warps + (threadIdx.x >> 5);
-  if (idx >= total) {
-    return;
-  }
-  const unsigned long long blocks = k / Codec::kBlockElements;
-  const unsigned long long per = blocks / split;
-  const unsigned long long b0 =
-      static_cast<unsigned long long>(blockIdx.y) * per;
-  const unsigned int lane = threadIdx.x & 31u;
-  const float* av = a + (idx / n) * k + b0 * Codec::kBlockElements;
-  const unsigned char* wr =
-      w + (idx % n) * blocks * Codec::kBlockBytes + b0 * Codec::kBlockBytes;
-  float acc = Codec::Dot(av, wr, per, lane);
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1) {
-    acc += __shfl_down_sync(~0ull, acc, off, 32);
-  }
-  if (lane == 0u) {
-    c[static_cast<unsigned long long>(blockIdx.y) * total + idx] = acc;
-  }
-}
+using detail::GemvVecBody;
 
 }  // namespace
 

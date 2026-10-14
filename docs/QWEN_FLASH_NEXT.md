@@ -544,6 +544,17 @@ the head read and the output projection).
   Covered by `EngineTest.RejectsNonFiniteLogits` and
   `EngineTest.StopsOnNonFiniteLogits`.
 
+- **M6: warp-per-output IQ expert GEMMs (the column GEMV was the cost).**
+  A decode profile (`TESSERA_PROFILE`) showed the routed-expert GEMVs at
+  66 percent of GPU time, each one-thread-per-output with an uncoalesced
+  K loop, measured at 10 to 15 GB/s. The IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and
+  Q2_0 dtypes now dispatch to a warp-per-output (`_vec`) GEMV on both
+  backends: one 32-lane group per output, five shuffles, coalesced weight
+  reads. On one R9700 (gfx1201), IQ3_S pack, `--gpu-layers 18`, 4K context,
+  fp32 KV: decode fell from 141 to 84 ms/token (7 to 11 tok/s) and prefill
+  from 6 to 11 prompt tok/s. The output stays coherent. The qwen4exp trunk
+  also gained the decode phase profiler qwen3_5 already had.
+
 ### Still required (in order)
 
  1. M6 follow-ups: add a fused MoE expert kernel and remove (or overlap)

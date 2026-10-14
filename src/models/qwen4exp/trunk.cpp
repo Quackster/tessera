@@ -10,6 +10,7 @@
 #include "core/decode_internal.hpp"
 #include "core/numerics/ngram.hpp"
 #include "core/numerics/qsa.hpp"
+#include "core/profile.hpp"
 #include "models/qwen4exp/architecture.hpp"
 #include "models/qwen4exp/ple_table.hpp"
 #include "models/qwen4exp/state.hpp"
@@ -890,6 +891,7 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
     return ready;
   }
   Qwen4ExpState& h = State(cache);
+  h.profile = cache.profile;
   auto embed = NeedWeightAny(model, "token_embd.weight");
   if (!embed) {
     return std::unexpected(StatusCode::MalformedFile);
@@ -921,7 +923,12 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
       ple_layer = true;
     }
   }
+  core::Profile* const deep_profile =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
   for (std::size_t l = 0; l < cfg.layers; ++l) {
+    core::PhaseScope layer_scope(
+        deep_profile, cfg.IsFullAttentionLayer(l) ? core::Phase::kFullLayer
+                                                  : core::Phase::kLinearLayer);
     if (auto ensured = model.EnsureLayerResident(l); !ensured) {
       return std::unexpected(ensured.error());
     }
@@ -969,13 +976,19 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
         !read) {
       return read;
     }
-    if (auto moe = RunMoeFfn(backend, model, cfg, h, l, *h.mixed); !moe) {
-      return moe;
+    {
+      core::PhaseScope ffn_scope(deep_profile, core::Phase::kFfn);
+      if (auto moe = RunMoeFfn(backend, model, cfg, h, l, *h.mixed); !moe) {
+        return moe;
+      }
     }
     if (auto write =
             HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject2);
         !write) {
       return write;
+    }
+    if (deep_profile != nullptr) {
+      backend.Synchronize();  // profile attribution only
     }
   }
   if (hidden_out != nullptr) {
@@ -994,10 +1007,17 @@ std::expected<std::vector<float>, StatusCode> Qwen4ExpArchitecture::Logits(
     std::uint32_t token, std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
     std::vector<Buffer*>* capture, const Buffer* embedding) const {
-  if (auto forward = Forward(backend, model, cache, token, hidden_out,
-                             capture_layers, capture, embedding);
-      !forward) {
-    return std::unexpected(forward.error());
+  core::Profile* const profile = cache.profile;
+  {
+    core::PhaseScope scope(profile, core::Phase::kForward);
+    if (auto forward = Forward(backend, model, cache, token, hidden_out,
+                               capture_layers, capture, embedding);
+        !forward) {
+      return std::unexpected(forward.error());
+    }
+    if (profile != nullptr) {
+      backend.Synchronize();  // profile attribution only
+    }
   }
   auto config = model.Config();
   if (!config) {
@@ -1009,9 +1029,16 @@ std::expected<std::vector<float>, StatusCode> Qwen4ExpArchitecture::Logits(
     return std::unexpected(geom.error());
   }
   Qwen4ExpState& h = State(cache);
-  if (auto head = RunHead(backend, model, cfg, *geom, h); !head) {
-    return std::unexpected(head.error());
+  {
+    core::PhaseScope scope(profile, core::Phase::kHead);
+    if (auto head = RunHead(backend, model, cfg, *geom, h); !head) {
+      return std::unexpected(head.error());
+    }
+    if (profile != nullptr) {
+      backend.Synchronize();  // profile attribution only
+    }
   }
+  core::PhaseScope scope(profile, core::Phase::kDownload);
   backend.Synchronize();
   return DownloadF32(backend, *h.logits);
 }

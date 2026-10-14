@@ -85,6 +85,9 @@ struct Qwen4ExpState final : core::ArchState {
   std::vector<QsaLayer> qsa;
   std::size_t position = 0;
   bool ready = false;
+  // Opt-in decode phase profiler (TESSERA_PROFILE), mirrored from the cache
+  // each forward. Null disables timing.
+  core::Profile* profile = nullptr;
 
   void ReportCaches(const log::Diagnostics& log,
                     std::string_view prefix) const override {

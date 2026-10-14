@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "backends/rocm/rocm_kernels_codec.hpp"
+
 namespace tessera::backends::rocm {
 // IQ4 codebook (ports kvalues_iq4nl; see CREDITS.md).
 __constant__ std::int8_t kIq4NlValuesDev[16] = {
@@ -1062,5 +1064,217 @@ template __global__ void GemmIq4XsRowsKernel<4>(
 template __global__ void GemmIq4XsRowsKernel<5>(
     const float*, const unsigned char*, float*, unsigned long long,
     unsigned long long, unsigned long long, unsigned long long);
+
+// Warp-per-output codecs for the IQ expert formats. Each lane owns the same
+// elements on both backends. The column GEMV these replace read the weights
+// uncoalesced; the vec family streams them at the memory rate.
+namespace detail {
+
+// IQ4_NL (18 bytes per 32): lane l owns element l, byte l&15, nibble l>>4.
+struct Iq4NlCodec {
+  static constexpr unsigned kBlockElements = 32;
+  static constexpr unsigned kBlockBytes = 18;
+
+  __device__ __forceinline__ static float Dot(const float* av,
+                                              const unsigned char* wr,
+                                              unsigned long long blocks,
+                                              unsigned int lane) {
+    const unsigned int j = lane & 15u;
+    const bool high = (lane >> 4) != 0u;
+    float acc = 0.0f;
+    for (unsigned long long b = 0; b < blocks; ++b) {
+      const unsigned char* base = wr + b * kBlockBytes;
+      const float d = Fp16ToFloatDev(LoadU16(base));
+      const unsigned char q = base[2 + j];
+      const unsigned int nib = high ? (q >> 4) : (q & 15u);
+      acc = fmaf(av[b * kBlockElements + lane],
+                 d * static_cast<float>(kIq4NlValuesDev[nib]), acc);
+    }
+    return acc;
+  }
+};
+
+// Q2_0 (18 bytes per 64): lane l owns elements l and l+32; element j is
+// base[2 + j/4] bits 2*(j%4), value (code - 1) * d.
+struct Q20Codec {
+  static constexpr unsigned kBlockElements = 64;
+  static constexpr unsigned kBlockBytes = 18;
+
+  __device__ __forceinline__ static float Dot(const float* av,
+                                              const unsigned char* wr,
+                                              unsigned long long blocks,
+                                              unsigned int lane) {
+    const unsigned int byte = lane >> 2;
+    const unsigned int shift = 2u * (lane & 3u);
+    float acc = 0.0f;
+    for (unsigned long long b = 0; b < blocks; ++b) {
+      const unsigned char* base = wr + b * kBlockBytes;
+      const float d = Fp16ToFloatDev(LoadU16(base));
+      const int lo = (base[2 + byte] >> shift) & 3;
+      const int hi = (base[2 + 8 + byte] >> shift) & 3;
+      const float* avb = av + b * kBlockElements;
+      acc = fmaf(avb[lane], static_cast<float>(lo - 1) * d, acc);
+      acc = fmaf(avb[lane + 32], static_cast<float>(hi - 1) * d, acc);
+    }
+    return acc;
+  }
+};
+
+// IQ3_XXS (98 bytes per 256): lane l -> ib=l/4, il=l%4 owns elements
+// ib*32+il*8..+7. Two grid bytes hold the 3-bit magnitudes, the aux word
+// the sub-block scale and the sign bits.
+struct Iq3XxsCodec {
+  static constexpr unsigned kBlockElements = 256;
+  static constexpr unsigned kBlockBytes = 98;
+
+  __device__ __forceinline__ static float Dot(const float* av,
+                                              const unsigned char* wr,
+                                              unsigned long long blocks,
+                                              unsigned int lane) {
+    const unsigned int ib = lane >> 2;
+    const unsigned int il = lane & 3u;
+    float acc = 0.0f;
+    for (unsigned long long b = 0; b < blocks; ++b) {
+      const unsigned char* base = wr + b * kBlockBytes;
+      const float d = Fp16ToFloatDev(LoadU16(base));
+      const std::uint32_t gas0 = LoadU16(base + 66 + 4 * ib);
+      const std::uint32_t gas1 = LoadU16(base + 68 + 4 * ib);
+      const std::uint32_t aux32 = gas0 | (gas1 << 16);
+      const float dl = d * (0.5f + static_cast<float>(aux32 >> 28)) * 0.5f;
+      const std::uint32_t g1 = kIq3XxsGridDev[base[2 + 8 * ib + 2 * il]];
+      const std::uint32_t g2 = kIq3XxsGridDev[base[2 + 8 * ib + 2 * il + 1]];
+      const unsigned char signs = kIq2XsSignsDev[(aux32 >> (7 * il)) & 127];
+      const float* e = av + b * kBlockElements + ib * 32 + il * 8;
+#pragma unroll
+      for (unsigned int j = 0; j < 4; ++j) {
+        const float m1 = (signs & (1u << j)) ? -1.0f : 1.0f;
+        const float m2 = (signs & (1u << (j + 4))) ? -1.0f : 1.0f;
+        acc =
+            fmaf(e[j], dl * static_cast<float>((g1 >> (8 * j)) & 255) * m1, acc);
+        acc = fmaf(e[4 + j], dl * static_cast<float>((g2 >> (8 * j)) & 255) * m2,
+                   acc);
+      }
+    }
+    return acc;
+  }
+};
+
+// IQ2_S (82 bytes per 256): lane l -> ib=l/4, il=l%4 owns eight elements.
+struct Iq2SCodec {
+  static constexpr unsigned kBlockElements = 256;
+  static constexpr unsigned kBlockBytes = 82;
+
+  __device__ __forceinline__ static float Dot(const float* av,
+                                              const unsigned char* wr,
+                                              unsigned long long blocks,
+                                              unsigned int lane) {
+    const unsigned int ib = lane >> 2;
+    const unsigned int il = lane & 3u;
+    float acc = 0.0f;
+    for (unsigned long long b = 0; b < blocks; ++b) {
+      const unsigned char* base = wr + b * kBlockBytes;
+      const float d = Fp16ToFloatDev(LoadU16(base));
+      const std::uint32_t qh = base[66 + ib];
+      const std::uint32_t sc = base[74 + ib];
+      const std::uint32_t gi =
+          (base[2 + 4 * ib + il] | ((qh << (8 - 2 * il)) & 0x300)) & 0x3FF;
+      const std::uint64_t grid = kIq2SGridDev[gi];
+      const float dl =
+          d * (0.5f + static_cast<float>((sc >> (4 * (il / 2))) & 15)) * 0.25f;
+      const unsigned char signs = base[34 + 4 * ib + il];
+      const float* e = av + b * kBlockElements + ib * 32 + il * 8;
+#pragma unroll
+      for (unsigned int j = 0; j < 8; ++j) {
+        const float m = (signs & (1u << j)) ? -1.0f : 1.0f;
+        acc =
+            fmaf(e[j], dl * static_cast<float>((grid >> (8 * j)) & 255) * m, acc);
+      }
+    }
+    return acc;
+  }
+};
+
+// IQ3_S (110 bytes per 256): lane l -> ib=(l/8)*2, half=(l/4)&1, j=l&3.
+struct Iq3SCodec {
+  static constexpr unsigned kBlockElements = 256;
+  static constexpr unsigned kBlockBytes = 110;
+
+  __device__ __forceinline__ static float Dot(const float* av,
+                                              const unsigned char* wr,
+                                              unsigned long long blocks,
+                                              unsigned int lane) {
+    const unsigned int ib = (lane >> 3) * 2;
+    const unsigned int half = (lane >> 2) & 1u;
+    const unsigned int l0 = lane & 3u;
+    float acc = 0.0f;
+    for (unsigned long long b = 0; b < blocks; ++b) {
+      const unsigned char* base = wr + b * kBlockBytes;
+      const float d = Fp16ToFloatDev(LoadU16(base));
+      const unsigned char sbyte = base[106 + ib / 2];
+      const float db =
+          d * (1.0f + 2.0f * static_cast<float>(half == 0 ? (sbyte & 15)
+                                                          : (sbyte >> 4)));
+      const std::uint32_t qh = base[66 + ib + half];
+      const std::uint32_t g1 =
+          kIq3sGridDev[base[2 + ib * 8 + 2 * l0] | ((qh << (8 - 2 * l0)) & 256)];
+      const std::uint32_t g2 = kIq3sGridDev[base[2 + ib * 8 + 2 * l0 + 1] |
+                                            ((qh << (7 - 2 * l0)) & 256)];
+      const unsigned char signs = base[74 + ib * 4 + half * 4 + l0];
+      const float* e = av + b * kBlockElements + ib * 32 + half * 32 + l0 * 8;
+#pragma unroll
+      for (unsigned int j = 0; j < 4; ++j) {
+        const float m1 = (signs & (1u << j)) ? -1.0f : 1.0f;
+        const float m2 = (signs & (1u << (j + 4))) ? -1.0f : 1.0f;
+        acc = fmaf(e[j], db * static_cast<float>((g1 >> (8 * j)) & 255) * m1, acc);
+        acc =
+            fmaf(e[4 + j], db * static_cast<float>((g2 >> (8 * j)) & 255) * m2,
+                 acc);
+      }
+    }
+    return acc;
+  }
+};
+
+}  // namespace detail
+
+// Built-in "gemm_iq4nl_vec": warp-per-output IQ4_NL GEMV.
+__global__ void GemmIq4NlVecKernel(const float* a, const unsigned char* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n, unsigned long long k,
+                                   unsigned long long split) {
+  detail::GemvVecBody<detail::Iq4NlCodec>(a, w, c, m, n, k, split);
+}
+
+// Built-in "gemm_iq2s_vec": warp-per-output IQ2_S GEMV.
+__global__ void GemmIq2SVecKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k,
+                                  unsigned long long split) {
+  detail::GemvVecBody<detail::Iq2SCodec>(a, w, c, m, n, k, split);
+}
+
+// Built-in "gemm_iq3xxs_vec": warp-per-output IQ3_XXS GEMV.
+__global__ void GemmIq3XxsVecKernel(const float* a, const unsigned char* w,
+                                    float* c, unsigned long long m,
+                                    unsigned long long n, unsigned long long k,
+                                    unsigned long long split) {
+  detail::GemvVecBody<detail::Iq3XxsCodec>(a, w, c, m, n, k, split);
+}
+
+// Built-in "gemm_iq3s_vec": warp-per-output IQ3_S GEMV.
+__global__ void GemmIq3SVecKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k,
+                                  unsigned long long split) {
+  detail::GemvVecBody<detail::Iq3SCodec>(a, w, c, m, n, k, split);
+}
+
+// Built-in "gemm_q20_vec": warp-per-output Q2_0 GEMV.
+__global__ void GemmQ20VecKernel(const float* a, const unsigned char* w,
+                                 float* c, unsigned long long m,
+                                 unsigned long long n, unsigned long long k,
+                                 unsigned long long split) {
+  detail::GemvVecBody<detail::Q20Codec>(a, w, c, m, n, k, split);
+}
 
 }  // namespace tessera::backends::rocm

@@ -1158,12 +1158,12 @@ inline std::string_view GemmKernelName(DType dtype) {
     case DType::Q6K: return "gemm_q6k_vec";
     case DType::Q3K: return "gemm_q3k";
     case DType::Q80: return "gemm_q80_vec";
-    case DType::IQ4_NL: return "gemm_iq4nl";
+    case DType::IQ4_NL: return "gemm_iq4nl_vec";
     case DType::IQ4_XS: return "gemm_iq4xs_vec";
-    case DType::IQ3_S: return "gemm_iq3s";
-    case DType::IQ3_XXS: return "gemm_iq3xxs";
-    case DType::IQ2_S: return "gemm_iq2s";
-    case DType::Q2_0: return "gemm_q20";
+    case DType::IQ3_S: return "gemm_iq3s_vec";
+    case DType::IQ3_XXS: return "gemm_iq3xxs_vec";
+    case DType::IQ2_S: return "gemm_iq2s_vec";
+    case DType::Q2_0: return "gemm_q20_vec";
     case DType::F32: return "gemm_f32";
     case DType::BF16: return "gemm_bf16";
     case DType::F4E2M1: return "gemm_mxfp4";
