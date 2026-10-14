@@ -1,5 +1,6 @@
 #include "fetch_mtp_command.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -62,7 +63,23 @@ int RunFetchMtpCommand(int argc, char** argv) {
     return kExitUsage;
   }
   const std::filesystem::path dir(out);
-  const tessera::MtpFetchOptions options{dir, only};
+  tessera::MtpFetchOptions options{dir, only, nullptr};
+  // Progress on stderr: one updating line per tensor. The fetch resumes from
+  // the bytes already on disk, so `done` may start above zero.
+  options.progress = [](std::string_view name, std::uint64_t done,
+                        std::uint64_t total) {
+    const double pct = total == 0 ? 100.0
+                                  : 100.0 * static_cast<double>(done) /
+                                        static_cast<double>(total);
+    std::fprintf(stderr, "\r  %-56s %5.1f%% (%llu/%llu MB)",
+                 std::string(name).c_str(), pct,
+                 static_cast<unsigned long long>(done >> 20),
+                 static_cast<unsigned long long>(total >> 20));
+    if (done >= total) {
+      std::fputc('\n', stderr);
+    }
+    std::fflush(stderr);
+  };
   if (mode == "inventory") {
     auto result = tessera::MtpInventory(options);
     if (!result) {

@@ -55,6 +55,23 @@ struct Qwen4ExpGeometry {
     const Buffer& w, Buffer& out, std::size_t m, std::size_t n,
     std::size_t k);
 
+// One gated residual read: normalize the stack into the sub-block input
+// `mixed`, and (when `w_inject` is non-null) the per-stream injection.
+// `w_norm` is the f32 gamma, `w_down`/`w_up` the bf16 low-rank pair and
+// `w_inject` the bf16 per-stream injection, or null. Used by the trunk and
+// the MTP head.
+[[nodiscard]] std::expected<void, StatusCode> HyperRead(
+    Backend& backend, Qwen4ExpState& h, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, const Buffer& w_norm, const Buffer& w_down,
+    const Buffer& w_up, const Buffer* w_inject, Buffer& r, Buffer& mixed,
+    Buffer* inject);
+
+// One gated residual write: fold `block_out` back into the stack with the
+// per-stream injection.
+[[nodiscard]] std::expected<void, StatusCode> HyperWrite(
+    Backend& backend, Qwen4ExpState& h, const Qwen4ExpGeometry& g, Buffer& r,
+    const Buffer& block_out, const Buffer& inject);
+
 // The sparse mixture-of-experts FFN for one layer: route, run `top_k`
 // routed experts and the always-on shared expert, and write the block
 // output to `h.block_out`. `mixed` is the normed activation from the FFN

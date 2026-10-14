@@ -90,6 +90,7 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3, single files and `-00001-of-00005` splits. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, Q2_0, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS and IQ2_S. Checks bounds. |
 | Qwen4-Exp split GGUF | Partial | Qwen3.8-Flash-Next GSQ-RCO loads and decodes: split shards merge, config parses, and the 51B n-gram table streams rows from SSD. The QSA indexer, hyper-connection mixer, PLE gather and GDN output-norm kernels run on both backends. Paged weights are held in system RAM. The expert cache is sized to the free device memory and lifts decode from about 3.7 to about 6 tok/s on one R9700 at a 4K context. The 48 tok/s target is not reached. The engine stops on non-finite logits instead of looping on `!`; that intermittent fault is still open. |
+| Flash-Next MTP head | Partial | The GSQ-RCO GGUF ships no MTP head. `tessera-cli fetch-mtp` reads the BF16 checkpoint's safetensors headers over HTTP and downloads only the 31 `mtp.*` tensors, resumable and checked against the pinned SHA256. The qwen4exp module loads them and runs the draft block. End-to-end drafting needs the downloaded tensors and is not yet measured. |
 | MXFP4 safetensors | Done | Parses the map and packs the weights. config.json drives the decode config. |
 | NVFP4 MoE | Done | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. |
 | DFlash2 FP8 draft | Done | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. |
@@ -293,6 +294,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--enable-thinking` | run | off | Render the chat template with thinking enabled. |
 | `--reasoning-effort <level>` | run | unset | Thinking difficulty for the chat template (for example `xhigh`). Ignored with `--no-chat`. |
 | `--speculate` | both | off | MTP speculative decode from the target head. Needs no checkpoint. |
+| `--mtp <dir>` | both | unset | Directory of a separately fetched MTP head (from `tessera-cli fetch-mtp`) for a model whose GGUF ships none, such as the Flash-Next target. |
 | `--sample` | run | off | Sample instead of greedy decode. |
 | `--temperature <f>` | run | 0.6 | Sampling temperature. |
 | `--top-p <f>` | run | 0.95 | Nucleus probability. |

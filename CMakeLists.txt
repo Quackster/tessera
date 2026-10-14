@@ -35,6 +35,8 @@ add_library(tessera STATIC
     src/models/qwen4exp/moe.cpp
     src/models/qwen4exp/weights.cpp
     src/models/qwen4exp/mtp_fetch.cpp
+    src/models/qwen4exp/mtp_weights.cpp
+    src/models/qwen4exp/mtp.cpp
     src/core/engine.cpp
     src/core/runner.cpp
     src/core/pipeline.cpp
