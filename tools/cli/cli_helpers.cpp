@@ -126,6 +126,8 @@ void PrintUsage() {
                "       tessera-cli calibrate --model <path> [--draft <dir>]\n"
                "       [--context <n>] [--calibration <file>] [--gpu <n>]\n"
                "       [--prompts <file>]\n"
+               "       tessera-cli fetch-mtp --out <dir> [inventory|fetch|"
+               "verify]\n"
                "       tessera-cli --list-gpus\n"
                "  --list-gpus       list the GPUs the backend sees and exit\n"
                "  --model <path>    a .gguf file or an MXFP4 model directory\n"

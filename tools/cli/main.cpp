@@ -15,6 +15,7 @@
 #include "calibrate_command.hpp"
 #include "cli_common.hpp"
 #include "cli_helpers.hpp"
+#include "fetch_mtp_command.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/image.hpp"
@@ -107,6 +108,9 @@ int main(int argc, char** argv) {
   }
   if (command == "calibrate") {
     return tessera::cli::RunCalibrateCommand(argc, argv);
+  }
+  if (command == "fetch-mtp") {
+    return tessera::cli::RunFetchMtpCommand(argc, argv);
   }
   if (command != "run" && command != "serve") {
     PrintUsage();

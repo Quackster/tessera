@@ -34,6 +34,7 @@ add_library(tessera STATIC
     src/models/qwen4exp/trunk.cpp
     src/models/qwen4exp/moe.cpp
     src/models/qwen4exp/weights.cpp
+    src/models/qwen4exp/mtp_fetch.cpp
     src/core/engine.cpp
     src/core/runner.cpp
     src/core/pipeline.cpp
@@ -49,6 +50,8 @@ add_library(tessera STATIC
     src/core/calibrate/calibrate.cpp
     src/core/model.cpp
     src/core/files.cpp
+    src/core/http.cpp
+    src/core/sha256.cpp
     src/core/tokenizer.cpp
     src/core/buffer.cpp
     src/core/loaders/gguf.cpp
@@ -114,6 +117,18 @@ add_library(tessera STATIC
 )
 target_include_directories(tessera PUBLIC include PRIVATE src)
 target_compile_options(tessera PRIVATE -Wall -Wextra)
+
+# The MTP head fetch needs an HTTPS client. libcurl is optional: without
+# it HttpAvailable() is false and the fetch reports UnsupportedFeature, so
+# the engine still builds with no network library.
+find_package(CURL)
+if(CURL_FOUND)
+    target_compile_definitions(tessera PRIVATE TESSERA_HAVE_CURL=1)
+    target_link_libraries(tessera PRIVATE CURL::libcurl)
+    message(STATUS "libcurl found: MTP head fetch over HTTP is enabled")
+else()
+    message(STATUS "libcurl not found: MTP head fetch over HTTP is disabled")
+endif()
 
 # Embed the web UI (single dependency-free files) in a generated
 # header. Editing src/serve/web/* needs a fresh `cmake -B` run, like
@@ -280,7 +295,8 @@ endif()
 add_executable(tessera-cli tools/cli/main.cpp
                             tools/cli/calibrate_command.cpp
                             tools/cli/calibrate_parallel.cpp
-                            tools/cli/cli_helpers.cpp)
+                            tools/cli/cli_helpers.cpp
+                            tools/cli/fetch_mtp_command.cpp)
 target_link_libraries(tessera-cli PRIVATE tessera)
 
 enable_testing()
