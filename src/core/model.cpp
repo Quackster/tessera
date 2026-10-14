@@ -1266,11 +1266,6 @@ bool Model::ExpertsPaged(std::size_t layer) const {
          !paged_expert_by_layer_[layer].empty();
 }
 
-// Cached expert triplets per routed-expert kind: a repeated expert costs
-// one device-side gather instead of a host upload. A tunable; each kind's
-// store holds this many expert slices.
-constexpr std::size_t kExpertCacheEntries = 32;
-
 // One expert's byte size and count from a rank-3 packed expert manifest.
 // MalformedFile when the shape cannot hold experts.
 std::expected<std::pair<std::size_t, std::size_t>, StatusCode> ExpertSpan(
@@ -1284,6 +1279,31 @@ std::expected<std::pair<std::size_t, std::size_t>, StatusCode> ExpertSpan(
     return std::unexpected(per ? StatusCode::MalformedFile : per.error());
   }
   return std::make_pair(*per, count);
+}
+
+// A repeated expert costs one device-side gather instead of a host upload,
+// so a larger store means fewer per-token uploads. The slot count trades
+// the free device memory against the reserve (see ExpertCacheSlots).
+std::size_t Model::ExpertCacheEntries() const {
+  if (expert_cache_entries_ != 0) {
+    return expert_cache_entries_;
+  }
+  // Every paged (layer, kind) pair gets the same slot count, so the cache
+  // spends one slot-set per pair: entries = budget / total_per, where
+  // total_per sums the per-expert slice bytes over every pair.
+  std::size_t total_per = 0;
+  for (const PagedTensor& entry : paged_) {
+    if (!core::IsRoutedExpertKind(entry.kind)) {
+      continue;
+    }
+    auto span = ExpertSpan(entry.manifest);
+    if (span) {
+      total_per += span->first;
+    }
+  }
+  expert_cache_entries_ =
+      core::ExpertCacheSlots(backend_.MemoryInfo().free_bytes, total_per);
+  return expert_cache_entries_;
 }
 
 std::expected<void, StatusCode> Model::EnsureLayerExperts(
@@ -1398,6 +1418,7 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   if (layer_cache.size() < rows->size()) {
     layer_cache.resize(rows->size());
   }
+  const std::size_t cache_entries = ExpertCacheEntries();
   std::vector<KindWork> kinds;
   kinds.reserve(rows->size());
   for (std::size_t k = 0; k < rows->size(); ++k) {
@@ -1427,16 +1448,16 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
     ExpertCache& held = layer_cache[k];
     if (held.store == nullptr) {
       auto store =
-          backend_.AllocateBuffer(kExpertCacheEntries * per, MemoryKind::Device);
+          backend_.AllocateBuffer(cache_entries * per, MemoryKind::Device);
       if (store) {
         held.stage_slot = staged->second;
         held.per_bytes = per;
         held.store = std::move(*store);
-        held.entries.resize(kExpertCacheEntries);
+        held.entries.resize(cache_entries);
       }
     }
     if (held.store != nullptr && held.per_bytes == per &&
-        held.entries.size() == kExpertCacheEntries) {
+        held.entries.size() == cache_entries) {
       cache = &held;
     }
     kinds.push_back(KindWork{i, staged->second, per, cache});
@@ -1468,7 +1489,7 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
         continue;
       }
       ExpertCache& cache = *kind.cache;
-      std::size_t slot = kExpertCacheEntries;
+      std::size_t slot = cache_entries;
       for (std::size_t s = 0; s < cache.entries.size(); ++s) {
         const ExpertCacheEntry& held = cache.entries[s];
         if (held.occupied && held.expert == expert) {
@@ -1476,7 +1497,7 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
           break;
         }
       }
-      if (slot < kExpertCacheEntries) {
+      if (slot < cache_entries) {
         cache.entries[slot].tick = ++expert_cache_tick_;
       } else {
         slot = 0;

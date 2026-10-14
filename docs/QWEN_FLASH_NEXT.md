@@ -289,9 +289,12 @@ architecture rules.
   reference layer order are recorded above.
 - M1 to M5 (load, GDN, MoE, hyper-connections, QSA, PLE): done. The module
   loads the two shards, decodes, and produces coherent output.
-- M6 (expert cache and 48 tokens per second): in progress. The current
-  paged path decodes at about 4 to 6 output tokens per second at a short
-  prompt on one R9700. The target is not reached.
+- M6 (expert cache and 48 tokens per second): in progress. The expert
+  cache is now sized to the free device memory, which lifts decode from
+  about 3.7 to about 6 output tokens per second at a 4K context on one
+  R9700 (gfx1201, 32 GB, fp32 KV, `--gpu-layers 18`). The target is not
+  reached. An intermittent non-finite logits fault remains (see the M6
+  investigation below).
 - M7 (MTP): out of scope. No draft file is present.
 
 Correctness evidence: with no completion cap and `--no-chat`, the prompt
@@ -439,10 +442,41 @@ the head read and the output projection).
   slice size differs by layer and a shared cache must key by both kind and
   slice size. A global LRU cache was prototyped and scales the slot count,
   but its hit rate and throughput do not yet beat the per-(layer, kind)
-  cache that is the default, so the prototype was reverted. The target of
-  48 tokens per second needs a much larger cache (order ten thousand
-  slices), sized to the free device memory, and likely expert streaming of
-  the dense weights to make room. Not reached yet.
+  cache that is the default, so the prototype was reverted.
+- **M6: the expert cache is sized to the free device memory.** The
+  per-(layer, kind) store now holds `ExpertCacheSlots(free_bytes,
+  total_per)` slices instead of a fixed 32
+  (`src/core/loaders/shard.hpp`, `Model::ExpertCacheEntries`). On the
+  R9700 at `--gpu-layers 18` the free device memory is about 7.9 GiB and
+  the summed per-expert slice bytes about 61 MB, so each pair holds about
+  100 slices, about 10,000 slices in total. That is close to the Strata
+  12,288-slot reference. Measured at a 4K context, fp32 KV, one R9700:
+  decode went from 271 ms/token (3.7 tok/s, 32 slices) to 158 to 166
+  ms/token (about 6 tok/s), and the cache hit rate is about 74 percent.
+  The expert staging per token fell from about 175 MB to about 106 MB.
+  The gain is not yet robust: under external contention the host `memcpy`
+  slows and a run can fall back to 271 ms/token, so the number is a best
+  case, not a floor.
+- **M6 open: the staging path dominates and its cost varies.** A profile
+  splits the token into the expert staging and the kernels. The staging
+  is a host `memcpy` from the system-RAM paged weights into the pinned
+  window, then an H2D copy. In a fast run the staging is about 52
+  ms/token and the kernels about 111 ms/token. The host `memcpy` alone
+  is 13 to 93 ms per token and varies run to run. The `memcpy` reads a
+  warm 31 GB buffer at 17 GB/s in isolation, so the variance is
+  contention with the GPU and the ROCm runtime during decode, not the
+  source layout or huge pages. The 48 tok/s target needs the staging
+  overlapped with the kernels, a prefetch or pipelined path, and a fused
+  MoE expert kernel. Not reached yet.
+- **M6 open: intermittent non-finite logits.** About half of the model
+  loads fail during prefill with `non-finite logits`, and the guard stops
+  the run. The committed baseline at `97e7af6` fails the same way, so the
+  fault predates the cache sizing. It is not the expert cache: the
+  failure is nondeterministic across runs of one binary. The earlier
+  finding was that buffered reads of the file returned different bytes on
+  each read, so the system-RAM copy made at load can inherit those bytes.
+  The next step is to read the shards with direct I/O, or verify them, so
+  the RAM copy is stable.
 - **Recommended sampling (qwen4exp).** The model card specifies a sampler
   per thinking mode: thinking on uses temperature 1.0 and top_p 0.95;
   thinking off uses temperature 0.7, top_p 0.80 and presence penalty 1.5;
@@ -486,10 +520,13 @@ the head read and the output projection).
 
 ### Still required (in order)
 
-1. The expert cache and streaming path (M6), then the throughput
-   measurement. The current paged path re-uploads every paged layer each
-   token and does not hold hot experts resident.
-2. MTP (M7), when the draft file is downloaded.
+1. M6 follow-ups: overlap the expert staging with the kernels (a
+   prefetch or pipelined path) and add a fused MoE expert kernel, then
+   reach the 48 tok/s target. The cache is already sized to the free
+   device memory.
+2. Fix the intermittent non-finite logits: read the shards with direct
+   I/O so the system-RAM copy is stable.
+3. MTP (M7), when the draft file is downloaded.
 
 ### Memory note
 

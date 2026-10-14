@@ -2000,6 +2000,30 @@ TEST(EngineTest, PagedMoeDenseResidentKeepsMoeDense) {
   EXPECT_FALSE(PagedMoeDenseResident("blk.0.attn_q.weight", 20, 0, true));
 }
 
+// The expert cache slot count divides the free device memory after a
+// fixed reserve by the summed per-expert slice bytes, clamped to the
+// configured bounds. The bounds and reserve live with the helper.
+TEST(EngineTest, ExpertCacheSlotsFitDeviceMemory) {
+  using tessera::core::ExpertCacheSlots;
+  using tessera::core::kExpertCacheReserveBytes;
+  using tessera::core::kMaxExpertCacheEntries;
+  using tessera::core::kMinExpertCacheEntries;
+  // A large budget against a tiny per-pair cost clamps to the maximum.
+  EXPECT_EQ(ExpertCacheSlots(64ull << 30, 1024), kMaxExpertCacheEntries);
+  // A budget of reserve + 100 MiB with a 1 MiB per-pair cost fits 100.
+  EXPECT_EQ(
+      ExpertCacheSlots(kExpertCacheReserveBytes + (100u << 20), 1u << 20), 100u);
+  // No paged experts, or a budget at or below the reserve, yields the
+  // minimum rather than a zero-sized store.
+  EXPECT_EQ(ExpertCacheSlots(64ull << 30, 0), kMinExpertCacheEntries);
+  EXPECT_EQ(ExpertCacheSlots(kExpertCacheReserveBytes, 1u << 20),
+            kMinExpertCacheEntries);
+  EXPECT_EQ(ExpertCacheSlots(0, 1u << 20), kMinExpertCacheEntries);
+  // A budget that fits fewer than the minimum clamps up to it.
+  EXPECT_EQ(ExpertCacheSlots(kExpertCacheReserveBytes + 1, 1u << 20),
+            kMinExpertCacheEntries);
+}
+
 // KV cache math pins the AppendKv growth: one F32 row per key and value,
 // geometric capacity, per-row scales only for quantized types.
 TEST(EngineTest, FullKvLayerBytesFollowsAppendKv) {

@@ -1,11 +1,41 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 
 #include "tessera/model.hpp"
 
 namespace tessera::core {
+
+// Expert-cache slot bounds and the device-memory reserve the cache leaves
+// for activations, the KV cache and the staging window.
+inline constexpr std::size_t kMinExpertCacheEntries = 32;
+inline constexpr std::size_t kMaxExpertCacheEntries = 512;
+inline constexpr std::uint64_t kExpertCacheReserveBytes = 1ull << 30;
+
+// Expert-cache slots per (layer, kind) pair that fit `free_bytes` of
+// device memory while leaving kExpertCacheReserveBytes for activations,
+// the KV cache and the staging window. The cache spends one slot-set per
+// pair, so the count is the budget divided by `total_per_bytes`, the sum
+// of the per-expert slice bytes over every paged pair, clamped to
+// [kMinExpertCacheEntries, kMaxExpertCacheEntries]. A zero
+// `total_per_bytes` or a budget below the reserve yields the minimum.
+//
+// Usage:
+//   const std::size_t slots = ExpertCacheSlots(info.free_bytes, total_per);
+[[nodiscard]] constexpr std::size_t ExpertCacheSlots(
+    std::uint64_t free_bytes, std::size_t total_per_bytes) {
+  if (total_per_bytes == 0 || free_bytes <= kExpertCacheReserveBytes) {
+    return kMinExpertCacheEntries;
+  }
+  const std::uint64_t budget = free_bytes - kExpertCacheReserveBytes;
+  const std::size_t fit = static_cast<std::size_t>(budget / total_per_bytes);
+  if (fit < kMinExpertCacheEntries) {
+    return kMinExpertCacheEntries;
+  }
+  return fit > kMaxExpertCacheEntries ? kMaxExpertCacheEntries : fit;
+}
 
 // Split an internal `blk.<layer>.<kind>` name into its layer index and
 // the kind suffix (the name after the layer prefix). Returns false when
