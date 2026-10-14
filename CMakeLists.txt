@@ -73,6 +73,7 @@ add_library(tessera STATIC
     src/core/numerics/ple.cpp
     src/core/numerics/qsa.cpp
     src/core/numerics/gemm.cpp
+    src/core/numerics/moe_cpu.cpp
     src/core/numerics/attention.cpp
     src/core/numerics/norm.cpp
     src/core/numerics/conv.cpp

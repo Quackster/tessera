@@ -36,6 +36,7 @@
 #include "spec/dflash2_block.hpp"
 #include "spec/dflash2_candidates.hpp"
 #include "core/numerics/gemm.hpp"
+#include "core/numerics/moe_cpu.hpp"
 #include "core/numerics/norm.hpp"
 #include "core/numerics/quant.hpp"
 #include "core/numerics/hyper.hpp"
@@ -8090,5 +8091,53 @@ TEST(BackendTest, MoeFusedDownFormatsMatchRef) {
     }
     EXPECT_LE(max_abs, tol.abs + tol.rel * peak)
         << c.kernel << " backend " << backend->Name() << " max_abs " << max_abs;
+  }
+}
+
+// Host: the CPU expert forward composes the gate/up/silu/down references and
+// reproduces them exactly.
+TEST(BackendTest, CpuMoeExpertForwardMatchesRef) {
+  std::mt19937 rng(91);
+  constexpr std::size_t kHidden = 256;
+  constexpr std::size_t kInter = 64;
+  const std::size_t gate_blocks = kHidden * kInter / 256;
+  std::vector<std::byte> gate = RandomBlocks(rng, gate_blocks, 98, 0);
+  std::vector<std::byte> up = RandomBlocks(rng, gate_blocks, 98, 0);
+  const std::size_t down_blocks = kHidden * (kInter / 32);
+  std::vector<std::byte> down = RandomBlocks(rng, down_blocks, 18, 0);
+  std::vector<float> x(kHidden);
+  for (auto& v : x) {
+    v = DrawValue(rng);
+  }
+
+  std::vector<float> gout(kInter);
+  std::vector<float> uout(kInter);
+  ASSERT_TRUE(core::GemmIq3XxsRef(std::span<const float>(x),
+                                  std::span<const std::byte>(gate),
+                                  std::span<float>(gout), 1, kInter, kHidden)
+                  .has_value());
+  ASSERT_TRUE(core::GemmIq3XxsRef(std::span<const float>(x),
+                                  std::span<const std::byte>(up),
+                                  std::span<float>(uout), 1, kInter, kHidden)
+                  .has_value());
+  std::vector<float> phi(kInter);
+  for (std::size_t j = 0; j < kInter; ++j) {
+    const float g = gout[j];
+    phi[j] = (g / (1.0f + std::exp(-g))) * uout[j];
+  }
+  std::vector<float> expected(kHidden);
+  ASSERT_TRUE(core::GemmIq4NlRef(std::span<const float>(phi),
+                                 std::span<const std::byte>(down),
+                                 std::span<float>(expected), 1, kHidden, kInter)
+                  .has_value());
+
+  std::vector<float> got(kHidden);
+  auto status = core::CpuMoeExpertForward(
+      std::span<const float>(x), DType::IQ3_XXS, std::span<const std::byte>(gate),
+      DType::IQ3_XXS, std::span<const std::byte>(up), DType::IQ4_NL,
+      std::span<const std::byte>(down), kHidden, kInter, std::span<float>(got));
+  ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
+  for (std::size_t i = 0; i < kHidden; ++i) {
+    EXPECT_FLOAT_EQ(got[i], expected[i]);
   }
 }
