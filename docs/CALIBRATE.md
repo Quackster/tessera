@@ -213,12 +213,11 @@ Remaining, with the reason:
 
 * The batched MoE FFN (`RunMoeFfnBatch`) is not tensor-parallel aware, so a
   batched verify on a MoE target is not correct yet.
-* `Pipeline` needs three things: a batched cross-stage forward and verify
-  (the stage handoff carries one row today), the MTP block loaded on the
-  last stage (a pipeline shards only trunk layers, so no stage owns the
-  nextn block), and the nextn count exposed to the pipeline builder (the
-  probed `TransformerConfig` stores trunk layers only). Its draft sweep is
-  not implemented yet.
+* `Pipeline` needs a batched cross-stage forward and verify: the stage
+  handoff carries one row today, and a verify must roll each stage's cache
+  back to the accepted prefix, so the architecture needs a per-stage target
+  truncate (the MTP block already loads on the last stage; the shard loader
+  gives it to `last_stage`). Its draft sweep is not implemented yet.
 * `ContextParallel` splits the key range, so a drafter cannot see the whole
   context. Speculation there needs a design of its own.
 * The tensor-parallel and pipeline paths need a two-device run to verify.

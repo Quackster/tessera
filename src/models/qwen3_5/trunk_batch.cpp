@@ -655,9 +655,9 @@ std::expected<void, StatusCode> RunFullBlockBatchMulti(
 std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
-    std::vector<float>* hidden_out, bool all_logits,
-    const Buffer* embeddings, const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture) const {
+    std::vector<float>* hidden_out, bool all_logits, const Buffer* embeddings,
+    const std::vector<std::size_t>* capture_layers, std::vector<Buffer*>* capture,
+    bool snapshot_state) const {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -683,8 +683,10 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
   Qwen35State& h = State(cache);
   const std::size_t logits_rows = (all_logits && rows > 1) ? rows : 1;
   // A verification may roll back to a fresh state even for a one-token
-  // draft, so it always needs the pre-block snapshot (slot 0).
-  const bool need_state_hist = all_logits;
+  // draft, so it always needs the pre-block snapshot (slot 0). A pipeline
+  // stage that scores no logits still snapshots when asked, so the verify
+  // can roll its cache back too.
+  const bool need_state_hist = all_logits || snapshot_state;
   auto alloc = AllocBatch(backend, cfg, g, h, rows, logits_rows,
                           need_state_hist);
   if (!alloc) {
@@ -785,6 +787,49 @@ std::expected<void, StatusCode> Qwen35Architecture::ForwardBatch(
       return std::unexpected(head.error());
     }
   }
+  return {};
+}
+
+std::expected<void, StatusCode> Qwen35Architecture::TruncateTarget(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
+    std::size_t keep_position) const {
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  auto geometry = DeriveGeometry(*config);
+  if (!geometry) {
+    return std::unexpected(geometry.error());
+  }
+  const LinearGeometry& g = *geometry;
+  const std::size_t state_len = g.num_v_heads * g.head_k_dim * g.head_v_dim;
+  const std::size_t hist_len = g.conv_dim * (g.width - 1);
+  Qwen35State& h = State(cache);
+  if (h.batch == nullptr) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  // A sharded stage owns only [first_layer, last_layer); touch its layers
+  // only, so an untouched global layer is never rewritten.
+  const ModelShard& shard = model.Shard();
+  const std::size_t layer_begin = shard.enabled ? shard.first_layer : 0;
+  std::size_t layer_end = config->layers;
+  if (shard.enabled && shard.last_layer != 0 && shard.last_layer < layer_end) {
+    layer_end = shard.last_layer;
+  }
+  for (std::size_t l = layer_begin; l < layer_end; ++l) {
+    if (config->IsFullAttentionLayer(l)) {
+      h.full[l].rows = keep_position;
+      continue;
+    }
+    if (!backend.CopyD2D(*h.batch->state_hist[l], keep_position * state_len * 4,
+                         *h.linear[l].state, 0, state_len * 4) ||
+        !backend.CopyD2D(*h.batch->conv_hist_hist[l],
+                         keep_position * hist_len * 4, *h.linear[l].conv_hist,
+                         0, hist_len * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  h.position = keep_position;
   return {};
 }
 

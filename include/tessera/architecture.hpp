@@ -129,13 +129,33 @@ class Architecture {
   // per-row residual hidden is copied into the matching `capture` buffer
   // (each sized rows*hidden), for a drafter that conditions on every
   // position; nullptr skips capture.
+  // `snapshot_state` forces the per-layer linear/recurrent state snapshots
+  // a rollback needs even when `all_logits` is false (a pipeline verify runs
+  // every stage with snapshots but only the last stage scores logits).
   [[nodiscard]] virtual std::expected<void, StatusCode> ForwardBatch(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
       std::vector<float>* hidden_out, bool all_logits,
       const Buffer* embeddings,
       const std::vector<std::size_t>* capture_layers = nullptr,
-      std::vector<Buffer*>* capture = nullptr) const = 0;
+      std::vector<Buffer*>* capture = nullptr,
+      bool snapshot_state = false) const = 0;
+
+  // Roll a cache advanced by a batched forward back to `keep_position`
+  // committed target rows (the accepted prefix, an absolute position):
+  // truncate the full-attention KV rows, restore the linear/recurrent state
+  // and conv history, and set the position. The default returns
+  // UnsupportedFeature; the pipeline verify uses it on every stage. A
+  // sharded stage touches only its own layers.
+  [[nodiscard]] virtual std::expected<void, StatusCode> TruncateTarget(
+      Backend& backend, const Model& model, core::DecodeCache& cache,
+      std::size_t keep_position) const {
+    (void)backend;
+    (void)model;
+    (void)cache;
+    (void)keep_position;
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
 
   // Score a draft against the target with rollback: accept the matching
   // prefix, leaving the cache at it, and return the bonus token. The

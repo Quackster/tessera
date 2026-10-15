@@ -56,7 +56,12 @@ class Qwen35Architecture final : public Architecture {
       std::vector<float>* hidden_out, bool all_logits,
       const Buffer* embeddings,
       const std::vector<std::size_t>* capture_layers,
-      std::vector<Buffer*>* capture) const override;
+      std::vector<Buffer*>* capture,
+      bool snapshot_state = false) const override;
+
+  [[nodiscard]] std::expected<void, StatusCode> TruncateTarget(
+      Backend& backend, const Model& model, core::DecodeCache& cache,
+      std::size_t keep_position) const override;
 
   [[nodiscard]] std::expected<DraftVerification, StatusCode> Verify(
       Backend& backend, const Model& model, core::DecodeCache& cache,
