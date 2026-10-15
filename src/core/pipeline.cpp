@@ -129,6 +129,10 @@ std::expected<std::unique_ptr<Pipeline>, StatusCode> Pipeline::Create(
     model_options.shard.last_layer = last;
     model_options.shard.first_stage = (i == 0);
     model_options.shard.last_stage = (i + 1 == stage_count);
+    // A fetched MTP head loads on the last stage only, which owns it.
+    if (i + 1 == stage_count) {
+      model_options.mtp_path = options.mtp_path;
+    }
     auto model = (*engine)->LoadModel(model_options);
     if (!model) {
       return std::unexpected(model.error());

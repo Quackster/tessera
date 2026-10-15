@@ -311,6 +311,17 @@ int main(int argc, char** argv) {
   // is set. This tells the user the split flags when they forget one.
   const bool split_active = pipeline_mode || tp_mode || cp_mode ||
                             spec_split_mode || hybrid_mode;
+  // serve is replica-only by design: it loads one full model per --gpus
+  // device. The split layouts are run-only, so refuse them here instead of
+  // silently loading replicas the user did not ask for.
+  if (command == "serve" && split_active) {
+    std::fprintf(stderr,
+                 "cli: serve runs one model replica per --gpus device and "
+                 "cannot split one model across devices; --pipeline, --tp, "
+                 "--cp, --spec-split and --hybrid are run-only. Use `run` for "
+                 "a split layout, or `serve` with one --gpus device.\n");
+    return kExitUsage;
+  }
   const std::string routing_hint = tessera::cli::DeviceRoutingHint(
       device_indices,
       command == "serve" ? tessera::cli::DeviceRouteKind::kServeReplicas
@@ -403,6 +414,9 @@ int main(int argc, char** argv) {
                          tessera::StatusCode> {
       auto pool = std::make_unique<tessera::RunnerPool>();
       tessera::CalibrationConfig calibration;
+      // Paged weights are private host RAM per replica, so the pool holds
+      // the sum across the devices. The device check above never sees it.
+      std::uint64_t host_held_bytes = 0;
       for (std::size_t i = 0; i < device_indices.size(); ++i) {
         const int device = device_indices[i];
         report("loading weights on gpu " + std::to_string(device));
@@ -453,6 +467,16 @@ int main(int argc, char** argv) {
             return std::unexpected(tessera::StatusCode::OutOfMemory);
           }
         }
+        // Refuse a replica whose paged weights cannot fit system RAM with
+        // the ones already loaded, so a multi-device serve never drives the
+        // host into the OOM killer.
+        std::uint64_t replica_host_bytes = 0;
+        if (!tessera::cli::CheckHostRamFit(*engine_ptr, model_path, gpu_layers,
+                                           strategy, host_held_bytes, device,
+                                           &replica_host_bytes)) {
+          return std::unexpected(tessera::StatusCode::OutOfMemory);
+        }
+        host_held_bytes += replica_host_bytes;
         tessera::ModelOptions model_options{model_path, context};
         model_options.gpu_layers = gpu_layers;
         model_options.mtp_path = mtp_path;
@@ -524,11 +548,29 @@ int main(int argc, char** argv) {
     pipeline_options.devices = device_indices;
     pipeline_options.context = context;
     pipeline_options.kv_type = kv_type;
+    pipeline_options.mtp_path = mtp_path;
     auto pipeline = tessera::Pipeline::Create(pipeline_options);
     if (!pipeline) {
       std::fprintf(stderr, "cli: pipeline create failed (%s)\n",
                    tessera::ToString(pipeline.error()).data());
       return kExitError;
+    }
+    // Attach the drafter to the pipeline: --draft selects DFlash2, else
+    // --speculate selects MTP on the last stage, which owns the MTP head.
+    if (speculate || !draft_path.empty()) {
+      const bool dflash2 = !draft_path.empty();
+      const auto factory =
+          [dflash2]() -> std::unique_ptr<tessera::SpeculativeStrategy> {
+        return dflash2 ? tessera::CreateDFlash2Strategy()
+                       : tessera::CreateMtpStrategy();
+      };
+      auto attached = (*pipeline)->AttachSpeculative(
+          factory, tessera::StrategyOptions{draft_path, draft_block});
+      if (!attached) {
+        std::fprintf(stderr, "cli: pipeline strategy attach failed (%s)\n",
+                     tessera::ToString(attached.error()).data());
+        return kExitError;
+      }
     }
     const tessera::Tokenizer* tokenizer = (*pipeline)->GetTokenizer();
     if (tokenizer == nullptr) {
@@ -857,6 +899,14 @@ int main(int argc, char** argv) {
                                          device_indices.front())) {
       return kExitError;
     }
+  }
+  // Refuse a paged load whose host weight copy cannot fit system RAM,
+  // before the weights start moving.
+  std::uint64_t run_host_bytes = 0;
+  if (!tessera::cli::CheckHostRamFit(engine, model_path, gpu_layers, strategy,
+                                     0, device_indices.front(),
+                                     &run_host_bytes)) {
+    return kExitError;
   }
   tessera::ModelOptions model_options{model_path, context};
   model_options.gpu_layers = gpu_layers;
