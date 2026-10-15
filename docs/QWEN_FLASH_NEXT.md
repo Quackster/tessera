@@ -614,6 +614,19 @@ the head read and the output projection).
   batched verify was measured slower, because five rows select almost five
   times the experts and the rejected drafts are wasted work.
 
+- **Decode: batched the expert cache's gathers and the gr_gate read.** The
+  paged expert staging gathered each cached expert slice from the cache
+  store into the staging view with its own `hipMemcpyAsync`, about thirty
+  per layer. `Backend::CopyD2DBatch` now moves the gathers that share a
+  (store, stage) pair with one `scatter_d2d` kernel per five slices: on one
+  R9700, IQ3_S, `--gpu-layers 8`, the device-to-device copy count over a
+  25-forward run fell from 34739 to 6458 and the MTP speculative decode
+  rose from about 17 to about 18 tok/s with the same output. Separately,
+  `gr_gate` now reads its weight coalesced (one 32-lane group per output):
+  the kernel fell from about 36 to about 26 us. The decode is still about
+  half GPU kernels and half launch gaps; each kernel is a few percent, so
+  the remaining gain needs batched mixer kernels.
+
 ### Still required (in order)
 
  1. **CPU+GPU hybrid MoE (the path to the target).** The reference for this

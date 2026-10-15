@@ -352,8 +352,6 @@ std::expected<void, StatusCode> RunMtpMoe(Backend& backend,
                   hidden, s)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    if (s == 0) {
-    }
   }
   if (!ScaleAdd(backend, h, *h.moe_acc, *h.moe_shared, *h.moe_sig, *h.block_out,
                 hidden, 0)) {
