@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "cli_common.hpp"
 #include "core/files.hpp"
 #include "core/sha256.hpp"
 #include "tessera/mtp_fetch.hpp"
@@ -175,6 +176,66 @@ TEST(Sha256Test, StreamedFileMatchesInMemory) {
                             text.size())));
   auto missing = tessera::core::Sha256File(dir / "absent.bin");
   EXPECT_EQ(missing.error(), StatusCode::FileNotFound);
+}
+
+TEST(ParseGpuListTest, AcceptsOneDeviceOrAList) {
+  using tessera::cli::ParseGpuList;
+  EXPECT_EQ(ParseGpuList("0"), (std::vector<int>{0}));
+  EXPECT_EQ(ParseGpuList("1"), (std::vector<int>{1}));
+  EXPECT_EQ(ParseGpuList("0,1"), (std::vector<int>{0, 1}));
+  EXPECT_EQ(ParseGpuList("2,3,5"), (std::vector<int>{2, 3, 5}));
+}
+
+TEST(ParseGpuListTest, SkipsEmptyItems) {
+  using tessera::cli::ParseGpuList;
+  EXPECT_EQ(ParseGpuList("0,"), (std::vector<int>{0}));
+  EXPECT_EQ(ParseGpuList(",1"), (std::vector<int>{1}));
+  EXPECT_TRUE(ParseGpuList("").empty());
+}
+
+TEST(DeviceRoutingHintTest, SingleDeviceIsSilent) {
+  using tessera::cli::DeviceRouteKind;
+  using tessera::cli::DeviceRoutingHint;
+  const std::vector<int> one{0};
+  EXPECT_TRUE(DeviceRoutingHint(one, DeviceRouteKind::kRunSingle, false).empty());
+  EXPECT_TRUE(
+      DeviceRoutingHint(one, DeviceRouteKind::kServeReplicas, false).empty());
+  EXPECT_TRUE(DeviceRoutingHint({}, DeviceRouteKind::kRunSingle, false).empty());
+}
+
+TEST(DeviceRoutingHintTest, RunWithoutSplitNamesFirstDeviceAndFlags) {
+  using tessera::cli::DeviceRouteKind;
+  using tessera::cli::DeviceRoutingHint;
+  const std::vector<int> devices{0, 1};
+  const std::string hint =
+      DeviceRoutingHint(devices, DeviceRouteKind::kRunSingle, false);
+  EXPECT_NE(hint.find("cli: "), std::string::npos);
+  EXPECT_NE(hint.find("only gpu 0 is used"), std::string::npos);
+  EXPECT_NE(hint.find("--pipeline"), std::string::npos);
+  EXPECT_NE(hint.find("--tp"), std::string::npos);
+  EXPECT_NE(hint.find("--cp"), std::string::npos);
+  EXPECT_NE(hint.find("--spec-split"), std::string::npos);
+  EXPECT_NE(hint.find("--hybrid"), std::string::npos);
+}
+
+TEST(DeviceRoutingHintTest, RunWithSplitIsSilent) {
+  using tessera::cli::DeviceRouteKind;
+  using tessera::cli::DeviceRoutingHint;
+  const std::vector<int> devices{0, 1};
+  EXPECT_TRUE(
+      DeviceRoutingHint(devices, DeviceRouteKind::kRunSingle, true).empty());
+}
+
+TEST(DeviceRoutingHintTest, ServeReportsReplicasAndFlags) {
+  using tessera::cli::DeviceRouteKind;
+  using tessera::cli::DeviceRoutingHint;
+  const std::vector<int> devices{2, 3, 5};
+  const std::string hint =
+      DeviceRoutingHint(devices, DeviceRouteKind::kServeReplicas, false);
+  EXPECT_NE(hint.find("--gpus 2, 3, 5"), std::string::npos);
+  EXPECT_NE(hint.find("replica"), std::string::npos);
+  EXPECT_NE(hint.find("--pipeline, --tp, --cp, --spec-split or --hybrid"),
+            std::string::npos);
 }
 
 TEST(MtpFetchTest, DigestsCoverEveryTensorOnce) {

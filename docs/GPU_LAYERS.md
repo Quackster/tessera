@@ -116,7 +116,7 @@ the power budget, so paging numbers from GPU1 run about 5 times
 lower and vary run to run.
 
 ```sh
-./cmake-build-vulkan/tessera-cli run --gpu 0 \
+./cmake-build-vulkan/tessera-cli run --gpus 0 \
   --model ~/models/Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-Q4_K_M.gguf \
   --gpu-layers 20 \
   --prompt-text "Explain gravity in one sentence." \
@@ -124,7 +124,7 @@ lower and vary run to run.
 ```
 
 ```sh
-./cmake-build-vulkan/tessera-cli run --gpu 0 \
+./cmake-build-vulkan/tessera-cli run --gpus 0 \
   --model ~/models/Ornith-1.5-35B-A3B-GGUF/Ornith-1.5-35B-Q4_K_M.gguf \
   --gpu-layers help --kv-q8 --context 262144
 ```

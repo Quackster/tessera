@@ -91,7 +91,7 @@ void PrintCalibrateUsage() {
       "usage: tessera-cli calibrate --model <path> [--draft <dir>]\n"
       "       [--speculate] [--context <n>]\n"
       "       [--kv-f16|--kv-q8|--kv-q4|--kv-fp8]\n"
-      "       [--calibration <file>] [--gpu <n>] [--prompts <file>]\n"
+      "       [--calibration <file>] [--gpus <a,b>] [--prompts <file>]\n"
       "  --model <path>    a .gguf file or an MXFP4 model directory\n"
       "  --draft <dir>     DFlash2 draft checkpoint (enables the draft "
       "block sweep)\n"
@@ -102,8 +102,8 @@ void PrintCalibrateUsage() {
       "kv8)\n"
        "  --calibration <file> calibration file to read and write (env "
        "TESSERA_CALIBRATION)\n"
-       "  --gpu <n>         GPU index to use (default 0, the first)\n"
-       "  --gpus <a,b>      parallel max-context: measure every listed GPU\n"
+       "  --gpus <a,b>      one GPU index or a list (default 0); two or more\n"
+       "                    run the parallel max-context over every device\n"
        "  --tp | --cp | --pipeline  parallel route for --gpus (exactly one)\n"
        "  --prompts <file>  fixed prompts, one per non-empty line\n"
        "  --calibrate-limit <n> measure at most n sweep points in total,\n"
@@ -143,8 +143,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   // int8 (kv8) is the default KvType for calibration, the memory-efficient
   // cache the maximum context is found for.
   KvCacheType kv_type = KvCacheType::Q8;
-  int gpu = 0;
-  std::string gpus;
+  std::vector<int> gpus;
   bool quiet = false;
   bool concurrent = false;
   bool speculate = false;
@@ -167,10 +166,8 @@ int RunCalibrateCommand(int argc, char** argv) {
       calibrate_limit = std::stoul(argv[++i]);
     } else if (arg == "--context" && i + 1 < argc) {
       context = std::stoul(argv[++i]);
-    } else if (arg == "--gpu" && i + 1 < argc) {
-      gpu = std::stoi(argv[++i]);
     } else if (arg == "--gpus" && i + 1 < argc) {
-      gpus = argv[++i];
+      gpus = ParseGpuList(argv[++i]);
     } else if (arg == "--tp") {
       tp_mode = true;
     } else if (arg == "--cp") {
@@ -204,20 +201,15 @@ int RunCalibrateCommand(int argc, char** argv) {
                  "TESSERA_CALIBRATION\n");
     return kExitUsage;
   }
-  if (!gpus.empty() || tp_mode || cp_mode || pipeline_mode) {
-    // MTP (--speculate) runs on the route; the DFlash2 --draft checkpoint is
-    // single-device only.
-    if (!draft_path.empty()) {
-      std::fprintf(stderr,
-                   "cli: --draft (DFlash2) is single-device only; the parallel "
-                   "sweep runs MTP with --speculate\n");
-      return kExitUsage;
-    }
+  // Two or more devices, or an explicit split flag, select the parallel
+  // sweep. One device (or none) runs the single-device sweep.
+  const bool parallel = tp_mode || cp_mode || pipeline_mode || gpus.size() >= 2;
+  if (parallel) {
     // Parallel calibration: the speed sweep runs through the layout and the
     // entry also carries the largest KV-cache context the layout allows.
     ParallelCalibrateOptions parallel_options;
     parallel_options.model_path = model_path;
-    parallel_options.gpus = gpus;
+    parallel_options.devices = gpus;
     parallel_options.tp = tp_mode;
     parallel_options.cp = cp_mode;
     parallel_options.pipeline = pipeline_mode;
@@ -227,6 +219,7 @@ int RunCalibrateCommand(int argc, char** argv) {
     parallel_options.prompts_path = prompts_path;
     parallel_options.calibrate_limit = calibrate_limit;
     parallel_options.speculate = speculate;
+    parallel_options.draft_path = draft_path;
     parallel_options.quiet = quiet;
     return RunParallelCalibrate(parallel_options);
   }
@@ -241,8 +234,9 @@ int RunCalibrateCommand(int argc, char** argv) {
     prompts = std::move(*loaded_prompts);
   }
 
+  const int device = gpus.empty() ? 0 : gpus.front();
   EngineOptions engine_options;
-  engine_options.device_index = gpu;
+  engine_options.device_index = device;
   auto created = Engine::Create(engine_options);
   if (!created) {
     std::fprintf(stderr, "cli: engine create failed (%s)\n",
@@ -492,7 +486,7 @@ int RunCalibrateCommand(int argc, char** argv) {
       std::unique_ptr<Model> model_ptr = std::move(*model);
       RunnerPool pool;
       pool.Add(std::make_unique<Runner>(std::move(engine_ptr),
-                                        std::move(model_ptr), gpu,
+                                        std::move(model_ptr), device,
                                         outcome->config, kv_type));
       for (const std::size_t sessions :
            {std::size_t{2}, std::size_t{3}, std::size_t{4}}) {

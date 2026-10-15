@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -74,8 +75,8 @@ inline bool ApplyDiagnosticFlag(std::string_view arg, int& i, char** argv,
   return false;
 }
 
-// Parse a comma-separated `--gpus` device list ("0,1") into indices.
-// Empty items are skipped; `--gpu` selects one device instead.
+// Parse a `--gpus` value into indices: one device ("0") or a
+// comma-separated list ("0,1"). Empty items are skipped.
 inline std::vector<int> ParseGpuList(std::string_view list) {
   std::vector<int> gpus;
   std::size_t pos = 0;
@@ -94,6 +95,47 @@ inline std::vector<int> ParseGpuList(std::string_view list) {
     pos = comma + 1;
   }
   return gpus;
+}
+
+// Which command is routing a multi-device `--gpus` list.
+enum class DeviceRouteKind {
+  kRunSingle,      // run: one device unless a split flag is set
+  kServeReplicas,  // serve: one model replica per device
+};
+
+// The hint for a multi-device `--gpus` list, or empty for one device or
+// fewer. `kRunSingle` names the split flags when none is active, so a run
+// that uses only the first device is explained; `kServeReplicas` reports
+// the replica layout and names the split flags as the alternative.
+inline std::string DeviceRoutingHint(std::span<const int> devices,
+                                     DeviceRouteKind kind, bool split_active) {
+  if (devices.size() <= 1) {
+    return {};
+  }
+  std::string list;
+  for (std::size_t i = 0; i < devices.size(); ++i) {
+    if (i != 0) {
+      list += ", ";
+    }
+    list += std::to_string(devices[i]);
+  }
+  constexpr std::string_view kSplits =
+      "--pipeline, --tp, --cp, --spec-split or --hybrid";
+  if (kind == DeviceRouteKind::kServeReplicas) {
+    return "cli: --gpus " + list +
+           " serves one model replica per gpu, so the devices answer "
+           "requests in parallel. To split one model across the devices, "
+           "run with one of " +
+           std::string(kSplits) + ".";
+  }
+  if (split_active) {
+    return {};
+  }
+  return "cli: --gpus " + list + " names " + std::to_string(devices.size()) +
+         " devices but no split flag is set, so only gpu " +
+         std::to_string(devices.front()) +
+         " is used. To spread one model across the devices, add one of " +
+         std::string(kSplits) + ".";
 }
 
 }  // namespace tessera::cli

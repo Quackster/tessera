@@ -108,14 +108,14 @@ if [[ "$MODE" != "parallel" ]]; then
 fi
 
 if [[ "$MODE" == "single" || "$MODE" == "all" ]]; then
-  run_single rocm gguf-none "$ROCM_BIN" calibrate --model "$GGUF" --calibration "$CALIB_FILE" --gpu "$GPU_SINGLE"
-  run_single rocm gguf-mtp "$ROCM_BIN" calibrate --model "$GGUF" --speculate --calibration "$CALIB_FILE" --gpu "$GPU_SINGLE"
-  run_single rocm mxfp4-none "$ROCM_BIN" calibrate --model "$MXFP4" --calibration "$CALIB_FILE" --gpu "$GPU_SINGLE"
-  run_single rocm mxfp4-dflash2 "$ROCM_BIN" calibrate --model "$MXFP4" --draft "$DRAFT" --calibration "$CALIB_FILE" --gpu "$GPU_SINGLE"
-  run_single vulkan gguf-none "$VULKAN_BIN" calibrate --model "$GGUF" --calibration "$CALIB_FILE" --gpu "$GPU_SINGLE"
-  run_single vulkan gguf-mtp "$VULKAN_BIN" calibrate --model "$GGUF" --speculate --calibration "$CALIB_FILE" --gpu "$GPU_SINGLE"
-  run_single vulkan mxfp4-none "$VULKAN_BIN" calibrate --model "$MXFP4" --calibration "$CALIB_FILE" --gpu "$GPU_SINGLE"
-  run_single vulkan mxfp4-dflash2 "$VULKAN_BIN" calibrate --model "$MXFP4" --draft "$DRAFT" --calibration "$CALIB_FILE" --gpu "$GPU_SINGLE"
+  run_single rocm gguf-none "$ROCM_BIN" calibrate --model "$GGUF" --calibration "$CALIB_FILE" --gpus "$GPU_SINGLE"
+  run_single rocm gguf-mtp "$ROCM_BIN" calibrate --model "$GGUF" --speculate --calibration "$CALIB_FILE" --gpus "$GPU_SINGLE"
+  run_single rocm mxfp4-none "$ROCM_BIN" calibrate --model "$MXFP4" --calibration "$CALIB_FILE" --gpus "$GPU_SINGLE"
+  run_single rocm mxfp4-dflash2 "$ROCM_BIN" calibrate --model "$MXFP4" --draft "$DRAFT" --calibration "$CALIB_FILE" --gpus "$GPU_SINGLE"
+  run_single vulkan gguf-none "$VULKAN_BIN" calibrate --model "$GGUF" --calibration "$CALIB_FILE" --gpus "$GPU_SINGLE"
+  run_single vulkan gguf-mtp "$VULKAN_BIN" calibrate --model "$GGUF" --speculate --calibration "$CALIB_FILE" --gpus "$GPU_SINGLE"
+  run_single vulkan mxfp4-none "$VULKAN_BIN" calibrate --model "$MXFP4" --calibration "$CALIB_FILE" --gpus "$GPU_SINGLE"
+  run_single vulkan mxfp4-dflash2 "$VULKAN_BIN" calibrate --model "$MXFP4" --draft "$DRAFT" --calibration "$CALIB_FILE" --gpus "$GPU_SINGLE"
 fi
 
 if [[ "$MODE" == "parallel" || "$MODE" == "all" ]]; then

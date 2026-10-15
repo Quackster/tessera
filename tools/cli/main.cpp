@@ -159,7 +159,8 @@ int main(int argc, char** argv) {
   std::size_t draft_context = 0;
   std::size_t gpu_layers = 0;
   bool gpu_layers_help = false;
-  int gpu = 0;
+  // GPU selection: one index or a comma-separated list. Empty means the
+  // first device.
   std::vector<int> gpus;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
@@ -199,11 +200,10 @@ int main(int argc, char** argv) {
       stats_interval_seconds = std::stoul(argv[++i]);
     } else if (arg == "--context" && i + 1 < argc) {
       context = std::stoul(argv[++i]);
-    } else if (arg == "--gpu" && i + 1 < argc) {
-      gpu = std::stoi(argv[++i]);
     } else if (arg == "--gpus" && i + 1 < argc) {
-      // A comma-separated device list for data-parallel serve, for
-      // example `--gpus 0,1`. `--gpu` selects one device.
+      // One device index or a comma-separated list, for example `0` or
+      // `0,1`. serve runs one replica per device; run splits one model
+      // across the devices only with a split flag.
       gpus = tessera::cli::ParseGpuList(argv[++i]);
     } else if (arg == "--calibration" && i + 1 < argc) {
       calibration_path = argv[++i];
@@ -301,10 +301,24 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Device selection: `--gpus 0,1` (data-parallel serve) or `--gpu n`
-  // (one device). `--gpus` wins when both are given.
+  // Device selection: an empty list means the first device; `--gpus 0`
+  // selects one device and `--gpus 0,1` selects two.
   const std::vector<int> device_indices =
-      gpus.empty() ? std::vector<int>{gpu} : gpus;
+      gpus.empty() ? std::vector<int>{0} : gpus;
+
+  // Explain how a multi-device `--gpus` list is routed: serve runs one
+  // replica per device, while run splits one model only when a split flag
+  // is set. This tells the user the split flags when they forget one.
+  const bool split_active = pipeline_mode || tp_mode || cp_mode ||
+                            spec_split_mode || hybrid_mode;
+  const std::string routing_hint = tessera::cli::DeviceRoutingHint(
+      device_indices,
+      command == "serve" ? tessera::cli::DeviceRouteKind::kServeReplicas
+                         : tessera::cli::DeviceRouteKind::kRunSingle,
+      split_active);
+  if (!routing_hint.empty()) {
+    std::fprintf(stderr, "%s\n", routing_hint.c_str());
+  }
 
   auto make_engine = [&](int device)
       -> std::expected<std::unique_ptr<tessera::Engine>, tessera::StatusCode> {

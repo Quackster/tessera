@@ -186,7 +186,9 @@ The `calibrate` flags:
   `TESSERA_CALIBRATION` supplies it when the flag is absent. One of the two is
   required.
 * `--context <n>` context length in the hardware key. Default 32768.
-* `--gpu <n>` device index. Default 0, the first device.
+* `--gpus <a,b>` one device index or a comma-separated list. Default 0, the
+  first device. A single index (for example `--gpus 0`) runs the
+  single-device sweep.
 * `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8` KV cache type. Default int8
   (kv8).
 * `--prompts <file>` fixed prompts, one per non-empty line. Default three
@@ -198,10 +200,10 @@ The `calibrate` flags:
   3, and 4 sessions together and reports the total and per-session tok/s,
   plus the largest count that fits the requested context. The path is
   non-speculative.
-* `--gpus <a,b>` with exactly one of `--tp`, `--cp`, or `--pipeline`
-  calibrates a parallel layout: it stores the memory-bound max context and
-  the fastest speed settings the layout honors. `--draft` and `--speculate`
-  are single-device only.
+* `--gpus <a,b>` with two or more devices and exactly one of `--tp`, `--cp`,
+  or `--pipeline` calibrates a parallel layout: it stores the memory-bound
+  max context and the fastest speed settings the layout honors. `--draft`
+  and `--speculate` are single-device only.
 
 It sweeps the speed settings for the current backend and draft setup. A skipped setting keeps its default. It stops a setting early when three candidates in a row are slower than the best value seen so far.
 
@@ -290,7 +292,6 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--model <path>` | both | required | A `.gguf` file or an MXFP4 model directory. |
 | `--draft <dir>` | both | none | DFlash2 draft checkpoint directory. |
 | `--context <n>` | both | 32768 | Maximum context length. |
-| `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
 | `--gpu-layers <n\|all>` | both | 0 | Layers kept in VRAM. The rest page from system RAM. 0 uploads everything. `help` prints counts without loading. With `--calibration`, `run` and `serve` take a saved layer count unless this flag overrides it. |
 | `--draft-block <n>` | both | 0 | Draft block tokens. 0 uses the checkpoint block. |
 | `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects 512. |
@@ -331,7 +332,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--prompts <file>` | calibrate | three fixed prompts | Fixed prompts, one per non-empty line, for the calibration sweep. |
 | `--calibrate-limit <n>` | calibrate | none | Measure at most n sweep points in total. |
 | **Parallelism** | | | The flags below spread work across the `--gpus` devices. |
-| `--gpus <a,b>` | both | none | One model replica per listed GPU (for example `--gpus 0,1`). Overrides `--gpu`. |
+| `--gpus <a,b>` | run, serve, calibrate | 0 | One GPU index or a comma-separated list (for example `--gpus 0` or `--gpus 0,1`). `serve` runs one model replica per listed GPU; `run` uses only the first device unless a split flag is set; `calibrate` runs the single-device sweep for one index and the parallel sweep for two or more. |
 | `--pipeline` | run | off | Split layers across the `--gpus` devices. |
 | `--tp` | run | off | Split attention, FFN and MoE experts across the `--gpus` devices. |
 | `--cp` | run | off | Split the key range across the `--gpus` devices. |

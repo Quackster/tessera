@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "tessera/calibrate_sweep.hpp"
-#include "cli_common.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/context_parallel.hpp"
 #include "tessera/engine.hpp"
@@ -127,7 +126,7 @@ std::expected<void, StatusCode> SaveCalibrationEntry(
 }
 
 int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
-  const std::vector<int> devices = ParseGpuList(options.gpus);
+  const std::vector<int>& devices = options.devices;
   const int routes = (options.tp ? 1 : 0) + (options.cp ? 1 : 0) +
                      (options.pipeline ? 1 : 0);
   if (devices.size() < 2 || routes != 1) {
@@ -193,29 +192,41 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
     }
     pipe = std::move(*built);
   }
-  // MTP speculation runs on the route when asked. The tensor-parallel and
+  // Speculation runs on the route when asked: a non-empty draft_path
+  // attaches DFlash2, else --speculate attaches MTP. The tensor-parallel and
   // context-parallel routes run one strategy per rank; the pipeline runs the
   // drafter on its last stage.
+  const bool dflash2 = !options.draft_path.empty();
+  // The pipeline prefill steps one token at a time and does not drive the
+  // drafter's context append, so DFlash2 there is not correct yet; MTP needs
+  // no prefill append and runs on every route.
+  if (dflash2 && options.pipeline) {
+    std::fprintf(stderr,
+                 "cli: --draft (DFlash2) needs a capturing prefill, which the "
+                 "--pipeline route does not run yet; use --tp, --cp, or MTP\n");
+    return kExitError;
+  }
   std::string strategy_label = "none";
-  if (options.speculate) {
-    const auto factory = []() -> std::unique_ptr<SpeculativeStrategy> {
-      return CreateMtpStrategy();
+  if (options.speculate || dflash2) {
+    const auto factory = [dflash2]() -> std::unique_ptr<SpeculativeStrategy> {
+      return dflash2 ? CreateDFlash2Strategy() : CreateMtpStrategy();
     };
+    const StrategyOptions strategy_options{options.draft_path, 0};
     std::expected<void, StatusCode> attached =
         std::unexpected(StatusCode::InvalidArgument);
     if (tp != nullptr) {
-      attached = tp->AttachSpeculative(factory, StrategyOptions{"", 0});
+      attached = tp->AttachSpeculative(factory, strategy_options);
     } else if (cp != nullptr) {
-      attached = cp->AttachSpeculative(factory, StrategyOptions{"", 0});
+      attached = cp->AttachSpeculative(factory, strategy_options);
     } else {
-      attached = pipe->AttachSpeculative(factory, StrategyOptions{"", 0});
+      attached = pipe->AttachSpeculative(factory, strategy_options);
     }
     if (!attached) {
-      std::fprintf(stderr, "cli: MTP attach failed (%s)\n",
+      std::fprintf(stderr, "cli: strategy attach failed (%s)\n",
                    std::string(ToString(attached.error())).c_str());
       return kExitError;
     }
-    strategy_label = "mtp";
+    strategy_label = dflash2 ? "dflash2" : "mtp";
   }
   // Measure each rank: resident bytes and free bytes on its own device.
   const std::size_t ranks =
@@ -338,7 +349,8 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   defaults.mxfp4_split_cap = kDefaultMxFp4SplitCap;
   defaults.prefill_chunk_tokens = kDefaultPrefillChunkTokens;
   defaults.attention_split = kDefaultAttentionSplitChunks;
-  // The MTP checkpoint block is the draft default (see kDefaultMtpBlock).
+  // MTP has a fixed checkpoint block; DFlash2 keeps its checkpoint value,
+  // the candidate the sweep must beat (--draft-block 0).
   defaults.draft_tokens = options.speculate ? kMtpDefaultDraftBlock : 0;
 
   const TimedGenerateFn generate =
@@ -365,9 +377,10 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   // TP and CP split the key range across ranks, so the flash-decoding split
   // is inert there; only a pipeline stage still uses it.
   sweep.sweep_attention_split = options.pipeline;
-  // MTP has a draft block but no DFlash2 draft context window.
-  sweep.sweep_draft_tokens = options.speculate;
-  sweep.sweep_draft_context = false;
+  // Both drafters have a draft block; only DFlash2 has a draft context
+  // window.
+  sweep.sweep_draft_tokens = options.speculate || dflash2;
+  sweep.sweep_draft_context = dflash2;
   // Warm the route once (kernel compile, first-touch weight loads) before the
   // first point. A limited run skips it: the passed count is the run count.
   if (options.calibrate_limit == 0) {
@@ -460,6 +473,7 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   report.kv_type = std::string(ToString(options.kv_type));
   report.kv_flag = KvFlag(options.kv_type);
   report.strategy = strategy_label;
+  report.draft_path = options.draft_path;
   report.parallel = label;
   report.parallel_flags = route_flag + " --gpus " + device_list;
   report.key_context = options.context;
@@ -474,7 +488,7 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   report.file = options.calibration_file;
   report.split_applicable = backend == "rocm";
   report.attention_applicable = sweep.sweep_attention_split;
-  report.draft_attached = options.speculate;
+  report.draft_attached = options.speculate || dflash2;
   std::fputs("\n", stdout);
   std::fputs(FormatCalibrationReport(report).c_str(), stdout);
   std::fflush(stdout);

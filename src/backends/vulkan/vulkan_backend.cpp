@@ -240,7 +240,7 @@ class VulkanBackend final : public Backend {
         static_cast<std::uint32_t>(device_index_) >= devices.size()) {
       LogError("requested GPU " + std::to_string(device_index_) + " but only " +
                std::to_string(devices.size()) + " device(s) are present; pass "
-               "--gpu in the range [0, " +
+               "--gpus in the range [0, " +
                std::to_string(devices.size() - 1) +
                "] (defaults to the first GPU)");
       DestroyState(state_);
@@ -264,7 +264,7 @@ class VulkanBackend final : public Backend {
     }
     if (!has_compute) {
       LogError("GPU " + std::to_string(device_index_) +
-               " has no compute queue family; pick another --gpu");
+               " has no compute queue family; pick another --gpus");
       DestroyState(state_);
       return std::unexpected(StatusCode::DeviceError);
     }

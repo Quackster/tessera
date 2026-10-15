@@ -329,7 +329,7 @@ def launch_server(args: argparse.Namespace, log_path: str) -> subprocess.Popen:
     command = [
         args.cli, "serve",
         "--model", args.model,
-        "--gpu", str(args.gpu),
+        "--gpus", str(args.gpus),
         "--port", str(args.port),
         "--context", str(args.context),
         "--no-auto-title",
@@ -372,7 +372,7 @@ def main() -> int:
     parser.add_argument("--model", required=True, help="model path")
     parser.add_argument("--draft", default="", help="DFlash2 draft directory")
     parser.add_argument("--speculate", action="store_true", help="enable MTP")
-    parser.add_argument("--gpu", type=int, default=1, help="device index")
+    parser.add_argument("--gpus", type=int, default=1, help="device index")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--context", type=int, default=8192)
     parser.add_argument("--kv-flag", default="", help="e.g. --kv-q8")
@@ -391,7 +391,7 @@ def main() -> int:
     safe = re.sub(r"[^A-Za-z0-9]+", "_", os.path.basename(args.model.rstrip("/")))
     log_path = f"/tmp/tessera-harness/{safe}.log"
 
-    print(f"harness: launching {args.cli} serve for {args.model} on gpu {args.gpu}")
+    print(f"harness: launching {args.cli} serve for {args.model} on gpu {args.gpus}")
     proc = launch_server(args, log_path)
     started = time.time()
     try:
@@ -421,7 +421,7 @@ def main() -> int:
 
     passed = sum(1 for r in results if r.passed)
     total = len(results)
-    print(f"\n=== {args.model} ({args.backend}, gpu {args.gpu}) ===")
+    print(f"\n=== {args.model} ({args.backend}, gpu {args.gpus}) ===")
     for r in results:
         status = "PASS" if r.passed else "FAIL"
         print(f"  [{status}] {r.name:28s} {r.elapsed_s:6.1f}s  {r.detail}")
@@ -430,7 +430,7 @@ def main() -> int:
     report = {
         "model": args.model,
         "backend": args.backend,
-        "gpu": args.gpu,
+        "gpu": args.gpus,
         "passed": passed,
         "total": total,
         "results": [r.__dict__ for r in results],

@@ -335,7 +335,7 @@ add_executable(tessera-tests
     tests/calibrate_sweep_test.cpp
 )
 target_link_libraries(tessera-tests PRIVATE tessera GTest::gtest GTest::gtest_main)
-target_include_directories(tessera-tests PRIVATE src)
+target_include_directories(tessera-tests PRIVATE src tools/cli)
 
 include(GoogleTest)
 gtest_discover_tests(tessera-tests)

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <string>
+#include <vector>
 
 #include "tessera/calibrate.hpp"
 #include "tessera/defaults.hpp"
@@ -38,7 +39,7 @@ std::expected<void, StatusCode> SaveCalibrationEntry(
 
 struct ParallelCalibrateOptions {
   std::string model_path;
-  std::string gpus;  // raw --gpus value, for example "0,1"
+  std::vector<int> devices;  // --gpus list, at least two entries
   bool tp = false;
   bool cp = false;
   bool pipeline = false;
@@ -50,10 +51,11 @@ struct ParallelCalibrateOptions {
   // decode speed knobs the single-device path does.
   std::string prompts_path;
   std::size_t calibrate_limit = 0;
-  // Attach the MTP strategy to the route and sweep the draft block. Only
-  // --speculate is supported on a parallel layout; the DFlash2 --draft
-  // checkpoint is single-device.
+  // Attach a speculative strategy to the route and sweep the draft. MTP
+  // (--speculate) drafts from the target head; a non-empty draft_path
+  // attaches DFlash2 instead. Both are swept on the parallel layouts.
   bool speculate = false;
+  std::string draft_path;
   bool quiet = false;
 };
 

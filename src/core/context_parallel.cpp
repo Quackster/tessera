@@ -215,7 +215,10 @@ ContextParallel::Impl::RunSpeculative(std::span<const std::uint32_t> prompt,
       core::SingleDeviceTarget target(
           rank.engine->Owner(), *rank.model, *rank.cache,
           rank.engine->Diagnostics(), 0, nullptr,
-          /*single_token_prefill=*/true);
+          // The batched prefill, now that ForwardBatch combines across the
+          // ranks: it captures the target hidden for a DFlash2 drafter and
+          // drives the strategy's context append. MTP captures nothing.
+          /*single_token_prefill=*/false);
       const bool emit = (r == 0);
       auto on_token = [emit, produced](std::uint32_t token) {
         if (emit && produced != nullptr) {

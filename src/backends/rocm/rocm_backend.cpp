@@ -277,7 +277,7 @@ class RocmBackend final : public Backend {
     if (device_index_ < 0 || device_index_ >= device_count) {
       LogError("requested GPU " + std::to_string(device_index_) + " but only " +
                std::to_string(device_count) + " device(s) are present; pass "
-               "--gpu in the range [0, " +
+               "--gpus in the range [0, " +
                std::to_string(device_count - 1) +
                "] (defaults to the first GPU)");
       return std::unexpected(StatusCode::InvalidArgument);
