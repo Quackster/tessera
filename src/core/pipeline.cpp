@@ -166,7 +166,9 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Pipeline::Generate(
   options.max_completion_tokens = max_tokens;
   options.kv_type = impl_->kv_type;
   std::vector<std::uint32_t> produced;
-  auto outcome = impl_->Run(prompt, options, &produced);
+  auto outcome = impl_->HasStrategy()
+                     ? impl_->RunSpeculative(prompt, options, &produced)
+                     : impl_->Run(prompt, options, &produced);
   if (!outcome) {
     return std::unexpected(outcome.error());
   }
@@ -198,7 +200,9 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Pipeline::Generate(
 std::expected<GenerateOutcome, StatusCode> Pipeline::GenerateTimed(
     std::span<const std::uint32_t> prompt, const GenerateOptions& options) {
   std::vector<std::uint32_t> produced;
-  auto outcome = impl_->Run(prompt, options, &produced);
+  auto outcome = impl_->HasStrategy()
+                     ? impl_->RunSpeculative(prompt, options, &produced)
+                     : impl_->Run(prompt, options, &produced);
   if (!outcome) {
     return std::unexpected(outcome.error());
   }

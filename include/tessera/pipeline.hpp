@@ -79,6 +79,16 @@ class Pipeline {
   std::expected<GenerateOutcome, StatusCode> GenerateTimed(
       std::span<const std::uint32_t> prompt, const GenerateOptions& options);
 
+  // Attach a speculative strategy (off by default). The factory is called
+  // once; the drafter runs on the last stage, which owns the MTP head, while
+  // the target forward runs across every stage.
+  //
+  // Usage:
+  //   pipeline->AttachSpeculative(CreateMtpStrategy, StrategyOptions{});
+  std::expected<void, StatusCode> AttachSpeculative(
+      const std::function<std::unique_ptr<SpeculativeStrategy>()>& factory,
+      const StrategyOptions& options);
+
   // Greedy generation for several prompts at once, overlapped across the
   // stages: each stage runs on its own thread, so while one stage
   // processes one sequence the next stage processes another. Each

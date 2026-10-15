@@ -42,6 +42,7 @@ add_library(tessera STATIC
     src/core/runner.cpp
     src/core/pipeline.cpp
     src/core/pipeline_many.cpp
+    src/core/pipeline_spec.cpp
     src/core/tensor_parallel.cpp
     src/core/context_parallel.cpp
     src/core/spec_split.cpp

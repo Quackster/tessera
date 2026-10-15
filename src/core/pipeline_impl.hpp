@@ -8,11 +8,13 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/spec_driver.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
 #include "tessera/pipeline.hpp"
+#include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
 
 // Private definition of Pipeline::Impl, shared by pipeline.cpp (the
@@ -70,6 +72,30 @@ struct Pipeline::Impl {
   std::size_t context = 0;
   KvCacheType kv_type = KvCacheType::F32;
   std::vector<std::uint32_t> stops;
+  // The speculative strategy (null when none is attached). The drafter runs
+  // on the last stage, which owns the MTP head.
+  std::unique_ptr<SpeculativeStrategy> strategy;
+  // The single-thread decode target over the stages (defined in
+  // pipeline_spec.cpp). Nested so it can reach the stage list.
+  struct Target;
+
+  // True when a speculative strategy is attached.
+  [[nodiscard]] bool HasStrategy() const { return strategy != nullptr; }
+
+  // One speculative generation: the decode driver runs on one thread and the
+  // target drives the stages in order (the drafter on the last stage).
+  std::expected<GenerateOutcome, StatusCode> RunSpeculative(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      std::vector<std::uint32_t>* produced);
+
+  // Batched cross-stage verify of [anchor, drafts...]: every stage runs a
+  // ForwardBatch over the rows, the last stage scores the logits and the
+  // accepted prefix is kept, rolling each stage back with TruncateTarget.
+  // `prefix_position` is the committed row count before the batch.
+  std::expected<DraftVerification, StatusCode> VerifyBatch(
+      std::span<const std::uint32_t> draft,
+      std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
+      std::vector<float>* hidden_out, std::size_t prefix_position);
 
   // Fresh caches for every stage, so a new sequence starts at position zero
   // and the request's speed tuning and KV type take effect (the architecture
@@ -94,8 +120,9 @@ struct Pipeline::Impl {
   // when `want_logits`; otherwise only the trunk runs and the logits
   // result is empty. The hidden handoff copies each stage's boundary
   // residual into the next stage's incoming buffer.
-  std::expected<std::vector<float>, StatusCode> Step(std::uint32_t token,
-                                                     bool want_logits) {
+  std::expected<std::vector<float>, StatusCode> Step(
+      std::uint32_t token, bool want_logits,
+      std::vector<float>* hidden_out = nullptr) {
     const std::size_t n = stages.size();
     for (std::size_t i = 0; i < n; ++i) {
       Stage& stage = stages[i];
@@ -108,7 +135,7 @@ struct Pipeline::Impl {
       if (i + 1 == n) {
         if (!want_logits) {
           auto forwarded = arch->Forward(backend, *stage.model, *stage.cache,
-                                         token, nullptr, nullptr, nullptr,
+                                         token, hidden_out, nullptr, nullptr,
                                          incoming);
           if (!forwarded) {
             return std::unexpected(forwarded.error());
@@ -116,7 +143,7 @@ struct Pipeline::Impl {
           return std::vector<float>{};
         }
         return arch->Logits(backend, *stage.model, *stage.cache, token,
-                            nullptr, nullptr, nullptr, incoming);
+                            hidden_out, nullptr, nullptr, incoming);
       }
       std::vector<std::size_t> capture_layers{stage.boundary_layer};
       std::vector<Buffer*> capture{stage.outgoing.get()};
