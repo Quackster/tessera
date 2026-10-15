@@ -1,5 +1,6 @@
 #include "models/qwen4exp/internal.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -9,11 +10,12 @@
 #include "models/qwen4exp/state.hpp"
 
 // The batched qwen4exp trunk: prefill and the multi-row verify run one
-// layer across every row before moving on, so a large batch stages each
-// paged layer's experts once (the union covers most experts) instead of
-// once per row. The per-row residual stack lives in `h.batch_r` and is
-// copied into the single-row scratch `h.R` for each row, so the layer body
-// is shared with the single-token forward (RunTrunkLayer).
+// layer across every row before moving on. The mixer half of a layer runs
+// per row (the recurrence and the paged cache are sequential), then every
+// row's MoE router runs, the selected ids are read back once, the union of
+// experts stages once, and the expert half runs per row. This pays the
+// per-layer id readback and expert transfer once per layer instead of once
+// per row. The per-row residual stack lives in `h.batch_r`.
 
 namespace tessera::models::qwen4exp {
 
@@ -87,22 +89,30 @@ std::expected<void, StatusCode> InitBatchStack(
 }
 
 std::expected<void, StatusCode> GrowBatchScratch(Backend& backend,
+                                                 const TransformerConfig& cfg,
                                                  const Qwen4ExpGeometry& g,
                                                  Qwen4ExpState& h,
                                                  std::size_t rows) {
-  if (h.batch_rows >= rows && h.batch_r != nullptr && h.batch_x != nullptr) {
+  if (h.batch_rows >= rows && h.batch_r != nullptr) {
     return {};
   }
-  auto r = backend.AllocateBuffer(rows * g.hc_dim * 4, MemoryKind::Device);
-  if (!r) {
-    return std::unexpected(StatusCode::OutOfMemory);
-  }
-  auto x = backend.AllocateBuffer(rows * g.hidden * 4, MemoryKind::Device);
-  if (!x) {
-    return std::unexpected(StatusCode::OutOfMemory);
-  }
-  h.batch_r = std::move(*r);
-  h.batch_x = std::move(*x);
+  const std::size_t top_k = cfg.experts_per_tok;
+  auto alloc = [&](std::unique_ptr<Buffer>& slot,
+                   std::size_t bytes) -> std::expected<void, StatusCode> {
+    auto buffer = backend.AllocateBuffer(bytes, MemoryKind::Device);
+    if (!buffer) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    slot = std::move(*buffer);
+    return {};
+  };
+  if (auto r = alloc(h.batch_r, rows * g.hc_dim * 4); !r) return r;
+  if (auto x = alloc(h.batch_x, rows * g.hidden * 4); !x) return x;
+  if (auto m = alloc(h.batch_mixed, rows * g.hidden * 4); !m) return m;
+  if (auto i = alloc(h.batch_inject2, rows * g.hc * 4); !i) return i;
+  if (auto id = alloc(h.batch_ids, rows * top_k * 4); !id) return id;
+  if (auto w = alloc(h.batch_wts, rows * top_k * 4); !w) return w;
+  if (auto s = alloc(h.batch_sig, rows * 4); !s) return s;
   h.batch_rows = rows;
   return {};
 }
@@ -129,7 +139,9 @@ std::expected<void, StatusCode> ForwardTrunkBatch(
   Qwen4ExpState& h = State(cache);
   h.profile = cache.profile;
   const std::size_t rows = tokens.size();
-  if (auto grown = GrowBatchScratch(backend, g, h, rows); !grown) {
+  const std::size_t hidden = g.hidden;
+  const std::size_t top_k = cfg.experts_per_tok;
+  if (auto grown = GrowBatchScratch(backend, cfg, g, h, rows); !grown) {
     return grown;
   }
   if (auto filled = FillBatchEmbeddings(backend, model, g, h, tokens,
@@ -141,21 +153,89 @@ std::expected<void, StatusCode> ForwardTrunkBatch(
     return init;
   }
   const bool ple_layer = CarriesPle(cfg);
-  // The layers run once each over every row, so RunMoeFfn's selective expert
-  // staging accumulates across the rows of a layer: an expert uploaded for
-  // one row is a device gather for the next, and the union per layer is
-  // paid once. This beats a whole-tensor upload, which reads every expert
-  // from RAM and ignores the cache.
+  std::vector<std::uint32_t> host_ids(rows * top_k);
+  std::vector<std::uint32_t> union_ids;
   for (std::size_t l = 0; l < cfg.layers; ++l) {
+    // Mixer half: the attention hyper-connection, the mixer and the FFN
+    // hyper-connection read, per row (the state is sequential). Store the
+    // FFN input and the injection for the expert half.
     for (std::size_t t = 0; t < rows; ++t) {
       if (!backend.CopyD2D(*h.batch_r, t * g.hc_dim * 4, *h.R, 0,
                            g.hc_dim * 4)) {
         return std::unexpected(StatusCode::DeviceError);
       }
-      if (auto layer = RunTrunkLayer(backend, model, cfg, g, h, l,
-                                     h.position + t, tokens[t], ple_layer);
-          !layer) {
-        return layer;
+      if (auto mixer = RunTrunkLayerMixer(backend, model, cfg, g, h, l,
+                                          h.position + t, tokens[t], ple_layer);
+          !mixer) {
+        return mixer;
+      }
+      if (!backend.CopyD2D(*h.mixed, 0, *h.batch_mixed, t * hidden * 4,
+                           hidden * 4) ||
+          !backend.CopyD2D(*h.inject2, 0, *h.batch_inject2, t * g.hc * 4,
+                           g.hc * 4) ||
+          !backend.CopyD2D(*h.R, 0, *h.batch_r, t * g.hc_dim * 4,
+                           g.hc_dim * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+    // Router for every row, then one readback of the whole selection.
+    for (std::size_t t = 0; t < rows; ++t) {
+      if (!backend.CopyD2D(*h.batch_mixed, t * hidden * 4, *h.mixed, 0,
+                           hidden * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      if (auto router = RunMoeRouter(backend, model, cfg, h, l, *h.mixed);
+          !router) {
+        return router;
+      }
+      if (!backend.CopyD2D(*h.moe_ids, 0, *h.batch_ids, t * top_k * 4,
+                           top_k * 4) ||
+          !backend.CopyD2D(*h.moe_wts, 0, *h.batch_wts, t * top_k * 4,
+                           top_k * 4) ||
+          !backend.CopyD2D(*h.moe_sig, 0, *h.batch_sig, t * 4, 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+    if (model.ExpertsPaged(l)) {
+      if (!backend.CopyD2H(*h.batch_ids,
+                           reinterpret_cast<std::byte*>(host_ids.data()),
+                           host_ids.size() * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      union_ids.assign(host_ids.begin(), host_ids.end());
+      std::sort(union_ids.begin(), union_ids.end());
+      union_ids.erase(std::unique(union_ids.begin(), union_ids.end()),
+                      union_ids.end());
+      if (auto staged = model.EnsureLayerExperts(
+              l, std::span<const std::uint32_t>(union_ids));
+          !staged) {
+        return std::unexpected(staged.error());
+      }
+    }
+    // Expert half: the shared expert, the routed experts from the staged
+    // union, and the FFN write back into the stack, per row.
+    for (std::size_t t = 0; t < rows; ++t) {
+      if (!backend.CopyD2D(*h.batch_mixed, t * hidden * 4, *h.mixed, 0,
+                           hidden * 4) ||
+          !backend.CopyD2D(*h.batch_inject2, t * g.hc * 4, *h.inject2, 0,
+                           g.hc * 4) ||
+          !backend.CopyD2D(*h.batch_ids, t * top_k * 4, *h.moe_ids, 0,
+                           top_k * 4) ||
+          !backend.CopyD2D(*h.batch_wts, t * top_k * 4, *h.moe_wts, 0,
+                           top_k * 4) ||
+          !backend.CopyD2D(*h.batch_sig, t * 4, *h.moe_sig, 0, 4) ||
+          !backend.CopyD2D(*h.batch_r, t * g.hc_dim * 4, *h.R, 0,
+                           g.hc_dim * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      if (auto experts = RunMoeExperts(backend, model, cfg, h, l, *h.mixed,
+                                       top_k, {}, {});
+          !experts) {
+        return experts;
+      }
+      if (auto write = HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject2);
+          !write) {
+        return write;
       }
       if (!backend.CopyD2D(*h.R, 0, *h.batch_r, t * g.hc_dim * 4,
                            g.hc_dim * 4)) {

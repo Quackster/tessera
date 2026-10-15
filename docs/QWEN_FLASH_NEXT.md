@@ -600,6 +600,20 @@ the head read and the output projection).
   decode fell from about 70 to 57 to 67 ms/token (about 15 to 17 tok/s).
   The Vulkan path keeps its single-window staging.
 
+- **Batched prefill (the prefill target).** The prefill ran one token per
+  forward, so every row paid the routed-expert staging on its own. The
+  trunk now runs layer-major over the chunk: for each layer, the mixer half
+  runs per row, then every row's MoE router runs, the selected ids are read
+  back once, the union of experts stages once, and the expert half runs per
+  row. The per-row residual stack is held in `h.batch_r`, and a chunk of one
+  row keeps the plain per-token path. On one R9700, IQ3_S, 4K context, fp32
+  KV, `--gpu-layers 8`, a 515-token prompt: the prefill rose from about 18
+  to about 31 tok/s. The batched prefill equals the per-token serial prefill
+  token for token (`EngineTest.BatchedPrefillMatchesSerialWhenProvided`).
+  The decode is unchanged: the MTP verify runs one row per forward, and a
+  batched verify was measured slower, because five rows select almost five
+  times the experts and the rejected drafts are wasted work.
+
 ### Still required (in order)
 
  1. **CPU+GPU hybrid MoE (the path to the target).** The reference for this
@@ -627,8 +641,11 @@ the head read and the output projection).
     token. The reference's 45 tok/s was measured on a Ryzen 9 7900X
     (AVX-512, 12 cores). A fast AVX2 IQ dequant and dot is the prerequisite;
     without it the hybrid cannot help on this machine.
- 2. Batched prefill (up to a few thousand tokens per forward) with the next
-    layer's expert work overlapped with the current layer's attention.
+ 2. Batched prefill: done for the layer-major path (about 31 tok/s from
+    about 18 at `--gpu-layers 8`). Still to do: batched kernels so one
+    launch covers all rows (the projections, the QSA attention and the
+    fused MoE are per row today), and the next layer's expert work
+    overlapped with the current layer's attention.
  3. MTP (M7), when the draft file is downloaded.
 
 ### Memory note

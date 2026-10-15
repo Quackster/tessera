@@ -80,6 +80,15 @@ struct Qwen4ExpGeometry {
     const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::size_t layer,
     std::uint64_t pos, std::uint32_t token, bool ple_layer);
 
+// The mixer half of a trunk block (attention hyper-connection read, the QSA
+// or gated-delta mixer, the attention write, and the FFN hyper-connection
+// read). Leaves the FFN input in `h.mixed` and the injection in `h.inject2`.
+// A batched caller runs it per row, then the router and experts separately.
+[[nodiscard]] std::expected<void, StatusCode> RunTrunkLayerMixer(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::size_t layer,
+    std::uint64_t pos, std::uint32_t token, bool ple_layer);
+
 // The output head on the current residual stack `h.R`: the output
 // hyper-connection read and the vocabulary projection into `h.logits`.
 [[nodiscard]] std::expected<void, StatusCode> RunTrunkHead(
@@ -101,9 +110,28 @@ struct Qwen4ExpGeometry {
 // routed experts and the always-on shared expert, and write the block
 // output to `h.block_out`. `mixed` is the normed activation from the FFN
 // hyper-connection read. The caller folds it into the residual stack with
-// the hyper-connection write.
+// the hyper-connection write. Stages the routed experts it selects.
 [[nodiscard]] std::expected<void, StatusCode> RunMoeFfn(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     Qwen4ExpState& h, std::size_t layer, const Buffer& mixed);
+
+// The MoE router phase: project the activation to one logit per expert,
+// take the top `experts_per_tok`, and write `h.moe_ids`, `h.moe_wts` and
+// `h.moe_sig`. No expert weights are staged. A batched caller runs this for
+// every row, reads the ids back once, stages the union, then calls
+// RunMoeExperts per row.
+[[nodiscard]] std::expected<void, StatusCode> RunMoeRouter(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen4ExpState& h, std::size_t layer, const Buffer& mixed);
+
+// The MoE expert phase: the shared expert plus the routed experts for
+// `h.moe_ids` (the first `n_gpu` slots on the device; `cpu_ids`/`cpu_wts`
+// are the CPU-side hybrid experts), combined into `h.block_out`. Assumes
+// the routed experts for `h.moe_ids` are already staged on the device.
+[[nodiscard]] std::expected<void, StatusCode> RunMoeExperts(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen4ExpState& h, std::size_t layer, const Buffer& mixed,
+    std::size_t n_gpu, std::span<const std::uint32_t> cpu_ids,
+    std::span<const float> cpu_wts);
 
 }  // namespace tessera::models::qwen4exp

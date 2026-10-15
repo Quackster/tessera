@@ -17,10 +17,9 @@
 // the normed activation to one logit per expert, the top-k experts are
 // selected and softmaxed, each runs a gated MLP with its own rank-3 packed
 // weights, and an always-on shared expert contributes a sigmoid-gated
-// dense MLP. The routed expert formats (IQ3_XXS gate/up, IQ4_NL down) have
-// no fused packed kernel, so each selected expert is gathered device to
-// device and run through the generic GEMM. A fused packed-expert kernel
-// and the residency cache are the throughput follow-up.
+// dense MLP. The phase is split into a router (selection) and an expert
+// phase so a batched caller can run every row's router, read the ids back
+// once, stage the union and then run the experts per row.
 
 namespace tessera::models::qwen4exp {
 
@@ -98,33 +97,22 @@ std::expected<void, StatusCode> ScaleAdd(Backend& backend, Qwen4ExpState& h,
 
 }  // namespace
 
-std::expected<void, StatusCode> RunMoeFfn(
+std::expected<void, StatusCode> RunMoeRouter(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     Qwen4ExpState& h, std::size_t layer, const Buffer& mixed) {
   const std::size_t hidden = cfg.hidden_dim;
   const std::size_t ne = cfg.num_experts;
   const std::size_t top_k = cfg.experts_per_tok;
-  const std::size_t inter = std::max(cfg.moe_intermediate,
-                                     cfg.shared_expert_intermediate);
   const std::string base = "blk." + std::to_string(layer) + ".";
-
   auto router = NeedWeightAny(model, base + "ffn_gate_inp.weight");
   auto shexp_gate = NeedWeightAny(model, base + "ffn_gate_inp_shexp.weight");
-  auto gate_sh = NeedWeightAny(model, base + "ffn_gate_shexp.weight");
-  auto up_sh = NeedWeightAny(model, base + "ffn_up_shexp.weight");
-  auto down_sh = NeedWeightAny(model, base + "ffn_down_shexp.weight");
-  if (!router || !shexp_gate || !gate_sh || !up_sh || !down_sh) {
+  if (!router || !shexp_gate) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   if (!Grow(backend, h.moe_logits, ne * 4) ||
       !Grow(backend, h.moe_ids, top_k * 4) ||
       !Grow(backend, h.moe_vals, top_k * 4) ||
-      !Grow(backend, h.moe_wts, top_k * 4) || !Grow(backend, h.moe_sig, 4) ||
-      !Grow(backend, h.moe_acc, hidden * 4) ||
-      !Grow(backend, h.moe_shared, hidden * 4) ||
-      !Grow(backend, h.moe_gate_out, inter * 4) ||
-      !Grow(backend, h.moe_up_out, inter * 4) ||
-      !Grow(backend, h.moe_inter, inter * 4)) {
+      !Grow(backend, h.moe_wts, top_k * 4) || !Grow(backend, h.moe_sig, 4)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   // The moe_gate kernel reads the shared-expert gate as fp32; the checkpoint
@@ -159,29 +147,55 @@ std::expected<void, StatusCode> RunMoeFfn(
     }
     shexp_w = h.moe_shexp_w[layer].get();
   }
-  {
-    core::PhaseScope scope(h.profile, core::Phase::kMoeRouter);
-    if (!Project(backend, h, (*router)->manifest.dtype, mixed,
-                 *(*router)->device, *h.moe_logits, 1, ne, hidden)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-    if (auto top = TopKRowsDevice(backend, *h.moe_topk, *h.moe_logits,
-                                  *h.moe_ids, *h.moe_vals, 1, ne, top_k);
-        !top) {
-      return std::unexpected(top.error());
-    }
-    KernelLaunch gate;
-    gate.grid_x = 1;
-    gate.block_x = kMoeThreads;
-    gate.buffers = {h.moe_vals.get(), const_cast<Buffer*>(&mixed), shexp_w,
-                    h.moe_wts.get(), h.moe_sig.get()};
-    gate.scalars = {top_k, hidden};
-    if (!backend.LaunchKernel(*h.moe_gate, gate)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
+  core::PhaseScope scope(h.profile, core::Phase::kMoeRouter);
+  if (!Project(backend, h, (*router)->manifest.dtype, mixed,
+               *(*router)->device, *h.moe_logits, 1, ne, hidden)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (auto top = TopKRowsDevice(backend, *h.moe_topk, *h.moe_logits, *h.moe_ids,
+                                *h.moe_vals, 1, ne, top_k);
+      !top) {
+    return std::unexpected(top.error());
+  }
+  KernelLaunch gate;
+  gate.grid_x = 1;
+  gate.block_x = kMoeThreads;
+  gate.buffers = {h.moe_vals.get(), const_cast<Buffer*>(&mixed), shexp_w,
+                  h.moe_wts.get(), h.moe_sig.get()};
+  gate.scalars = {top_k, hidden};
+  if (!backend.LaunchKernel(*h.moe_gate, gate)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return {};
+}
+
+std::expected<void, StatusCode> RunMoeExperts(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen4ExpState& h, std::size_t layer, const Buffer& mixed,
+    std::size_t n_gpu, std::span<const std::uint32_t> cpu_ids,
+    std::span<const float> cpu_wts) {
+  const std::size_t hidden = cfg.hidden_dim;
+  const std::size_t ne = cfg.num_experts;
+  const std::size_t top_k = cfg.experts_per_tok;
+  const std::size_t inter = std::max(cfg.moe_intermediate,
+                                     cfg.shared_expert_intermediate);
+  const std::string base = "blk." + std::to_string(layer) + ".";
+  auto gate_sh = NeedWeightAny(model, base + "ffn_gate_shexp.weight");
+  auto up_sh = NeedWeightAny(model, base + "ffn_up_shexp.weight");
+  auto down_sh = NeedWeightAny(model, base + "ffn_down_shexp.weight");
+  if (!gate_sh || !up_sh || !down_sh) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (!Grow(backend, h.moe_acc, hidden * 4) ||
+      !Grow(backend, h.moe_shared, hidden * 4) ||
+      !Grow(backend, h.moe_gate_out, inter * 4) ||
+      !Grow(backend, h.moe_up_out, inter * 4) ||
+      !Grow(backend, h.moe_inter, inter * 4)) {
+    return std::unexpected(StatusCode::OutOfMemory);
   }
   // The shared expert reads only the activation, so run it before the routed
-  // staging: its GPU work overlaps the host staging copy and upload below.
+  // expert kernels: its GPU work overlaps the host staging copy and upload
+  // when the caller stages after this call.
   const std::size_t shared = cfg.shared_expert_intermediate;
   {
     core::PhaseScope scope(h.profile, core::Phase::kMoeShared);
@@ -196,78 +210,8 @@ std::expected<void, StatusCode> RunMoeFfn(
       return std::unexpected(StatusCode::DeviceError);
     }
   }
-
-  // Routed experts. Without TESSERA_CPU_MOE the whole selection is staged and
-  // computed on the GPU. With it, the CPU computes up to that many of the
-  // uncached experts (the CPU+GPU hybrid) while the GPU computes the rest;
-  // the two overlap. A resident layer needs no readback.
-  std::vector<std::uint32_t> cpu_ids;
-  std::vector<float> cpu_wts;
-  std::size_t n_gpu = top_k;
-  if (model.ExpertsPaged(layer)) {
-    core::PhaseScope staging_scope(h.profile, core::Phase::kMoeStaging);
-    std::vector<std::uint32_t> ids(top_k, 0);
-    {
-      core::PhaseScope scope(h.profile, core::Phase::kMoeReadback);
-      if (!backend.CopyD2H(*h.moe_ids,
-                           reinterpret_cast<std::byte*>(ids.data()),
-                           top_k * 4)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-    }
-    // Keep at least one expert on the GPU so the staging views stay resolved.
-    const std::size_t cpu_target =
-        std::min(kCpuMoeExpertsPerLayer, top_k > 0 ? top_k - 1 : 0);
-    if (cpu_target == 0) {
-      // GPU-only: stage the whole selection in place, no weight readback.
-      core::PhaseScope scope(h.profile, core::Phase::kMoeUpload);
-      if (auto staged = model.EnsureLayerExperts(
-              layer, std::span<const std::uint32_t>(ids));
-          !staged) {
-        return std::unexpected(staged.error());
-      }
-    } else {
-      std::vector<float> wts(top_k, 0.0f);
-      if (!backend.CopyD2H(*h.moe_wts,
-                           reinterpret_cast<std::byte*>(wts.data()),
-                           top_k * 4)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-      std::vector<std::uint32_t> gpu;
-      std::vector<float> gpu_wts;
-      for (std::size_t s = 0; s < top_k; ++s) {
-        if (model.ExpertCached(layer, ids[s]) ||
-            cpu_ids.size() >= cpu_target) {
-          gpu.push_back(ids[s]);
-          gpu_wts.push_back(wts[s]);
-        } else {
-          cpu_ids.push_back(ids[s]);
-          cpu_wts.push_back(wts[s]);
-        }
-      }
-      n_gpu = gpu.size();
-      core::PhaseScope scope(h.profile, core::Phase::kMoeUpload);
-      if (auto staged = model.EnsureLayerExperts(
-              layer, std::span<const std::uint32_t>(gpu));
-          !staged) {
-        return std::unexpected(staged.error());
-      }
-      if (!backend.CopyH2D(
-              *h.moe_ids,
-              std::span<const std::byte>(
-                  reinterpret_cast<const std::byte*>(gpu.data()),
-                  gpu.size() * 4)) ||
-          !backend.CopyH2D(
-              *h.moe_wts,
-              std::span<const std::byte>(
-                  reinterpret_cast<const std::byte*>(gpu_wts.data()),
-                  gpu_wts.size() * 4))) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-    }
-  }
-  // The staging above resolved the paged tensors, so the slice geometry and
-  // the fused kernel are known now.
+  // The caller staged the routed experts, so the slice geometry and the
+  // fused kernel are known now.
   const DeviceTensor* gate_exps =
       model.FindDeviceTensor(base + "ffn_gate_exps.weight");
   const DeviceTensor* up_exps =
@@ -335,19 +279,16 @@ std::expected<void, StatusCode> RunMoeFfn(
     if (h.cpu_x.size() < hidden) {
       h.cpu_x.resize(hidden);
     }
-    if (!backend.CopyD2H(mixed,
-                         reinterpret_cast<std::byte*>(h.cpu_x.data()),
+    if (!backend.CopyD2H(mixed, reinterpret_cast<std::byte*>(h.cpu_x.data()),
                          hidden * 4)) {
       return std::unexpected(StatusCode::DeviceError);
     }
-    const std::string gate_name = base + "ffn_gate_exps.weight";
-    const std::string up_name = base + "ffn_up_exps.weight";
-    const std::string down_name = base + "ffn_down_exps.weight";
     const std::span<const std::byte> gate_host =
-        model.PagedTensorHost(gate_name);
-    const std::span<const std::byte> up_host = model.PagedTensorHost(up_name);
+        model.PagedTensorHost(base + "ffn_gate_exps.weight");
+    const std::span<const std::byte> up_host =
+        model.PagedTensorHost(base + "ffn_up_exps.weight");
     const std::span<const std::byte> down_host =
-        model.PagedTensorHost(down_name);
+        model.PagedTensorHost(base + "ffn_down_exps.weight");
     h.cpu_acc.assign(hidden, 0.0f);
     if (auto computed = core::CpuMoeExpertsForward(
             std::span<const float>(h.cpu_x), cpu_ids, cpu_wts,
@@ -369,14 +310,99 @@ std::expected<void, StatusCode> RunMoeFfn(
       return std::unexpected(StatusCode::DeviceError);
     }
   }
+  return ScaleAdd(backend, h, *h.moe_acc, *h.moe_shared, *h.moe_sig,
+                  *h.block_out, hidden, 0);
+}
 
-  if (auto combined =
-          ScaleAdd(backend, h, *h.moe_acc, *h.moe_shared, *h.moe_sig,
-                   *h.block_out, hidden, 0);
-      !combined) {
-    return combined;
+// Read back the selected ids, split the uncached experts to the CPU when the
+// hybrid is on, and stage the GPU experts. `n_gpu`, `cpu_ids` and `cpu_wts`
+// describe the split for the expert phase.
+std::expected<void, StatusCode> StageMoeSelection(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen4ExpState& h, std::size_t layer, std::size_t* n_gpu,
+    std::vector<std::uint32_t>* cpu_ids, std::vector<float>* cpu_wts) {
+  const std::size_t top_k = cfg.experts_per_tok;
+  *n_gpu = top_k;
+  cpu_ids->clear();
+  cpu_wts->clear();
+  if (!model.ExpertsPaged(layer)) {
+    return {};
+  }
+  core::PhaseScope staging_scope(h.profile, core::Phase::kMoeStaging);
+  std::vector<std::uint32_t> ids(top_k, 0);
+  {
+    core::PhaseScope scope(h.profile, core::Phase::kMoeReadback);
+    if (!backend.CopyD2H(*h.moe_ids, reinterpret_cast<std::byte*>(ids.data()),
+                         top_k * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  // Keep at least one expert on the GPU so the staging views stay resolved.
+  const std::size_t cpu_target =
+      std::min(kCpuMoeExpertsPerLayer, top_k > 0 ? top_k - 1 : 0);
+  if (cpu_target == 0) {
+    core::PhaseScope scope(h.profile, core::Phase::kMoeUpload);
+    if (auto staged = model.EnsureLayerExperts(
+            layer, std::span<const std::uint32_t>(ids));
+        !staged) {
+      return std::unexpected(staged.error());
+    }
+    return {};
+  }
+  std::vector<float> wts(top_k, 0.0f);
+  if (!backend.CopyD2H(*h.moe_wts, reinterpret_cast<std::byte*>(wts.data()),
+                       top_k * 4)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  std::vector<std::uint32_t> gpu;
+  std::vector<float> gpu_wts;
+  for (std::size_t s = 0; s < top_k; ++s) {
+    if (model.ExpertCached(layer, ids[s]) || cpu_ids->size() >= cpu_target) {
+      gpu.push_back(ids[s]);
+      gpu_wts.push_back(wts[s]);
+    } else {
+      cpu_ids->push_back(ids[s]);
+      cpu_wts->push_back(wts[s]);
+    }
+  }
+  *n_gpu = gpu.size();
+  core::PhaseScope scope(h.profile, core::Phase::kMoeUpload);
+  if (auto staged =
+          model.EnsureLayerExperts(layer,
+                                   std::span<const std::uint32_t>(gpu));
+      !staged) {
+    return std::unexpected(staged.error());
+  }
+  if (!backend.CopyH2D(
+          *h.moe_ids,
+          std::span<const std::byte>(
+              reinterpret_cast<const std::byte*>(gpu.data()), gpu.size() * 4)) ||
+      !backend.CopyH2D(*h.moe_wts,
+                       std::span<const std::byte>(
+                           reinterpret_cast<const std::byte*>(gpu_wts.data()),
+                           gpu_wts.size() * 4))) {
+    return std::unexpected(StatusCode::DeviceError);
   }
   return {};
+}
+
+std::expected<void, StatusCode> RunMoeFfn(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    Qwen4ExpState& h, std::size_t layer, const Buffer& mixed) {
+  if (auto routed = RunMoeRouter(backend, model, cfg, h, layer, mixed);
+      !routed) {
+    return routed;
+  }
+  std::size_t n_gpu = 0;
+  std::vector<std::uint32_t> cpu_ids;
+  std::vector<float> cpu_wts;
+  if (auto staged = StageMoeSelection(backend, model, cfg, h, layer, &n_gpu,
+                                      &cpu_ids, &cpu_wts);
+      !staged) {
+    return staged;
+  }
+  return RunMoeExperts(backend, model, cfg, h, layer, mixed, n_gpu, cpu_ids,
+                       cpu_wts);
 }
 
 }  // namespace tessera::models::qwen4exp

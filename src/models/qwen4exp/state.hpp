@@ -99,7 +99,11 @@ struct Qwen4ExpState final : core::ArchState {
   // Batched-forward scratch (prefill and the multi-row verify). The residual
   // stack is held per row (rows * hc * hidden) so a layer can run every row
   // before its experts stage once; the embedding gather writes one row each.
-  std::unique_ptr<Buffer> batch_r, batch_x, batch_ids;
+  // The FFN input, the per-stream injection and the router selection are
+  // held per row so a layer can run every row's router, read the ids back
+  // once, stage the union and then run the experts.
+  std::unique_ptr<Buffer> batch_r, batch_x, batch_mixed, batch_inject2,
+      batch_ids, batch_wts, batch_sig;
   std::size_t batch_rows = 0;
 
   // MTP draft head: the fetched weights (loaded lazily on first draft), its

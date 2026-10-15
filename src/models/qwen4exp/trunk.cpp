@@ -614,26 +614,21 @@ std::expected<void, StatusCode> RunTrunkHead(
                  *(*w_out)->device, *h.logits, 1, cfg.vocab_size, g.hidden);
 }
 
-// One trunk block on the current residual stack `h.R`, at absolute position
-// `pos`, with `token` feeding the PLE block when this layer carries it. The
-// mixer is QSA on a full-attention layer and gated-delta otherwise. Used by
-// the single-token Forward and by the batched forward, which drives one row
-// at a time so both share this body.
-std::expected<void, StatusCode> RunTrunkLayer(
+// The mixer half of a trunk block: the attention hyper-connection read, the
+// QSA or gated-delta mixer, the attention write back into the stack, and the
+// FFN hyper-connection read. Leaves the FFN input in `h.mixed` and the
+// per-stream injection in `h.inject2` for the FFN half. The PLE block runs
+// here when this layer carries it.
+std::expected<void, StatusCode> RunTrunkLayerMixer(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::size_t l,
     std::uint64_t pos, std::uint32_t token, bool ple_layer) {
-  core::Profile* const deep_profile =
-      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
-  core::PhaseScope layer_scope(
-      deep_profile, cfg.IsFullAttentionLayer(l) ? core::Phase::kFullLayer
-                                                : core::Phase::kLinearLayer);
   if (auto ensured = model.EnsureLayerResident(l); !ensured) {
     return std::unexpected(ensured.error());
   }
   if (ple_layer && l == 1) {
-    auto ple = RunPleBlock(backend, model, cfg, g, h, token, *h.R);
-    if (!ple) {
+    if (auto ple = RunPleBlock(backend, model, cfg, g, h, token, *h.R);
+        !ple) {
       return ple;
     }
   }
@@ -670,21 +665,46 @@ std::expected<void, StatusCode> RunTrunkLayer(
   if (!fn || !fd || !fu || !fi) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  if (auto read = HyperRead(backend, h, cfg, g, *(*fn)->device, *(*fd)->device,
-                            *(*fu)->device, (*fi)->device.get(), *h.R, *h.mixed,
-                            h.inject2.get());
-      !read) {
-    return read;
+  return HyperRead(backend, h, cfg, g, *(*fn)->device, *(*fd)->device,
+                   *(*fu)->device, (*fi)->device.get(), *h.R, *h.mixed,
+                   h.inject2.get());
+}
+
+// The FFN half: run the MoE on `h.mixed` and fold the block output into the
+// stack with `h.inject2`. The mixer half must have run first.
+std::expected<void, StatusCode> RunTrunkLayerFfn(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::size_t l,
+    core::Profile* deep_profile) {
+  core::PhaseScope ffn_scope(deep_profile, core::Phase::kFfn);
+  if (auto moe = RunMoeFfn(backend, model, cfg, h, l, *h.mixed); !moe) {
+    return moe;
   }
-  {
-    core::PhaseScope ffn_scope(deep_profile, core::Phase::kFfn);
-    if (auto moe = RunMoeFfn(backend, model, cfg, h, l, *h.mixed); !moe) {
-      return moe;
-    }
+  return HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject2);
+}
+
+// One trunk block on the current residual stack `h.R`, at absolute position
+// `pos`, with `token` feeding the PLE block when this layer carries it. The
+// mixer is QSA on a full-attention layer and gated-delta otherwise. Used by
+// the single-token Forward and by the batched forward, which drives one row
+// at a time so both share this body.
+std::expected<void, StatusCode> RunTrunkLayer(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::size_t l,
+    std::uint64_t pos, std::uint32_t token, bool ple_layer) {
+  core::Profile* const deep_profile =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
+  core::PhaseScope layer_scope(
+      deep_profile, cfg.IsFullAttentionLayer(l) ? core::Phase::kFullLayer
+                                                : core::Phase::kLinearLayer);
+  if (auto mixer = RunTrunkLayerMixer(backend, model, cfg, g, h, l, pos, token,
+                                      ple_layer);
+      !mixer) {
+    return mixer;
   }
-  if (auto write = HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject2);
-      !write) {
-    return write;
+  if (auto ffn = RunTrunkLayerFfn(backend, model, cfg, g, h, l, deep_profile);
+      !ffn) {
+    return ffn;
   }
   if (deep_profile != nullptr) {
     backend.Synchronize();  // profile attribution only
