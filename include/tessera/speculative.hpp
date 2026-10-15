@@ -56,6 +56,13 @@ class SpeculativeStrategy {
   // Maximum draft tokens proposed per window (0 = strategy default).
   [[nodiscard]] virtual std::size_t DraftBlock() const = 0;
 
+  // True when the draft and accept path is correct under sampling
+  // (speculative sampling: the drafter's distribution feeds the accept
+  // rule). False (the default) means greedy only. The engine runs a
+  // sampled request without a greedy-only strategy, so a sampled request
+  // is never silently decoded as greedy.
+  [[nodiscard]] virtual bool SupportsSampling() const { return false; }
+
   // True when the drafter reads the target's MTP (next-token-prediction)
   // head and therefore needs its weights loaded. The engine skips the
   // head on load when the attached strategy returns false.

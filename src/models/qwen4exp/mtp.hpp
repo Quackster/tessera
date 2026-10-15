@@ -18,6 +18,14 @@
 // (see CREDITS.md).
 namespace tessera::models::qwen4exp {
 
+// Load the MTP weights and allocate the draft cache and scratch, once. A
+// no-op when already ready or when the model has no MTP path. The module
+// calls this from EnsureReady, before the expert cache sizes itself to the
+// free device memory, so the MTP weights get their share first.
+[[nodiscard]] std::expected<void, StatusCode> EnsureMtpReady(
+    Backend& backend, const Model& model, const Qwen4ExpGeometry& g,
+    Qwen4ExpState& h);
+
 // One MTP draft step: consume the target's final multi-stream residual
 // `hidden` (hc * hidden) and the anchor `token`, run the MTP block at KV
 // cell `pos`, and return the drafted token. When `mtp_hidden_out` is

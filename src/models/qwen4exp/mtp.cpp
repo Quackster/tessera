@@ -38,10 +38,12 @@ using detail::UploadF32;
 
 namespace {
 
-// The MTP draft cache geometry. The pool covers the same context the trunk
-// QSA cache does; the dense attention reads at most the most recent cells,
-// which bounds the softmax scratch (qsa_attend's cap).
-constexpr std::size_t kMtpCells = 8192;
+
+// The MTP draft cache geometry. The pool covers the model's context (the
+// CLI default), so the draft never faults before the trunk; the dense
+// attention reads at most the most recent cells, which bounds the softmax
+// scratch (qsa_attend's cap).
+constexpr std::size_t kMtpCells = 32768;
 constexpr std::size_t kMtpPageSize = 4;
 constexpr std::size_t kMtpPages = kMtpCells / kMtpPageSize;
 constexpr std::size_t kMtpMaxAttend = 4096;
@@ -73,6 +75,8 @@ std::expected<void, StatusCode> ScaleAdd(Backend& backend, Qwen4ExpState& h,
   launch.scalars = {n, idx};
   return backend.LaunchKernel(*h.moe_scale_add, launch);
 }
+
+}  // namespace
 
 // Load the MTP weights and allocate the draft cache and scratch once.
 std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
@@ -120,6 +124,8 @@ std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
   h.mtp_ready = true;
   return {};
 }
+
+namespace {
 
 // Dense QSA attention over the MTP's own cache: project q (with gate), k
 // and v, norm and rotate, append the cell, gather the attended cells and
@@ -320,6 +326,8 @@ std::expected<void, StatusCode> RunMtpMoe(Backend& backend,
                   hidden, s)) {
       return std::unexpected(StatusCode::DeviceError);
     }
+    if (s == 0) {
+    }
   }
   if (!ScaleAdd(backend, h, *h.moe_acc, *h.moe_shared, *h.moe_sig, *h.block_out,
                 hidden, 0)) {
@@ -384,16 +392,26 @@ std::expected<std::uint32_t, StatusCode> RunMtpDraft(
         !gathered) {
       return std::unexpected(gathered.error());
     }
-    if (!UploadF32(backend, *h.x, row) ||
-        !RmsNormDevice(backend, *h.rmsnorm, *h.x, *norm_embed, *h.xn, 1,
-                       g.hidden, cfg.norm_eps) ||
-        !Project(backend, h, DType::BF16, *h.xn, *fc_embedding, *h.proj, 1,
-                 g.hidden, g.hidden) ||
-        !UploadF32(backend, *h.mtp_hidden_branch,
-                   std::vector<float>(hidden.begin(), hidden.end())) ||
-        !RmsNormDevice(backend, *h.rmsnorm, *h.mtp_hidden_branch, *norm_hidden,
-                       *h.mtp_hidden_branch, 1, g.hc_dim, cfg.norm_eps) ||
-        !Project(backend, h, DType::BF16, *h.mtp_hidden_branch, *fc_hidden,
+    if (!UploadF32(backend, *h.x, row)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!RmsNormDevice(backend, *h.rmsnorm, *h.x, *norm_embed, *h.mixed, 1,
+                       g.hidden, cfg.norm_eps)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!Project(backend, h, DType::BF16, *h.mixed, *fc_embedding, *h.proj, 1,
+                 g.hidden, g.hidden)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!UploadF32(backend, *h.mtp_hidden_branch,
+                   std::vector<float>(hidden.begin(), hidden.end()))) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!RmsNormDevice(backend, *h.rmsnorm, *h.mtp_hidden_branch, *norm_hidden,
+                       *h.mtp_hidden_branch, 1, g.hc_dim, cfg.norm_eps)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (!Project(backend, h, DType::BF16, *h.mtp_hidden_branch, *fc_hidden,
                  *h.mtp_streams, g.hc, g.hidden, g.hidden)) {
       return std::unexpected(StatusCode::DeviceError);
     }
