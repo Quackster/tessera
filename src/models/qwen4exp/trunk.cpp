@@ -139,7 +139,9 @@ std::expected<void, StatusCode> HyperRead(
   }
   KernelLaunch down;
   down.grid_x = static_cast<std::uint32_t>(g.hc_lr);
-  down.block_x = 256;
+  // Sixteen warps shorten the per-output reduction; the kernel's block
+  // reduce is sized for them.
+  down.block_x = 512;
   down.buffers = {h.hc_xq.get(), const_cast<Buffer*>(&w_down), h.hc_lq.get()};
   down.scalars = {g.hc_dim, g.hc_lr, g.hc};
   if (!backend.LaunchKernel(*h.gr_down, down)) {

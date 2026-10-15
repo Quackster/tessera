@@ -115,7 +115,7 @@ __global__ void GrDownKernel(const float* xq, const unsigned short* w_down,
     acc += xq[i] * Bf16ToF32Dev(row[i]);
   }
   acc = WarpSumDev(acc);
-  __shared__ float part[8];
+  __shared__ float part[16];
   if (lane == 0) {
     part[warp] = acc;
   }

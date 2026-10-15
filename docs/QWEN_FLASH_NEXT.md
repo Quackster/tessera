@@ -621,11 +621,15 @@ the head read and the output projection).
   (store, stage) pair with one `scatter_d2d` kernel per five slices: on one
   R9700, IQ3_S, `--gpu-layers 8`, the device-to-device copy count over a
   25-forward run fell from 34739 to 6458 and the MTP speculative decode
-  rose from about 17 to about 18 tok/s with the same output. Separately,
-  `gr_gate` now reads its weight coalesced (one 32-lane group per output):
-  the kernel fell from about 36 to about 26 us. The decode is still about
-  half GPU kernels and half launch gaps; each kernel is a few percent, so
-  the remaining gain needs batched mixer kernels.
+  rose from about 17 to about 19 tok/s with the same output. Three kernels
+  also got faster on the ROCm backend: `gr_gate` reads its weight coalesced
+  (one 32-lane group per output) and caches the bottleneck in shared memory
+  (about 36 to about 26 us); the fused MoE down caches the activation in
+  shared memory instead of re-reading it from L2 per output (about 72 to
+  about 43 us); and `gr_down` runs 16 warps per output so its reduction is
+  half as long (about 21 to about 17 us). The decode is still about half
+  GPU kernels and half launch gaps; each kernel is a few percent, so the
+  remaining gain needs batched mixer kernels.
 
 ### Still required (in order)
 

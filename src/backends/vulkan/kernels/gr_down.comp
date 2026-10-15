@@ -1,7 +1,7 @@
 #version 450
 
 // One workgroup per bottleneck row; the dispatch is hc_lr workgroups.
-layout(local_size_x = 256) in;
+layout(local_size_x = 512) in;
 
 // "gr_down" contract: buffer 0 is xq (fp32, hc*n_embd), buffer 1 the
 // bf16 down weight (hc_lr x hc*n_embd, two bytes each), buffer 2 the
@@ -15,7 +15,7 @@ layout(set = 0, binding = 0) readonly buffer XQ { float xq[]; };
 layout(set = 0, binding = 1) readonly buffer WD { uint wd[]; };
 layout(set = 0, binding = 2) writeonly buffer LQ { float lq[]; };
 
-shared float red[256];
+shared float red[512];
 
 uint wbyte(uint off) {
   return (wd[off >> 2] >> ((off & 3) << 3)) & 0xFF;
@@ -44,12 +44,12 @@ void main() {
   }
   uint row = k * hc_dim;
   float acc = 0.0;
-  for (uint i = gl_LocalInvocationID.x; i < hc_dim; i += 256u) {
+  for (uint i = gl_LocalInvocationID.x; i < hc_dim; i += 512u) {
     acc += xq[i] * bf16_at((row + i) * 2u);
   }
   red[gl_LocalInvocationID.x] = acc;
   barrier();
-  for (uint s = 128u; s > 0u; s >>= 1u) {
+  for (uint s = 256u; s > 0u; s >>= 1u) {
     if (gl_LocalInvocationID.x < s) {
       red[gl_LocalInvocationID.x] += red[gl_LocalInvocationID.x + s];
     }
