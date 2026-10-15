@@ -189,51 +189,33 @@ Read it top to bottom:
 * `Wrote` names the JSON file the entry went to.
 * `Example` shows two `run` commands that reuse the result. The first spells the flags. The second applies the saved entry with `--calibration`.
 
-## TODO
+## Parallel draft sweep
 
-1. Add the draft sweep to the parallel path. Cover `--draft` and `--speculate` for each layout. This needs speculative decoding on `TensorParallel`, `ContextParallel`, and `Pipeline`, which do not run a strategy today. The tool refuses `--draft` and `--speculate` with `--gpus` until then.
+`TensorParallel`, `ContextParallel`, and `Pipeline` run both MTP
+(`--speculate`) and DFlash2 (`--draft`). `calibrate --gpus` attaches the
+strategy to the chosen layout and sweeps the draft.
 
-### Progress on TODO 1
+One decode driver (`core::RunDecode`) serves the single-device engine and
+the parallel routes behind a `SpecTarget` seam. Details:
 
-Landed:
+* Tensor parallel. The batched `ForwardBatch` all-reduces across the ranks
+  for the dense FFN, the attention output, and the MoE FFN (per row). Each
+  rank runs its own strategy on its own sharded MTP head, and the rank
+  target uses the batched capturing prefill, so DFlash2 builds its context
+  during prefill.
+* Context parallel. The batched full attention combines per row across the
+  ranks. The full model (and MTP head) is on every rank, so the drafter
+  runs per rank.
+* Pipeline. A batched cross-stage verify runs every stage with state
+  snapshots and rolls each stage back to the accepted prefix. Its
+  `ForwardRows` forward captures a drafter's target layers on their owning
+  stages and copies each captured layer to the drafter's stage, so DFlash2
+  runs there too. The MTP block loads on the last stage.
 
-* One decode driver (`core::RunDecode`) behind a `SpecTarget` seam. The
-  single-device engine implements the seam, so greedy and speculative
-  decode share one loop.
-* Batched tensor-parallel all-reduce in the qwen3_5 `ForwardBatch` path for
-  the dense FFN and the attention output projection. The rank partial and
-  the rank-0 staging buffers cover a whole verify batch.
-* `TensorParallel` runs MTP speculation: one strategy per rank on that
-  rank's own sharded MTP head, so the tensor-parallel draft needs no
-  replicated head. `calibrate --gpus ... --tp --speculate` attaches MTP and
-  sweeps the draft block, and stores the winner under the `tp2` key. The
-  `--draft` DFlash2 checkpoint stays single-device.
+`calibrate --gpus ... --draft` or `--speculate` sweeps the draft block and,
+for DFlash2, the draft context, and stores the winner under the layout key.
 
-Remaining, with the reason:
-
-* The batched MoE FFN (`RunMoeFfnBatch`) is not tensor-parallel aware, so a
-  batched verify on a MoE target is not correct yet.
-* `Pipeline` runs MTP speculation at the library level: a batched
-  cross-stage verify (every stage snapshots, the last stage scores and
-  accepts, each stage rolls back to the accepted prefix), with the drafter
-  on the last stage, which owns the MTP head. The `--gpus --pipeline
-  --speculate` CLI wiring is not landed yet.
-* `ContextParallel` runs MTP speculation at the library level: the full
-  model (and MTP head) is on every rank, so the drafter runs per rank, and
-  the batched full attention now combines per row across the ranks. The
-  `--gpus --cp --speculate` CLI wiring is not landed yet.
-* `calibrate --gpus ... --speculate` attaches MTP to any of `--tp`,
-  `--cp`, or `--pipeline` and sweeps the draft block, storing the winner
-  under the layout key.
-* DFlash2 `--draft` is swept on `--tp` and `--cp`: the rank target runs the
-  batched capturing prefill, so the drafter builds its context during
-  prefill and reads the captured target hidden at its layers.
-* DFlash2 stays refused on `--pipeline`. Its prefill steps one token at a
-  time and does not drive the drafter's context append, and the drafter
-  captures several target layers (`target_layer_ids`) that a layer-split
-  pipeline owns on different stages and devices. DFlash2 there needs a
-  cross-stage capturing prefill plus cross-device capture copies.
-* The parallel paths need a two-device run to verify.
+What remains: the parallel decode needs a two-device run to verify.
 
 The diagnostic flags stay manual. The sweep names none of them.
 `TESSERA_MXFP4_WMMA`, `TESSERA_MXFP4_W4A8`, `TESSERA_TARGET_BF16`, the
