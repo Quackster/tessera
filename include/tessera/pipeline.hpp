@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "tessera/engine.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
@@ -63,6 +64,19 @@ class Pipeline {
   // serve one request at a time.
   std::expected<std::vector<std::uint32_t>, StatusCode> Generate(
       std::span<const std::uint32_t> prompt, std::size_t max_tokens);
+
+  // Greedy generation with per-request speed tuning, timed. Applies
+  // `options.kv_type`, `options.mxfp4_split_target`, `options.mxfp4_split_cap`
+  // and `options.attention_split` to every stage, caps the decode at
+  // `options.max_completion_tokens` (0 fills the context), and returns the
+  // produced count with the prefill and decode wall times. Calibration uses
+  // the times to score a setting; the produced tokens equal Generate for the
+  // same input.
+  //
+  // Usage:
+  //   auto outcome = pipeline->GenerateTimed(prompt, tuning);
+  std::expected<GenerateOutcome, StatusCode> GenerateTimed(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options);
 
   // Greedy generation for several prompts at once, overlapped across the
   // stages: each stage runs on its own thread, so while one stage

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -136,6 +137,36 @@ struct SweepOutcome {
                                           const TransformerConfig& config,
                                           KvCacheType kv_type);
 
+// Bytes of one full-attention KV cache token for `config` and `kv_type`,
+// counted over the full-attention layers only (a hybrid model has fewer).
+// Zero when the inputs cannot size a cache (no layers, no KV heads, no
+// head dim, or no full-attention layer).
+[[nodiscard]] std::uint64_t KvBytesPerToken(const TransformerConfig& config,
+                                            KvCacheType kv_type);
+
+// Largest number of concurrent sessions whose KV caches at `context`
+// tokens each fit `available_bytes`: available divided by the per-session
+// cache size (context times the per-token bytes). Zero when any input is
+// zero.
+[[nodiscard]] std::size_t MaxConcurrentSessions(
+    std::uint64_t available_bytes, std::uint64_t kv_bytes_per_token,
+    std::size_t context);
+
+// Throughput of one concurrent-session count, for the report.
+struct ConcurrentRate {
+  std::size_t sessions = 0;
+  double total_tps = 0.0;        // all sessions together
+  double per_session_tps = 0.0;  // total_tps divided by `sessions`
+};
+
+// Aggregate one benchmark row. `tokens` and `decode_ms` are parallel, one
+// entry per session. The total rate is the total tokens over the wall time
+// of the slowest session; the per-session rate divides that by the session
+// count. A zero or empty input yields a zeroed rate with `sessions` set.
+[[nodiscard]] ConcurrentRate SummarizeConcurrentSessions(
+    std::size_t sessions, std::span<const std::size_t> tokens,
+    std::span<const double> decode_ms);
+
 // Pick the value to keep. `candidates` and `rates` are parallel. Returns
 // the default when the best value does not beat it by more than kMinGain,
 // the best value when no default is present in the list, and nullopt for an
@@ -144,11 +175,13 @@ struct SweepOutcome {
     std::span<const std::size_t> candidates, std::size_t default_value,
     std::span<const double> rates);
 
-// Run the sweep. For each enabled setting it warms and measures every
-// candidate, applies the pick rule, and confirms a winner against the
-// default with an interleaved re-measurement (three rounds each, median),
-// so a single noisy win is rejected. A failure from `measure` aborts the
-// sweep with that status and leaves the caller's defaults untouched.
+// Run the sweep. For each enabled setting it warms and measures candidates
+// in ascending order, stops that setting once three candidates in a row
+// fail to beat the best value so far (a downward trend), applies the pick
+// rule, and confirms a winner against the default with an interleaved
+// re-measurement (three rounds each, median), so a single noisy win is
+// rejected. A failure from `measure` aborts the sweep with that status and
+// leaves the caller's defaults untouched.
 //
 // Usage:
 //   auto outcome = RunCalibrationSweep(options, measure);
@@ -261,6 +294,12 @@ struct CalibrationReport {
   bool split_applicable = false;
   bool attention_applicable = false;
   bool draft_attached = false;
+  // Concurrent-session benchmark, one row per session count, plus the
+  // largest count whose KV caches fit the active context for this KV type.
+  // Empty when the benchmark did not run (`max_concurrent` is still set by
+  // the memory bound).
+  std::vector<ConcurrentRate> concurrent;
+  std::size_t max_concurrent = 0;
 };
 
 // The two copy-paste run commands for a report: the explicit-flags form

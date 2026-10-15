@@ -1,22 +1,31 @@
 #include "tessera/calibrate.hpp"
 
 #include <algorithm>
-#include <cstdio>
-#include <filesystem>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <optional>
+#include <span>
+#include <string_view>
 #include <utility>
+#include <vector>
 
-#include "core/files.hpp"
-#include "core/json.hpp"
-#include "tessera/engine.hpp"
-
-// The calibration module: candidate lists, the pick rule, the sweep, and
-// the hardware key. One canonical implementation of each (AGENTS.md rules
-// 2 and 3). The measurement itself is the MeasureFn the caller supplies, so
-// the sweep runs unchanged against a real engine or a stand-in.
+// The calibration sweep: the candidate lists, the pick rule, the
+// three-consecutive-degradation early stop, and the KV sizing helpers. One
+// canonical implementation of each (AGENTS.md rules 2 and 3). The
+// measurement itself is the MeasureFn the caller supplies, so the sweep
+// runs unchanged against a real engine or a stand-in. The JSON file lives
+// in file.cpp and the report text in report.cpp.
 
 namespace tessera {
 
 namespace {
+
+// Abort one setting's sweep once this many candidates in a row fail to beat
+// the best value measured so far: the trend is down, so the remaining
+// candidates would only cost measurements. The sweep then moves to the next
+// setting.
+constexpr std::size_t kMaxConsecutiveDegradations = 3;
 
 // Apply one setting value onto a configuration.
 void ApplySetting(CalibrationConfig& config, Setting setting,
@@ -101,6 +110,8 @@ std::expected<void, StatusCode> SweepSetting(
   measured.reserve(candidates.size());
   rates.reserve(candidates.size());
   const std::size_t base = outcome.points.size();
+  double best_rate = -1.0;
+  std::size_t degradations = 0;
   for (std::size_t i = 0; i < candidates.size(); ++i) {
     if (budgeted && outcome.points.size() >= options.max_points) {
       break;
@@ -125,6 +136,18 @@ std::expected<void, StatusCode> SweepSetting(
     measured.push_back(candidates[i]);
     rates.push_back(tps);
     outcome.points.push_back(SweepPoint{setting, candidates[i], tps, false});
+    // Stop early on a downward trend. A candidate at or above the best so
+    // far resets the streak; a tie is not a degradation.
+    if (tps > best_rate) {
+      best_rate = tps;
+      degradations = 0;
+    } else if (tps < best_rate) {
+      if (++degradations >= kMaxConsecutiveDegradations) {
+        break;
+      }
+    } else {
+      degradations = 0;
+    }
   }
   if (measured.empty()) {
     outcome.skipped.push_back(setting);
@@ -186,109 +209,6 @@ std::expected<void, StatusCode> SweepSetting(
   return {};
 }
 
-// JSON helpers: a missing or wrong-typed field leaves the output untouched
-// and returns false.
-bool ReadString(const core::Json& object, std::string_view key,
-                std::string& out) {
-  const core::Json* field = object.Find(key);
-  if (field == nullptr || !field->isString()) {
-    return false;
-  }
-  out = field->AsString();
-  return true;
-}
-
-bool ReadNumber(const core::Json& object, std::string_view key, double& out) {
-  const core::Json* field = object.Find(key);
-  if (field == nullptr || field->type() != core::Json::Type::Number) {
-    return false;
-  }
-  out = field->AsNumber();
-  return true;
-}
-
-// Optional numeric field: absent leaves `out` unchanged. Used for fields
-// added after the first calibration file version, so a file without them
-// still loads.
-bool ReadOptionalNumber(const core::Json& object, std::string_view key,
-                        double& out) {
-  const core::Json* field = object.Find(key);
-  if (field == nullptr) {
-    return true;
-  }
-  if (field->type() != core::Json::Type::Number) {
-    return false;
-  }
-  out = field->AsNumber();
-  return true;
-}
-
-// Optional string field: absent leaves `out` unchanged. Used for fields
-// added after the first calibration file version, so a file without them
-// still loads.
-bool ReadOptionalString(const core::Json& object, std::string_view key,
-                        std::string& out) {
-  const core::Json* field = object.Find(key);
-  if (field == nullptr) {
-    return true;
-  }
-  if (!field->isString()) {
-    return false;
-  }
-  out = field->AsString();
-  return true;
-}
-
-// Parse one entry object. Any missing or wrong-typed field is
-// MalformedFile, so a truncated file is rejected instead of half-applied.
-std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
-  if (!item.isObject()) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  CalibrationEntry entry;
-  double context = 0.0;
-  double split = 0.0;
-  double cap = 0.0;
-  double prefill = 0.0;
-  double attention = 0.0;
-  double draft = 0.0;
-  double draft_context = 0.0;
-  double max_context = 0.0;
-  if (!ReadString(item, "backend", entry.key.backend) ||
-      !ReadString(item, "device", entry.key.device) ||
-      !ReadString(item, "model", entry.key.model) ||
-      !ReadNumber(item, "context", context) ||
-      !ReadString(item, "kv_type", entry.key.kv_type) ||
-      !ReadString(item, "strategy", entry.key.strategy) ||
-      !ReadOptionalString(item, "parallel", entry.key.parallel) ||
-      !ReadNumber(item, "mxfp4_split_target", split) ||
-      !ReadOptionalNumber(item, "mxfp4_split_cap", cap) ||
-      !ReadNumber(item, "prefill_chunk_tokens", prefill) ||
-      !ReadOptionalNumber(item, "attention_split", attention) ||
-      !ReadNumber(item, "draft_tokens", draft) ||
-      !ReadOptionalNumber(item, "draft_context", draft_context) ||
-      !ReadOptionalNumber(item, "max_context", max_context) ||
-      !ReadNumber(item, "decode_tps", entry.decode_tps) ||
-      !ReadNumber(item, "prefill_tps", entry.prefill_tps) ||
-      !ReadString(item, "date", entry.date)) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  if (context < 0.0 || split < 0.0 || cap < 0.0 || prefill < 0.0 ||
-      attention < 0.0 || draft < 0.0 || draft_context < 0.0 ||
-      max_context < 0.0) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  entry.key.context = static_cast<std::size_t>(context);
-  entry.config.mxfp4_split_target = static_cast<std::size_t>(split);
-  entry.config.mxfp4_split_cap = static_cast<std::size_t>(cap);
-  entry.config.prefill_chunk_tokens = static_cast<std::size_t>(prefill);
-  entry.config.attention_split = static_cast<std::size_t>(attention);
-  entry.config.draft_tokens = static_cast<std::size_t>(draft);
-  entry.config.draft_context = static_cast<std::size_t>(draft_context);
-  entry.max_context = static_cast<std::size_t>(max_context);
-  return entry;
-}
-
 }  // namespace
 
 std::string_view ToString(Setting setting) {
@@ -331,7 +251,9 @@ std::vector<std::size_t> CandidateValues(Setting setting,
       values = {4, 8, 16, 32};
       break;
     case Setting::DraftTokens:
-      values = {4, 8};
+      // Small draft blocks. The checkpoint value is the default candidate:
+      // --draft-block 0 leaves the block at the checkpoint's own size.
+      values = {1, 2, 3, 4};
       break;
     case Setting::DraftContext:
       // Draft context window in rows; the checkpoint value is the default.
@@ -368,9 +290,8 @@ double MedianOf(std::span<const double> values) {
   return 0.5 * (sorted[count / 2 - 1] + sorted[count / 2]);
 }
 
-std::size_t MaxContextForKv(std::uint64_t available_bytes,
-                            const TransformerConfig& config,
-                            KvCacheType kv_type) {
+std::uint64_t KvBytesPerToken(const TransformerConfig& config,
+                              KvCacheType kv_type) {
   if (config.layers == 0 || config.attention.kv_heads == 0 ||
       config.attention.head_dim == 0) {
     return 0;
@@ -406,7 +327,13 @@ std::size_t MaxContextForKv(std::uint64_t available_bytes,
       denominator = 2;
       break;
   }
-  const std::uint64_t per_token = elements * numerator / denominator;
+  return elements * numerator / denominator;
+}
+
+std::size_t MaxContextForKv(std::uint64_t available_bytes,
+                            const TransformerConfig& config,
+                            KvCacheType kv_type) {
+  const std::uint64_t per_token = KvBytesPerToken(config, kv_type);
   if (per_token == 0) {
     return 0;
   }
@@ -488,320 +415,6 @@ std::expected<SweepOutcome, StatusCode> RunCalibrationSweep(
     return std::unexpected(status.error());
   }
   return outcome;
-}
-
-std::string HardwareKey::ToString() const {
-  return backend + "|" + device + "|" + model + "|" + std::to_string(context) +
-         "|" + kv_type + "|" + strategy + "|" + parallel;
-}
-
-std::expected<CalibrationFile, StatusCode> CalibrationFile::Load(
-    std::string_view path) {
-  auto bytes = core::ReadFile(std::filesystem::path(path));
-  if (!bytes) {
-    return std::unexpected(bytes.error());
-  }
-  const std::string text(reinterpret_cast<const char*>(bytes->data()),
-                         bytes->size());
-  auto document = core::Json::Parse(text);
-  if (!document || !document->isObject()) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  const core::Json* entries = document->Find("entries");
-  if (entries == nullptr || !entries->isArray()) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  CalibrationFile file;
-  for (const core::Json& item : entries->AsArray()) {
-    auto entry = ParseEntry(item);
-    if (!entry) {
-      return std::unexpected(entry.error());
-    }
-    file.Set(std::move(*entry));
-  }
-  return file;
-}
-
-std::expected<void, StatusCode> CalibrationFile::Save(
-    std::string_view path) const {
-  core::Json root = core::Json::Object();
-  root.Set("version", core::Json::Number(1));
-  core::Json entries = core::Json::Array();
-  for (const CalibrationEntry& entry : entries_) {
-    core::Json item = core::Json::Object();
-    item.Set("backend", core::Json::String(entry.key.backend));
-    item.Set("device", core::Json::String(entry.key.device));
-    item.Set("model", core::Json::String(entry.key.model));
-    item.Set("context", core::Json::Number(
-                            static_cast<double>(entry.key.context)));
-    item.Set("max_context",
-             core::Json::Number(static_cast<double>(entry.max_context)));
-    item.Set("kv_type", core::Json::String(entry.key.kv_type));
-    item.Set("strategy", core::Json::String(entry.key.strategy));
-    item.Set("parallel", core::Json::String(entry.key.parallel));
-    item.Set("mxfp4_split_target",
-             core::Json::Number(
-                 static_cast<double>(entry.config.mxfp4_split_target)));
-    item.Set("mxfp4_split_cap",
-             core::Json::Number(
-                 static_cast<double>(entry.config.mxfp4_split_cap)));
-    item.Set("prefill_chunk_tokens",
-             core::Json::Number(
-                 static_cast<double>(entry.config.prefill_chunk_tokens)));
-    item.Set("attention_split",
-             core::Json::Number(
-                 static_cast<double>(entry.config.attention_split)));
-    item.Set("draft_tokens", core::Json::Number(
-                                 static_cast<double>(entry.config.draft_tokens)));
-    item.Set("draft_context",
-             core::Json::Number(
-                 static_cast<double>(entry.config.draft_context)));
-    item.Set("decode_tps", core::Json::Number(entry.decode_tps));
-    item.Set("prefill_tps", core::Json::Number(entry.prefill_tps));
-    item.Set("date", core::Json::String(entry.date));
-    entries.Push(std::move(item));
-  }
-  root.Set("entries", std::move(entries));
-  const std::string dumped = root.Dump();
-  const auto bytes = std::span<const std::byte>(
-      reinterpret_cast<const std::byte*>(dumped.data()), dumped.size());
-  return core::WriteFile(std::filesystem::path(path), bytes);
-}
-
-const CalibrationEntry* CalibrationFile::Find(const HardwareKey& key) const {
-  for (const CalibrationEntry& entry : entries_) {
-    if (entry.key == key) {
-      return &entry;
-    }
-  }
-  return nullptr;
-}
-
-void CalibrationFile::Set(CalibrationEntry entry) {
-  for (CalibrationEntry& existing : entries_) {
-    if (existing.key == entry.key) {
-      existing = std::move(entry);
-      return;
-    }
-  }
-  entries_.push_back(std::move(entry));
-}
-
-std::span<const CalibrationEntry> CalibrationFile::Entries() const {
-  return entries_;
-}
-
-HardwareKey MakeHardwareKey(std::string_view backend, std::string_view device,
-                            std::string_view model, std::size_t context,
-                            std::string_view kv_type,
-                            std::string_view strategy,
-                            std::string_view parallel) {
-  HardwareKey key;
-  key.backend = std::string(backend);
-  key.device = std::string(device);
-  key.model = std::string(model);
-  key.context = context;
-  key.kv_type = std::string(kv_type);
-  key.strategy = std::string(strategy);
-  key.parallel = std::string(parallel);
-  return key;
-}
-
-CalibrationConfig ApplySavedCalibration(
-    const CalibrationConfig& explicit_config, const CalibrationEntry& saved) {
-  CalibrationConfig merged = explicit_config;
-  if (merged.mxfp4_split_target == 0) {
-    merged.mxfp4_split_target = saved.config.mxfp4_split_target;
-  }
-  if (merged.mxfp4_split_cap == 0) {
-    merged.mxfp4_split_cap = saved.config.mxfp4_split_cap;
-  }
-  if (merged.prefill_chunk_tokens == 0) {
-    merged.prefill_chunk_tokens = saved.config.prefill_chunk_tokens;
-  }
-  if (merged.attention_split == 0) {
-    merged.attention_split = saved.config.attention_split;
-  }
-  if (merged.draft_tokens == 0) {
-    merged.draft_tokens = saved.config.draft_tokens;
-  }
-  if (merged.draft_context == 0) {
-    merged.draft_context = saved.config.draft_context;
-  }
-  return merged;
-}
-
-void ApplyToGenerateOptions(const CalibrationConfig& config,
-                            GenerateOptions& options) {
-  if (config.mxfp4_split_target != 0) {
-    options.mxfp4_split_target = config.mxfp4_split_target;
-  }
-  if (config.mxfp4_split_cap != 0) {
-    options.mxfp4_split_cap = config.mxfp4_split_cap;
-  }
-  if (config.prefill_chunk_tokens != 0) {
-    options.prefill_chunk_tokens = config.prefill_chunk_tokens;
-  }
-  if (config.attention_split != 0) {
-    options.attention_split = config.attention_split;
-  }
-  if (config.draft_tokens != 0) {
-    options.draft_tokens = config.draft_tokens;
-  }
-  if (config.draft_context != 0) {
-    options.draft_context = config.draft_context;
-  }
-}
-
-ExampleCommands BuildExampleCommands(const CalibrationReport& report) {
-  // The draft checkpoint the run must attach for a dflash2 entry: without
-  // it the example would run a different strategy than the sweep used.
-  const std::string draft_flag =
-      (report.strategy == "dflash2" && !report.draft_path.empty())
-          ? " --draft " + report.draft_path
-          : "";
-  // Both commands run at the memory-bound max context: the sweep tunes
-  // speed knobs, and the bound is the cache size worth running with.
-  ExampleCommands commands;
-  commands.explicit_flags =
-      "tessera-cli run --model " + report.model_path + draft_flag + " " +
-      report.kv_flag + report.parallel_flags + "\\\n      --context " +
-      std::to_string(report.max_context);
-  commands.explicit_flags += " --prefill-chunk " +
-                             std::to_string(report.chosen.prefill_chunk_tokens);
-  if (report.split_applicable) {
-    commands.explicit_flags += " --split-target " +
-                               std::to_string(report.chosen.mxfp4_split_target);
-    commands.explicit_flags +=
-        " --split-cap " + std::to_string(report.chosen.mxfp4_split_cap);
-  }
-  if (report.attention_applicable) {
-    commands.explicit_flags +=
-        " --attention-split " + std::to_string(report.chosen.attention_split);
-  }
-  if (report.draft_attached) {
-    commands.explicit_flags +=
-        " --draft-block " + std::to_string(report.chosen.draft_tokens);
-    commands.explicit_flags +=
-        " --draft-context " + std::to_string(report.chosen.draft_context);
-  }
-  if (report.strategy == "mtp") {
-    commands.explicit_flags += " --speculate";
-  }
-  commands.explicit_flags += " --prompt-text \"Hello\"";
-  commands.from_file = "tessera-cli run --model " + report.model_path +
-                       draft_flag + " " + report.kv_flag +
-                       report.parallel_flags + "\\\n      --context " +
-                       std::to_string(report.max_context) +
-                       (report.strategy == "mtp" ? " --speculate" : "") +
-                       " --calibration " + report.file +
-                       " --prompt-text \"Hello\"";
-  return commands;
-}
-
-std::string FormatCalibrationReport(const CalibrationReport& report) {
-  const auto row = [](const std::string& label, const std::string& value,
-                      std::size_t width) {
-    std::string line = label;
-    if (line.size() < width) {
-      line.append(width - line.size(), ' ');
-    }
-    return line + value + "\n";
-  };
-  const auto default_for = [&](Setting setting) -> std::size_t {
-    switch (setting) {
-      case Setting::MxFp4SplitTarget:
-        return report.defaults.mxfp4_split_target;
-      case Setting::MxFp4SplitCap:
-        return report.defaults.mxfp4_split_cap;
-      case Setting::PrefillChunkTokens:
-        return report.defaults.prefill_chunk_tokens;
-      case Setting::AttentionSplit:
-        return report.defaults.attention_split;
-      case Setting::DraftTokens:
-        return report.defaults.draft_tokens;
-      case Setting::DraftContext:
-        return report.defaults.draft_context;
-    }
-    return 0;
-  };
-  char rate[32];
-  const auto format_rate = [&](double value) {
-    std::snprintf(rate, sizeof(rate), "%.2f", value);
-    return std::string(rate);
-  };
-
-  std::string out;
-  out += "Tessera calibration report\n";
-  out += "==========================\n";
-  out += row("backend", report.backend, 14);
-  out += row("device", report.device, 14);
-  out += row("model", report.model, 14);
-  out += row("kv cache", report.kv_type, 14);
-  out += row("strategy", report.strategy, 14);
-  out += row("parallel", report.parallel, 14);
-  out += row("key context", std::to_string(report.key_context), 14);
-  out += row("max context", std::to_string(report.max_context) + " token(s), " +
-                                report.kv_type + " memory bound",
-             14);
-  out += "\nSweep\n-----\n";
-  for (Setting setting :
-       {Setting::MxFp4SplitTarget, Setting::MxFp4SplitCap,
-        Setting::PrefillChunkTokens, Setting::AttentionSplit,
-        Setting::DraftTokens, Setting::DraftContext}) {
-    out += std::string(ToString(setting)) + "\n";
-    bool any = false;
-    for (const SweepPoint& point : report.points) {
-      if (point.setting != setting) {
-        continue;
-      }
-      any = true;
-      std::string note;
-      if (point.value == default_for(setting)) {
-        note += " (default)";
-      }
-      if (point.kept) {
-        note += " (kept)";
-      }
-      out += row("  " + std::to_string(point.value),
-                 format_rate(point.tps) + " tok/s" + note, 8);
-    }
-    if (!any) {
-      const bool skipped =
-          std::find(report.skipped.begin(), report.skipped.end(), setting) !=
-          report.skipped.end();
-      out += skipped ? "  skipped (point budget)\n"
-                     : "  not applicable on " + report.backend + "\n";
-    }
-  }
-  out += "\nChosen\n------\n";
-  out += row("mxfp4_split_target",
-             std::to_string(report.chosen.mxfp4_split_target), 21);
-  out += row("mxfp4_split_cap",
-             std::to_string(report.chosen.mxfp4_split_cap), 21);
-  out += row("prefill_chunk_tokens",
-             std::to_string(report.chosen.prefill_chunk_tokens), 21);
-  out += row("attention_split",
-             std::to_string(report.chosen.attention_split), 21);
-  out += row("draft_tokens",
-             report.chosen.draft_tokens == 0
-                 ? std::string("(none)")
-                 : std::to_string(report.chosen.draft_tokens),
-             21);
-  out += row("draft_context",
-             report.chosen.draft_context == 0
-                 ? std::string("(checkpoint)")
-                 : std::to_string(report.chosen.draft_context),
-             21);
-  out += row("decode", format_rate(report.decode_tps) + " tok/s", 21);
-  out += row("prefill", format_rate(report.prefill_tps) + " tok/s", 21);
-  out += "\nWrote " + report.file + "\n";
-  const ExampleCommands commands = BuildExampleCommands(report);
-  out += "\nExample\n-------\n";
-  out += "  " + commands.explicit_flags + "\n";
-  out += "  # or apply the saved entry directly:\n";
-  out += "  " + commands.from_file + "\n";
-  return out;
 }
 
 }  // namespace tessera

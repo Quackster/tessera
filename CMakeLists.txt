@@ -40,6 +40,7 @@ add_library(tessera STATIC
     src/core/engine.cpp
     src/core/runner.cpp
     src/core/pipeline.cpp
+    src/core/pipeline_many.cpp
     src/core/tensor_parallel.cpp
     src/core/context_parallel.cpp
     src/core/spec_split.cpp
@@ -50,6 +51,10 @@ add_library(tessera STATIC
     src/core/generate_helpers.cpp
     src/core/generate_multimodal.cpp
     src/core/calibrate/calibrate.cpp
+    src/core/calibrate/file.cpp
+    src/core/calibrate/report.cpp
+    src/core/calibrate/sweep.cpp
+    src/core/calibrate/concurrent.cpp
     src/core/model.cpp
     src/core/files.cpp
     src/core/http.cpp
@@ -323,6 +328,7 @@ add_executable(tessera-tests
     tests/backend_test.cpp
     tests/spec_test.cpp
     tests/calibrate_test.cpp
+    tests/calibrate_sweep_test.cpp
 )
 target_link_libraries(tessera-tests PRIVATE tessera GTest::gtest GTest::gtest_main)
 target_include_directories(tessera-tests PRIVATE src)

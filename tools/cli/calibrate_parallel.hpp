@@ -44,6 +44,11 @@ struct ParallelCalibrateOptions {
   std::size_t context = 32768;
   KvCacheType kv_type = KvCacheType::Q8;
   std::string calibration_file;
+  // Speed sweep inputs: prompts file (empty uses the fixed default set) and
+  // the point budget (0 means unlimited). The parallel path sweeps the same
+  // decode speed knobs the single-device path does.
+  std::string prompts_path;
+  std::size_t calibrate_limit = 0;
   bool quiet = false;
 };
 

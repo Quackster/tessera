@@ -1,15 +1,19 @@
 #include "calibrate_parallel.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <expected>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "tessera/calibrate_sweep.hpp"
 #include "cli_common.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/context_parallel.hpp"
@@ -279,6 +283,118 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   }
   const std::string backend(first_engine.Owner().Name());
   const std::string device_name(first_engine.Owner().DeviceName());
+
+  // The speed sweep: the same decode knobs the single-device path tunes, run
+  // through the layout. prefill_chunk_tokens and the draft knobs are not
+  // swept: the parallel prefill steps one token at a time, and a layout has
+  // no attached draft (see docs/CALIBRATE.md).
+  std::vector<std::string> prompt_texts = DefaultCalibrationPrompts();
+  if (!options.prompts_path.empty()) {
+    auto loaded = CalibrationPromptsFromFile(options.prompts_path);
+    if (!loaded) {
+      std::fprintf(stderr, "cli: cannot read prompts file '%s'\n",
+                   options.prompts_path.c_str());
+      return kExitError;
+    }
+    prompt_texts = std::move(*loaded);
+  }
+  auto encoded = EncodeCalibrationPrompts(*tokenizer, prompt_texts);
+  if (!encoded) {
+    std::fprintf(stderr, "cli: prompt encode failed\n");
+    return kExitError;
+  }
+  const CalibrationPrompts& prompt_set = *encoded;
+
+  CalibrationConfig defaults;
+  defaults.mxfp4_split_target = kDefaultMxFp4SplitTarget;
+  defaults.mxfp4_split_cap = kDefaultMxFp4SplitCap;
+  defaults.prefill_chunk_tokens = kDefaultPrefillChunkTokens;
+  defaults.attention_split = kDefaultAttentionSplitChunks;
+
+  const TimedGenerateFn generate =
+      [&](std::span<const std::uint32_t> prompt, const GenerateOptions& gen)
+      -> std::expected<GenerateOutcome, StatusCode> {
+    if (tp != nullptr) {
+      return tp->GenerateTimed(prompt, gen);
+    }
+    if (cp != nullptr) {
+      return cp->GenerateTimed(prompt, gen);
+    }
+    return pipe->GenerateTimed(prompt, gen);
+  };
+  const MeasureFn measure =
+      BuildSweepMeasure(generate, prompt_set, options.kv_type);
+
+  SweepOptions sweep;
+  sweep.prompt_count = prompt_set.count();
+  sweep.max_points = options.calibrate_limit;
+  sweep.defaults = defaults;
+  sweep.sweep_split_target = backend == "rocm";
+  sweep.sweep_split_cap = backend == "rocm";
+  sweep.sweep_prefill_chunk = false;
+  // TP and CP split the key range across ranks, so the flash-decoding split
+  // is inert there; only a pipeline stage still uses it.
+  sweep.sweep_attention_split = options.pipeline;
+  sweep.sweep_draft_tokens = false;
+  sweep.sweep_draft_context = false;
+  // Warm the route once (kernel compile, first-touch weight loads) before the
+  // first point. A limited run skips it: the passed count is the run count.
+  if (options.calibrate_limit == 0) {
+    if (auto warmed = measure(Setting::MxFp4SplitTarget, defaults, 0, true);
+        !warmed) {
+      log.Error("calibrate", std::string("warmup failed (") +
+                                 std::string(ToString(warmed.error())) + ")");
+      return kExitError;
+    }
+  }
+  if (!options.quiet) {
+    const std::string budget =
+        sweep.max_points > 0
+            ? ", max " + std::to_string(sweep.max_points) + " points"
+            : "";
+    log.Info("calibrate", std::string("sweeping through ") + label + " on " +
+                               backend + ", " +
+                               std::to_string(sweep.prompt_count) +
+                               " prompt(s)" + budget + ", " +
+                               std::string(ToString(options.kv_type)) + " KV");
+  }
+  auto outcome = RunCalibrationSweep(sweep, measure);
+  if (!outcome) {
+    log.Error("calibrate", std::string("sweep failed (") +
+                               std::string(ToString(outcome.error())) + ")");
+    return kExitError;
+  }
+  for (const SweepPoint& point : outcome->points) {
+    log.Info("calibrate", std::string(ToString(point.setting)) + " " +
+                              std::to_string(point.value) + " = " +
+                              std::to_string(point.tps) + " tok/s" +
+                              (point.kept ? "  (kept)" : ""));
+  }
+  double decode_tps = 0.0;
+  double prefill_tps = 0.0;
+  if (sweep.max_points == 0) {
+    auto rates = MeasureChosenRates(measure, outcome->config, prompt_set);
+    if (!rates) {
+      log.Error("calibrate", std::string("final rate measurement failed (") +
+                                 std::string(ToString(rates.error())) + ")");
+      return kExitError;
+    }
+    decode_tps = rates->first;
+    prefill_tps = rates->second;
+  } else {
+    std::vector<double> decode_rates;
+    std::vector<double> prefill_rates;
+    for (const SweepPoint& point : outcome->points) {
+      if (point.setting == Setting::PrefillChunkTokens) {
+        prefill_rates.push_back(point.tps);
+      } else {
+        decode_rates.push_back(point.tps);
+      }
+    }
+    decode_tps = MedianOf(decode_rates);
+    prefill_tps = MedianOf(prefill_rates);
+  }
+
   Model& first_model = tp != nullptr  ? tp->RankModel(0)
                        : cp != nullptr ? cp->RankModel(0)
                                        : pipe->StageModel(0);
@@ -289,6 +405,9 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
           ? std::filesystem::path(options.model_path).filename().string()
           : std::string(first_model.Name()),
       options.context, ToString(options.kv_type), "none", label);
+  entry.config = outcome->config;
+  entry.decode_tps = decode_tps;
+  entry.prefill_tps = prefill_tps;
   entry.max_context = max_context;
   entry.date = TodayIso();
   if (auto saved = SaveCalibrationEntry(log, options.calibration_file,
@@ -314,7 +433,17 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   report.parallel_flags = route_flag + " --gpus " + device_list;
   report.key_context = options.context;
   report.max_context = max_context;
+  report.defaults = defaults;
+  report.points = outcome->points;
+  report.not_applicable = outcome->not_applicable;
+  report.skipped = outcome->skipped;
+  report.chosen = outcome->config;
+  report.decode_tps = decode_tps;
+  report.prefill_tps = prefill_tps;
   report.file = options.calibration_file;
+  report.split_applicable = backend == "rocm";
+  report.attention_applicable = sweep.sweep_attention_split;
+  report.draft_attached = false;
   std::fputs("\n", stdout);
   std::fputs(FormatCalibrationReport(report).c_str(), stdout);
   std::fflush(stdout);

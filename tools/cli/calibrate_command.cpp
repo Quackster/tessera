@@ -14,10 +14,13 @@
 #include <vector>
 
 #include "calibrate_parallel.hpp"
+#include "tessera/calibrate_sweep.hpp"
 #include "cli_common.hpp"
+#include "cli_helpers.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
+#include "tessera/runner.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
 
@@ -33,67 +36,9 @@ namespace {
 constexpr int kExitOk = 0;
 constexpr int kExitError = 1;
 constexpr int kExitUsage = 2;
-// Decode tokens produced per decode measurement. Enough to average out
-// launch jitter.
-constexpr std::size_t kDecodeTokens = 32;
-// Decode sweeps run on a short prompt: the decode rate does not depend on
-// the prompt length, and prefilling a long prompt for every decode point
-// would dominate the run.
-constexpr std::size_t kDecodePromptTokens = 64;
-// The fixed prompt set is a file-local constant. Each base line repeats to
-// this many sentences so the prompt exceeds the attention-split threshold
-// (1024 keys) and the prefill chunk half of the candidate list, and the
-// sweep can tell the chunks apart.
-constexpr std::size_t kPromptRepeats = 72;
 // The attention split only applies at this many keys or more (mirrors
 // core::detail::kSplitMinKeys; the CLI cannot include that header).
 constexpr std::size_t kAttentionSplitMinKeys = 1024;
-const char* const kPromptBases[] = {
-    "Explain step by step how a large language model computes self "
-    "attention over its context. ",
-    "Describe the difference between the prefill and the decode phase of a "
-    "transformer inference engine. ",
-    "Summarize how a grouped query attention cache is stored and read back "
-    "on an accelerator. ",
-};
-
-// The three fixed prompts: each base line repeated to a length that
-// exercises the prefill chunk candidates.
-std::vector<std::string> DefaultPrompts() {
-  std::vector<std::string> prompts;
-  for (const char* base : kPromptBases) {
-    std::string text;
-    for (std::size_t i = 0; i < kPromptRepeats; ++i) {
-      text += base;
-    }
-    prompts.push_back(std::move(text));
-  }
-  return prompts;
-}
-
-// Read prompts from a file: one prompt per non-empty line. A file with no
-// prompt lines is rejected.
-std::expected<std::vector<std::string>, bool> PromptsFromFile(
-    const std::string& path) {
-  std::ifstream stream(path);
-  if (!stream) {
-    return std::unexpected(false);
-  }
-  std::vector<std::string> prompts;
-  std::string line;
-  while (std::getline(stream, line)) {
-    if (!line.empty() && line.back() == '\r') {
-      line.pop_back();
-    }
-    if (!line.empty()) {
-      prompts.push_back(line);
-    }
-  }
-  if (prompts.empty()) {
-    return std::unexpected(false);
-  }
-  return prompts;
-}
 
 std::string FormatRate(double rate) {
   char buffer[32];
@@ -161,6 +106,7 @@ void PrintCalibrateUsage() {
        "  --prompts <file>  fixed prompts, one per non-empty line\n"
        "  --calibrate-limit <n> measure at most n sweep points in total,\n"
        "                    in sweep order (default unlimited)\n"
+       "  --concurrent      also benchmark 2, 3 and 4 concurrent sessions\n"
       "  --wmma|--no-wmma  fp8 tensor-core MXFP4 GEMM (diagnostic)\n"
       "  --w4a8            MXFP4 W4A8 activation quant (diagnostic)\n"
       "  --target-bf16     round projection outputs to bf16 (diagnostic)\n"
@@ -198,6 +144,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   int gpu = 0;
   std::string gpus;
   bool quiet = false;
+  bool concurrent = false;
   bool speculate = false;
   bool tp_mode = false;
   bool cp_mode = false;
@@ -230,6 +177,8 @@ int RunCalibrateCommand(int argc, char** argv) {
       pipeline_mode = true;
     } else if (arg == "--quiet") {
       quiet = true;
+    } else if (arg == "--concurrent") {
+      concurrent = true;
     } else if (MatchKvType(arg, kv_type)) {
       // handled by MatchKvType
     } else if (ApplyDiagnosticFlag(arg, i, argv, argc)) {
@@ -254,13 +203,17 @@ int RunCalibrateCommand(int argc, char** argv) {
     return kExitUsage;
   }
   if (!gpus.empty() || tp_mode || cp_mode || pipeline_mode) {
-    if (calibrate_limit > 0) {
-      std::fprintf(stderr, "cli: --calibrate-limit needs a speed sweep; the "
-                           "--gpus path measures memory only\n");
+    // A speculative draft needs the single-device engine: none of the
+    // parallel layouts (--tp/--cp/--pipeline) attaches a strategy, so the
+    // draft sweep stays single-device (see docs/CALIBRATE.md).
+    if (!draft_path.empty() || speculate) {
+      std::fprintf(stderr,
+                   "cli: the parallel sweep has no speculative draft; "
+                   "--draft/--speculate are single-device only\n");
       return kExitUsage;
     }
-    // Parallel max-context calibration: no speed sweep, one entry per
-    // layout carrying the largest KV-cache context it allows.
+    // Parallel calibration: the speed sweep runs through the layout and the
+    // entry also carries the largest KV-cache context the layout allows.
     ParallelCalibrateOptions parallel_options;
     parallel_options.model_path = model_path;
     parallel_options.gpus = gpus;
@@ -270,12 +223,14 @@ int RunCalibrateCommand(int argc, char** argv) {
     parallel_options.context = context;
     parallel_options.kv_type = kv_type;
     parallel_options.calibration_file = calibration_file;
+    parallel_options.prompts_path = prompts_path;
+    parallel_options.calibrate_limit = calibrate_limit;
     parallel_options.quiet = quiet;
     return RunParallelCalibrate(parallel_options);
   }
-  std::vector<std::string> prompts = DefaultPrompts();
+  std::vector<std::string> prompts = DefaultCalibrationPrompts();
   if (!prompts_path.empty()) {
-    auto loaded_prompts = PromptsFromFile(prompts_path);
+    auto loaded_prompts = CalibrationPromptsFromFile(prompts_path);
     if (!loaded_prompts) {
       std::fprintf(stderr, "cli: cannot read prompts file '%s'\n",
                    prompts_path.c_str());
@@ -334,22 +289,13 @@ int RunCalibrateCommand(int argc, char** argv) {
     return kExitError;
   }
   // The prefill prompts are the full fixed prompts; the decode prompts are
-  // their first kDecodePromptTokens tokens.
-  std::vector<std::vector<std::uint32_t>> prefill_ids;
-  std::vector<std::vector<std::uint32_t>> decode_ids;
-  for (const std::string& prompt : prompts) {
-    auto ids = tokenizer->Encode(prompt);
-    if (!ids || ids->size() < 2) {
-      log.Error("calibrate", "prompt encode failed or produced no tokens");
-      return kExitError;
-    }
-    std::vector<std::uint32_t> short_ids = *ids;
-    if (short_ids.size() > kDecodePromptTokens) {
-      short_ids.resize(kDecodePromptTokens);
-    }
-    prefill_ids.push_back(std::move(*ids));
-    decode_ids.push_back(std::move(short_ids));
+  // their first kDecodeMeasurePromptTokens tokens.
+  auto encoded_prompts = EncodeCalibrationPrompts(*tokenizer, prompts);
+  if (!encoded_prompts) {
+    log.Error("calibrate", "prompt encode failed or produced no tokens");
+    return kExitError;
   }
+  const CalibrationPrompts& prompt_set = *encoded_prompts;
   const std::string backend(engine.Owner().Name());
   const std::string strategy_label =
       dflash2_attached ? "dflash2" : (draft_attached ? "mtp" : "none");
@@ -364,43 +310,15 @@ int RunCalibrateCommand(int argc, char** argv) {
     defaults.draft_tokens = strategy != nullptr ? strategy->DraftBlock() : 0;
   }
 
-  const auto measure =
-      [&](Setting setting, const CalibrationConfig& config,
-          std::size_t prompt, bool warmup)
-      -> std::expected<Measurement, StatusCode> {
-    const bool prefill = setting == Setting::PrefillChunkTokens;
-    // The attention split only applies at a long key range, so it measures
-    // decode on the long prompts; the other decode settings use the short
-    // ones.
-    const bool long_context = prefill || setting == Setting::AttentionSplit;
-    GenerateOptions gen;
-    gen.max_completion_tokens = warmup ? 1 : (prefill ? 1 : kDecodeTokens);
-    gen.sample = false;
-    gen.progress_every = 0;
-    gen.kv_type = kv_type;
-    gen.prefill_chunk_tokens = config.prefill_chunk_tokens;
-    gen.draft_tokens = config.draft_tokens;
-    gen.mxfp4_split_target = config.mxfp4_split_target;
-    gen.mxfp4_split_cap = config.mxfp4_split_cap;
-    gen.attention_split = config.attention_split;
-    gen.draft_context = config.draft_context;
-    gen.prompt_tokens = long_context ? prefill_ids[prompt] : decode_ids[prompt];
-    auto outcome =
-        engine.GenerateStreaming(loaded, gen, [](std::uint32_t) { return true; });
-    if (!outcome) {
-      return std::unexpected(outcome.error());
-    }
-    Measurement measured;
-    if (outcome->produced > 0 && outcome->decode_ms > 0.0) {
-      measured.decode_tps =
-          static_cast<double>(outcome->produced) * 1000.0 / outcome->decode_ms;
-    }
-    if (outcome->prompt_tokens > 0 && outcome->prefill_ms > 0.0) {
-      measured.prefill_tps = static_cast<double>(outcome->prompt_tokens) *
-                             1000.0 / outcome->prefill_ms;
-    }
-    return measured;
-  };
+  // The single-device route: the engine streams one greedy generation.
+  const TimedGenerateFn generate =
+      [&](std::span<const std::uint32_t> prompt, const GenerateOptions& gen) {
+        GenerateOptions options = gen;
+        options.prompt_tokens.assign(prompt.begin(), prompt.end());
+        return engine.GenerateStreaming(loaded, options,
+                                        [](std::uint32_t) { return true; });
+      };
+  const MeasureFn measure = BuildSweepMeasure(generate, prompt_set, kv_type);
 
   // Warm the engine once before the first measurement (kernel compile and
   // the first-touch weight loads), so the sweep points measure steady state.
@@ -418,7 +336,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   }
 
   SweepOptions sweep;
-  sweep.prompt_count = prefill_ids.size();
+  sweep.prompt_count = prompt_set.count();
   // A limit measures at most that many points in total, whatever the
   // setting, and keeps the fastest measured value. Zero means no limit.
   sweep.max_points = calibrate_limit;
@@ -426,11 +344,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   sweep.sweep_split_target = backend == "rocm";
   sweep.sweep_split_cap = backend == "rocm";
   sweep.sweep_prefill_chunk = true;
-  std::size_t longest_prompt = 0;
-  for (const auto& ids : prefill_ids) {
-    longest_prompt = std::max(longest_prompt, ids.size());
-  }
-  sweep.sweep_attention_split = longest_prompt >= kAttentionSplitMinKeys;
+  sweep.sweep_attention_split = prompt_set.longest() >= kAttentionSplitMinKeys;
   sweep.sweep_draft_tokens = draft_attached && defaults.draft_tokens > 0;
   // MTP has no draft context window; only DFlash2 sweeps that knob.
   sweep.sweep_draft_context = dflash2_attached;
@@ -466,30 +380,14 @@ int RunCalibrateCommand(int argc, char** argv) {
   double decode_tps = 0.0;
   double prefill_tps = 0.0;
   if (sweep.max_points == 0) {
-    std::vector<double> decode_rates;
-    std::vector<double> prefill_rates;
-    for (std::size_t prompt = 0; prompt < prefill_ids.size(); ++prompt) {
-      auto decode_measured =
-          measure(Setting::MxFp4SplitTarget, outcome->config, prompt, false);
-      if (!decode_measured) {
-        log.Error("calibrate", std::string("final decode measurement failed (") +
-                                   std::string(ToString(decode_measured.error())) +
-                                   ")");
-        return kExitError;
-      }
-      decode_rates.push_back(decode_measured->decode_tps);
-      auto prefill_measured = measure(Setting::PrefillChunkTokens,
-                                      outcome->config, prompt, false);
-      if (!prefill_measured) {
-        log.Error("calibrate",
-                  std::string("final prefill measurement failed (") +
-                      std::string(ToString(prefill_measured.error())) + ")");
-        return kExitError;
-      }
-      prefill_rates.push_back(prefill_measured->prefill_tps);
+    auto rates = MeasureChosenRates(measure, outcome->config, prompt_set);
+    if (!rates) {
+      log.Error("calibrate", std::string("final rate measurement failed (") +
+                                 std::string(ToString(rates.error())) + ")");
+      return kExitError;
     }
-    decode_tps = MedianOf(decode_rates);
-    prefill_tps = MedianOf(prefill_rates);
+    decode_tps = rates->first;
+    prefill_tps = rates->second;
   } else {
     std::vector<double> decode_rates;
     std::vector<double> prefill_rates;
@@ -510,20 +408,103 @@ int RunCalibrateCommand(int argc, char** argv) {
   const std::size_t max_context =
       LogMaxContext(engine, loaded, kv_type, quiet);
 
+  const std::string device_name(engine.Owner().DeviceName());
+  const std::string model_id =
+      loaded.Name().empty()
+          ? std::filesystem::path(model_path).filename().string()
+          : std::string(loaded.Name());
+
+  // The largest number of concurrent sessions whose KV caches at the
+  // requested context fit the device (informational), and, when asked, the
+  // measured throughput for 2, 3 and 4 sessions.
+  std::vector<ConcurrentRate> concurrent_rates;
+  std::size_t max_concurrent = 0;
+  {
+    const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
+    std::uint64_t model_bytes = 0;
+    for (const auto& weight : loaded.Weights()) {
+      model_bytes += weight.device->Size();
+    }
+    std::uint64_t available = 0;
+    if (memory.free_bytes > 0) {
+      available = memory.free_bytes;
+    } else if (memory.total_bytes > model_bytes) {
+      available = memory.total_bytes - model_bytes;
+    }
+    available = available > kMemoryReserveBytes
+                    ? available - kMemoryReserveBytes
+                    : 0;
+    auto model_config = loaded.Config();
+    if (model_config) {
+      max_concurrent = MaxConcurrentSessions(
+          available, KvBytesPerToken(*model_config, kv_type), context);
+    }
+  }
+  if (concurrent) {
+    if (draft_attached) {
+      log.Warn("calibrate",
+               "concurrent benchmark skipped: the scheduler does not drive "
+               "the attached draft strategy");
+    } else {
+      std::unique_ptr<Engine> engine_ptr = std::move(*created);
+      std::unique_ptr<Model> model_ptr = std::move(*model);
+      RunnerPool pool;
+      pool.Add(std::make_unique<Runner>(std::move(engine_ptr),
+                                        std::move(model_ptr), gpu,
+                                        outcome->config, kv_type));
+      for (const std::size_t sessions :
+           {std::size_t{2}, std::size_t{3}, std::size_t{4}}) {
+        std::vector<GenerateOptions> requests;
+        requests.reserve(sessions);
+        for (std::size_t s = 0; s < sessions; ++s) {
+          GenerateOptions gen;
+          gen.max_completion_tokens = kDecodeMeasureTokens;
+          gen.kv_type = kv_type;
+          gen.progress_every = 0;
+          gen.prompt_tokens = prompt_set.decode[0];
+          requests.push_back(std::move(gen));
+        }
+        auto results = RunConcurrentSessions(pool, requests);
+        std::vector<std::size_t> tokens;
+        std::vector<double> decode_ms;
+        bool ok = true;
+        for (const ConcurrentSessionResult& result : results) {
+          if (!result.outcome) {
+            ok = false;
+            break;
+          }
+          tokens.push_back(result.tokens.size());
+          decode_ms.push_back(result.outcome->decode_ms);
+        }
+        if (!ok) {
+          log.Warn("calibrate",
+                   "concurrent benchmark failed at " +
+                       std::to_string(sessions) +
+                       " session(s); reporting the rows measured so far");
+          break;
+        }
+        concurrent_rates.push_back(
+            SummarizeConcurrentSessions(sessions, tokens, decode_ms));
+      }
+      if (!quiet) {
+        for (const ConcurrentRate& rate : concurrent_rates) {
+          log.Info("calibrate",
+                   std::to_string(rate.sessions) + " session(s): " +
+                       FormatRate(rate.total_tps) + " tok/s total, " +
+                       FormatRate(rate.per_session_tps) + " tok/s each");
+        }
+      }
+    }
+  }
+
   CalibrationEntry entry;
-  entry.key =
-      MakeHardwareKey(backend, engine.Owner().DeviceName(),
-                      loaded.Name().empty()
-                          ? std::filesystem::path(model_path).filename().string()
-                          : std::string(loaded.Name()),
-                      context, ToString(kv_type), strategy_label);
+  entry.key = MakeHardwareKey(backend, device_name, model_id, context,
+                              ToString(kv_type), strategy_label);
   entry.config = outcome->config;
   entry.decode_tps = decode_tps;
   entry.prefill_tps = prefill_tps;
   entry.max_context = max_context;
   entry.date = TodayIso();
-  // Keep the identity for the report: `entry` is moved into the file below.
-  const std::string model_id = entry.key.model;
 
   if (auto saved =
           SaveCalibrationEntry(log, calibration_file, std::move(entry));
@@ -539,7 +520,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   // library so it is unit tested.
   CalibrationReport report;
   report.backend = backend;
-  report.device = std::string(engine.Owner().DeviceName());
+  report.device = device_name;
   report.model = model_id;
   report.model_path = model_path;
   report.draft_path = draft_path;
@@ -559,6 +540,8 @@ int RunCalibrateCommand(int argc, char** argv) {
   report.split_applicable = backend == "rocm";
   report.attention_applicable = sweep.sweep_attention_split;
   report.draft_attached = draft_attached;
+  report.concurrent = concurrent_rates;
+  report.max_concurrent = max_concurrent;
   std::fputs("\n", stdout);
   std::fputs(FormatCalibrationReport(report).c_str(), stdout);
   std::fflush(stdout);

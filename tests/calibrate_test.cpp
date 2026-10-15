@@ -10,25 +10,39 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "core/decode.hpp"
 #include "test_helpers.hpp"
 #include "tessera/calibrate.hpp"
+#include "tessera/calibrate_sweep.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/types.hpp"
 
+using tessera::BuildSweepMeasure;
 using tessera::CalibrationConfig;
 using tessera::CalibrationEntry;
 using tessera::CalibrationFile;
+using tessera::CalibrationPrompts;
+using tessera::CalibrationPromptsFromFile;
 using tessera::CalibrationReport;
 using tessera::CandidateValues;
+using tessera::ConcurrentRate;
+using tessera::DefaultCalibrationPrompts;
 using tessera::FormatCalibrationReport;
+using tessera::GenerateOptions;
+using tessera::GenerateOutcome;
 using tessera::HardwareKey;
+using tessera::kDecodeMeasureTokens;
 using tessera::kMinGain;
+using tessera::KvBytesPerToken;
 using tessera::KvCacheType;
+using tessera::MeasureChosenRates;
+using tessera::TimedGenerateFn;
 using tessera::MakeHardwareKey;
+using tessera::MaxConcurrentSessions;
 using tessera::MaxContextForKv;
 using tessera::MeasureFn;
 using tessera::Measurement;
@@ -36,6 +50,7 @@ using tessera::MedianOf;
 using tessera::PickBest;
 using tessera::Setting;
 using tessera::StatusCode;
+using tessera::SummarizeConcurrentSessions;
 using tessera::SweepOptions;
 using tessera::TransformerConfig;
 using tessera::testing::FreshTempDir;
@@ -349,7 +364,119 @@ TEST(CalibrateTest, BudgetSkipsUnmeasuredSettings) {
             std::string::npos);
 }
 
-// A real gain in the draft block is found and kept.
+// A real gain in the draft block is found and kept. The draft candidates
+// are the small blocks; the checkpoint value is the default candidate.
+TEST(CalibrateTest, SweepFindsDraftBlockGain) {
+  SweepOptions options;
+  options.prompt_count = 1;
+  options.defaults.draft_tokens = 4;
+  OnlySweep(options, Setting::DraftTokens);
+  auto measure = [](Setting, const CalibrationConfig& config, std::size_t, bool)
+      -> std::expected<Measurement, StatusCode> {
+    Measurement m;
+    m.decode_tps = config.draft_tokens == 2 ? 2.0 : 1.0;
+    m.prefill_tps = m.decode_tps;
+    return m;
+  };
+  auto outcome = tessera::RunCalibrationSweep(options, measure);
+  ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  EXPECT_EQ(outcome->config.draft_tokens, 2u);
+  bool kept = false;
+  for (const auto& point : outcome->points) {
+    if (point.setting == Setting::DraftTokens && point.value == 2) {
+      kept = point.kept;
+    }
+  }
+  EXPECT_TRUE(kept);
+}
+
+// The draft block candidates cover the small blocks; the checkpoint value
+// (--draft-block 0) is the default candidate, and the upper bound clamps a
+// draft to the checkpoint block.
+TEST(CalibrateTest, DraftCandidatesCoverSmallBlocks) {
+  EXPECT_EQ(CandidateValues(Setting::DraftTokens, 0),
+            (std::vector<std::size_t>{1, 2, 3, 4}));
+  EXPECT_EQ(CandidateValues(Setting::DraftTokens, 8),
+            (std::vector<std::size_t>{1, 2, 3, 4, 8}));
+  EXPECT_EQ(CandidateValues(Setting::DraftTokens, 8, 4),
+            (std::vector<std::size_t>{1, 2, 3, 4}));
+}
+
+// The draft sweep is exercised with speculation on and off over a
+// checkpoint block of 0 to 4. With speculation off the setting is not
+// applicable; with it on, the sweep measures blocks 1 to 4 plus the
+// checkpoint value and keeps a real gain.
+TEST(CalibrateTest, DraftSweepMatrix) {
+  for (std::size_t checkpoint = 0; checkpoint <= 4; ++checkpoint) {
+    // Speculation off: no draft attached, the setting is not applicable.
+    {
+      SweepOptions off;
+      off.prompt_count = 1;
+      off.defaults.draft_tokens = checkpoint;
+      OnlySweep(off, Setting::DraftTokens);
+      off.sweep_draft_tokens = false;
+      auto measure = [](Setting, const CalibrationConfig&, std::size_t, bool)
+          -> std::expected<Measurement, StatusCode> { return Measurement{}; };
+      auto outcome = tessera::RunCalibrationSweep(off, measure);
+      ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+      EXPECT_NE(std::find(outcome->not_applicable.begin(),
+                          outcome->not_applicable.end(),
+                          Setting::DraftTokens),
+                outcome->not_applicable.end());
+    }
+    // Speculation on: the sweep covers the small blocks plus the checkpoint.
+    if (checkpoint == 0) {
+      continue;
+    }
+    SweepOptions on;
+    on.prompt_count = 1;
+    on.defaults.draft_tokens = checkpoint;
+    OnlySweep(on, Setting::DraftTokens);
+    const std::size_t fast = checkpoint > 1 ? 1 : 2;
+    auto measure = [fast](Setting, const CalibrationConfig& config,
+                          std::size_t, bool)
+        -> std::expected<Measurement, StatusCode> {
+      Measurement m;
+      m.decode_tps = config.draft_tokens == fast ? 2.0 : 1.0;
+      m.prefill_tps = m.decode_tps;
+      return m;
+    };
+    auto outcome = tessera::RunCalibrationSweep(on, measure);
+    ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+    EXPECT_EQ(outcome->config.draft_tokens, fast);
+    EXPECT_FALSE(outcome->points.empty());
+    for (const auto& point : outcome->points) {
+      EXPECT_GE(point.value, 1u);
+      EXPECT_LE(point.value, 4u);
+    }
+  }
+}
+
+// Three candidates in a row slower than the best value so far abort the
+// setting's sweep: the larger prefill chunks are never measured.
+TEST(CalibrateTest, SweepStopsAfterThreeDegradations) {
+  SweepOptions options;
+  options.prompt_count = 1;
+  options.defaults.prefill_chunk_tokens = 512;
+  OnlySweep(options, Setting::PrefillChunkTokens);
+  auto measure = [](Setting, const CalibrationConfig& config, std::size_t, bool)
+      -> std::expected<Measurement, StatusCode> {
+    Measurement m;
+    // Each larger chunk is slower than the one before it.
+    m.prefill_tps =
+        1000.0 - static_cast<double>(config.prefill_chunk_tokens) / 16.0;
+    return m;
+  };
+  auto outcome = tessera::RunCalibrationSweep(options, measure);
+  ASSERT_TRUE(outcome.has_value()) << tessera::ToString(outcome.error());
+  // 512, 768, 1024, 1536 are measured; the third degradation at 1536 stops
+  // the sweep before 2048.
+  EXPECT_EQ(outcome->points.size(), 4u);
+  for (const auto& point : outcome->points) {
+    EXPECT_NE(point.value, 2048u);
+  }
+  EXPECT_EQ(outcome->config.prefill_chunk_tokens, 512u);
+}
 
 // The interleaved confirmation rejects a win that was a single burst of
 // noise: the sweep sees a fast candidate once, then the confirmation sees
