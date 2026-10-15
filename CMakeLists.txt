@@ -32,6 +32,7 @@ add_library(tessera STATIC
     src/models/qwen3_5/convert.cpp
     src/models/qwen4exp/ple_table.cpp
     src/models/qwen4exp/trunk.cpp
+    src/models/qwen4exp/trunk_batch.cpp
     src/models/qwen4exp/moe.cpp
     src/models/qwen4exp/weights.cpp
     src/models/qwen4exp/mtp_fetch.cpp

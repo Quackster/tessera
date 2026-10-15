@@ -96,6 +96,12 @@ struct Qwen4ExpState final : core::ArchState {
   std::size_t position = 0;
   bool ready = false;
 
+  // Batched-forward scratch (prefill and the multi-row verify). The residual
+  // stack is held per row (rows * hc * hidden) so a layer can run every row
+  // before its experts stage once; the embedding gather writes one row each.
+  std::unique_ptr<Buffer> batch_r, batch_x, batch_ids;
+  std::size_t batch_rows = 0;
+
   // MTP draft head: the fetched weights (loaded lazily on first draft), its
   // own paged FP16 QSA cache, dense-attention scratch and expert scratch.
   std::unique_ptr<MtpWeights> mtp_weights;

@@ -1429,6 +1429,35 @@ TEST(EngineTest, GgufGeneratesWhenProvided) {
   }
 }
 
+// The layer-major batched prefill (a chunk of more than one row) must match
+// the per-token serial prefill exactly: a chunk of one row per forward keeps
+// the plain path. Needs TESSERA_TEST_MODEL (a qwen4exp target).
+TEST(EngineTest, BatchedPrefillMatchesSerialWhenProvided) {
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
+  }
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  ModelOptions load{path, 1024};
+  // The Flash-Next target does not fit one card, so it pages; the test still
+  // exercises the same batched prefill path under paging.
+  load.gpu_layers = 8;
+  auto model = engine->LoadModel(load);
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+  GenerateOptions base;
+  base.max_completion_tokens = 8;
+  base.prompt_tokens = {760, 6511, 314, 9338, 369, 760, 6511, 314, 9338, 369};
+  auto batched = engine->Generate(**model, base);
+  ASSERT_TRUE(batched.has_value()) << tessera::ToString(batched.error());
+  GenerateOptions serial = base;
+  serial.prefill_chunk_tokens = 1;
+  auto serial_out = engine->Generate(**model, serial);
+  ASSERT_TRUE(serial_out.has_value()) << tessera::ToString(serial_out.error());
+  ASSERT_EQ(batched->size(), serial_out->size());
+  EXPECT_EQ(*batched, *serial_out);
+}
+
 // Print a tensor's dequantized fp32 statistics for cross-target
 // comparison (set TESSERA_DUMP_MODEL and TESSERA_DUMP_TENSOR).
 

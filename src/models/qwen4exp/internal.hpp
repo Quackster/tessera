@@ -72,6 +72,31 @@ struct Qwen4ExpGeometry {
     Backend& backend, Qwen4ExpState& h, const Qwen4ExpGeometry& g, Buffer& r,
     const Buffer& block_out, const Buffer& inject);
 
+// One trunk block on the current residual stack `h.R`, at absolute
+// position `pos`. `token` feeds the PLE block when `ple_layer` and `l == 1`.
+// Shared by the single-token Forward and the batched forward.
+[[nodiscard]] std::expected<void, StatusCode> RunTrunkLayer(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::size_t layer,
+    std::uint64_t pos, std::uint32_t token, bool ple_layer);
+
+// The output head on the current residual stack `h.R`: the output
+// hyper-connection read and the vocabulary projection into `h.logits`.
+[[nodiscard]] std::expected<void, StatusCode> RunTrunkHead(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, Qwen4ExpState& h);
+
+// Multi-row trunk forward (prefill and the multi-row verify). Runs the
+// layers once each over every row, staging the whole paged expert set per
+// layer once when the batch is large enough that the union covers most
+// experts, so the expert readback and transfer are not paid per row. The
+// per-row residual stack is held in `h.batch_r`. `all_logits` writes one
+// vocab row per token, otherwise only the last row.
+[[nodiscard]] std::expected<void, StatusCode> ForwardTrunkBatch(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
+    std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
+    std::vector<float>* hidden_out, bool all_logits, const Buffer* embeddings);
+
 // The sparse mixture-of-experts FFN for one layer: route, run `top_k`
 // routed experts and the always-on shared expert, and write the block
 // output to `h.block_out`. `mixed` is the normed activation from the FFN

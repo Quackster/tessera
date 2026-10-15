@@ -578,12 +578,25 @@ std::expected<void, StatusCode> RunPleBlock(
   return {};
 }
 
+std::int32_t ArgMaxToken(std::span<const float> logits) {
+  std::int32_t best = 0;
+  float best_value = logits.empty() ? 0.0f : logits[0];
+  for (std::size_t i = 1; i < logits.size(); ++i) {
+    if (logits[i] > best_value) {
+      best_value = logits[i];
+      best = static_cast<std::int32_t>(i);
+    }
+  }
+  return best;
+}
+
+}  // namespace
+
 // The output head: a hyper-connection read of the stack with the
-// output_hc_* weights, then the vocabulary projection.
-std::expected<void, StatusCode> RunHead(Backend& backend, const Model& model,
-                                        const TransformerConfig& cfg,
-                                        const Qwen4ExpGeometry& g,
-                                        Qwen4ExpState& h) {
+// output_hc_* weights, then the vocabulary projection into `h.logits`.
+std::expected<void, StatusCode> RunTrunkHead(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, Qwen4ExpState& h) {
   auto w_norm = NeedWeight(model, "output_hc_norm.weight", DType::F32);
   auto w_down = NeedWeight(model, "output_hc_down.weight", DType::BF16);
   auto w_up = NeedWeight(model, "output_hc_up.weight", DType::BF16);
@@ -601,19 +614,83 @@ std::expected<void, StatusCode> RunHead(Backend& backend, const Model& model,
                  *(*w_out)->device, *h.logits, 1, cfg.vocab_size, g.hidden);
 }
 
-std::int32_t ArgMaxToken(std::span<const float> logits) {
-  std::int32_t best = 0;
-  float best_value = logits.empty() ? 0.0f : logits[0];
-  for (std::size_t i = 1; i < logits.size(); ++i) {
-    if (logits[i] > best_value) {
-      best_value = logits[i];
-      best = static_cast<std::int32_t>(i);
+// One trunk block on the current residual stack `h.R`, at absolute position
+// `pos`, with `token` feeding the PLE block when this layer carries it. The
+// mixer is QSA on a full-attention layer and gated-delta otherwise. Used by
+// the single-token Forward and by the batched forward, which drives one row
+// at a time so both share this body.
+std::expected<void, StatusCode> RunTrunkLayer(
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::size_t l,
+    std::uint64_t pos, std::uint32_t token, bool ple_layer) {
+  core::Profile* const deep_profile =
+      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
+  core::PhaseScope layer_scope(
+      deep_profile, cfg.IsFullAttentionLayer(l) ? core::Phase::kFullLayer
+                                                : core::Phase::kLinearLayer);
+  if (auto ensured = model.EnsureLayerResident(l); !ensured) {
+    return std::unexpected(ensured.error());
+  }
+  if (ple_layer && l == 1) {
+    auto ple = RunPleBlock(backend, model, cfg, g, h, token, *h.R);
+    if (!ple) {
+      return ple;
     }
   }
-  return best;
+  const std::string base = "blk." + std::to_string(l) + ".";
+  auto an = NeedWeight(model, base + "hc_attn_norm.weight", DType::F32);
+  auto ad = NeedWeight(model, base + "hc_attn_down.weight", DType::BF16);
+  auto au = NeedWeight(model, base + "hc_attn_up.weight", DType::BF16);
+  auto ai = NeedWeight(model, base + "hc_attn_inject.weight", DType::BF16);
+  if (!an || !ad || !au || !ai) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (auto read = HyperRead(backend, h, cfg, g, *(*an)->device, *(*ad)->device,
+                            *(*au)->device, (*ai)->device.get(), *h.R, *h.mixed,
+                            h.inject.get());
+      !read) {
+    return read;
+  }
+  std::expected<void, StatusCode> mixer =
+      cfg.IsFullAttentionLayer(l)
+          ? RunQsaLayer(backend, model, cfg, g, h, l, pos, *h.mixed,
+                        *h.block_out)
+          : RunGdnLayer(backend, model, cfg, g, h, l, *h.mixed, *h.block_out);
+  if (!mixer) {
+    return mixer;
+  }
+  if (auto write = HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject);
+      !write) {
+    return write;
+  }
+  auto fn = NeedWeight(model, base + "hc_ffn_norm.weight", DType::F32);
+  auto fd = NeedWeight(model, base + "hc_ffn_down.weight", DType::BF16);
+  auto fu = NeedWeight(model, base + "hc_ffn_up.weight", DType::BF16);
+  auto fi = NeedWeight(model, base + "hc_ffn_inject.weight", DType::BF16);
+  if (!fn || !fd || !fu || !fi) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (auto read = HyperRead(backend, h, cfg, g, *(*fn)->device, *(*fd)->device,
+                            *(*fu)->device, (*fi)->device.get(), *h.R, *h.mixed,
+                            h.inject2.get());
+      !read) {
+    return read;
+  }
+  {
+    core::PhaseScope ffn_scope(deep_profile, core::Phase::kFfn);
+    if (auto moe = RunMoeFfn(backend, model, cfg, h, l, *h.mixed); !moe) {
+      return moe;
+    }
+  }
+  if (auto write = HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject2);
+      !write) {
+    return write;
+  }
+  if (deep_profile != nullptr) {
+    backend.Synchronize();  // profile attribution only
+  }
+  return {};
 }
-
-}  // namespace
 
 // Derive the last split shard's path from a "...-NNNNN-of-MMMMM.gguf"
 // name; the PLE table lives there. Empty when the name has no split
@@ -940,74 +1017,11 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
       ple_layer = true;
     }
   }
-  core::Profile* const deep_profile =
-      h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
   for (std::size_t l = 0; l < cfg.layers; ++l) {
-    core::PhaseScope layer_scope(
-        deep_profile, cfg.IsFullAttentionLayer(l) ? core::Phase::kFullLayer
-                                                  : core::Phase::kLinearLayer);
-    if (auto ensured = model.EnsureLayerResident(l); !ensured) {
-      return std::unexpected(ensured.error());
-    }
-    if (ple_layer && l == 1) {
-      auto ple = RunPleBlock(backend, model, cfg, g, h, token, *h.R);
-      if (!ple) {
-        return ple;
-      }
-    }
-    const std::string base = "blk." + std::to_string(l) + ".";
-    auto an = NeedWeight(model, base + "hc_attn_norm.weight", DType::F32);
-    auto ad = NeedWeight(model, base + "hc_attn_down.weight", DType::BF16);
-    auto au = NeedWeight(model, base + "hc_attn_up.weight", DType::BF16);
-    auto ai = NeedWeight(model, base + "hc_attn_inject.weight", DType::BF16);
-    if (!an || !ad || !au || !ai) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    if (auto read = HyperRead(backend, h, cfg, g, *(*an)->device,
-                              *(*ad)->device, *(*au)->device, (*ai)->device.get(),
-                              *h.R, *h.mixed, h.inject.get());
-        !read) {
-      return read;
-    }
-    std::expected<void, StatusCode> mixer =
-        cfg.IsFullAttentionLayer(l)
-            ? RunQsaLayer(backend, model, cfg, g, h, l, pos, *h.mixed,
-                          *h.block_out)
-            : RunGdnLayer(backend, model, cfg, g, h, l, *h.mixed, *h.block_out);
-    if (!mixer) {
-      return mixer;
-    }
-    if (auto write =
-            HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject);
-        !write) {
-      return write;
-    }
-    auto fn = NeedWeight(model, base + "hc_ffn_norm.weight", DType::F32);
-    auto fd = NeedWeight(model, base + "hc_ffn_down.weight", DType::BF16);
-    auto fu = NeedWeight(model, base + "hc_ffn_up.weight", DType::BF16);
-    auto fi = NeedWeight(model, base + "hc_ffn_inject.weight", DType::BF16);
-    if (!fn || !fd || !fu || !fi) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    if (auto read = HyperRead(backend, h, cfg, g, *(*fn)->device,
-                              *(*fd)->device, *(*fu)->device, (*fi)->device.get(),
-                              *h.R, *h.mixed, h.inject2.get());
-        !read) {
-      return read;
-    }
-    {
-      core::PhaseScope ffn_scope(deep_profile, core::Phase::kFfn);
-      if (auto moe = RunMoeFfn(backend, model, cfg, h, l, *h.mixed); !moe) {
-        return moe;
-      }
-    }
-    if (auto write =
-            HyperWrite(backend, h, g, *h.R, *h.block_out, *h.inject2);
-        !write) {
-      return write;
-    }
-    if (deep_profile != nullptr) {
-      backend.Synchronize();  // profile attribution only
+    if (auto layer = RunTrunkLayer(backend, model, cfg, g, h, l, pos, token,
+                                   ple_layer);
+        !layer) {
+      return layer;
     }
   }
   if (hidden_out != nullptr) {
@@ -1053,7 +1067,7 @@ std::expected<std::vector<float>, StatusCode> Qwen4ExpArchitecture::Logits(
   Qwen4ExpState& h = State(cache);
   {
     core::PhaseScope scope(profile, core::Phase::kHead);
-    if (auto head = RunHead(backend, model, cfg, *geom, h); !head) {
+    if (auto head = RunTrunkHead(backend, model, cfg, *geom, h); !head) {
       return std::unexpected(head.error());
     }
     if (profile != nullptr) {
@@ -1082,6 +1096,17 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::ForwardBatch(
   if (logits_out != nullptr && all_logits) {
     logits_out->clear();
     logits_out->reserve(tokens.size() * vocab);
+  }
+  // A multi-row batch runs the layers once each over all rows, so the paged
+  // experts stage once per layer instead of once per row. The single-row
+  // case keeps the plain per-token path.
+  if (tokens.size() > 1) {
+    auto ready = EnsureReady(backend, model, cache);
+    if (!ready) {
+      return ready;
+    }
+    return ForwardTrunkBatch(backend, model, cache, tokens, logits_out,
+                             hidden_out, all_logits, embeddings);
   }
   for (std::size_t i = 0; i < tokens.size(); ++i) {
     const bool last = i + 1 == tokens.size();

@@ -39,6 +39,14 @@ enum class Phase : std::size_t {
   kFullLayer,
   kLinearLayer,
   kFfn,
+  // MoE sub-phases: the router/selection, the shared expert, the paged
+  // expert staging (readback + upload) and the routed-expert kernels.
+  kMoeRouter,
+  kMoeShared,
+  kMoeStaging,
+  kMoeReadback,
+  kMoeUpload,
+  kMoeCompute,
   kCount,
 };
 
@@ -74,6 +82,18 @@ inline constexpr std::size_t kPhaseCount = static_cast<std::size_t>(Phase::kCoun
     return "linear-attn layer";
   case Phase::kFfn:
     return "ffn";
+  case Phase::kMoeRouter:
+    return "moe router";
+  case Phase::kMoeShared:
+    return "moe shared";
+  case Phase::kMoeStaging:
+    return "moe staging";
+  case Phase::kMoeReadback:
+    return "moe readback";
+  case Phase::kMoeUpload:
+    return "moe upload";
+  case Phase::kMoeCompute:
+    return "moe compute";
   case Phase::kCount:
     break;
   }
