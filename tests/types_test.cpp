@@ -202,6 +202,14 @@ TEST(ParseGpuListTest, SkipsEmptyItems) {
   EXPECT_TRUE(ParseGpuList("").empty());
 }
 
+TEST(ParseSizeListTest, ParsesLayerCounts) {
+  using tessera::cli::ParseSizeList;
+  EXPECT_EQ(ParseSizeList("27,21"), (std::vector<std::size_t>{27, 21}));
+  EXPECT_EQ(ParseSizeList("48"), (std::vector<std::size_t>{48}));
+  EXPECT_EQ(ParseSizeList("27,,21"), (std::vector<std::size_t>{27, 21}));
+  EXPECT_TRUE(ParseSizeList("").empty());
+}
+
 TEST(DeviceRoutingHintTest, SingleDeviceIsSilent) {
   using tessera::cli::DeviceRouteKind;
   using tessera::cli::DeviceRoutingHint;

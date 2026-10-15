@@ -28,6 +28,7 @@
 #include "core/decode_internal.hpp"
 #include "core/json.hpp"
 #include "core/loaders/shard.hpp"
+#include "core/pipeline_impl.hpp"
 #include "core/sampling.hpp"
 #include "tessera/budget.hpp"
 #include "core/timing.hpp"
@@ -2003,6 +2004,31 @@ TEST(EngineTest, GpuLayerResidentSplitsLastLayers) {
   EXPECT_TRUE(GpuLayerResident("blk.3.attn_q.weight", 5, 0));
   // Non-block globals stay resident at any setting.
   EXPECT_TRUE(GpuLayerResident("position_embd.weight", 1, kTrunk));
+}
+
+TEST(EngineTest, StageLayerRangesSplitBalancedOrByCount) {
+  using tessera::pipeline_internal::StageLayerRanges;
+  // Even split by stage count.
+  auto two = StageLayerRanges(48, 2, {});
+  ASSERT_TRUE(two.has_value());
+  EXPECT_EQ((*two)[0], (std::pair<std::size_t, std::size_t>{0, 24}));
+  EXPECT_EQ((*two)[1], (std::pair<std::size_t, std::size_t>{24, 48}));
+  auto three = StageLayerRanges(48, 3, {});
+  ASSERT_TRUE(three.has_value());
+  EXPECT_EQ((*three)[1], (std::pair<std::size_t, std::size_t>{16, 32}));
+  // An explicit uneven split: fewer layers on the last stage.
+  const std::vector<std::size_t> counts{27, 21};
+  auto uneven = StageLayerRanges(48, 2, counts);
+  ASSERT_TRUE(uneven.has_value());
+  EXPECT_EQ((*uneven)[0], (std::pair<std::size_t, std::size_t>{0, 27}));
+  EXPECT_EQ((*uneven)[1], (std::pair<std::size_t, std::size_t>{27, 48}));
+  // Bad counts: wrong size, a zero, a wrong sum, too few layers.
+  EXPECT_FALSE(StageLayerRanges(48, 2, std::vector<std::size_t>{48}).has_value());
+  EXPECT_FALSE(
+      StageLayerRanges(48, 2, std::vector<std::size_t>{0, 48}).has_value());
+  EXPECT_FALSE(
+      StageLayerRanges(48, 2, std::vector<std::size_t>{20, 20}).has_value());
+  EXPECT_FALSE(StageLayerRanges(1, 2, {}).has_value());
 }
 
 TEST(EngineTest, ShardKeepsHeadAndEmbeddingOnTheirStage) {

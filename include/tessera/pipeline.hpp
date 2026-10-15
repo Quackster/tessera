@@ -28,6 +28,12 @@ struct PipelineOptions {
   // Device index per stage, in stage order. At least one device; the
   // layer count must be at least the device count.
   std::vector<int> devices;
+  // Trunk layers per stage, in stage order. Empty splits the layers as
+  // evenly as the count allows. When set, one entry per device, each at
+  // least one, summing to the model's trunk layer count. A stage that
+  // carries extra weight (the output head, an MTP head) can be given fewer
+  // layers so every device fits.
+  std::vector<std::size_t> stage_layers;
   // Maximum context length to prepare for.
   std::size_t context = kDefaultContext;
   // Storage type of the full-attention KV cache.

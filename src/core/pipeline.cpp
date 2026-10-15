@@ -97,7 +97,9 @@ std::expected<std::unique_ptr<Pipeline>, StatusCode> Pipeline::Create(
   }
   const std::size_t layers = config->layers;
   const std::size_t stage_count = options.devices.size();
-  if (layers < stage_count) {
+  auto ranges = pipeline_internal::StageLayerRanges(
+      layers, stage_count, options.stage_layers);
+  if (!ranges) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
   auto impl = std::make_unique<Impl>();
@@ -109,12 +111,9 @@ std::expected<std::unique_ptr<Pipeline>, StatusCode> Pipeline::Create(
   impl->kv_type = options.kv_type;
   impl->stages.reserve(stage_count);
   for (std::size_t i = 0; i < stage_count; ++i) {
-    // Contiguous, balanced ranges: stage i owns [layers*i/n, layers*(i+1)/n).
-    const std::size_t first = layers * i / stage_count;
-    const std::size_t last = layers * (i + 1) / stage_count;
-    if (last <= first) {
-      return std::unexpected(StatusCode::InvalidArgument);
-    }
+    // Contiguous ranges, balanced unless the caller supplied counts.
+    const std::size_t first = (*ranges)[i].first;
+    const std::size_t last = (*ranges)[i].second;
     EngineOptions engine_options;
     engine_options.device_index = options.devices[i];
     auto engine = Engine::Create(engine_options);

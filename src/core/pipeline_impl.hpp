@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "core/decode.hpp"
@@ -46,6 +48,53 @@ inline bool IsStop(std::uint32_t token, std::span<const std::uint32_t> stops) {
     }
   }
   return false;
+}
+
+// Contiguous trunk layer ranges, one [first, last) per stage. An empty
+// `stage_layers` splits `total_layers` as evenly as the count allows;
+// otherwise it holds each stage's layer count and must have one entry per
+// stage, each at least one, summing to `total_layers`. nullopt on a bad
+// count.
+//
+// Usage:
+//   auto ranges = StageLayerRanges(layers, devices.size(), stage_layers);
+inline std::optional<std::vector<std::pair<std::size_t, std::size_t>>>
+StageLayerRanges(std::size_t total_layers, std::size_t stage_count,
+                 std::span<const std::size_t> stage_layers) {
+  if (stage_count == 0 || total_layers < stage_count) {
+    return std::nullopt;
+  }
+  std::vector<std::pair<std::size_t, std::size_t>> ranges(stage_count);
+  if (!stage_layers.empty()) {
+    if (stage_layers.size() != stage_count) {
+      return std::nullopt;
+    }
+    std::size_t sum = 0;
+    for (const std::size_t count : stage_layers) {
+      if (count == 0) {
+        return std::nullopt;
+      }
+      sum += count;
+    }
+    if (sum != total_layers) {
+      return std::nullopt;
+    }
+    std::size_t first = 0;
+    for (std::size_t i = 0; i < stage_count; ++i) {
+      ranges[i] = {first, first + stage_layers[i]};
+      first += stage_layers[i];
+    }
+    return ranges;
+  }
+  for (std::size_t i = 0; i < stage_count; ++i) {
+    const std::size_t first = total_layers * i / stage_count;
+    const std::size_t last = total_layers * (i + 1) / stage_count;
+    if (last <= first) {
+      return std::nullopt;
+    }
+    ranges[i] = {first, last};
+  }
+  return ranges;
 }
 
 }  // namespace pipeline_internal

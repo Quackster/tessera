@@ -75,26 +75,46 @@ inline bool ApplyDiagnosticFlag(std::string_view arg, int& i, char** argv,
   return false;
 }
 
-// Parse a `--gpus` value into indices: one device ("0") or a
-// comma-separated list ("0,1"). Empty items are skipped.
-inline std::vector<int> ParseGpuList(std::string_view list) {
-  std::vector<int> gpus;
+namespace detail {
+
+// Split a comma-separated value and convert each non-empty item. Shared
+// by the device list and the layer-count list.
+template <typename T, typename Convert>
+inline std::vector<T> ParseCommaList(std::string_view list, Convert convert) {
+  std::vector<T> out;
   std::size_t pos = 0;
   while (pos <= list.size()) {
     const std::size_t comma = list.find(',', pos);
     const std::string_view item =
-        list.substr(pos, comma == std::string_view::npos
-                             ? std::string_view::npos
-                             : comma - pos);
+        list.substr(pos, comma == std::string_view::npos ? std::string_view::npos
+                                                         : comma - pos);
     if (!item.empty()) {
-      gpus.push_back(std::stoi(std::string(item)));
+      out.push_back(convert(std::string(item)));
     }
     if (comma == std::string_view::npos) {
       break;
     }
     pos = comma + 1;
   }
-  return gpus;
+  return out;
+}
+
+}  // namespace detail
+
+// Parse a `--gpus` value into indices: one device ("0") or a
+// comma-separated list ("0,1"). Empty items are skipped.
+inline std::vector<int> ParseGpuList(std::string_view list) {
+  return detail::ParseCommaList<int>(
+      list, [](const std::string& item) { return std::stoi(item); });
+}
+
+// Parse a `--pipeline-split` value into per-stage layer counts: a
+// comma-separated list ("27,21"). Empty items are skipped.
+inline std::vector<std::size_t> ParseSizeList(std::string_view list) {
+  return detail::ParseCommaList<std::size_t>(
+      list, [](const std::string& item) {
+        return static_cast<std::size_t>(std::stoul(item));
+      });
 }
 
 // Which command is routing a multi-device `--gpus` list.

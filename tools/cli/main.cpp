@@ -162,6 +162,8 @@ int main(int argc, char** argv) {
   // GPU selection: one index or a comma-separated list. Empty means the
   // first device.
   std::vector<int> gpus;
+  // Trunk layers per stage for --pipeline; empty splits evenly.
+  std::vector<std::size_t> pipeline_split;
   for (int i = 2; i < argc; ++i) {
     const std::string_view arg = argv[i];
     if (arg == "--model" && i + 1 < argc) {
@@ -236,6 +238,8 @@ int main(int argc, char** argv) {
       speculate = true;
     } else if (arg == "--pipeline") {
       pipeline_mode = true;
+    } else if (arg == "--pipeline-split" && i + 1 < argc) {
+      pipeline_split = tessera::cli::ParseSizeList(argv[++i]);
     } else if (arg == "--tp") {
       tp_mode = true;
     } else if (arg == "--spec-split") {
@@ -549,6 +553,7 @@ int main(int argc, char** argv) {
     pipeline_options.context = context;
     pipeline_options.kv_type = kv_type;
     pipeline_options.mtp_path = mtp_path;
+    pipeline_options.stage_layers = pipeline_split;
     auto pipeline = tessera::Pipeline::Create(pipeline_options);
     if (!pipeline) {
       std::fprintf(stderr, "cli: pipeline create failed (%s)\n",
