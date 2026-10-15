@@ -197,15 +197,6 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   // context-parallel routes run one strategy per rank; the pipeline runs the
   // drafter on its last stage.
   const bool dflash2 = !options.draft_path.empty();
-  // The pipeline prefill steps one token at a time and does not drive the
-  // drafter's context append, so DFlash2 there is not correct yet; MTP needs
-  // no prefill append and runs on every route.
-  if (dflash2 && options.pipeline) {
-    std::fprintf(stderr,
-                 "cli: --draft (DFlash2) needs a capturing prefill, which the "
-                 "--pipeline route does not run yet; use --tp, --cp, or MTP\n");
-    return kExitError;
-  }
   std::string strategy_label = "none";
   if (options.speculate || dflash2) {
     const auto factory = [dflash2]() -> std::unique_ptr<SpeculativeStrategy> {

@@ -95,7 +95,31 @@ struct Pipeline::Impl {
   std::expected<DraftVerification, StatusCode> VerifyBatch(
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
-      std::vector<float>* hidden_out, std::size_t prefix_position);
+      std::vector<float>* hidden_out, std::size_t prefix_position,
+      const std::vector<std::size_t>* capture_layers = nullptr,
+      const std::vector<Buffer*>* capture_out = nullptr);
+
+  // Run one batched cross-stage forward over `tokens` (rows) with the
+  // boundary handoff. `capture_layers`, when non-null, are target block ids
+  // captured on their owning stages and copied to `capture_out` (one
+  // rows*hidden buffer per layer, on the last stage). `logits_all` fills
+  // `logits_out` with rows*vocab. `hidden_all_out`, when non-null, receives
+  // every row's final hidden (rows*hidden). Shared by the prefill, the
+  // verify, and the single-token step.
+  std::expected<void, StatusCode> ForwardRows(
+      std::span<const std::uint32_t> tokens, bool snapshot_state,
+      const std::vector<std::size_t>* capture_layers,
+      const std::vector<Buffer*>* capture_out, bool logits_all,
+      std::vector<float>* logits_out, std::vector<float>* hidden_all_out);
+
+  // Batched cross-stage prefill with target-hidden capture for a
+  // hidden-conditioned drafter (DFlash2): each chunk runs ForwardRows and
+  // strategy.AppendPrefill appends the captured rows. `position_out` is set
+  // to the prompt length. MTP does not use this path.
+  std::expected<void, StatusCode> PrefillCapturing(
+      SpeculativeStrategy& strategy, std::span<const std::uint32_t> prompt,
+      const GenerateOptions& options, std::vector<float>* hidden_out,
+      std::vector<float>* logits_out, std::size_t* position_out);
 
   // Fresh caches for every stage, so a new sequence starts at position zero
   // and the request's speed tuning and KV type take effect (the architecture
