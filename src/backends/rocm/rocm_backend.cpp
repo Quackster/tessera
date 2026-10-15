@@ -26,6 +26,15 @@ namespace {
 // bounds the pinned host memory regardless of the total weight bytes.
 constexpr std::size_t kUploadStagingBytes = 4ull << 20;
 
+// Batched device-to-device scatter sizing. The scatter_d2d kernel carries
+// at most this many slices per launch, runs 256-thread blocks, and targets
+// a handful of 32-bit words per thread before more y-blocks are added.
+constexpr std::size_t kScatterSlices = 5;
+constexpr std::size_t kScatterThreads = 256;
+constexpr std::size_t kScatterWordBytes = 4;
+constexpr std::size_t kScatterWordsPerThread = 8;
+constexpr std::size_t kScatterMaxGridY = 256;
+
 StatusCode FromHip(hipError_t error) {
   switch (error) {
     case hipSuccess: return StatusCode::Ok;
@@ -46,6 +55,7 @@ struct BuiltInKernel {
 };
 const BuiltInKernel kBuiltInKernels[] = {
     {"fill", reinterpret_cast<void*>(&FillKernel)},
+    {"scatter_d2d", reinterpret_cast<void*>(&ScatterD2DKernel)},
     {"device_probe", reinterpret_cast<void*>(&DeviceProbeKernel)},
     {"gemm_q4k", reinterpret_cast<void*>(&GemmQ4KKernel)},
     {"gemm_q4k_row", reinterpret_cast<void*>(&GemmQ4KRowKernel)},
@@ -358,7 +368,7 @@ class RocmBackend final : public Backend {
   std::expected<void, StatusCode> CopyH2DAt(
       Buffer& dst, std::size_t offset,
       std::span<const std::byte> src) override {
-    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+        if (auto device = SelectDevice(); device != StatusCode::Ok) {
       return std::unexpected(device);
     }
     if (offset > dst.Size() || src.size() > dst.Size() - offset) {
@@ -389,7 +399,7 @@ class RocmBackend final : public Backend {
 
   std::expected<void, StatusCode> CopyH2DBatch(
       std::span<const Backend::HostCopy> copies) override {
-    if (copies.empty()) {
+        if (copies.empty()) {
       return {};
     }
     if (auto device = SelectDevice(); device != StatusCode::Ok) {
@@ -472,7 +482,7 @@ class RocmBackend final : public Backend {
   std::expected<void, StatusCode> CopyD2HAt(
       const Buffer& src, std::size_t offset, std::byte* dst,
       std::size_t bytes) override {
-    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+        if (auto device = SelectDevice(); device != StatusCode::Ok) {
       return std::unexpected(device);
     }
     if (offset > src.Size() || bytes > src.Size() - offset) {
@@ -503,7 +513,7 @@ class RocmBackend final : public Backend {
   std::expected<void, StatusCode> CopyD2D(
       const Buffer& src, std::size_t src_offset, Buffer& dst,
       std::size_t dst_offset, std::size_t bytes) override {
-    if (auto device = SelectDevice(); device != StatusCode::Ok) {
+        if (auto device = SelectDevice(); device != StatusCode::Ok) {
       return std::unexpected(device);
     }
     if (src_offset > src.Size() || bytes > src.Size() - src_offset ||
@@ -525,6 +535,61 @@ class RocmBackend final : public Backend {
       LogError(std::string("hipMemcpy D2D of ") + std::to_string(bytes) +
                " bytes failed (" + HipErrorName(error) + ")");
       return std::unexpected(FromHip(error));
+    }
+    return {};
+  }
+
+  // Batched D2D: one scatter kernel per up-to-five slices instead of one
+  // hipMemcpyAsync per slice, so a layer's cache-to-staging gathers cost a
+  // few launches instead of dozens.
+  std::expected<void, StatusCode> CopyD2DBatch(
+      const Buffer& src, Buffer& dst,
+      std::span<const DeviceCopySpan> spans) override {
+    if (spans.empty()) {
+      return {};
+    }
+    for (const DeviceCopySpan& span : spans) {
+      if (span.src_offset > src.Size() || span.bytes > src.Size() - span.src_offset ||
+          span.dst_offset > dst.Size() ||
+          span.bytes > dst.Size() - span.dst_offset) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+    }
+    auto kernel = LoadKernel("scatter_d2d", {});
+    if (!kernel) {
+      return std::unexpected(kernel.error());
+    }
+    const std::size_t words_per_block =
+        kScatterThreads * kScatterWordsPerThread;
+    for (std::size_t base = 0; base < spans.size(); base += kScatterSlices) {
+      const std::size_t n =
+          std::min(kScatterSlices, spans.size() - base);
+      std::size_t max_words = 0;
+      for (std::size_t i = 0; i < n; ++i) {
+        max_words = std::max(max_words, spans[base + i].bytes /
+                                            kScatterWordBytes);
+      }
+      // Enough y-blocks that each thread copies a handful of words; capped
+      // so a tiny span does not launch thousands of idle blocks.
+      const std::size_t grid_y =
+          std::clamp((max_words + words_per_block - 1) / words_per_block,
+                     std::size_t{1}, kScatterMaxGridY);
+      KernelLaunch launch;
+      launch.grid_x = static_cast<std::uint32_t>(n);
+      launch.grid_y = static_cast<std::uint32_t>(grid_y);
+      launch.block_x = static_cast<std::uint32_t>(kScatterThreads);
+      launch.buffers = {&src, &dst};
+      launch.scalars = {n};
+      for (std::size_t i = 0; i < kScatterSlices; ++i) {
+        const DeviceCopySpan span =
+            i < n ? spans[base + i] : DeviceCopySpan{};
+        launch.scalars.push_back(span.src_offset);
+        launch.scalars.push_back(span.dst_offset);
+        launch.scalars.push_back(span.bytes);
+      }
+      if (auto launched = LaunchKernel(**kernel, launch); !launched) {
+        return launched;
+      }
     }
     return {};
   }

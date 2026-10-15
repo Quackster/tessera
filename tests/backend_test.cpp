@@ -236,6 +236,106 @@ TEST(BackendTest, BatchedUploadMatchesSingleCopies) {
   EXPECT_FALSE(backend->CopyH2DBatch(null_dst).has_value());
 }
 
+// CopyD2DBatch must move every slice exactly like one CopyD2D per slice,
+// including spans that cross the internal chunking and spans whose length
+// is not a multiple of the copy word. This is the expert cache's
+// cache-to-staging gather path.
+TEST(BackendTest, BatchedDeviceScatterMatchesSingleCopies) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kSrc = 4096;
+  constexpr std::size_t kDst = 8192;
+  auto src = backend->AllocateBuffer(kSrc, MemoryKind::Device);
+  auto dst = backend->AllocateBuffer(kDst, MemoryKind::Device);
+  ASSERT_TRUE(src.has_value()) << tessera::ToString(src.error());
+  ASSERT_TRUE(dst.has_value()) << tessera::ToString(dst.error());
+  std::vector<std::byte> pattern(kSrc);
+  for (std::size_t i = 0; i < kSrc; ++i) {
+    pattern[i] = static_cast<std::byte>((i * 7 + 3) & 0xFF);
+  }
+  ASSERT_TRUE(backend->CopyH2D(**src, pattern).has_value());
+  const std::vector<std::byte> zero(kDst, std::byte{0});
+  ASSERT_TRUE(backend->CopyH2D(**dst, zero).has_value());
+  // Seven spans cross the five-slice chunking; the odd lengths exercise the
+  // byte tail, and the gaps between them prove only the spans are written.
+  std::vector<Backend::DeviceCopySpan> spans;
+  std::size_t dst_off = 0;
+  for (std::size_t i = 0; i < 7; ++i) {
+    const std::size_t len = 100 + i * 33;
+    spans.push_back(Backend::DeviceCopySpan{i * 200, dst_off, len});
+    dst_off += len + 5;
+  }
+  ASSERT_TRUE(backend->CopyD2DBatch(**src, **dst, spans).has_value());
+  std::vector<std::byte> out(kDst, std::byte{0});
+  ASSERT_TRUE(backend->CopyD2H(**dst, out.data(), out.size()).has_value());
+  for (const Backend::DeviceCopySpan& span : spans) {
+    for (std::size_t k = 0; k < span.bytes; ++k) {
+      EXPECT_EQ(out[span.dst_offset + k], pattern[span.src_offset + k])
+          << "dst " << span.dst_offset << " byte " << k;
+    }
+  }
+  // A span past the source end is rejected, and an empty batch is a no-op.
+  const std::vector<Backend::DeviceCopySpan> bad = {
+      Backend::DeviceCopySpan{kSrc - 8, 0, 16},
+  };
+  EXPECT_FALSE(backend->CopyD2DBatch(**src, **dst, bad).has_value());
+  EXPECT_TRUE(backend->CopyD2DBatch(**src, **dst, {}).has_value());
+}
+
+// Batched device-to-device scatter: several disjoint slices move between
+// two device buffers in one call, the gaps stay untouched, and an overrun
+// is rejected. This is the expert cache's cache-to-staging gather, so it
+// must match a per-slice CopyD2D exactly.
+TEST(BackendTest, BatchedScatterMatchesSingleCopies) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  constexpr std::size_t kSrc = 128;
+  constexpr std::size_t kDst = 160;
+  auto src = backend->AllocateBuffer(kSrc, MemoryKind::Device);
+  auto dst = backend->AllocateBuffer(kDst, MemoryKind::Device);
+  ASSERT_TRUE(src.has_value()) << tessera::ToString(src.error());
+  ASSERT_TRUE(dst.has_value()) << tessera::ToString(dst.error());
+  std::vector<std::byte> src_bytes(kSrc);
+  for (std::size_t i = 0; i < kSrc; ++i) {
+    src_bytes[i] = static_cast<std::byte>(i + 7);
+  }
+  ASSERT_TRUE(
+      backend->CopyH2D(**src, std::span<const std::byte>(src_bytes)).has_value());
+  const std::vector<std::byte> fill(kDst, std::byte{0x55});
+  ASSERT_TRUE(
+      backend->CopyH2D(**dst, std::span<const std::byte>(fill)).has_value());
+  // Three slices: two into disjoint destination offsets and one more, so
+  // the batched path spans more than one internal launch.
+  const std::vector<Backend::DeviceCopySpan> spans = {
+      {0, 0, 24},
+      {24, 48, 32},
+      {64, 104, 56},
+  };
+  auto copied = backend->CopyD2DBatch(**src, **dst, spans);
+  ASSERT_TRUE(copied.has_value()) << tessera::ToString(copied.error());
+  std::vector<std::byte> back(kDst, std::byte{0});
+  ASSERT_TRUE(backend->CopyD2H(**dst, back.data(), back.size()).has_value());
+  for (const Backend::DeviceCopySpan& span : spans) {
+    for (std::size_t i = 0; i < span.bytes; ++i) {
+      EXPECT_EQ(back[span.dst_offset + i], src_bytes[span.src_offset + i])
+          << "dst " << span.dst_offset + i;
+    }
+  }
+  // The gaps between the slices keep the prefill pattern.
+  for (std::size_t i = 24; i < 48; ++i) {
+    EXPECT_EQ(back[i], std::byte{0x55}) << "gap byte " << i;
+  }
+  // A slice past either buffer is rejected.
+  const std::vector<Backend::DeviceCopySpan> overrun = {
+      {120, 0, 16},
+  };
+  EXPECT_FALSE(backend->CopyD2DBatch(**src, **dst, overrun).has_value());
+  const std::vector<Backend::DeviceCopySpan> past_dst = {
+      {0, 152, 16},
+  };
+  EXPECT_FALSE(backend->CopyD2DBatch(**src, **dst, past_dst).has_value());
+}
+
 
 // Per backend tolerance for the fp GEMM kernels.
 struct FpTolerance {

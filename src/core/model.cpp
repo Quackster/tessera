@@ -1601,14 +1601,30 @@ std::expected<void, StatusCode> Model::EnsureLayerExperts(
   }
   // Ordered after the uploads on both backends (Vulkan records into the
   // pending compute buffer, ROCm onto the same stream), so the kernels
-  // that run next read the gathered bytes.
-  for (const Gather& gather : gathers) {
-    if (auto copied = backend_.CopyD2D(*gather.store, gather.src_offset,
-                                       *gather.stage, gather.dst_offset,
-                                       gather.bytes);
+  // that run next read the gathered bytes. Runs of gathers that share a
+  // (store, stage) pair go through one batched copy, so a layer's dozens of
+  // per-expert gathers cost a few launches.
+  std::size_t gather_begin = 0;
+  while (gather_begin < gathers.size()) {
+    std::size_t gather_end = gather_begin + 1;
+    while (gather_end < gathers.size() &&
+           gathers[gather_end].store == gathers[gather_begin].store &&
+           gathers[gather_end].stage == gathers[gather_begin].stage) {
+      ++gather_end;
+    }
+    std::vector<Backend::DeviceCopySpan> spans;
+    spans.reserve(gather_end - gather_begin);
+    for (std::size_t k = gather_begin; k < gather_end; ++k) {
+      spans.push_back(Backend::DeviceCopySpan{
+          gathers[k].src_offset, gathers[k].dst_offset, gathers[k].bytes});
+    }
+    if (auto copied = backend_.CopyD2DBatch(*gathers[gather_begin].store,
+                                            *gathers[gather_begin].stage,
+                                            spans);
         !copied) {
       return std::unexpected(copied.error());
     }
+    gather_begin = gather_end;
   }
   for (std::size_t k = 0; k < kinds.size(); ++k) {
     stage_views_[slots[k]].manifest = paged_[kinds[k].row].manifest;

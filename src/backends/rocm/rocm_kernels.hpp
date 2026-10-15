@@ -108,6 +108,13 @@ inline __device__ const float kE2M1Dev[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 __global__ void FillKernel(int* out, unsigned long long value,
                            unsigned long long count);
+__global__ void ScatterD2DKernel(
+    const unsigned char* src, unsigned char* dst, unsigned long long n,
+    unsigned long long s0, unsigned long long d0, unsigned long long l0,
+    unsigned long long s1, unsigned long long d1, unsigned long long l1,
+    unsigned long long s2, unsigned long long d2, unsigned long long l2,
+    unsigned long long s3, unsigned long long d3, unsigned long long l3,
+    unsigned long long s4, unsigned long long d4, unsigned long long l4);
 __global__ void RopeKernel(float* data, unsigned long long rows,
                            unsigned long long heads,
                            unsigned long long head_dim,

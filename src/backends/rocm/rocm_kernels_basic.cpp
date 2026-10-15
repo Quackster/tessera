@@ -18,6 +18,47 @@ __global__ void FillKernel(int* out, unsigned long long value,
   }
 }
 
+// Built-in "scatter_d2d": up to kScatterSlices device-to-device slices in
+// one launch. Buffers: src, dst. Scalars: n (<= kScatterSlices), then n
+// triples (src_offset, dst_offset, bytes). Copies 32-bit words, one block
+// per (slice, y) pair.
+constexpr unsigned kScatterSlices = 5;
+constexpr unsigned kScatterWordBytes = 4;
+
+__global__ void ScatterD2DKernel(
+    const unsigned char* src, unsigned char* dst, unsigned long long n,
+    unsigned long long s0, unsigned long long d0, unsigned long long l0,
+    unsigned long long s1, unsigned long long d1, unsigned long long l1,
+    unsigned long long s2, unsigned long long d2, unsigned long long l2,
+    unsigned long long s3, unsigned long long d3, unsigned long long l3,
+    unsigned long long s4, unsigned long long d4, unsigned long long l4) {
+  const unsigned long long off[kScatterSlices][3] = {
+      {s0, d0, l0}, {s1, d1, l1}, {s2, d2, l2}, {s3, d3, l3}, {s4, d4, l4}};
+  const unsigned long long op = blockIdx.x;
+  if (op >= n) {
+    return;
+  }
+  const unsigned long long s = off[op][0];
+  const unsigned long long d = off[op][1];
+  const unsigned long long len = off[op][2];
+  const unsigned long long words = len / kScatterWordBytes;
+  const unsigned long long tail = len % kScatterWordBytes;
+  const unsigned long long stride =
+      static_cast<unsigned long long>(gridDim.y) * blockDim.x;
+  for (unsigned long long w = static_cast<unsigned long long>(blockIdx.y) *
+                                   blockDim.x +
+                               threadIdx.x;
+       w < words; w += stride) {
+    unsigned int v = 0;
+    __builtin_memcpy(&v, src + s + w * kScatterWordBytes, kScatterWordBytes);
+    __builtin_memcpy(dst + d + w * kScatterWordBytes, &v, kScatterWordBytes);
+  }
+  if (blockIdx.y == 0u && threadIdx.x < tail) {
+    dst[d + words * kScatterWordBytes + threadIdx.x] =
+        src[s + words * kScatterWordBytes + threadIdx.x];
+  }
+}
+
 // Built-in "rope": NeoX-style rotary embedding over rows x heads x
 // head_dim fp32 in place (buffer 0); scalars are rows, heads,
 // head_dim, rope_dim, pos_base, theta fp32 bits. One thread per pair.

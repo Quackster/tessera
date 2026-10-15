@@ -940,6 +940,34 @@ class Backend {
       const Buffer& src, std::size_t src_offset, Buffer& dst,
       std::size_t dst_offset, std::size_t bytes) = 0;
 
+  // One copy in a batched device-to-device scatter: `bytes` move from
+  // `src_offset` in `src` to `dst_offset` in `dst`.
+  struct DeviceCopySpan {
+    std::size_t src_offset = 0;
+    std::size_t dst_offset = 0;
+    std::size_t bytes = 0;
+  };
+
+  // Copy many slices from `src` into `dst` with far fewer launches than
+  // one CopyD2D per slice. Every span must fit both buffers (otherwise
+  // InvalidArgument) and the regions must not overlap. Used by the expert
+  // cache, whose per-expert cache-to-staging gathers are dozens of small
+  // slices per layer. The default loops CopyD2D; ROCm overrides it with a
+  // single scatter kernel per few slices. Vulkan keeps the default: its
+  // CopyD2D records a vkCmdCopyBuffer into the pending command buffer, so
+  // the loop already costs one command buffer and no extra submit.
+  virtual std::expected<void, StatusCode> CopyD2DBatch(
+      const Buffer& src, Buffer& dst, std::span<const DeviceCopySpan> spans) {
+    for (const DeviceCopySpan& span : spans) {
+      auto result =
+          CopyD2D(src, span.src_offset, dst, span.dst_offset, span.bytes);
+      if (!result) {
+        return result;
+      }
+    }
+    return {};
+  }
+
   // Copy `bytes` from `src` (owned by another backend) into `dst` on this
   // backend. A direct peer transfer when the two devices can reach each
   // other; the default host-stages through CopyD2HAt and CopyH2DAt, which
