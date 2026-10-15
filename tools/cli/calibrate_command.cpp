@@ -15,6 +15,7 @@
 
 #include "calibrate_parallel.hpp"
 #include "cli_common.hpp"
+#include "tessera/budget.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/defaults.hpp"
 #include "tessera/engine.hpp"
@@ -320,8 +321,50 @@ int RunCalibrateCommand(int argc, char** argv) {
     draft_attached = true;
     dflash2_attached = !draft_path.empty();
   }
+  const std::string strategy_label =
+      dflash2_attached ? "dflash2" : (draft_attached ? "mtp" : "none");
 
-  auto model = engine.LoadModel(ModelOptions{model_path, context});
+  // Size the paging from the free device memory before the load: an MoE
+  // target can exceed VRAM, and a full upload then fails. The chosen value
+  // is stored in the entry so run and serve reuse it.
+  std::size_t gpu_layers = 0;
+  {
+    const auto memory = engine.Owner().MemoryInfo();
+    const std::uint64_t budget =
+        memory.free_bytes != 0 ? memory.free_bytes : memory.total_bytes;
+    auto advice = core::RecommendGpuLayers(model_path, context, kv_type, budget,
+                                           strategy_label);
+    if (!advice) {
+      log.Error("calibrate", std::string("cannot size --gpu-layers for '") +
+                                 model_path + "' (" +
+                                 std::string(ToString(advice.error())) + ")");
+      return kExitError;
+    }
+    if (!advice->has_best && budget != 0) {
+      log.Error("calibrate",
+                "no --gpu-layers value fits the " + std::to_string(budget) +
+                    " byte device budget; lower --context, quantize the KV "
+                    "cache, or use a smaller model");
+      return kExitError;
+    }
+    gpu_layers = advice->best;
+    if (!quiet) {
+      if (gpu_layers == 0) {
+        log.Info("calibrate", "paging: full upload fits (" +
+                                  std::to_string(advice->full_bytes) +
+                                  " resident bytes)");
+      } else {
+        log.Info("calibrate", "paging: --gpu-layers " +
+                                  std::to_string(gpu_layers) + " (resident " +
+                                  std::to_string(advice->best_bytes) +
+                                  " bytes of " + std::to_string(budget) +
+                                  " budget)");
+      }
+    }
+  }
+  ModelOptions model_options{model_path, context};
+  model_options.gpu_layers = gpu_layers;
+  auto model = engine.LoadModel(model_options);
   if (!model) {
     log.Error("calibrate", std::string("model load failed (") +
                                std::string(ToString(model.error())) + ")");
@@ -352,8 +395,6 @@ int RunCalibrateCommand(int argc, char** argv) {
     decode_ids.push_back(std::move(short_ids));
   }
   const std::string backend(engine.Owner().Name());
-  const std::string strategy_label =
-      dflash2_attached ? "dflash2" : (draft_attached ? "mtp" : "none");
 
   CalibrationConfig defaults;
   defaults.mxfp4_split_target = kDefaultMxFp4SplitTarget;
@@ -522,6 +563,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   entry.decode_tps = decode_tps;
   entry.prefill_tps = prefill_tps;
   entry.max_context = max_context;
+  entry.gpu_layers = gpu_layers;
   entry.date = TodayIso();
   // Keep the identity for the report: `entry` is moved into the file below.
   const std::string model_id = entry.key.model;
@@ -549,6 +591,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   report.strategy = strategy_label;
   report.key_context = context;
   report.max_context = max_context;
+  report.gpu_layers = gpu_layers;
   report.defaults = defaults;
   report.points = outcome->points;
   report.not_applicable = outcome->not_applicable;

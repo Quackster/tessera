@@ -130,6 +130,18 @@ class Model {
   [[nodiscard]] static std::expected<TransformerConfig, StatusCode> ProbeConfig(
       const std::string& path);
 
+  // The model's `general.name` metadata for a GGUF file, or an empty string
+  // for a directory (MXFP4) or a GGUF without the key. This is the identity
+  // the calibration key stores, so a caller can find a saved calibration
+  // entry before a full weight load. FileNotFound / MalformedFile on a bad
+  // path.
+  //
+  // Usage:
+  //   auto name = Model::ProbeName(path);
+  //   std::string id = name->empty() ? basename : *name;
+  [[nodiscard]] static std::expected<std::string, StatusCode> ProbeName(
+      const std::string& path);
+
   [[nodiscard]] ModelFormat Format() const;
   [[nodiscard]] std::span<const TensorEntry> Tensors() const;
   // Resident uploaded weights. Without `--gpu-layers` paging this is

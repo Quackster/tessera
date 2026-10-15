@@ -57,6 +57,14 @@ struct WeightBudget {
 [[nodiscard]] std::uint64_t ResidentWeightBytes(const WeightBudget& budget,
                                                 std::size_t gpu_layers);
 
+// Device bytes of the paging staging buffers for `gpu_layers`: one buffer
+// per paged tensor kind, sized to that kind's largest layer, as the loader
+// allocates them (see UploadWeights). Zero for a full upload (0) and for a
+// model with no paged tensors. A fit must count it: the staging runs the
+// resident set close to the device.
+[[nodiscard]] std::uint64_t StagingWeightBytes(const WeightBudget& budget,
+                                               std::size_t gpu_layers);
+
 // --gpu-layers sizing advice for one load.
 struct GpuLayersAdvice {
   std::size_t trunk_layers = 0;
@@ -66,6 +74,8 @@ struct GpuLayersAdvice {
   std::size_t linear_layers = 0;
   // Resident bytes at 0 (the full upload).
   std::uint64_t full_bytes = 0;
+  // Staging bytes at `best` (0 for the full upload).
+  std::uint64_t staging_bytes = 0;
   // Cache bytes at context, with one MTP layer when strategy is "mtp".
   std::uint64_t kv_bytes = 0;
   // Device budget in bytes: free memory when the backend reports it, else
@@ -97,6 +107,8 @@ struct GpuLayersFit {
   std::size_t total_layers = 0;
   // Resident weight bytes at the requested value.
   std::uint64_t resident_bytes = 0;
+  // Staging buffer bytes at the requested value (0 for the full upload).
+  std::uint64_t staging_bytes = 0;
   // Cache bytes at context, with one MTP layer when strategy is "mtp".
   std::uint64_t kv_bytes = 0;
   // Device budget in bytes (free memory or the device total).

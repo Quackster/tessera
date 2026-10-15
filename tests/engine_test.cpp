@@ -230,6 +230,26 @@ TEST(EngineTest, LoadGgufModelParsesManifest) {
   EXPECT_EQ(loaded->Path(), path.string());
 }
 
+// ProbeName reads the model identity without a load, so a caller can find a
+// saved calibration entry before the weights are uploaded. A directory
+// (MXFP4) and a GGUF without a name both probe as empty; a missing path is
+// FileNotFound.
+TEST(EngineTest, ProbeNameReadsGgufMetadata) {
+  auto path = WriteGgufFixture("probe.gguf");
+  auto name = tessera::Model::ProbeName(path.string());
+  ASSERT_TRUE(name.has_value()) << tessera::ToString(name.error());
+  EXPECT_EQ(*name, "test-model");
+
+  const auto dir = FreshTempDir("tessera_tests_probe");
+  auto empty = tessera::Model::ProbeName(dir.string());
+  ASSERT_TRUE(empty.has_value()) << tessera::ToString(empty.error());
+  EXPECT_TRUE(empty->empty());
+
+  auto missing = tessera::Model::ProbeName((dir / "nope.gguf").string());
+  ASSERT_FALSE(missing.has_value());
+  EXPECT_EQ(missing.error(), StatusCode::FileNotFound);
+}
+
 // The chat template sees the thinking options: thinking stays off by
 // default, enable_thinking opens it, and a reasoning effort reaches the
 // template as the reasoning_effort argument.
@@ -2072,8 +2092,7 @@ TEST(EngineTest, FullKvLayerBytesFollowsAppendKv) {
 }
 
 // Linear state is context independent; dense configs carry none.
-TEST(EngineTest, LinearStateLayerBytesNeedsHybrid) {
-  tessera::TransformerConfig dense;
+TEST(EngineTest, LinearStateLayerBytesNeedsHybrid) {  tessera::TransformerConfig dense;
   EXPECT_EQ(tessera::core::LinearStateLayerBytes(dense), 0u);
   tessera::TransformerConfig hybrid;
   hybrid.hybrid = true;
@@ -2085,6 +2104,23 @@ TEST(EngineTest, LinearStateLayerBytesNeedsHybrid) {
   // hist 8192 x 3 x 4 plus state 32 x 128 x 128 x 4.
   EXPECT_EQ(tessera::core::LinearStateLayerBytes(hybrid),
             8192u * 3u * 4u + 32u * 128u * 128u * 4u);
+}
+
+// The paging staging buffers: none for a full upload, and for a paged dense
+// model the sum of one buffer per paged tensor kind, which equals the paged
+// layer bytes (full minus resident).
+TEST(EngineTest, StagingWeightBytesCountsPagedKinds) {
+  using tessera::core::MeasureWeights;
+  using tessera::core::ResidentWeightBytes;
+  using tessera::core::StagingWeightBytes;
+  auto path = WriteTinyModelFixture("staging.gguf", 2);
+  auto budget = MeasureWeights(path.string(), true);
+  ASSERT_TRUE(budget.has_value()) << tessera::ToString(budget.error());
+  EXPECT_EQ(StagingWeightBytes(*budget, 0), 0u);
+  const std::uint64_t two = StagingWeightBytes(*budget, 2);
+  EXPECT_GT(two, 0u);
+  EXPECT_EQ(two, ResidentWeightBytes(*budget, 0) -
+                     ResidentWeightBytes(*budget, 2));
 }
 
 // The layer advisor on the 2-layer tiny fixture: total layers, full fit

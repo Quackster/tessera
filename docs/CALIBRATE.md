@@ -35,7 +35,7 @@ Useful flags:
 
 * `--model <path>`: model file or directory. Required.
 * `--gpu <n>`: device index. Default is 0.
-* `--context <n>`: context length stored in the key. Default is 4096.
+* `--context <n>`: context length stored in the key. Default is 32768.
 * `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`: KV cache type. Default is int8.
 * `--draft <dir>`: DFlash2 draft checkpoint. It enables the draft sweeps.
 * `--speculate`: MTP draft from the target head. It enables the draft block sweep.
@@ -58,6 +58,7 @@ What it tunes:
 How it measures:
 
 * It loads the model one time in one process.
+* It sizes `--gpu-layers` from the free device memory before the load. A model that fits stays a full upload. An MoE model larger than VRAM loads paged, so calibration works for it.
 * It uses greedy decode. Greedy output is the reference.
 * Decode settings use a short prompt and 32 decode tokens.
 * The prefill setting uses long prompts and measures prompt tokens per second.
@@ -70,9 +71,10 @@ What it stores:
 
 * One entry under key `backend | device | model | context | kv type | strategy | none`.
 * Strategy is `none`, `mtp`, or `dflash2`.
-* The entry holds the chosen settings, the median decode rate, the median prefill rate, the memory bound context, and the date.
+* The entry holds the chosen settings, the median decode rate, the median prefill rate, the memory bound context, the layer count, and the date.
 * The memory bound is informational. It equals free device memory minus a 2 GiB reserve, divided by KV bytes per token.
-* The report prints each point, the chosen values, and an example `run` command.
+* The layer count is the paging the sweep ran with. `run` and `serve` read it from the entry, so an explicit `--gpu-layers` is not needed. An explicit flag still wins.
+* The report prints each point, the chosen values, the layer count, and an example `run` command.
 
 ## Mode 2: parallel memory bound
 
@@ -128,6 +130,7 @@ Only `calibrate` writes the file. `run` and `serve` only read it. A missing file
 ## What calibration does not do
 
 * It does not tune speed for a parallel layout. The `--gpus` path stores memory only.
+* It does not size the layer count for a parallel layout. The `--gpus` path loads each rank in full.
 * It does not benchmark concurrent sessions. There is no sweep over 2, 3, or 4 sessions with tok/s per count.
 * It does not report max KV cache under concurrent load.
 * It does not store speed rates for parallel entries.
@@ -156,7 +159,7 @@ Progress lines go to stderr. The report goes to stdout. Redirect both, or the fi
 
 Read it top to bottom:
 
-* Identity rows name the backend, device, model, KV type, strategy, key context, and memory bound.
+* Identity rows name the backend, device, model, KV type, strategy, key context, memory bound, and layer count.
 * `Sweep` lists each tested value with its tok/s. `(default)` marks the built-in value. `(kept)` marks the winner.
 * `Chosen` lists the values the run keeps.
 * `Wrote` names the JSON file the entry went to.

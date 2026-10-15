@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -228,6 +229,38 @@ std::uint64_t ResidentWeightBytes(const WeightBudget& budget,
   return total;
 }
 
+std::uint64_t StagingWeightBytes(const WeightBudget& budget,
+                                 std::size_t gpu_layers) {
+  // A full upload stages nothing. Under paging the loader keeps one device
+  // buffer per paged tensor kind, sized to that kind's largest paged layer
+  // (see UploadWeights' stage_max), and reuses it for every paged layer.
+  if (gpu_layers == 0) {
+    return 0;
+  }
+  std::map<std::string, std::uint64_t> max_by_kind;
+  for (const auto& [name, bytes] : budget.tensors) {
+    if (GpuLayerResident(name, gpu_layers, budget.trunk_layers) ||
+        PagedMoeDenseResident(name, gpu_layers, budget.trunk_layers,
+                              budget.has_moe)) {
+      continue;
+    }
+    std::size_t layer = 0;
+    std::string_view kind;
+    if (!SplitBlockName(name, &layer, &kind) || layer >= budget.trunk_layers) {
+      continue;
+    }
+    auto [it, inserted] = max_by_kind.try_emplace(std::string(kind), bytes);
+    if (!inserted && it->second < bytes) {
+      it->second = bytes;
+    }
+  }
+  std::uint64_t total = 0;
+  for (const auto& entry : max_by_kind) {
+    total += entry.second;
+  }
+  return total;
+}
+
 // Cache bytes at context: one geometrically grown full-attention layer
 // each, the context-independent linear state each, plus one MTP layer
 // for the "mtp" strategy. Shared with RecommendGpuLayers so the help
@@ -253,14 +286,20 @@ std::uint64_t CacheBytes(const TransformerConfig& config,
   return kv_bytes;
 }
 
-// Overflow-safe fit: resident plus cache plus the headroom reserve stays
-// within the budget.
-bool FitsBudget(std::uint64_t resident, std::uint64_t kv_bytes,
-                std::uint64_t budget) {
+// Overflow-safe fit: resident weights plus the paging staging buffers plus
+// the cache plus the headroom reserve stays within the budget. The staging
+// term runs the resident set close to the device, so omitting it lets a
+// recommendation land on an out-of-memory load.
+bool FitsBudget(std::uint64_t resident, std::uint64_t staging,
+                std::uint64_t kv_bytes, std::uint64_t budget) {
   if (resident > budget) {
     return false;
   }
-  const std::uint64_t rest = budget - resident;
+  const std::uint64_t after_resident = budget - resident;
+  if (staging > after_resident) {
+    return false;
+  }
+  const std::uint64_t rest = after_resident - staging;
   return kv_bytes <= rest && kRecommendHeadroomBytes <= rest - kv_bytes;
 }
 
@@ -298,7 +337,7 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
   if (free_bytes == 0) {
     return advice;
   }
-  if (FitsBudget(advice.full_bytes, kv_bytes, free_bytes)) {
+  if (FitsBudget(advice.full_bytes, /*staging=*/0, kv_bytes, free_bytes)) {
     advice.has_best = true;
     advice.best = 0;
     advice.best_bytes = advice.full_bytes;
@@ -306,10 +345,12 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
   }
   for (std::size_t layers = budget->trunk_layers; layers > 0; --layers) {
     const std::uint64_t resident = ResidentWeightBytes(*budget, layers);
-    if (FitsBudget(resident, kv_bytes, free_bytes)) {
+    const std::uint64_t staging = StagingWeightBytes(*budget, layers);
+    if (FitsBudget(resident, staging, kv_bytes, free_bytes)) {
       advice.has_best = true;
       advice.best = layers;
       advice.best_bytes = resident;
+      advice.staging_bytes = staging;
       return advice;
     }
   }
@@ -332,10 +373,12 @@ std::expected<GpuLayersFit, StatusCode> FitGpuLayers(
   GpuLayersFit fit;
   fit.total_layers = budget->trunk_layers + 1;
   fit.resident_bytes = ResidentWeightBytes(*budget, gpu_layers);
+  fit.staging_bytes = StagingWeightBytes(*budget, gpu_layers);
   fit.kv_bytes =
       CacheBytes(*config, budget->trunk_layers, context, kv_type, strategy);
   fit.budget_bytes = budget_bytes;
-  fit.fits = FitsBudget(fit.resident_bytes, fit.kv_bytes, budget_bytes);
+  fit.fits = FitsBudget(fit.resident_bytes, fit.staging_bytes, fit.kv_bytes,
+                        budget_bytes);
   return fit;
 }
 

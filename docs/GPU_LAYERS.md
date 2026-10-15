@@ -27,6 +27,10 @@ resident too. Only the routed experts page per token. Every token uses
 the dense weights whole while touching top_k of num_experts. Dense
 models page whole early blocks and are unchanged. The fit check, the
 help sizing, and the load summary count the same resident set.
+The fit and the help also count the staging buffers, one per paged
+tensor kind, sized to that kind's largest layer. On Qwen3.8-Flash-Next
+IQ3_S the staging is about 1.1 GiB, large enough that omitting it
+recommends a layer count that out-of-memory fails at load.
 
 ## Status
 

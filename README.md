@@ -49,7 +49,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
 | MoE, MLP, norms | Done | Norms and MLP kernels done. Ornith-1.5 MoE decodes on both backends (84 tok/s ROCm, 88 Vulkan). |
-| Calibration | Done | Measures speed settings per machine and keeps the fastest. Covers split target and cap (ROCm), prefill chunk, attention split, and draft settings with a strategy attached. Reports and stores the memory-bound max context, and the example commands run at that context. `--calibrate-limit N` caps a run at N measurements. Writes JSON keyed by backend, device, model, context, KV type, strategy, and layout. |
+| Calibration | Done | Measures speed settings per machine and keeps the fastest. Covers split target and cap (ROCm), prefill chunk, attention split, and draft settings with a strategy attached. Reports and stores the memory-bound max context, and the example commands run at that context. Sizes and stores the layer count from free device memory, so an MoE model larger than VRAM loads paged, and `run` and `serve` apply it. `--calibrate-limit N` caps a run at N measurements. Writes JSON keyed by backend, device, model, context, KV type, strategy, and layout. |
 
 See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
 
@@ -161,6 +161,12 @@ completion. It writes a JSON file and prints a report with the sweep
 points, the chosen settings, and an example `run` command. The example
 commands run at the memory-bound max context.
 
+Before the load it sizes `--gpu-layers` from the free device memory. A
+model that fits stays a full upload. An MoE model larger than VRAM
+loads paged, so calibration works for it. The chosen layer count is
+stored in the entry and applied by `run` and `serve`, unless an
+explicit `--gpu-layers` overrides it.
+
 ```sh
 # Sweep on ROCm with the DFlash2 draft and write the result.
 ./cmake-build-rocm/tessera-cli calibrate \
@@ -179,7 +185,7 @@ The `calibrate` flags:
 * `--calibration <file>` file to read and write. The environment variable
   `TESSERA_CALIBRATION` supplies it when the flag is absent. One of the two is
   required.
-* `--context <n>` context length in the hardware key. Default 4096.
+* `--context <n>` context length in the hardware key. Default 32768.
 * `--gpu <n>` device index. Default 0, the first device.
 * `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8` KV cache type. Default int8
   (kv8).
@@ -275,9 +281,9 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | --- | --- | --- | --- |
 | `--model <path>` | both | required | A `.gguf` file or an MXFP4 model directory. |
 | `--draft <dir>` | both | none | DFlash2 draft checkpoint directory. |
-| `--context <n>` | both | 4096 | Maximum context length. |
+| `--context <n>` | both | 32768 | Maximum context length. |
 | `--gpu <n>` | both | 0 | GPU index to use (0 is the first). |
-| `--gpu-layers <n\|all>` | both | 0 | Layers kept in VRAM. The rest page from system RAM. 0 uploads everything. `help` prints counts without loading. |
+| `--gpu-layers <n\|all>` | both | 0 | Layers kept in VRAM. The rest page from system RAM. 0 uploads everything. `help` prints counts without loading. With `--calibration`, `run` and `serve` take a saved layer count unless this flag overrides it. |
 | `--draft-block <n>` | both | 0 | Draft block tokens. 0 uses the checkpoint block. |
 | `--prefill-chunk <n>` | both | 0 | Prefill tokens per forward. 0 selects 512. |
 | `--split-target <n>` | both | 0 | fp8 MXFP4 split-K target (ROCm only). 0 uses 320. |
@@ -313,7 +319,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--no-auto-title` | serve | off | Keep the first user line as the chat title instead of asking the model. |
 | `--api-key <k>` | serve | none | Accepted API key. Repeatable. |
 | `--allow-origin <o>` | serve | none | CORS origin. Repeatable. `*` allows all origins. |
-| `--calibration <file>` | run, serve, calibrate | env `TESSERA_CALIBRATION` | Calibration file. `run` and `serve` apply a saved entry for the current machine and model unless an explicit flag overrides it. `calibrate` reads and writes it. |
+| `--calibration <file>` | run, serve, calibrate | env `TESSERA_CALIBRATION` | Calibration file. `run` and `serve` apply a saved entry for the current machine and model unless an explicit flag overrides it. The entry's layer count applies too. `calibrate` reads and writes it. |
 | `--prompts <file>` | calibrate | three fixed prompts | Fixed prompts, one per non-empty line, for the calibration sweep. |
 | `--calibrate-limit <n>` | calibrate | none | Measure at most n sweep points in total. |
 | **Parallelism** | | | The flags below spread work across the `--gpus` devices. |

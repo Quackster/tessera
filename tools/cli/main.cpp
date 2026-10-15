@@ -397,6 +397,22 @@ int main(int argc, char** argv) {
           return std::unexpected(created.error());
         }
         std::unique_ptr<tessera::Engine> engine_ptr = std::move(*created);
+        // Apply a calibrated paging value before the load: an MoE target
+        // larger than VRAM only loads paged, and paging is a load-time
+        // setting. An explicit --gpu-layers always wins.
+        const std::string strategy =
+            draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
+        if (!calibration_path.empty()) {
+          const std::size_t explicit_gpu_layers = gpu_layers;
+          gpu_layers = tessera::cli::ResolveCalibrationGpuLayers(
+              *engine_ptr, model_path, context, kv_type, strategy,
+              calibration_path, gpu_layers);
+          if (gpu_layers != explicit_gpu_layers) {
+            engine_ptr->Diagnostics().Info(
+                "cli", "calibration: --gpu-layers " +
+                           std::to_string(gpu_layers));
+          }
+        }
         // Refuse a device that cannot hold the weights before the load
         // starts, so a two-device serve does not half-load. Under paging
         // the file size is not the resident size, so the resident set
@@ -417,8 +433,6 @@ int main(int argc, char** argv) {
           return std::unexpected(tessera::StatusCode::OutOfMemory);
         }
         if (gpu_layers != 0) {
-          const std::string strategy =
-              draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
           if (!tessera::cli::CheckGpuLayersFit(*engine_ptr, model_path,
                                                context, kv_type, strategy,
                                                gpu_layers, device)) {
@@ -442,8 +456,6 @@ int main(int argc, char** argv) {
         if (!calibration_path.empty() && i == 0) {
           // The calibration key depends on the model; resolve it on the
           // first device. Homogeneous devices share the settings.
-          const std::string strategy =
-              draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
           tessera::CalibrationConfig explicit_config;
           explicit_config.prefill_chunk_tokens = prefill_chunk;
           explicit_config.draft_tokens = draft_block;
@@ -808,13 +820,26 @@ int main(int argc, char** argv) {
   }
   attach_strategy(engine);
 
+  // Apply a calibrated paging value before the load: an MoE target larger
+  // than VRAM only loads paged, and paging is a load-time setting. An
+  // explicit --gpu-layers always wins.
+  const std::string strategy =
+      draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
+  if (!calibration_path.empty()) {
+    const std::size_t explicit_gpu_layers = gpu_layers;
+    gpu_layers = tessera::cli::ResolveCalibrationGpuLayers(
+        engine, model_path, context, kv_type, strategy, calibration_path,
+        gpu_layers);
+    if (gpu_layers != explicit_gpu_layers) {
+      log.Info("cli", "calibration: --gpu-layers " +
+                          std::to_string(gpu_layers));
+    }
+  }
   if (gpu_layers != 0) {
     // Refuse a paged load whose resident set plus KV cache cannot fit,
     // before the weights start moving.
-    const std::string strategy =
-        draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
-    if (!tessera::cli::CheckGpuLayersFit(engine, model_path, context,
-                                         kv_type, strategy, gpu_layers,
+    if (!tessera::cli::CheckGpuLayersFit(engine, model_path, context, kv_type,
+                                         strategy, gpu_layers,
                                          device_indices.front())) {
       return kExitError;
     }
@@ -849,8 +874,6 @@ int main(int argc, char** argv) {
   applied.attention_split = attention_split;
   applied.draft_context = draft_context;
   if (!calibration_path.empty()) {
-    const std::string strategy =
-        draft_path.empty() ? (speculate ? "mtp" : "none") : "dflash2";
     applied = ResolveCalibration(engine, loaded, context, kv_type, strategy,
                                  calibration_path, applied);
   }

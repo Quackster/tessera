@@ -186,6 +186,11 @@ struct CalibrationEntry {
   // key's KV type when the entry was written. Informational; 0 when the
   // entry predates the field.
   std::size_t max_context = 0;
+  // Layers kept in VRAM when the entry was measured (llama.cpp -ngl order).
+  // 0 means the full upload; a nonzero value pages the early trunk blocks.
+  // An MoE target larger than VRAM needs a nonzero value to load at all, so
+  // run and serve apply it. 0 when the entry predates the field.
+  std::size_t gpu_layers = 0;
   std::string date;
 };
 
@@ -229,6 +234,13 @@ class CalibrationFile {
 [[nodiscard]] CalibrationConfig ApplySavedCalibration(
     const CalibrationConfig& explicit_config, const CalibrationEntry& saved);
 
+// The paging to load with. An explicit nonzero value always wins; a zero
+// explicit value takes the saved entry's `gpu_layers`. A zero result means
+// the full upload, so an explicit 0 cannot force it over a saved nonzero
+// value (pass the flag only when it is set).
+[[nodiscard]] std::size_t ApplySavedGpuLayers(std::size_t explicit_layers,
+                                              const CalibrationEntry& saved);
+
 // Copy a calibration configuration onto a request's tuning fields
 // (prefill chunk, draft block, split target). A zero field leaves the
 // request's value unchanged, so an explicit request value always wins.
@@ -250,6 +262,8 @@ struct CalibrationReport {
   std::string parallel_flags;
   std::size_t key_context = 0;
   std::size_t max_context = 0;  // memory-bound context for the KV type
+  // Layers kept in VRAM for the example commands; 0 is the full upload.
+  std::size_t gpu_layers = 0;
   CalibrationConfig defaults;
   std::vector<SweepPoint> points;
   std::vector<Setting> not_applicable;

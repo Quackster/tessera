@@ -58,6 +58,17 @@ std::optional<double> AsDouble(const core::GgufValue& value) {
   return std::nullopt;
 }
 
+// The `general.name` metadata as text, or empty when absent or not text.
+// One canonical extraction for Model::Load and Model::ProbeName.
+std::string GgufName(const core::GgufFile& gguf) {
+  const auto* value = gguf.Find("general.name");
+  if (value == nullptr) {
+    return {};
+  }
+  const auto* name = std::get_if<std::string>(value);
+  return name != nullptr ? *name : std::string{};
+}
+
 // Attention parameters from GGUF metadata; nullopt without keys.
 // Explicit key/value lengths set head dim (hybrid); else embed/heads.
 std::expected<std::optional<AttentionParams>, StatusCode>
@@ -944,12 +955,7 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
       return std::unexpected(gguf.error());
     }
     gguf_timer.Stop(std::to_string(gguf->tensors.size()) + " tensors");
-    std::string name;
-    if (const auto* value = gguf->Find("general.name"); value != nullptr) {
-      if (const auto* name_str = std::get_if<std::string>(value)) {
-        name = *name_str;
-      }
-    }
+    std::string name = GgufName(*gguf);
     std::string architecture;
     if (const auto* value = gguf->Find("general.architecture");
         value != nullptr) {
@@ -1233,6 +1239,32 @@ std::expected<TransformerConfig, StatusCode> Model::ProbeConfig(
     return module->ParseConfigJson(text);
   }
   return std::unexpected(StatusCode::InvalidArgument);
+}
+
+std::expected<std::string, StatusCode> Model::ProbeName(
+    const std::string& path) {
+  if (path.empty()) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  std::error_code ec;
+  const std::filesystem::path file_path(path);
+  if (!std::filesystem::exists(file_path, ec) || ec) {
+    return std::unexpected(StatusCode::FileNotFound);
+  }
+  // A directory (MXFP4) carries no GGUF name; Model::Load leaves the name
+  // empty there, so the caller keys on the path basename.
+  if (!std::filesystem::is_regular_file(file_path, ec) || ec) {
+    return std::string{};
+  }
+  auto mapped = core::MappedFile::Open(file_path);
+  if (!mapped) {
+    return std::unexpected(mapped.error());
+  }
+  auto gguf = core::ParseGguf(mapped->bytes());
+  if (!gguf) {
+    return std::unexpected(gguf.error());
+  }
+  return GgufName(*gguf);
 }
 
 ModelFormat Model::Format() const {

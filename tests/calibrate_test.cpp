@@ -109,6 +109,7 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   CalibrationFile file;
   CalibrationEntry entry = MakeEntry(key, config, 61.5, 1234.0);
   entry.max_context = 197632;
+  entry.gpu_layers = 25;
   file.Set(std::move(entry));
 
   ASSERT_TRUE(file.Save(path).has_value());
@@ -122,6 +123,7 @@ TEST(CalibrateTest, CalibrationFileRoundTrips) {
   EXPECT_DOUBLE_EQ(found->decode_tps, 61.5);
   EXPECT_DOUBLE_EQ(found->prefill_tps, 1234.0);
   EXPECT_EQ(found->max_context, 197632u);
+  EXPECT_EQ(found->gpu_layers, 25u);
   EXPECT_EQ(found->date, "2026-10-10");
 
   // An unknown key has no entry.
@@ -176,6 +178,19 @@ TEST(CalibrateTest, FileWithoutMaxContextStillLoads) {
   ASSERT_TRUE(loaded.has_value()) << tessera::ToString(loaded.error());
   ASSERT_EQ(loaded->Entries().size(), 1u);
   EXPECT_EQ(loaded->Entries()[0].max_context, 0u);
+  EXPECT_EQ(loaded->Entries()[0].gpu_layers, 0u);
+}
+
+// The paging merge: an explicit nonzero value wins, otherwise the saved
+// entry supplies it. Zero means the full upload and falls through.
+TEST(CalibrateTest, ApplySavedGpuLayersPrefersExplicit) {
+  CalibrationEntry saved;
+  saved.gpu_layers = 25;
+  EXPECT_EQ(tessera::ApplySavedGpuLayers(0, saved), 25u);
+  EXPECT_EQ(tessera::ApplySavedGpuLayers(8, saved), 8u);
+  saved.gpu_layers = 0;
+  EXPECT_EQ(tessera::ApplySavedGpuLayers(0, saved), 0u);
+  EXPECT_EQ(tessera::ApplySavedGpuLayers(4, saved), 4u);
 }
 
 // The report prints the memory-bound max context and its example commands
@@ -193,6 +208,7 @@ TEST(CalibrateTest, ReportNamesMaxContextAndKeyContext) {
   report.strategy = "dflash2";
   report.key_context = 4096;
   report.max_context = 197632;
+  report.gpu_layers = 25;
   report.file = "/tmp/calibration.json";
   report.split_applicable = true;
   report.attention_applicable = true;
@@ -208,6 +224,7 @@ TEST(CalibrateTest, ReportNamesMaxContextAndKeyContext) {
             std::string::npos);
   EXPECT_NE(text.find("--context 197632"), std::string::npos);
   EXPECT_EQ(text.find("--context 4096"), std::string::npos);
+  EXPECT_NE(text.find("--gpu-layers 25"), std::string::npos);
   EXPECT_NE(text.find("--draft /models/Qwen3.8-27B-DFlash2-FP8"),
             std::string::npos);
   EXPECT_NE(text.find("--split-target 320"), std::string::npos);

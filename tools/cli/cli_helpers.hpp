@@ -52,6 +52,18 @@ void PrintUsage();
     std::string_view strategy, const std::string& path,
     const CalibrationConfig& explicit_config);
 
+// Resolve `--gpu-layers` for a model before it is loaded. An explicit
+// nonzero value always wins; otherwise the calibration file's stored value
+// for the model's key applies. This runs before Model::Load because paging
+// is a load-time setting, so the model identity comes from its metadata
+// (Model::ProbeName), not a load. A missing file or key, an unreadable
+// path, or an empty `path` leaves the explicit value. An MoE target larger
+// than VRAM needs the nonzero result to load at all.
+[[nodiscard]] std::size_t ResolveCalibrationGpuLayers(
+    Engine& engine, const std::string& model_path, std::size_t context,
+    KvCacheType kv_type, std::string_view strategy, const std::string& path,
+    std::size_t explicit_layers);
+
 // Print the `--gpu-layers help` sizing advice for a model path without
 // loading it: the offloadable layer count, the KV cache cost at
 // `context`, and the largest fitting layer count on this engine's

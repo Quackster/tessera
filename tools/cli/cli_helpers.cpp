@@ -30,6 +30,17 @@ namespace {
 // How many tensor names to print when summarizing a model.
 constexpr std::size_t kPrintedTensorNames = 5;
 
+// The hardware key for a loaded or probed model: the runtime backend and
+// device, the model identity, the context, the KV type and the strategy.
+// One canonical build for the speed-knob lookup and the pre-load paging
+// lookup, so both resolve the same entry.
+HardwareKey KeyFor(Engine& engine, std::string_view model_id,
+                   std::size_t context, KvCacheType kv_type,
+                   std::string_view strategy) {
+  return MakeHardwareKey(engine.Owner().Name(), engine.Owner().DeviceName(),
+                         model_id, context, ToString(kv_type), strategy);
+}
+
 // The sampler a model's card recommends, keyed by general.architecture and
 // the thinking mode. nullopt when the architecture has no recommendation,
 // so greedy stays the default. A thinking model loops under greedy decode,
@@ -223,9 +234,7 @@ CalibrationConfig ResolveCalibration(Engine& engine, Model& model,
   if (model_id.empty()) {
     model_id = std::filesystem::path(model.Path()).filename().string();
   }
-  const HardwareKey key =
-      MakeHardwareKey(engine.Owner().Name(), engine.Owner().DeviceName(),
-                      model_id, context, ToString(kv_type), strategy);
+  const HardwareKey key = KeyFor(engine, model_id, context, kv_type, strategy);
   auto file = CalibrationFile::Load(path);
   if (!file) {
     if (file.error() != StatusCode::FileNotFound) {
@@ -249,6 +258,37 @@ CalibrationConfig ResolveCalibration(Engine& engine, Model& model,
                       std::to_string(merged.prefill_chunk_tokens) +
                       " draft_tokens=" + std::to_string(merged.draft_tokens));
   return merged;
+}
+
+std::size_t ResolveCalibrationGpuLayers(Engine& engine,
+                                        const std::string& model_path,
+                                        std::size_t context,
+                                        KvCacheType kv_type,
+                                        std::string_view strategy,
+                                        const std::string& path,
+                                        std::size_t explicit_layers) {
+  if (path.empty()) {
+    return explicit_layers;
+  }
+  auto name = Model::ProbeName(model_path);
+  if (!name) {
+    // The upcoming load reports the real error; paging stays explicit.
+    return explicit_layers;
+  }
+  std::string model_id = *name;
+  if (model_id.empty()) {
+    model_id = std::filesystem::path(model_path).filename().string();
+  }
+  const HardwareKey key = KeyFor(engine, model_id, context, kv_type, strategy);
+  auto file = CalibrationFile::Load(path);
+  if (!file) {
+    return explicit_layers;
+  }
+  const CalibrationEntry* entry = file->Find(key);
+  if (entry == nullptr) {
+    return explicit_layers;
+  }
+  return ApplySavedGpuLayers(explicit_layers, *entry);
 }
 
 namespace {
@@ -314,7 +354,9 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
     log.Info("cli", "best --gpu-layers " + std::to_string(advice->best) +
                         ": resident " +
                         std::to_string(ToMiB(advice->best_bytes)) +
-                        " MiB of " + budget_label);
+                        " MiB plus " +
+                        std::to_string(ToMiB(advice->staging_bytes)) +
+                        " MiB staging of " + budget_label);
   }
   return 0;
 }
@@ -353,6 +395,7 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
            "gpu " + std::to_string(device) + " cannot hold --gpu-layers " +
                std::to_string(gpu_layers) + ": resident about " +
                std::to_string(ToMiB(fit->resident_bytes)) + " MiB plus " +
+               std::to_string(ToMiB(fit->staging_bytes)) + " MiB staging plus " +
                std::to_string(ToMiB(fit->kv_bytes)) + " MiB KV cache exceeds " +
                budget_label + "; lower --gpu-layers (try --gpu-layers help), "
                               "lower --context, or quantize the KV cache");

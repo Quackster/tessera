@@ -254,6 +254,7 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
   double draft = 0.0;
   double draft_context = 0.0;
   double max_context = 0.0;
+  double gpu_layers = 0.0;
   if (!ReadString(item, "backend", entry.key.backend) ||
       !ReadString(item, "device", entry.key.device) ||
       !ReadString(item, "model", entry.key.model) ||
@@ -268,6 +269,7 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
       !ReadNumber(item, "draft_tokens", draft) ||
       !ReadOptionalNumber(item, "draft_context", draft_context) ||
       !ReadOptionalNumber(item, "max_context", max_context) ||
+      !ReadOptionalNumber(item, "gpu_layers", gpu_layers) ||
       !ReadNumber(item, "decode_tps", entry.decode_tps) ||
       !ReadNumber(item, "prefill_tps", entry.prefill_tps) ||
       !ReadString(item, "date", entry.date)) {
@@ -275,7 +277,7 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
   }
   if (context < 0.0 || split < 0.0 || cap < 0.0 || prefill < 0.0 ||
       attention < 0.0 || draft < 0.0 || draft_context < 0.0 ||
-      max_context < 0.0) {
+      max_context < 0.0 || gpu_layers < 0.0) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   entry.key.context = static_cast<std::size_t>(context);
@@ -286,6 +288,7 @@ std::expected<CalibrationEntry, StatusCode> ParseEntry(const core::Json& item) {
   entry.config.draft_tokens = static_cast<std::size_t>(draft);
   entry.config.draft_context = static_cast<std::size_t>(draft_context);
   entry.max_context = static_cast<std::size_t>(max_context);
+  entry.gpu_layers = static_cast<std::size_t>(gpu_layers);
   return entry;
 }
 
@@ -536,6 +539,8 @@ std::expected<void, StatusCode> CalibrationFile::Save(
                             static_cast<double>(entry.key.context)));
     item.Set("max_context",
              core::Json::Number(static_cast<double>(entry.max_context)));
+    item.Set("gpu_layers",
+             core::Json::Number(static_cast<double>(entry.gpu_layers)));
     item.Set("kv_type", core::Json::String(entry.key.kv_type));
     item.Set("strategy", core::Json::String(entry.key.strategy));
     item.Set("parallel", core::Json::String(entry.key.parallel));
@@ -631,6 +636,11 @@ CalibrationConfig ApplySavedCalibration(
   return merged;
 }
 
+std::size_t ApplySavedGpuLayers(std::size_t explicit_layers,
+                                const CalibrationEntry& saved) {
+  return explicit_layers != 0 ? explicit_layers : saved.gpu_layers;
+}
+
 void ApplyToGenerateOptions(const CalibrationConfig& config,
                             GenerateOptions& options) {
   if (config.mxfp4_split_target != 0) {
@@ -667,6 +677,10 @@ ExampleCommands BuildExampleCommands(const CalibrationReport& report) {
       "tessera-cli run --model " + report.model_path + draft_flag + " " +
       report.kv_flag + report.parallel_flags + "\\\n      --context " +
       std::to_string(report.max_context);
+  if (report.gpu_layers != 0) {
+    commands.explicit_flags +=
+        " --gpu-layers " + std::to_string(report.gpu_layers);
+  }
   commands.explicit_flags += " --prefill-chunk " +
                              std::to_string(report.chosen.prefill_chunk_tokens);
   if (report.split_applicable) {
@@ -743,6 +757,10 @@ std::string FormatCalibrationReport(const CalibrationReport& report) {
   out += row("key context", std::to_string(report.key_context), 14);
   out += row("max context", std::to_string(report.max_context) + " token(s), " +
                                 report.kv_type + " memory bound",
+             14);
+  out += row("gpu layers",
+             report.gpu_layers == 0 ? std::string("all (full upload)")
+                                    : std::to_string(report.gpu_layers),
              14);
   out += "\nSweep\n-----\n";
   for (Setting setting :
