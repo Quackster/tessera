@@ -222,6 +222,13 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   // its partial is all-reduced across the ranks. Mirrors the single-token
   // RunFullBlock.
   const bool tp = h.tp != nullptr && h.tp->enabled;
+  // Context-parallel attention: each rank owns the key chunk [k0, k1) and
+  // runs its partial per query row; rank 0 combines. Mirrors the single-token
+  // RunFullBlock.
+  const bool cp = h.cp != nullptr && h.cp->enabled;
+  if (tp && cp) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
   const std::size_t world = tp ? static_cast<std::size_t>(h.tp->world) : 1;
   const std::size_t heads = cfg.attention.heads / world;
   const std::size_t kv_heads = cfg.attention.kv_heads / world;
@@ -271,6 +278,10 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   // round-trip); the cast/quant paths still copy the row first.
   const bool kv_f32 = kv.type == KvCacheType::F32;
   for (std::size_t t = 0; t < rows; ++t) {
+    // A rank under context parallelism keeps only the rows in its key chunk.
+    if (cp && (pos + t < h.cp->k0 || pos + t >= h.cp->k1)) {
+      continue;
+    }
     const Buffer* ksrc = b.kf.get();
     const Buffer* vsrc = b.vf.get();
     std::size_t row_offset = 0;
@@ -296,17 +307,47 @@ std::expected<void, StatusCode> RunFullBlockBatch(
   const bool quantized = kv.type == KvCacheType::Q8 ||
                          kv.type == KvCacheType::Q4 ||
                          kv.type == KvCacheType::FP8;
-  const bool attention_ok =
-      quantized
-          ? detail::AttentionQuantDevice(backend, *h.attention_kernel, *b.q,
-                                         *kv.k, *kv.v, *kv.k_scale,
-                                         *kv.v_scale, *b.attn, kv.rows, heads,
-                                         kv_heads, head_dim, pos, 0, rows)
-                .has_value()
-          : AttentionDevice(backend, *h.attention_kernel, *b.q, *kv.k, *kv.v,
-                            *b.attn, kv.rows, heads, kv_heads, head_dim, pos,
-                            0, rows, kv.type == KvCacheType::F16)
-                .has_value();
+  bool attention_ok = false;
+  if (cp) {
+    // One row at a time through the context-parallel split/combine: each
+    // rank stages its chunk partial and rank 0 gathers and combines. The
+    // rows run in the same order on every rank, so the barriers align.
+    auto ready = EnsureSplitReady(backend, cfg, h, kv.type);
+    if (!ready) {
+      return std::unexpected(ready.error());
+    }
+    attention_ok = true;
+    for (std::size_t t = 0; t < rows; ++t) {
+      if (!backend.CopyD2D(*b.q, t * heads * head_dim * 4, *h.q, 0,
+                           heads * head_dim * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      auto cp_ok = detail::CpAttentionDevice(
+          backend, *h.attention_split_kernel, *h.attention_combine_kernel,
+          *h.q, kv, *h.attn, *h.split_acc, *h.split_max, *h.split_sum, heads,
+          kv_heads, head_dim, pos + t, *h.cp, quantized,
+          kv.type == KvCacheType::F16);
+      if (!cp_ok) {
+        return std::unexpected(cp_ok.error());
+      }
+      if (!backend.CopyD2D(*h.attn, 0, *b.attn, t * heads * head_dim * 4,
+                           heads * head_dim * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+  } else {
+    attention_ok =
+        quantized
+            ? detail::AttentionQuantDevice(backend, *h.attention_kernel, *b.q,
+                                           *kv.k, *kv.v, *kv.k_scale,
+                                           *kv.v_scale, *b.attn, kv.rows, heads,
+                                           kv_heads, head_dim, pos, 0, rows)
+                  .has_value()
+            : AttentionDevice(backend, *h.attention_kernel, *b.q, *kv.k, *kv.v,
+                              *b.attn, kv.rows, heads, kv_heads, head_dim, pos,
+                              0, rows, kv.type == KvCacheType::F16)
+                  .has_value();
+  }
   Buffer& out_partial = tp ? *h.tp->ffn_partial[static_cast<std::size_t>(h.tp->rank)]
                            : *b.proj;
   if (!attention_ok ||
