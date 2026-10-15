@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "tessera/defaults.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
@@ -29,7 +30,7 @@ struct HybridOptions {
   std::vector<int> devices;  // dp_groups * mp_ranks, group-major
   std::size_t dp_groups = 1;
   HybridMpKind mp_kind = HybridMpKind::Tensor;
-  std::size_t context = 32768;
+  std::size_t context = kDefaultContext;
   KvCacheType kv_type = KvCacheType::F32;
 };
 

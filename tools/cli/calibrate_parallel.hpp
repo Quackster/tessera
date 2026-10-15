@@ -6,6 +6,7 @@
 #include <string>
 
 #include "tessera/calibrate.hpp"
+#include "tessera/defaults.hpp"
 #include "tessera/log.hpp"
 #include "tessera/types.hpp"
 
@@ -41,7 +42,7 @@ struct ParallelCalibrateOptions {
   bool tp = false;
   bool cp = false;
   bool pipeline = false;
-  std::size_t context = 32768;
+  std::size_t context = kDefaultContext;
   KvCacheType kv_type = KvCacheType::Q8;
   std::string calibration_file;
   bool quiet = false;

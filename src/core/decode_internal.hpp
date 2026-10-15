@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "tessera/backend.hpp"
+#include "tessera/defaults.hpp"
 #include "tessera/model.hpp"
 #include "tessera/types.hpp"
 

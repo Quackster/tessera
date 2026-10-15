@@ -6,15 +6,13 @@
 #include <memory>
 #include <mutex>
 
+#include "tessera/defaults.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
 
 class Model;
-
-// Bound on admitted jobs when SchedulerOptions leaves it zero.
-constexpr std::size_t kDefaultMaxConcurrent = 4;
 
 // Options for one shared device slot (see Scheduler).
 struct SchedulerOptions {

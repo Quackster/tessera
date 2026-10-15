@@ -16,6 +16,7 @@
 #include "calibrate_parallel.hpp"
 #include "cli_common.hpp"
 #include "tessera/calibrate.hpp"
+#include "tessera/defaults.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
 #include "tessera/speculative.hpp"

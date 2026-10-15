@@ -17,6 +17,7 @@
 #include "cli_helpers.hpp"
 #include "fetch_mtp_command.hpp"
 #include "tessera/calibrate.hpp"
+#include "tessera/defaults.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/image.hpp"
 #include "tessera/pipeline.hpp"
@@ -31,9 +32,9 @@
 
 namespace {
 
-using tessera::cli::kDefaultContext;
-using tessera::cli::kDefaultDraftBlock;
-using tessera::cli::kDefaultPrefillChunk;
+using tessera::kDefaultContext;
+using tessera::kDefaultDraftBlock;
+using tessera::kDefaultPrefillChunk;
 using tessera::cli::ApplyDiagnosticFlag;
 using tessera::cli::LogModelSummary;
 using tessera::cli::MatchKvType;
@@ -145,7 +146,7 @@ int main(int argc, char** argv) {
   bool sampling_explicit = false;
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   std::uint64_t seed = 0;
-  std::uint16_t port = 8080;
+  std::uint16_t port = tessera::kDefaultServePort;
   std::size_t stats_interval_seconds = tessera::kDefaultStatsIntervalSeconds;
   std::size_t max_completion_tokens = 0;
   std::size_t max_thinking_tokens = 0;
