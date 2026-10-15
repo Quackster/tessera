@@ -129,13 +129,23 @@ __global__ void GrDownKernel(const float* xq, const unsigned short* w_down,
   }
 }
 
+// Upper bound on the hyper-connection bottleneck the gr_gate shared cache
+// holds; the model's low rank (320) is well under it.
+constexpr unsigned kGrGateMaxLr = 512;
+
 // Built-in "gr_gate": gated = xn * sigmoid(lq @ w_up.T). One warp per
 // output element, so a warp reads the weight row coalesced (lane k, k+32,
-// ...) instead of one strided read per thread.
+// ...) instead of one strided read per thread. The bottleneck is cached in
+// shared memory once per block, so the block's warps do not each re-read it.
 __global__ void GrGateKernel(const float* lq, const unsigned short* w_up,
                              const float* xn, float* gated,
                              unsigned long long hc_dim,
                              unsigned long long hc_lr) {
+  __shared__ float s_lq[kGrGateMaxLr];
+  for (unsigned long long k = threadIdx.x; k < hc_lr; k += blockDim.x) {
+    s_lq[k] = lq[k];
+  }
+  __syncthreads();
   const int lane = threadIdx.x & 31;
   const unsigned long long i =
       static_cast<unsigned long long>(blockIdx.x) * (blockDim.x >> 5) +
@@ -146,7 +156,7 @@ __global__ void GrGateKernel(const float* lq, const unsigned short* w_up,
   const unsigned short* row = w_up + i * hc_lr;
   float acc = 0.0f;
   for (unsigned long long k = lane; k < hc_lr; k += 32) {
-    acc += lq[k] * Bf16ToF32Dev(row[k]);
+    acc += s_lq[k] * Bf16ToF32Dev(row[k]);
   }
   acc = WarpSumDev(acc);
   if (lane == 0) {

@@ -20,6 +20,9 @@ layout(set = 0, binding = 2) readonly buffer XN { float xn[]; };
 layout(set = 0, binding = 3) writeonly buffer G { float gated[]; };
 
 shared float part[8 * 32];
+// Upper bound on the hyper-connection bottleneck (the model's low rank is
+// 320), cached once per block so the block's groups do not each re-read lq.
+shared float s_lq[512];
 
 uint wbyte(uint off) {
   return (wu[off >> 2] >> ((off & 3) << 3)) & 0xFF;
@@ -38,11 +41,15 @@ void main() {
   uint i = gl_WorkGroupID.x * 8u + group;
   uint hc_dim = pc.v[0];
   uint hc_lr = pc.v[2];
+  for (uint k = gl_LocalInvocationID.x; k < hc_lr; k += 256u) {
+    s_lq[k] = lq[k];
+  }
+  barrier();
   float acc = 0.0;
   if (i < hc_dim) {
     uint row = i * hc_lr;
     for (uint k = lane; k < hc_lr; k += 32u) {
-      acc += lq[k] * bf16_at((row + k) * 2u);
+      acc += s_lq[k] * bf16_at((row + k) * 2u);
     }
   }
   part[group * 32u + lane] = acc;
