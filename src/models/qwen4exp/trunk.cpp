@@ -146,7 +146,9 @@ std::expected<void, StatusCode> HyperRead(
     return std::unexpected(StatusCode::DeviceError);
   }
   KernelLaunch gate;
-  gate.grid_x = Grid(g.hc_dim);
+  // One warp per output element: block 256 holds 8 warps, so the grid is
+  // ceil(hc_dim / 8). The warp reads the weight row coalesced.
+  gate.grid_x = static_cast<std::uint32_t>((g.hc_dim + 7) / 8);
   gate.block_x = 256;
   gate.buffers = {h.hc_lq.get(), const_cast<Buffer*>(&w_up), h.hc_xn.get(),
                   h.hc_gated.get()};

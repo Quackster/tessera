@@ -129,23 +129,29 @@ __global__ void GrDownKernel(const float* xq, const unsigned short* w_down,
   }
 }
 
-// Built-in "gr_gate": gated = xn * sigmoid(lq @ w_up.T). One thread per
-// output element, sequential over the bottleneck.
+// Built-in "gr_gate": gated = xn * sigmoid(lq @ w_up.T). One warp per
+// output element, so a warp reads the weight row coalesced (lane k, k+32,
+// ...) instead of one strided read per thread.
 __global__ void GrGateKernel(const float* lq, const unsigned short* w_up,
                              const float* xn, float* gated,
                              unsigned long long hc_dim,
                              unsigned long long hc_lr) {
+  const int lane = threadIdx.x & 31;
   const unsigned long long i =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+      static_cast<unsigned long long>(blockIdx.x) * (blockDim.x >> 5) +
+      (threadIdx.x >> 5);
   if (i >= hc_dim) {
     return;
   }
   const unsigned short* row = w_up + i * hc_lr;
   float acc = 0.0f;
-  for (unsigned long long k = 0; k < hc_lr; ++k) {
+  for (unsigned long long k = lane; k < hc_lr; k += 32) {
     acc += lq[k] * Bf16ToF32Dev(row[k]);
   }
-  gated[i] = xn[i] * SigmoidDev(acc);
+  acc = WarpSumDev(acc);
+  if (lane == 0) {
+    gated[i] = xn[i] * SigmoidDev(acc);
+  }
 }
 
 // Built-in "gr_mean": mixed[d] = mean over streams of gated.

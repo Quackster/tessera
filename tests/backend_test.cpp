@@ -1365,8 +1365,9 @@ TEST(BackendTest, HyperConnectionMatchesRef) {
   ASSERT_TRUE(launch(**down_k, static_cast<std::uint32_t>(kLr),
                      {dev_xq->get(), dev_down->get(), dev_lq->get()},
                      {hc_dim, kLr, kHc}));
+  // gr_gate is one 32-lane group per output; block 256 holds 8 groups.
   ASSERT_TRUE(launch(
-      **gate_k, static_cast<std::uint32_t>((hc_dim + 255) / 256),
+      **gate_k, static_cast<std::uint32_t>((hc_dim + 7) / 8),
       {dev_lq->get(), dev_up->get(), dev_xn->get(), dev_gated->get()},
       {hc_dim, kLr}));
   ASSERT_TRUE(launch(**mean_k, static_cast<std::uint32_t>((kN + 255) / 256),
