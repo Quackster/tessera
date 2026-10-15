@@ -2160,6 +2160,7 @@ TEST(EngineTest, ShardedPipelineMatchesSingleDeviceWhenProvided) {
     baseline = *out;
   }
   std::vector<std::uint32_t> sharded;
+  std::vector<std::uint32_t> speculative;
   {
     tessera::PipelineOptions options;
     options.model_path = path;
@@ -2171,8 +2172,37 @@ TEST(EngineTest, ShardedPipelineMatchesSingleDeviceWhenProvided) {
     auto out = (*pipe)->Generate(prompt, count);
     ASSERT_TRUE(out.has_value()) << tessera::ToString(out.error());
     sharded = *out;
+    // The speculative path receives the prompt separately from the options
+    // and must prefill the whole prompt, not just first_token. A
+    // non-proposing strategy exercises that path while producing greedy
+    // tokens, so the result must still match the single-device baseline.
+    auto attached = (*pipe)->AttachSpeculative(
+        [] { return std::make_unique<NonProposingStrategy>(); },
+        tessera::StrategyOptions{});
+    ASSERT_TRUE(attached.has_value()) << tessera::ToString(attached.error());
+    auto spec = (*pipe)->Generate(prompt, count);
+    ASSERT_TRUE(spec.has_value()) << tessera::ToString(spec.error());
+    speculative = *spec;
   }
   EXPECT_EQ(sharded, baseline);
+  EXPECT_EQ(speculative, baseline);
+}
+
+// WithPrompt folds a separately-passed prompt into the decode options, so a
+// parallel entry point (pipeline, tensor-parallel, context-parallel) prefills
+// the whole prompt instead of falling back to the single first_token. The
+// source options are unchanged, since the callers still use them.
+TEST(EngineTest, WithPromptFoldsPromptTokens) {
+  using tessera::core::WithPrompt;
+  GenerateOptions options;
+  options.first_token = 7;
+  options.max_completion_tokens = 3;
+  const std::vector<std::uint32_t> prompt = {3, 5, 7, 11};
+  const GenerateOptions folded = WithPrompt(options, prompt);
+  EXPECT_EQ(folded.prompt_tokens, prompt);
+  EXPECT_EQ(folded.first_token, 7u);
+  EXPECT_EQ(folded.max_completion_tokens, 3u);
+  EXPECT_TRUE(options.prompt_tokens.empty());
 }
 
 TEST(EngineTest, RoutedExpertKindMatchesSuffix) {

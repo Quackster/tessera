@@ -477,8 +477,10 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::RunSpeculative(
   }
   produced->clear();
   Target target(*this);
+  // The prompt arrives separately from the options; fold it in so the
+  // driver prefills it instead of the single first_token.
   auto outcome = core::RunDecode(
-      target, strategy.get(), options,
+      target, strategy.get(), core::WithPrompt(options, prompt),
       [produced](std::uint32_t token) {
         produced->push_back(token);
         return true;
@@ -487,6 +489,13 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::RunSpeculative(
     return std::unexpected(outcome.error());
   }
   return *outcome;
+}
+
+std::expected<GenerateOutcome, StatusCode> Pipeline::GenerateStreaming(
+    const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token) {
+  Impl::Target target(*impl_);
+  return core::RunDecode(target, impl_->strategy.get(), options, on_token);
 }
 
 std::expected<void, StatusCode> Pipeline::AttachSpeculative(

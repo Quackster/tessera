@@ -673,18 +673,31 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "cli: prompt encode failed\n");
       return kExitError;
     }
-    auto generated = (*pipeline)->Generate(ids, max_completion_tokens);
-    if (!generated) {
+    // Stream over the pipeline so each token reaches the console as it is
+    // generated. A blocking Generate would return only after every step (by
+    // default the whole remaining context), which looks hung after the
+    // prefill line.
+    tessera::GenerateOptions gen;
+    gen.prompt_tokens = std::move(ids);
+    gen.max_completion_tokens = max_completion_tokens;
+    gen.kv_type = kv_type;
+    auto outcome = (*pipeline)->GenerateStreaming(
+        gen, [&](std::uint32_t token) {
+          auto piece =
+              tokenizer->Decode(std::span<const std::uint32_t>(&token, 1));
+          if (piece) {
+            std::fwrite(piece->data(), 1, piece->size(), stdout);
+            std::fflush(stdout);
+          }
+          return true;
+        });
+    if (!outcome) {
       std::fprintf(stderr, "cli: pipeline generation failed (%s)\n",
-                   tessera::ToString(generated.error()).data());
+                   tessera::ToString(outcome.error()).data());
       return kExitError;
     }
-    auto output_text = tokenizer->Decode(*generated);
-    if (output_text) {
-      std::fwrite(output_text->data(), 1, output_text->size(), stdout);
-      std::fputc('\n', stdout);
-      std::fflush(stdout);
-    }
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
     return kExitOk;
   }
 

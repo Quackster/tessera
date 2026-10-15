@@ -81,4 +81,19 @@ class SpecTarget {
     const GenerateOptions& options,
     const std::function<bool(std::uint32_t)>& on_token);
 
+// Return a copy of `options` carrying `prompt` as its prompt_tokens. An
+// entry point that receives the prompt separately from the options uses
+// this before RunDecode, so the driver prefills the whole prompt instead of
+// falling back to the single `options.first_token`.
+//
+// Usage:
+//   auto filled = core::WithPrompt(options, prompt);
+//   core::RunDecode(target, strategy, filled, on_token);
+[[nodiscard]] inline GenerateOptions WithPrompt(
+    const GenerateOptions& options, std::span<const std::uint32_t> prompt) {
+  GenerateOptions filled = options;
+  filled.prompt_tokens.assign(prompt.begin(), prompt.end());
+  return filled;
+}
+
 }  // namespace tessera::core

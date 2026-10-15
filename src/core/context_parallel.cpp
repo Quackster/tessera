@@ -209,8 +209,11 @@ ContextParallel::Impl::RunSpeculative(std::span<const std::uint32_t> prompt,
       ranks.size(), std::unexpected(StatusCode::DeviceError));
   std::vector<std::thread> threads;
   threads.reserve(ranks.size());
+  // The prompt arrives separately from the options; fold it in once so every
+  // rank's driver prefills it instead of the single first_token.
+  const GenerateOptions framed = core::WithPrompt(options, prompt);
   for (std::size_t r = 0; r < ranks.size(); ++r) {
-    threads.emplace_back([this, r, prompt, &options, produced, &outcomes] {
+    threads.emplace_back([this, r, &framed, produced, &outcomes] {
       Rank& rank = ranks[r];
       core::SingleDeviceTarget target(
           rank.engine->Owner(), *rank.model, *rank.cache,
@@ -227,7 +230,7 @@ ContextParallel::Impl::RunSpeculative(std::span<const std::uint32_t> prompt,
         return true;
       };
       outcomes[r] =
-          core::RunDecode(target, rank.strategy.get(), options, on_token);
+          core::RunDecode(target, rank.strategy.get(), framed, on_token);
     });
   }
   for (std::thread& thread : threads) {
