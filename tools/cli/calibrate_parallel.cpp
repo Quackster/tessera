@@ -193,22 +193,23 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
     }
     pipe = std::move(*built);
   }
-  // MTP speculation runs on the route when asked. Each TP rank runs its own
-  // strategy instance on its own sharded MTP head; the other layouts do not
-  // support it yet.
+  // MTP speculation runs on the route when asked. The tensor-parallel and
+  // context-parallel routes run one strategy per rank; the pipeline runs the
+  // drafter on its last stage.
   std::string strategy_label = "none";
   if (options.speculate) {
-    if (tp == nullptr) {
-      std::fprintf(stderr,
-                   "cli: --speculate needs --tp for now; --cp and --pipeline "
-                   "speculation is not implemented yet\n");
-      return kExitError;
+    const auto factory = []() -> std::unique_ptr<SpeculativeStrategy> {
+      return CreateMtpStrategy();
+    };
+    std::expected<void, StatusCode> attached =
+        std::unexpected(StatusCode::InvalidArgument);
+    if (tp != nullptr) {
+      attached = tp->AttachSpeculative(factory, StrategyOptions{"", 0});
+    } else if (cp != nullptr) {
+      attached = cp->AttachSpeculative(factory, StrategyOptions{"", 0});
+    } else {
+      attached = pipe->AttachSpeculative(factory, StrategyOptions{"", 0});
     }
-    auto attached = tp->AttachSpeculative(
-        []() -> std::unique_ptr<SpeculativeStrategy> {
-          return CreateMtpStrategy();
-        },
-        StrategyOptions{"", 0});
     if (!attached) {
       std::fprintf(stderr, "cli: MTP attach failed (%s)\n",
                    std::string(ToString(attached.error())).c_str());
