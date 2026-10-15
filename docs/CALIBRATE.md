@@ -203,15 +203,18 @@ Landed:
 * Batched tensor-parallel all-reduce in the qwen3_5 `ForwardBatch` path for
   the dense FFN and the attention output projection. The rank partial and
   the rank-0 staging buffers cover a whole verify batch.
+* `TensorParallel` runs MTP speculation: one strategy per rank on that
+  rank's own sharded MTP head, so the tensor-parallel draft needs no
+  replicated head. `calibrate --gpus ... --tp --speculate` attaches MTP and
+  sweeps the draft block, and stores the winner under the `tp2` key. The
+  `--draft` DFlash2 checkpoint stays single-device.
 
 Remaining, with the reason:
 
 * The batched MoE FFN (`RunMoeFfnBatch`) is not tensor-parallel aware, so a
   batched verify on a MoE target is not correct yet.
-* The MTP head is tensor-parallel sliced (its block projections match the
-  FFN and attention names). The drafter runs on one rank today, so it needs
-  a full head on one rank or a collective draft.
-* `Pipeline` has no batched cross-stage forward or verify.
+* `Pipeline` has no batched cross-stage forward or verify, so its draft
+  sweep is not implemented yet.
 * `ContextParallel` splits the key range, so a drafter cannot see the whole
   context. Speculation there needs a design of its own.
 * The tensor-parallel and pipeline paths need a two-device run to verify.

@@ -25,9 +25,12 @@ namespace tessera::core {
 
 class SingleDeviceTarget : public SpecTarget {
  public:
+  // `single_token_prefill` selects a one-token-at-a-time prefill (the
+  // tensor-parallel rank path, where the collective forward runs per token)
+  // instead of the chunked batched prefill of the single-device engine.
   SingleDeviceTarget(Backend& backend, Model& model, DecodeCache& cache,
                      log::Diagnostics& diagnostics, std::size_t prefill_chunk,
-                     Profile* profile);
+                     Profile* profile, bool single_token_prefill = false);
   SingleDeviceTarget(const SingleDeviceTarget&) = delete;
   SingleDeviceTarget& operator=(const SingleDeviceTarget&) = delete;
 
@@ -62,6 +65,7 @@ class SingleDeviceTarget : public SpecTarget {
   log::Diagnostics& diagnostics_;
   std::size_t prefill_chunk_ = 0;
   Profile* profile_ = nullptr;
+  bool single_token_prefill_ = false;
   SpeculativeStrategy* strategy_ = nullptr;
   std::vector<std::size_t> capture_layers_;
   std::vector<Buffer*> capture_buffers_;

@@ -50,6 +50,10 @@ struct ParallelCalibrateOptions {
   // decode speed knobs the single-device path does.
   std::string prompts_path;
   std::size_t calibrate_limit = 0;
+  // Attach the MTP strategy to the route and sweep the draft block. Only
+  // --speculate is supported on a parallel layout; the DFlash2 --draft
+  // checkpoint is single-device.
+  bool speculate = false;
   bool quiet = false;
 };
 

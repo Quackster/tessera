@@ -20,13 +20,15 @@ SingleDeviceTarget::SingleDeviceTarget(Backend& backend, Model& model,
                                        DecodeCache& cache,
                                        log::Diagnostics& diagnostics,
                                        std::size_t prefill_chunk,
-                                       Profile* profile)
+                                       Profile* profile,
+                                       bool single_token_prefill)
     : backend_(backend),
       model_(model),
       cache_(cache),
       diagnostics_(diagnostics),
       prefill_chunk_(prefill_chunk),
-      profile_(profile) {}
+      profile_(profile),
+      single_token_prefill_(single_token_prefill) {}
 
 std::expected<void, StatusCode> SingleDeviceTarget::Prepare(
     SpeculativeStrategy* strategy, const GenerateOptions& options) {
@@ -61,6 +63,36 @@ std::expected<void, StatusCode> SingleDeviceTarget::Prefill(
     std::span<const std::uint32_t> prompt, const GenerateOptions& options,
     std::vector<float>* hidden, std::vector<float>* logits,
     double* compute_ms) {
+  if (single_token_prefill_) {
+    // One token per forward: the tensor-parallel rank path, where the
+    // collective forward (all-reduce) runs per token. The last token scores
+    // the logits and its hidden feeds the drafter.
+    const Architecture* arch = model_.Arch();
+    if (arch == nullptr) {
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+      const bool last = (i + 1 == prompt.size());
+      if (last) {
+        auto scored = arch->Logits(backend_, model_, cache_, prompt[i], hidden,
+                                   nullptr, nullptr, nullptr);
+        if (!scored) {
+          return std::unexpected(scored.error());
+        }
+        *logits = std::move(*scored);
+      } else {
+        auto forwarded = arch->Forward(backend_, model_, cache_, prompt[i],
+                                       nullptr, nullptr, nullptr, nullptr);
+        if (!forwarded) {
+          return std::unexpected(forwarded.error());
+        }
+      }
+      if (options.prefill_progress) {
+        options.prefill_progress(i + 1, prompt.size());
+      }
+    }
+    return {};
+  }
   const std::size_t prefill_chunk = ResolvePrefillChunkTokens(
       prefill_chunk_, options.prefill_chunk_tokens, model_.MaxContextLength());
   if (options.progress_every > 0) {

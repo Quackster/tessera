@@ -20,6 +20,7 @@
 #include "tessera/engine.hpp"
 #include "tessera/log.hpp"
 #include "tessera/model.hpp"
+#include "tessera/speculative.hpp"
 #include "tessera/pipeline.hpp"
 #include "tessera/tensor_parallel.hpp"
 #include "tessera/tokenizer.hpp"
@@ -38,6 +39,9 @@ constexpr int kExitUsage = 2;
 // Validation generate length: enough to run every rank through one full
 // step without timing anything.
 constexpr std::size_t kValidateTokens = 8;
+// The MTP checkpoint block size, the draft-block candidate the sweep must
+// beat (mirrors kDefaultMtpBlock; the CLI cannot include that header).
+constexpr std::size_t kMtpDefaultDraftBlock = 2;
 
 // Join device indices for logs, keys and the report's example command.
 std::string JoinDevices(const std::vector<int>& devices) {
@@ -189,6 +193,29 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
     }
     pipe = std::move(*built);
   }
+  // MTP speculation runs on the route when asked. Each TP rank runs its own
+  // strategy instance on its own sharded MTP head; the other layouts do not
+  // support it yet.
+  std::string strategy_label = "none";
+  if (options.speculate) {
+    if (tp == nullptr) {
+      std::fprintf(stderr,
+                   "cli: --speculate needs --tp for now; --cp and --pipeline "
+                   "speculation is not implemented yet\n");
+      return kExitError;
+    }
+    auto attached = tp->AttachSpeculative(
+        []() -> std::unique_ptr<SpeculativeStrategy> {
+          return CreateMtpStrategy();
+        },
+        StrategyOptions{"", 0});
+    if (!attached) {
+      std::fprintf(stderr, "cli: MTP attach failed (%s)\n",
+                   std::string(ToString(attached.error())).c_str());
+      return kExitError;
+    }
+    strategy_label = "mtp";
+  }
   // Measure each rank: resident bytes and free bytes on its own device.
   const std::size_t ranks =
       tp != nullptr ? tp->RankCount()
@@ -310,6 +337,8 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   defaults.mxfp4_split_cap = kDefaultMxFp4SplitCap;
   defaults.prefill_chunk_tokens = kDefaultPrefillChunkTokens;
   defaults.attention_split = kDefaultAttentionSplitChunks;
+  // The MTP checkpoint block is the draft default (see kDefaultMtpBlock).
+  defaults.draft_tokens = options.speculate ? kMtpDefaultDraftBlock : 0;
 
   const TimedGenerateFn generate =
       [&](std::span<const std::uint32_t> prompt, const GenerateOptions& gen)
@@ -335,7 +364,8 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   // TP and CP split the key range across ranks, so the flash-decoding split
   // is inert there; only a pipeline stage still uses it.
   sweep.sweep_attention_split = options.pipeline;
-  sweep.sweep_draft_tokens = false;
+  // MTP has a draft block but no DFlash2 draft context window.
+  sweep.sweep_draft_tokens = options.speculate;
   sweep.sweep_draft_context = false;
   // Warm the route once (kernel compile, first-touch weight loads) before the
   // first point. A limited run skips it: the passed count is the run count.
@@ -404,7 +434,7 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
       first_model.Name().empty()
           ? std::filesystem::path(options.model_path).filename().string()
           : std::string(first_model.Name()),
-      options.context, ToString(options.kv_type), "none", label);
+      options.context, ToString(options.kv_type), strategy_label, label);
   entry.config = outcome->config;
   entry.decode_tps = decode_tps;
   entry.prefill_tps = prefill_tps;
@@ -428,7 +458,7 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   report.model_path = options.model_path;
   report.kv_type = std::string(ToString(options.kv_type));
   report.kv_flag = KvFlag(options.kv_type);
-  report.strategy = "none";
+  report.strategy = strategy_label;
   report.parallel = label;
   report.parallel_flags = route_flag + " --gpus " + device_list;
   report.key_context = options.context;
@@ -443,7 +473,7 @@ int RunParallelCalibrate(const ParallelCalibrateOptions& options) {
   report.file = options.calibration_file;
   report.split_applicable = backend == "rocm";
   report.attention_applicable = sweep.sweep_attention_split;
-  report.draft_attached = false;
+  report.draft_attached = options.speculate;
   std::fputs("\n", stdout);
   std::fputs(FormatCalibrationReport(report).c_str(), stdout);
   std::fflush(stdout);

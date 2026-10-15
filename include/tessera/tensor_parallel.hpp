@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -11,6 +12,7 @@
 
 #include "tessera/defaults.hpp"
 #include "tessera/engine.hpp"
+#include "tessera/speculative.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
@@ -69,6 +71,17 @@ class TensorParallel {
   //   auto outcome = tp->GenerateTimed(prompt, tuning);
   std::expected<GenerateOutcome, StatusCode> GenerateTimed(
       std::span<const std::uint32_t> prompt, const GenerateOptions& options);
+
+  // Attach a speculative strategy to every rank (off by default). The
+  // factory is called once per rank; each rank owns and runs its own
+  // instance on its own sharded model, so a tensor-parallel draft head (the
+  // MTP block) works without replicating it. The factory must be null-free.
+  //
+  // Usage:
+  //   tp->AttachSpeculative(CreateMtpStrategy, StrategyOptions{});
+  std::expected<void, StatusCode> AttachSpeculative(
+      const std::function<std::unique_ptr<SpeculativeStrategy>()>& factory,
+      const StrategyOptions& options);
 
   [[nodiscard]] std::size_t RankCount() const;
   // Rank `i`'s engine and model for measurement (for example per-device

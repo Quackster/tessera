@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/single_device_target.hpp"
+#include "core/spec_driver.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/engine.hpp"
@@ -44,6 +46,9 @@ struct TensorParallel::Impl {
     std::unique_ptr<Model> model;
     std::unique_ptr<core::DecodeCache> cache;
     std::unique_ptr<Buffer> ffn_partial;
+    // The rank's speculative strategy (null when none is attached). Each
+    // rank runs its own instance on its own sharded model.
+    std::unique_ptr<SpeculativeStrategy> strategy;
   };
   std::vector<Rank> ranks;
   core::TpBarrier barrier;
@@ -74,6 +79,24 @@ struct TensorParallel::Impl {
   // Greedy generation with `options` tuning, filling `produced`; the outcome
   // carries the produced count and the prefill/decode wall times.
   std::expected<GenerateOutcome, StatusCode> Run(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      std::vector<std::uint32_t>* produced);
+
+  // True when a speculative strategy is attached on the ranks.
+  bool HasStrategy() const {
+    for (const Rank& rank : ranks) {
+      if (rank.strategy != nullptr) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // One speculative generation across the ranks: every rank runs the decode
+  // driver on its own target and its own strategy instance, so a
+  // tensor-parallel (sharded) draft head works. The collective forwards keep
+  // the ranks in lockstep; rank 0's tokens and outcome are the result.
+  std::expected<GenerateOutcome, StatusCode> RunSpeculative(
       std::span<const std::uint32_t> prompt, const GenerateOptions& options,
       std::vector<std::uint32_t>* produced);
 
@@ -172,6 +195,62 @@ std::expected<GenerateOutcome, StatusCode> TensorParallel::Impl::Run(
   return outcome;
 }
 
+std::expected<GenerateOutcome, StatusCode>
+TensorParallel::Impl::RunSpeculative(std::span<const std::uint32_t> prompt,
+                                     const GenerateOptions& options,
+                                     std::vector<std::uint32_t>* produced) {
+  if (prompt.empty() || prompt.size() > context) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  produced->clear();
+  ResetCaches(options);
+  // Every rank prepares its own strategy on its own backend and model, so a
+  // sharded (tensor-parallel) draft head stays on its own rank.
+  for (Rank& rank : ranks) {
+    if (rank.strategy == nullptr) {
+      continue;
+    }
+    auto prepared = rank.strategy->Prepare(rank.engine->Owner(), *rank.model);
+    if (!prepared) {
+      return std::unexpected(prepared.error());
+    }
+    rank.strategy->SetDraftContext(options.draft_context);
+  }
+  std::vector<std::expected<GenerateOutcome, StatusCode>> outcomes(
+      ranks.size(), std::unexpected(StatusCode::DeviceError));
+  std::vector<std::thread> threads;
+  threads.reserve(ranks.size());
+  for (std::size_t r = 0; r < ranks.size(); ++r) {
+    threads.emplace_back([this, r, prompt, &options, produced, &outcomes] {
+      Rank& rank = ranks[r];
+      core::SingleDeviceTarget target(
+          rank.engine->Owner(), *rank.model, *rank.cache,
+          rank.engine->Diagnostics(), 0, nullptr,
+          /*single_token_prefill=*/true);
+      // Rank 0 owns the produced token list; the ranks stay in lockstep
+      // through the collective forwards, so every rank sees the same tokens.
+      const bool emit = (r == 0);
+      auto on_token = [emit, produced](std::uint32_t token) {
+        if (emit && produced != nullptr) {
+          produced->push_back(token);
+        }
+        return true;
+      };
+      outcomes[r] =
+          core::RunDecode(target, rank.strategy.get(), options, on_token);
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  for (const auto& outcome : outcomes) {
+    if (!outcome) {
+      return std::unexpected(outcome.error());
+    }
+  }
+  return outcomes[0];
+}
+
 TensorParallel::TensorParallel(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
@@ -254,13 +333,35 @@ TensorParallel::Create(const TensorParallelOptions& options) {
   return std::unique_ptr<TensorParallel>(new TensorParallel(std::move(impl)));
 }
 
+std::expected<void, StatusCode> TensorParallel::AttachSpeculative(
+    const std::function<std::unique_ptr<SpeculativeStrategy>()>& factory,
+    const StrategyOptions& options) {
+  if (!factory) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  for (Impl::Rank& rank : impl_->ranks) {
+    auto strategy = factory();
+    if (strategy == nullptr) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    auto attached = strategy->Attach(options);
+    if (!attached) {
+      return std::unexpected(attached.error());
+    }
+    rank.strategy = std::move(strategy);
+  }
+  return {};
+}
+
 std::expected<std::vector<std::uint32_t>, StatusCode> TensorParallel::Generate(
     std::span<const std::uint32_t> prompt, std::size_t max_tokens) {
   GenerateOptions options;
   options.max_completion_tokens = max_tokens;
   options.kv_type = impl_->kv_type;
   std::vector<std::uint32_t> produced;
-  auto outcome = impl_->Run(prompt, options, &produced);
+  auto outcome = impl_->HasStrategy()
+                     ? impl_->RunSpeculative(prompt, options, &produced)
+                     : impl_->Run(prompt, options, &produced);
   if (!outcome) {
     return std::unexpected(outcome.error());
   }
@@ -279,7 +380,9 @@ std::expected<std::vector<std::uint32_t>, StatusCode> TensorParallel::Generate(
 std::expected<GenerateOutcome, StatusCode> TensorParallel::GenerateTimed(
     std::span<const std::uint32_t> prompt, const GenerateOptions& options) {
   std::vector<std::uint32_t> produced;
-  auto outcome = impl_->Run(prompt, options, &produced);
+  auto outcome = impl_->HasStrategy()
+                     ? impl_->RunSpeculative(prompt, options, &produced)
+                     : impl_->Run(prompt, options, &produced);
   if (!outcome) {
     return std::unexpected(outcome.error());
   }

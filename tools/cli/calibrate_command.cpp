@@ -205,13 +205,12 @@ int RunCalibrateCommand(int argc, char** argv) {
     return kExitUsage;
   }
   if (!gpus.empty() || tp_mode || cp_mode || pipeline_mode) {
-    // A speculative draft needs the single-device engine: none of the
-    // parallel layouts (--tp/--cp/--pipeline) attaches a strategy, so the
-    // draft sweep stays single-device (see docs/CALIBRATE.md).
-    if (!draft_path.empty() || speculate) {
+    // MTP (--speculate) runs on the route; the DFlash2 --draft checkpoint is
+    // single-device only.
+    if (!draft_path.empty()) {
       std::fprintf(stderr,
-                   "cli: the parallel sweep has no speculative draft; "
-                   "--draft/--speculate are single-device only\n");
+                   "cli: --draft (DFlash2) is single-device only; the parallel "
+                   "sweep runs MTP with --speculate\n");
       return kExitUsage;
     }
     // Parallel calibration: the speed sweep runs through the layout and the
@@ -227,6 +226,7 @@ int RunCalibrateCommand(int argc, char** argv) {
     parallel_options.calibration_file = calibration_file;
     parallel_options.prompts_path = prompts_path;
     parallel_options.calibrate_limit = calibrate_limit;
+    parallel_options.speculate = speculate;
     parallel_options.quiet = quiet;
     return RunParallelCalibrate(parallel_options);
   }
