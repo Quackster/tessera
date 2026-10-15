@@ -2344,6 +2344,34 @@ TEST(EngineTest, FitGpuLayersJudgesRequestedValue) {
                   .error() == tessera::StatusCode::FileNotFound);
 }
 
+// The paged host bytes are the non-resident weight bytes: zero for a full
+// upload, and the full-minus-resident difference under paging. One replica
+// holds this much in system RAM, so a pool multiplies it per device.
+TEST(EngineTest, PagedWeightBytesCountsNonResidentWeights) {
+  using tessera::core::MeasureWeights;
+  using tessera::core::PagedWeightBytes;
+  using tessera::core::ResidentWeightBytes;
+  auto path = WriteTinyModelFixture("paged_host.gguf", 2);
+  auto budget = MeasureWeights(path.string(), true);
+  ASSERT_TRUE(budget.has_value()) << tessera::ToString(budget.error());
+  EXPECT_EQ(PagedWeightBytes(*budget, 0), 0u);
+  const std::uint64_t two = PagedWeightBytes(*budget, 2);
+  EXPECT_GT(two, 0u);
+  EXPECT_EQ(two, ResidentWeightBytes(*budget, 0) -
+                     ResidentWeightBytes(*budget, 2));
+}
+
+// The host memory figures come from the platform. When reported, available
+// never exceeds total; a zero total means the query is unavailable, not a
+// zero-memory host.
+TEST(EngineTest, HostMemoryReportsFigures) {
+  const tessera::core::HostMemoryInfo host = tessera::core::HostMemory();
+#if defined(__linux__)
+  EXPECT_GT(host.total_bytes, 0u);
+  EXPECT_LE(host.available_bytes, host.total_bytes);
+#endif
+}
+
 namespace {
 
 // A minimal qwen4exp (Qwen3.8-Flash-Next) GGUF: the metadata the generic

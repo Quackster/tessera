@@ -30,6 +30,10 @@ namespace {
 // How many tensor names to print when summarizing a model.
 constexpr std::size_t kPrintedTensorNames = 5;
 
+// Host RAM kept free on top of the paged weights for the process working
+// set and the OS. MemAvailable is already reclaimable, so this is small.
+constexpr std::uint64_t kHostRamHeadroomBytes = 2ull << 30;
+
 // The hardware key for a loaded or probed model: the runtime backend and
 // device, the model identity, the context, the KV type and the strategy.
 // One canonical build for the speed-knob lookup and the pre-load paging
@@ -398,6 +402,41 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
                std::to_string(ToMiB(fit->kv_bytes)) + " MiB KV cache exceeds " +
                budget_label + "; lower --gpu-layers (try --gpu-layers help), "
                               "lower --context, or quantize the KV cache");
+  return false;
+}
+
+bool CheckHostRamFit(Engine& engine, const std::string& model_path,
+                     std::size_t gpu_layers, std::string_view strategy,
+                     std::uint64_t held_bytes, int device,
+                     std::uint64_t* replica_bytes) {
+  *replica_bytes = 0;
+  auto budget = core::MeasureWeights(model_path, strategy != "dflash2");
+  if (!budget) {
+    // The load reports the real error; do not block on a probe failure.
+    return true;
+  }
+  const std::uint64_t paged = core::PagedWeightBytes(*budget, gpu_layers);
+  *replica_bytes = paged;
+  if (paged == 0) {
+    return true;
+  }
+  const core::HostMemoryInfo host = core::HostMemory();
+  if (host.available_bytes == 0) {
+    return true;
+  }
+  const std::uint64_t required = held_bytes + paged;
+  if (required + kHostRamHeadroomBytes <= host.available_bytes) {
+    return true;
+  }
+  engine.Diagnostics().Warn(
+      "cli", "gpu " + std::to_string(device) + ": paged weights need about " +
+                 std::to_string(ToMiB(paged)) + " MiB in host RAM (about " +
+                 std::to_string(ToMiB(required)) + " MiB with " +
+                 std::to_string(ToMiB(held_bytes)) +
+                 " MiB already held), but only " +
+                 std::to_string(ToMiB(host.available_bytes)) +
+                 " MiB is available; use fewer --gpus replicas or a smaller "
+                 "quantization");
   return false;
 }
 

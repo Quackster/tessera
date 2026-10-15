@@ -683,3 +683,8 @@ The paged weights are held in system RAM, not the file mapping. The
 Qwen3.8-Flash-Next paged set is about 31 GB and fits the 60 GB host. A
 model whose paged set exceeds the host RAM will not load, so size
 `--gpu-layers` to keep the paged set within the host budget.
+Each replica holds its own private host copy, so a multi-device `serve`
+multiplies the paged set per device. Before each replica loads, `serve`
+refuses it when the running total cannot fit the available host RAM, so
+the host OOM killer never fires. Use one `--gpus` device, or `run` with a
+split layout, for a model whose replicas do not fit host RAM.

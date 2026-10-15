@@ -332,7 +332,7 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--prompts <file>` | calibrate | three fixed prompts | Fixed prompts, one per non-empty line, for the calibration sweep. |
 | `--calibrate-limit <n>` | calibrate | none | Measure at most n sweep points in total. |
 | **Parallelism** | | | The flags below spread work across the `--gpus` devices. |
-| `--gpus <a,b>` | run, serve, calibrate | 0 | One GPU index or a comma-separated list (for example `--gpus 0` or `--gpus 0,1`). `serve` runs one model replica per listed GPU; `run` uses only the first device unless a split flag is set; `calibrate` runs the single-device sweep for one index and the parallel sweep for two or more. |
+| `--gpus <a,b>` | run, serve, calibrate | 0 | One GPU index or a comma-separated list (for example `--gpus 0` or `--gpus 0,1`). `serve` runs one model replica per listed GPU; the split flags below are run-only and `serve` refuses them instead of silently loading replicas. Before each replica loads, `serve` refuses it when its paged weights cannot fit host RAM with the replicas already loaded. `run` uses only the first device unless a split flag is set; `calibrate` runs the single-device sweep for one index and the parallel sweep for two or more. |
 | `--pipeline` | run | off | Split layers across the `--gpus` devices. |
 | `--tp` | run | off | Split attention, FFN and MoE experts across the `--gpus` devices. |
 | `--cp` | run | off | Split the key range across the `--gpus` devices. |

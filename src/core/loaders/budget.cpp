@@ -1,6 +1,8 @@
 #include "tessera/budget.hpp"
 
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <string>
@@ -65,6 +67,32 @@ std::expected<std::uint64_t, StatusCode> MxFp4ConvertedBytes(
 }
 
 }  // namespace
+
+HostMemoryInfo HostMemory() {
+  HostMemoryInfo info;
+#if defined(__linux__)
+  std::ifstream stream("/proc/meminfo");
+  if (!stream) {
+    return info;
+  }
+  std::string line;
+  while (std::getline(stream, line)) {
+    // Each line reads "<name>: <value> kB"; parse from after the colon so
+    // the alignment spaces do not matter.
+    const std::size_t colon = line.find(':');
+    if (colon == std::string::npos) {
+      continue;
+    }
+    const char* value = line.c_str() + colon + 1;
+    if (line.rfind("MemTotal", 0) == 0) {
+      info.total_bytes = std::strtoull(value, nullptr, 10) * 1024;
+    } else if (line.rfind("MemAvailable", 0) == 0) {
+      info.available_bytes = std::strtoull(value, nullptr, 10) * 1024;
+    }
+  }
+#endif
+  return info;
+}
 
 std::expected<WeightBudget, StatusCode> MeasureWeights(
     const std::string& path, bool include_mtp_head) {
@@ -227,6 +255,16 @@ std::uint64_t ResidentWeightBytes(const WeightBudget& budget,
     }
   }
   return total;
+}
+
+std::uint64_t PagedWeightBytes(const WeightBudget& budget,
+                               std::size_t gpu_layers) {
+  std::uint64_t total = 0;
+  for (const auto& [name, bytes] : budget.tensors) {
+    total += bytes;
+  }
+  const std::uint64_t resident = ResidentWeightBytes(budget, gpu_layers);
+  return total > resident ? total - resident : 0;
 }
 
 std::uint64_t StagingWeightBytes(const WeightBudget& budget,

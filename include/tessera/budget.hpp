@@ -9,11 +9,25 @@
 
 #include "tessera/types.hpp"
 
-// VRAM budget advisor for `--gpu-layers`: how many layers a model has,
-// what they weigh, what the KV cache costs, and which layer count fits
-// the free device memory. Reads definitions only, never uploads.
+// Budget advisor for `--gpu-layers`: how many layers a model has, what
+// they weigh, what the KV cache costs, which layer count fits the free
+// device memory, and how much paged weight a load holds in system RAM.
+// Reads definitions only, never uploads.
 
 namespace tessera::core {
+
+// System RAM the process may use, for judging a paged replica before it
+// loads. Zero fields mean the platform cannot report the figure, so a
+// caller skips the host check instead of refusing.
+struct HostMemoryInfo {
+  // Reclaimable plus free memory (MemAvailable on Linux).
+  std::uint64_t available_bytes = 0;
+  std::uint64_t total_bytes = 0;
+};
+
+// Read the host memory figures. A missing or unreadable source yields
+// zero fields rather than an error.
+[[nodiscard]] HostMemoryInfo HostMemory();
 
 // On-disk weight bytes per tensor in manifest order.
 struct WeightBudget {
@@ -56,6 +70,14 @@ struct WeightBudget {
 // plus the last gpu_layers - 1 trunk blocks; 0 keeps everything).
 [[nodiscard]] std::uint64_t ResidentWeightBytes(const WeightBudget& budget,
                                                 std::size_t gpu_layers);
+
+// Host bytes a paged load at `gpu_layers` holds in system RAM: the
+// non-resident weight bytes the loader copies out of the file (see
+// UploadWeights). Zero for a full upload (0) and for a model with no
+// paged tensors. One replica holds this much, so a data-parallel pool
+// multiplies it per device.
+[[nodiscard]] std::uint64_t PagedWeightBytes(const WeightBudget& budget,
+                                             std::size_t gpu_layers);
 
 // Device bytes of the paging staging buffers for `gpu_layers`: one buffer
 // per paged tensor kind, sized to that kind's largest layer, as the loader

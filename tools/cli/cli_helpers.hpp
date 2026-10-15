@@ -82,6 +82,18 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
                        std::string_view strategy, std::size_t gpu_layers,
                        int device);
 
+// Refuse a replica load whose paged weights cannot fit system RAM, before
+// the load starts. `held_bytes` is the paged host bytes of the replicas
+// already loaded; on a proceed result `*replica_bytes` is this replica's
+// paged host bytes, so the caller can accumulate across devices. Returns
+// true when the load may proceed: a full upload holds no host weights, and
+// an unreportable host figure skips the check. `strategy` selects the MTP
+// head the same way the fit check does; `device` names the GPU.
+bool CheckHostRamFit(Engine& engine, const std::string& model_path,
+                     std::size_t gpu_layers, std::string_view strategy,
+                     std::uint64_t held_bytes, int device,
+                     std::uint64_t* replica_bytes);
+
 // One concurrent CLI session: the streamed tokens plus the outcome.
 // `outcome` holds the error when the session failed.
 struct ConcurrentSessionResult {
