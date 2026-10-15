@@ -51,7 +51,10 @@ bool ShardKeepsTensor(std::string_view name, const ModelShard& shard,
   if (name == "token_embd.weight") {
     return shard.first_stage;
   }
-  if (name == "output.weight" || name == "output_norm.weight") {
+  // The output head belongs to the last stage: the vocabulary projection,
+  // the final norm, and any head-side weight named with the `output`
+  // prefix (for example a head hyper-connection output_hc_*).
+  if (name.rfind("output", 0) == 0) {
     return shard.last_stage;
   }
   std::size_t layer = 0;
@@ -70,6 +73,16 @@ bool ShardKeepsTensor(std::string_view name, const ModelShard& shard,
   }
   // A global tensor with no layer belongs to the first stage.
   return shard.first_stage;
+}
+
+LayerRange ShardLayerRange(const ModelShard& shard, std::size_t trunk_layers) {
+  LayerRange range;
+  range.first = shard.enabled ? shard.first_layer : 0;
+  range.last = trunk_layers;
+  if (shard.enabled && shard.last_layer != 0 && shard.last_layer < range.last) {
+    range.last = shard.last_layer;
+  }
+  return range;
 }
 
 bool GpuLayerResident(std::string_view name, std::size_t gpu_layers,

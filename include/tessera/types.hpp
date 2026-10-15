@@ -320,6 +320,14 @@ struct TransformerConfig {
   std::vector<std::uint64_t> rope_sections;
   // Gated residual stack (hyper-connections). count == 0 when absent.
   HyperConnectionParams hyper_connection;
+  // Width of the residual stream that crosses a pipeline stage boundary:
+  // `hidden_dim`, times the hyper-connection stream count when the model
+  // carries a gated residual stack. A single-stream model returns
+  // `hidden_dim`.
+  [[nodiscard]] std::size_t ResidualWidth() const {
+    return hidden_dim *
+           (hyper_connection.count == 0 ? 1 : hyper_connection.count);
+  }
   // Per-layer n-gram embedding. layers empty when absent.
   PleParams ple;
   // Sparse-attention indexer. heads == 0 when absent.

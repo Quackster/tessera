@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/decode_internal.hpp"
+#include "core/loaders/shard.hpp"
 #include "core/profile.hpp"
 #include "models/qwen4exp/state.hpp"
 
@@ -88,12 +89,50 @@ std::expected<void, StatusCode> InitBatchStack(
   return {};
 }
 
+// Allocates the per-layer gated-delta state snapshots for a verify: one
+// slot per committed position (rows + 1, slot 0 is the pre-batch state),
+// for every owned recurrent layer.
+std::expected<void, StatusCode> AllocSnapshotScratch(
+    Backend& backend, const TransformerConfig& cfg, const Qwen4ExpGeometry& g,
+    const ModelShard& shard, Qwen4ExpState& h, std::size_t rows) {
+  const core::LayerRange range = core::ShardLayerRange(shard, cfg.layers);
+  const std::size_t state_len =
+      g.gdn_num_v_heads * g.gdn_head_k_dim * g.gdn_head_v_dim;
+  const std::size_t hist_len = g.gdn_conv_dim * (g.gdn_width - 1);
+  h.batch_gdn_state.clear();
+  h.batch_gdn_state.resize(cfg.layers);
+  h.batch_gdn_conv.clear();
+  h.batch_gdn_conv.resize(cfg.layers);
+  for (std::size_t l = range.first; l < range.last; ++l) {
+    if (cfg.IsFullAttentionLayer(l)) {
+      continue;
+    }
+    auto state =
+        backend.AllocateBuffer((rows + 1) * state_len * 4, MemoryKind::Device);
+    auto conv =
+        backend.AllocateBuffer((rows + 1) * hist_len * 4, MemoryKind::Device);
+    if (!state || !conv) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    h.batch_gdn_state[l] = std::move(*state);
+    h.batch_gdn_conv[l] = std::move(*conv);
+  }
+  h.batch_snapshot_rows = rows;
+  return {};
+}
+
 std::expected<void, StatusCode> GrowBatchScratch(Backend& backend,
                                                  const TransformerConfig& cfg,
                                                  const Qwen4ExpGeometry& g,
+                                                 const ModelShard& shard,
                                                  Qwen4ExpState& h,
-                                                 std::size_t rows) {
+                                                 std::size_t rows,
+                                                 bool snapshot_state) {
   if (h.batch_rows >= rows && h.batch_r != nullptr) {
+    if (snapshot_state && h.batch_snapshot_rows < rows &&
+        !AllocSnapshotScratch(backend, cfg, g, shard, h, rows)) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
     return {};
   }
   const std::size_t top_k = cfg.experts_per_tok;
@@ -114,6 +153,12 @@ std::expected<void, StatusCode> GrowBatchScratch(Backend& backend,
   if (auto w = alloc(h.batch_wts, rows * top_k * 4); !w) return w;
   if (auto s = alloc(h.batch_sig, rows * 4); !s) return s;
   h.batch_rows = rows;
+  if (snapshot_state) {
+    if (auto snap = AllocSnapshotScratch(backend, cfg, g, shard, h, rows);
+        !snap) {
+      return snap;
+    }
+  }
   return {};
 }
 
@@ -122,7 +167,9 @@ std::expected<void, StatusCode> GrowBatchScratch(Backend& backend,
 std::expected<void, StatusCode> ForwardTrunkBatch(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
-    std::vector<float>* hidden_out, bool all_logits, const Buffer* embeddings) {
+    std::vector<float>* hidden_out, bool all_logits, const Buffer* embeddings,
+    const std::vector<std::size_t>* capture_layers,
+    std::vector<Buffer*>* capture, bool snapshot_state) {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -141,21 +188,56 @@ std::expected<void, StatusCode> ForwardTrunkBatch(
   const std::size_t rows = tokens.size();
   const std::size_t hidden = g.hidden;
   const std::size_t top_k = cfg.experts_per_tok;
-  if (auto grown = GrowBatchScratch(backend, cfg, g, h, rows); !grown) {
+  const std::size_t gdn_state_len =
+      g.gdn_num_v_heads * g.gdn_head_k_dim * g.gdn_head_v_dim;
+  const std::size_t gdn_hist_len = g.gdn_conv_dim * (g.gdn_width - 1);
+  const ModelShard& shard = model.Shard();
+  const core::LayerRange range = core::ShardLayerRange(shard, cfg.layers);
+  if (range.first >= range.last) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (auto grown = GrowBatchScratch(backend, cfg, g, shard, h, rows,
+                                    snapshot_state);
+      !grown) {
     return grown;
   }
-  if (auto filled = FillBatchEmbeddings(backend, model, g, h, tokens,
-                                        embeddings);
-      !filled) {
-    return filled;
+  // The first stage gathers one embedding row per token; a later stage
+  // receives the previous stage's whole residual stack and loads it whole.
+  if (shard.enabled && !shard.first_stage) {
+    if (embeddings == nullptr ||
+        embeddings->Size() < rows * g.hc_dim * 4 ||
+        !backend.CopyD2D(*embeddings, 0, *h.batch_r, 0, rows * g.hc_dim * 4)) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+  } else {
+    if (auto filled = FillBatchEmbeddings(backend, model, g, h, tokens,
+                                          embeddings);
+        !filled) {
+      return filled;
+    }
+    if (auto init = InitBatchStack(backend, g, h, rows); !init) {
+      return init;
+    }
   }
-  if (auto init = InitBatchStack(backend, g, h, rows); !init) {
-    return init;
+  h.batch_snapshot_start = h.position;
+  // Snapshot slot 0 (the pre-batch gated-delta state) per owned layer.
+  if (snapshot_state) {
+    for (std::size_t l = range.first; l < range.last; ++l) {
+      if (cfg.IsFullAttentionLayer(l)) {
+        continue;
+      }
+      if (!backend.CopyD2D(*h.gdn[l].state, 0, *h.batch_gdn_state[l], 0,
+                           gdn_state_len * 4) ||
+          !backend.CopyD2D(*h.gdn[l].conv_hist, 0, *h.batch_gdn_conv[l], 0,
+                           gdn_hist_len * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
   }
   const bool ple_layer = CarriesPle(cfg);
   std::vector<std::uint32_t> host_ids(rows * top_k);
   std::vector<std::uint32_t> union_ids;
-  for (std::size_t l = 0; l < cfg.layers; ++l) {
+  for (std::size_t l = range.first; l < range.last; ++l) {
     // Mixer half: the attention hyper-connection, the mixer and the FFN
     // hyper-connection read, per row (the state is sequential). Store the
     // FFN input and the injection for the expert half.
@@ -168,6 +250,15 @@ std::expected<void, StatusCode> ForwardTrunkBatch(
                                           h.position + t, tokens[t], ple_layer);
           !mixer) {
         return mixer;
+      }
+      // Row t's post-step recurrent state lands in slot t + 1, so a verify
+      // can restore the state at any committed prefix.
+      if (snapshot_state && !cfg.IsFullAttentionLayer(l) &&
+          (!backend.CopyD2D(*h.gdn[l].state, 0, *h.batch_gdn_state[l],
+                            (t + 1) * gdn_state_len * 4, gdn_state_len * 4) ||
+           !backend.CopyD2D(*h.gdn[l].conv_hist, 0, *h.batch_gdn_conv[l],
+                            (t + 1) * gdn_hist_len * 4, gdn_hist_len * 4))) {
+        return std::unexpected(StatusCode::DeviceError);
       }
       if (!backend.CopyD2D(*h.mixed, 0, *h.batch_mixed, t * hidden * 4,
                            hidden * 4) ||
@@ -240,6 +331,17 @@ std::expected<void, StatusCode> ForwardTrunkBatch(
       if (!backend.CopyD2D(*h.R, 0, *h.batch_r, t * g.hc_dim * 4,
                            g.hc_dim * 4)) {
         return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+    // Capture the per-row residual stack after the boundary layer for the
+    // next stage's handoff.
+    if (capture_layers != nullptr && capture != nullptr) {
+      for (std::size_t i = 0; i < capture_layers->size(); ++i) {
+        if ((*capture_layers)[i] == l &&
+            !backend.CopyD2D(*h.batch_r, 0, *(*capture)[i], 0,
+                             rows * g.hc_dim * 4)) {
+          return std::unexpected(StatusCode::DeviceError);
+        }
       }
     }
   }

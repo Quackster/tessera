@@ -52,6 +52,10 @@ class Qwen4ExpArchitecture final : public Architecture {
       std::vector<Buffer*>* capture,
       bool snapshot_state = false) const override;
 
+  [[nodiscard]] std::expected<void, StatusCode> TruncateTarget(
+      Backend& backend, const Model& model, core::DecodeCache& cache,
+      std::size_t keep_rows) const override;
+
   [[nodiscard]] std::expected<DraftVerification, StatusCode> Verify(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> draft,

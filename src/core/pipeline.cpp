@@ -101,7 +101,10 @@ std::expected<std::unique_ptr<Pipeline>, StatusCode> Pipeline::Create(
     return std::unexpected(StatusCode::InvalidArgument);
   }
   auto impl = std::make_unique<Impl>();
-  impl->hidden_dim = config->hidden_dim;
+  // The boundary handoff carries the architecture residual stream, not the
+  // single hidden: a gated residual stack hands off every stream. A
+  // single-stream model returns hidden_dim, so its buffers are unchanged.
+  impl->hidden_dim = config->ResidualWidth();
   impl->context = options.context;
   impl->kv_type = options.kv_type;
   impl->stages.reserve(stage_count);

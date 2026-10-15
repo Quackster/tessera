@@ -117,6 +117,13 @@ std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
       !Alloc(backend, h.mtp_streams, g.hc_dim * 4)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
+  // The draft's paged K/V pools start empty, so an unwritten cell reads as
+  // zero rather than whatever the allocator returned.
+  const std::vector<std::byte> mtp_pool_zeros(pool_bytes, std::byte{0});
+  if (!backend.CopyH2D(*h.mtp_k_pool, mtp_pool_zeros) ||
+      !backend.CopyH2D(*h.mtp_v_pool, mtp_pool_zeros)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
   // The MTP MoE reuses the trunk's shared MoE scratch. On a head-only draft
   // device the trunk never ran, so those buffers were never grown; allocate
   // them here with the sizes the MTP and the trunk both use.

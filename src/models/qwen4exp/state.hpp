@@ -106,6 +106,15 @@ struct Qwen4ExpState final : core::ArchState {
       batch_ids, batch_wts, batch_sig;
   std::size_t batch_rows = 0;
 
+  // Per-layer gated-delta state snapshots for the cross-stage verify: one
+  // slot per state (rows + 1, slot 0 is the pre-batch state), indexed by the
+  // global layer number. Only allocated when a verify requests snapshots.
+  std::vector<std::unique_ptr<Buffer>> batch_gdn_state, batch_gdn_conv;
+  std::size_t batch_snapshot_rows = 0;
+  // Absolute position of snapshot slot 0, so a rollback maps a committed
+  // position to its slot.
+  std::uint64_t batch_snapshot_start = 0;
+
   // MTP draft head: the fetched weights (loaded lazily on first draft), its
   // own paged FP16 QSA cache, dense-attention scratch and expert scratch.
   std::unique_ptr<MtpWeights> mtp_weights;

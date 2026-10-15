@@ -33,8 +33,11 @@
 #include "core/timing.hpp"
 #include "test_helpers.hpp"
 #include "tessera/architecture.hpp"
+#include "tessera/backend.hpp"
 #include "tessera/engine.hpp"
+#include "tessera/pipeline.hpp"
 #include "tessera/runner.hpp"
+#include "tessera/tokenizer.hpp"
 #include "tessera/scheduler.hpp"
 #include "tessera/speculative.hpp"
 #include "tessera/image.hpp"
@@ -2000,6 +2003,146 @@ TEST(EngineTest, GpuLayerResidentSplitsLastLayers) {
   EXPECT_TRUE(GpuLayerResident("blk.3.attn_q.weight", 5, 0));
   // Non-block globals stay resident at any setting.
   EXPECT_TRUE(GpuLayerResident("position_embd.weight", 1, kTrunk));
+}
+
+TEST(EngineTest, ShardKeepsHeadAndEmbeddingOnTheirStage) {
+  using tessera::ModelShard;
+  using tessera::core::ShardKeepsTensor;
+  constexpr std::size_t kTrunk = 48;
+  // A disabled shard keeps every tensor.
+  ModelShard off;
+  EXPECT_TRUE(ShardKeepsTensor("output_hc_norm.weight", off, kTrunk));
+  EXPECT_TRUE(ShardKeepsTensor("blk.40.attn_q.weight", off, kTrunk));
+  // The first stage owns the embedding and its trunk range, not the head.
+  ModelShard first;
+  first.enabled = true;
+  first.first_layer = 0;
+  first.last_layer = 24;
+  first.first_stage = true;
+  first.last_stage = false;
+  EXPECT_TRUE(ShardKeepsTensor("token_embd.weight", first, kTrunk));
+  EXPECT_TRUE(ShardKeepsTensor("blk.0.attn_q.weight", first, kTrunk));
+  EXPECT_FALSE(ShardKeepsTensor("blk.24.attn_q.weight", first, kTrunk));
+  EXPECT_FALSE(ShardKeepsTensor("output.weight", first, kTrunk));
+  EXPECT_FALSE(ShardKeepsTensor("output_hc_norm.weight", first, kTrunk));
+  // The last stage owns the head (including the output_hc_* hyper-connection
+  // weights) and its trunk range, not the embedding.
+  ModelShard last;
+  last.enabled = true;
+  last.first_layer = 24;
+  last.last_layer = 0;  // through the last trunk layer
+  last.first_stage = false;
+  last.last_stage = true;
+  EXPECT_TRUE(ShardKeepsTensor("output.weight", last, kTrunk));
+  EXPECT_TRUE(ShardKeepsTensor("output_norm.weight", last, kTrunk));
+  EXPECT_TRUE(ShardKeepsTensor("output_hc_norm.weight", last, kTrunk));
+  EXPECT_TRUE(ShardKeepsTensor("output_hc_down.weight", last, kTrunk));
+  EXPECT_TRUE(ShardKeepsTensor("blk.47.attn_q.weight", last, kTrunk));
+  EXPECT_TRUE(ShardKeepsTensor("blk.48.nextn.eh_proj.weight", last, kTrunk));
+  EXPECT_FALSE(ShardKeepsTensor("token_embd.weight", last, kTrunk));
+  EXPECT_FALSE(ShardKeepsTensor("blk.23.attn_q.weight", last, kTrunk));
+}
+
+TEST(EngineTest, ShardLayerRangeTracksTheShard) {
+  using tessera::ModelShard;
+  using tessera::core::ShardLayerRange;
+  constexpr std::size_t kTrunk = 40;
+  // A disabled shard owns every trunk layer.
+  ModelShard all;
+  const auto full = ShardLayerRange(all, kTrunk);
+  EXPECT_EQ(full.first, 0u);
+  EXPECT_EQ(full.last, kTrunk);
+  // A last stage with last_layer 0 owns through the last trunk layer.
+  ModelShard last;
+  last.enabled = true;
+  last.first_layer = 24;
+  const auto tail = ShardLayerRange(last, kTrunk);
+  EXPECT_EQ(tail.first, 24u);
+  EXPECT_EQ(tail.last, kTrunk);
+  // A middle stage with an explicit end.
+  ModelShard mid;
+  mid.enabled = true;
+  mid.first_layer = 8;
+  mid.last_layer = 16;
+  const auto middle = ShardLayerRange(mid, kTrunk);
+  EXPECT_EQ(middle.first, 8u);
+  EXPECT_EQ(middle.last, 16u);
+  // An end past the trunk count clamps to the trunk count.
+  ModelShard over;
+  over.enabled = true;
+  over.last_layer = 99;
+  EXPECT_EQ(ShardLayerRange(over, kTrunk).last, kTrunk);
+}
+
+// A two-stage layer split must reproduce the single-device greedy token ids
+// for the same prompt. Opt-in and model-gated because it loads the model
+// with paging and again as a two-stage pipeline; set TESSERA_TEST_MODEL,
+// TESSERA_TEST_SHARD and, for a model too large for one device,
+// TESSERA_TEST_GPU_LAYERS.
+TEST(EngineTest, ShardedPipelineMatchesSingleDeviceWhenProvided) {
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
+  }
+  if (std::getenv("TESSERA_TEST_SHARD") == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_SHARD not set";
+  }
+  auto names = tessera::ListGpuNames();
+  if (!names || names->size() < 2) {
+    GTEST_SKIP() << "needs two devices";
+  }
+  const int gpu = tessera::testing::TestDeviceIndex();
+  if (gpu + 1 >= static_cast<int>(names->size())) {
+    GTEST_SKIP() << "need a second device above TESSERA_TEST_GPU";
+  }
+  std::size_t gpu_layers = 0;
+  if (const char* value = std::getenv("TESSERA_TEST_GPU_LAYERS")) {
+    gpu_layers = static_cast<std::size_t>(std::atoi(value));
+  }
+  const std::size_t count = 8;
+  std::vector<std::uint32_t> prompt;
+  std::vector<std::uint32_t> baseline;
+  {
+    tessera::EngineOptions engine_options;
+    engine_options.device_index = gpu;
+    // Match the pipeline's per-token prefill, so the only difference is the
+    // layer split. The chunk is an engine option, not a per-request one.
+    engine_options.prefill_chunk_tokens = 1;
+    auto engine = tessera::Engine::Create(engine_options);
+    ASSERT_TRUE(engine.has_value());
+    tessera::ModelOptions model_options{path, 512};
+    model_options.gpu_layers = gpu_layers;
+    auto model = (*engine)->LoadModel(model_options);
+    ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+    const tessera::Tokenizer* tokenizer = (*model)->GetTokenizer();
+    ASSERT_NE(tokenizer, nullptr);
+    auto rendered = (*model)->ChatPrompt("The capital of France is", false, "");
+    ASSERT_TRUE(rendered.has_value());
+    auto ids = tokenizer->Encode(*rendered);
+    ASSERT_TRUE(ids.has_value());
+    prompt = *ids;
+    tessera::GenerateOptions options;
+    options.prompt_tokens = prompt;
+    options.max_completion_tokens = count;
+    options.kv_type = tessera::KvCacheType::Q8;
+    auto out = (*engine)->Generate(**model, options);
+    ASSERT_TRUE(out.has_value()) << tessera::ToString(out.error());
+    baseline = *out;
+  }
+  std::vector<std::uint32_t> sharded;
+  {
+    tessera::PipelineOptions options;
+    options.model_path = path;
+    options.devices = {gpu, gpu + 1};
+    options.context = 512;
+    options.kv_type = tessera::KvCacheType::Q8;
+    auto pipe = tessera::Pipeline::Create(options);
+    ASSERT_TRUE(pipe.has_value()) << tessera::ToString(pipe.error());
+    auto out = (*pipe)->Generate(prompt, count);
+    ASSERT_TRUE(out.has_value()) << tessera::ToString(out.error());
+    sharded = *out;
+  }
+  EXPECT_EQ(sharded, baseline);
 }
 
 TEST(EngineTest, RoutedExpertKindMatchesSuffix) {

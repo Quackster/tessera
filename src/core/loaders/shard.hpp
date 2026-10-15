@@ -73,6 +73,21 @@ inline constexpr std::uint64_t kExpertCacheReserveBytes = 1ull << 30;
                                      const ModelShard& shard,
                                      std::size_t trunk_layers);
 
+// The trunk layer range [first, last) a shard owns, so a module limits its
+// layer loop to it and stays in step with what the load kept. A disabled
+// shard owns every layer; `last_layer` 0 means the last trunk layer.
+//
+// Usage:
+//   const LayerRange range = ShardLayerRange(model.Shard(), cfg.layers);
+//   for (std::size_t l = range.first; l < range.last; ++l) { /* layer l */ }
+struct LayerRange {
+  std::size_t first = 0;
+  std::size_t last = 0;
+};
+
+[[nodiscard]] LayerRange ShardLayerRange(const ModelShard& shard,
+                                         std::size_t trunk_layers);
+
 // True when the `--gpu-layers` resident set keeps the tensor `name` on the
 // device. `gpu_layers` 0 keeps everything (the full-upload default). A
 // nonzero value keeps the output head, the embedding, the non-block globals

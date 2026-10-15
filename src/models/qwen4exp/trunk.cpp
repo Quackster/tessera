@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "core/decode_internal.hpp"
+#include "core/loaders/shard.hpp"
 #include "core/numerics/ngram.hpp"
 #include "core/numerics/qsa.hpp"
 #include "core/profile.hpp"
@@ -751,6 +752,11 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
   if (h.ready) {
     return &h;
   }
+  // A sharded stage allocates per-layer state only for the layers it owns;
+  // the vectors stay sized to the trunk so indexing by the global layer
+  // number is unchanged.
+  const core::LayerRange range =
+      core::ShardLayerRange(model.Shard(), cfg.layers);
   if (auto r = LoadKernel(backend, h.rmsnorm, "rmsnorm"); !r)
     return std::unexpected(r.error());
   if (auto r = LoadKernel(backend, h.rmsnorm_rows, "rmsnorm_rows"); !r)
@@ -865,6 +871,10 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
 
   const std::size_t pool_bytes =
       kQsaPages * g.kv_heads * kQsaPageSize * g.head_dim * 2;
+  // The paged K/V pools start empty. The indexer can select a cell in the
+  // current block that the append has not written yet, so an unwritten pool
+  // must read as zeros, never as whatever the allocator returned.
+  const std::vector<std::byte> pool_zeros(pool_bytes, std::byte{0});
   const std::size_t cos_elems = kQsaCells * (kQsaNRot / 2);
   std::vector<float> cos_tab(cos_elems);
   std::vector<float> sin_tab(cos_elems);
@@ -881,7 +891,7 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
   h.gdn.resize(cfg.layers);
   h.qsa.resize(cfg.layers);
   std::vector<float> zeros_state;
-  for (std::size_t l = 0; l < cfg.layers; ++l) {
+  for (std::size_t l = range.first; l < range.last; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
       Qwen4ExpState::QsaLayer& st = h.qsa[l];
       if (!make(st.k_pool, pool_bytes) || !make(st.v_pool, pool_bytes) ||
@@ -892,6 +902,10 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
           !make(st.idx_cos, cos_elems * f) || !make(st.idx_sin, cos_elems * f) ||
           !make(st.block_pos, 4)) {
         return std::unexpected(StatusCode::OutOfMemory);
+      }
+      if (!backend.CopyH2D(*st.k_pool, pool_zeros) ||
+          !backend.CopyH2D(*st.v_pool, pool_zeros)) {
+        return std::unexpected(StatusCode::DeviceError);
       }
       std::vector<std::int32_t> table(kQsaPages);
       for (std::size_t p = 0; p < kQsaPages; ++p) {
@@ -935,7 +949,11 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
     }
   }
 
-  if (!cfg.ple.layers.empty()) {
+  // The PLE block runs once, before layer 1, so only the stage that owns
+  // layer 1 allocates the n-gram table and its history.
+  const bool owns_ple =
+      !cfg.ple.layers.empty() && range.first <= 1 && range.last > 1;
+  if (owns_ple) {
     const std::string table_path = PleTablePath(model.Path());
     if (!table_path.empty()) {
       auto table = PleTable::Open(table_path);
@@ -989,8 +1007,6 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
     std::uint32_t token, std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
     std::vector<Buffer*>* capture, const Buffer* embedding) const {
-  (void)capture_layers;
-  (void)capture;
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -1010,28 +1026,44 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
   }
   Qwen4ExpState& h = State(cache);
   h.profile = cache.profile;
-  auto embed = NeedWeightAny(model, "token_embd.weight");
-  if (!embed) {
-    return std::unexpected(StatusCode::MalformedFile);
+  const ModelShard& shard = model.Shard();
+  const core::LayerRange range = core::ShardLayerRange(shard, cfg.layers);
+  if (range.first >= range.last) {
+    return std::unexpected(StatusCode::InvalidArgument);
   }
-  if (embedding != nullptr) {
-    if (!backend.CopyD2D(*embedding, 0, *h.x, 0, g.hidden * 4)) {
+  // The first stage gathers the token embedding (or a caller embedding). A
+  // later stage receives the previous stage's whole residual stack through
+  // `embedding`: the hyper-connection keeps `hc` parallel streams across
+  // the split, so the handoff is hc*hidden and is loaded whole.
+  if (shard.enabled && !shard.first_stage) {
+    if (embedding == nullptr || embedding->Size() < g.hc_dim * 4 ||
+        !backend.CopyD2D(*embedding, 0, *h.R, 0, g.hc_dim * 4)) {
       return std::unexpected(StatusCode::InvalidArgument);
     }
   } else {
-    std::vector<float> row(g.hidden);
-    if (auto gathered =
-            detail::GatherEmbedding(backend, **embed, token, g.hidden, row);
-        !gathered) {
-      return std::unexpected(gathered.error());
+    if (embedding != nullptr) {
+      if (!backend.CopyD2D(*embedding, 0, *h.x, 0, g.hidden * 4)) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+    } else {
+      auto embed = NeedWeightAny(model, "token_embd.weight");
+      if (!embed) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      std::vector<float> row(g.hidden);
+      if (auto gathered =
+              detail::GatherEmbedding(backend, **embed, token, g.hidden, row);
+          !gathered) {
+        return std::unexpected(gathered.error());
+      }
+      if (!UploadF32(backend, *h.x, row)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
     }
-    if (!UploadF32(backend, *h.x, row)) {
-      return std::unexpected(StatusCode::DeviceError);
-    }
-  }
-  for (std::size_t c = 0; c < g.hc; ++c) {
-    if (!backend.CopyD2D(*h.x, 0, *h.R, c * g.hidden * 4, g.hidden * 4)) {
-      return std::unexpected(StatusCode::DeviceError);
+    for (std::size_t c = 0; c < g.hc; ++c) {
+      if (!backend.CopyD2D(*h.x, 0, *h.R, c * g.hidden * 4, g.hidden * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
     }
   }
   const std::uint64_t pos = h.position;
@@ -1041,11 +1073,21 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
       ple_layer = true;
     }
   }
-  for (std::size_t l = 0; l < cfg.layers; ++l) {
+  for (std::size_t l = range.first; l < range.last; ++l) {
     if (auto layer = RunTrunkLayer(backend, model, cfg, g, h, l, pos, token,
                                    ple_layer);
         !layer) {
       return layer;
+    }
+    // Capture the residual stack after the boundary layer for the next
+    // stage's handoff (the pipeline asks for one boundary layer).
+    if (capture_layers != nullptr && capture != nullptr) {
+      for (std::size_t i = 0; i < capture_layers->size(); ++i) {
+        if ((*capture_layers)[i] == l &&
+            !backend.CopyD2D(*h.R, 0, *(*capture)[i], 0, g.hc_dim * 4)) {
+          return std::unexpected(StatusCode::DeviceError);
+        }
+      }
     }
   }
   if (hidden_out != nullptr) {
@@ -1109,7 +1151,6 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::ForwardBatch(
     std::vector<float>* hidden_out, bool all_logits, const Buffer* embeddings,
     const std::vector<std::size_t>* capture_layers,
     std::vector<Buffer*>* capture, bool snapshot_state) const {
-  (void)snapshot_state;
   if (tokens.empty()) {
     return {};
   }
@@ -1123,15 +1164,18 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::ForwardBatch(
     logits_out->reserve(tokens.size() * vocab);
   }
   // A multi-row batch runs the layers once each over all rows, so the paged
-  // experts stage once per layer instead of once per row. The single-row
-  // case keeps the plain per-token path.
-  if (tokens.size() > 1) {
+  // experts stage once per layer instead of once per row. A verify that
+  // requests state snapshots also takes the batched path, so a one-row
+  // verify still records the pre/post recurrent state for rollback. The
+  // plain single-token case keeps the per-token path.
+  if (tokens.size() > 1 || snapshot_state) {
     auto ready = EnsureReady(backend, model, cache);
     if (!ready) {
       return ready;
     }
     return ForwardTrunkBatch(backend, model, cache, tokens, logits_out,
-                             hidden_out, all_logits, embeddings);
+                             hidden_out, all_logits, embeddings, capture_layers,
+                             capture, snapshot_state);
   }
   for (std::size_t i = 0; i < tokens.size(); ++i) {
     const bool last = i + 1 == tokens.size();
@@ -1152,6 +1196,51 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::ForwardBatch(
       }
     }
   }
+  return {};
+}
+
+std::expected<void, StatusCode> Qwen4ExpArchitecture::TruncateTarget(
+    Backend& backend, const Model& model, core::DecodeCache& cache,
+    std::size_t keep_rows) const {
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  auto geom = DeriveGeometry(*config);
+  if (!geom) {
+    return std::unexpected(geom.error());
+  }
+  const Qwen4ExpGeometry& g = *geom;
+  Qwen4ExpState& h = State(cache);
+  if (h.batch_gdn_state.empty()) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  if (keep_rows < h.batch_snapshot_start ||
+      keep_rows - h.batch_snapshot_start > h.batch_snapshot_rows) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const std::size_t slot =
+      static_cast<std::size_t>(keep_rows - h.batch_snapshot_start);
+  const std::size_t state_len =
+      g.gdn_num_v_heads * g.gdn_head_k_dim * g.gdn_head_v_dim;
+  const std::size_t hist_len = g.gdn_conv_dim * (g.gdn_width - 1);
+  // A sharded stage owns only its layers; the full-attention layers roll
+  // back through the position alone because their paged cache is bounded
+  // by the position, so only the recurrent state needs restoring.
+  const core::LayerRange range =
+      core::ShardLayerRange(model.Shard(), config->layers);
+  for (std::size_t l = range.first; l < range.last; ++l) {
+    if (config->IsFullAttentionLayer(l) || h.batch_gdn_state[l] == nullptr) {
+      continue;
+    }
+    if (!backend.CopyD2D(*h.batch_gdn_state[l], slot * state_len * 4,
+                         *h.gdn[l].state, 0, state_len * 4) ||
+        !backend.CopyD2D(*h.batch_gdn_conv[l], slot * hist_len * 4,
+                         *h.gdn[l].conv_hist, 0, hist_len * 4)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+  }
+  h.position = keep_rows;
   return {};
 }
 

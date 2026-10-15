@@ -319,6 +319,18 @@ architecture rules.
   greedy-only drafter, so it is not silently decoded as greedy. The loader
   is covered by `MtpWeightsTest`.
 
+Layer split: `--pipeline --gpus 0,1` splits the 48 trunk blocks into two
+contiguous halves (24 each). The module honors `ModelShard`: each stage runs
+only its layer range, allocates only that range's QSA and gated-delta state,
+gathers the embedding only on the first stage, and carries the whole
+`hc`-stream residual stack across the stage boundary. Verified on two R9700s
+(IQ3_S, 4K context, `--kv-q8`): the two-stage greedy token ids equal the
+single-device reference. The paged K/V pool must start zeroed, because the
+indexer can select a cell in the current block that the append has not
+written yet; the single-device path only held by luck on a fresh allocation.
+The cross-stage verify (pipeline speculation) runs the batched forward per
+stage and rolls each stage back with `TruncateTarget`.
+
 Correctness evidence: with no completion cap and `--no-chat`, the prompt
 `The capital of France is` produces a reasoning block and the answer
 `The capital of France is **Paris**.` in 115 tokens. Every forward block

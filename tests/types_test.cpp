@@ -178,6 +178,15 @@ TEST(Sha256Test, StreamedFileMatchesInMemory) {
   EXPECT_EQ(missing.error(), StatusCode::FileNotFound);
 }
 
+TEST(TransformerConfigTest, ResidualWidthIncludesHyperStreams) {
+  using tessera::TransformerConfig;
+  TransformerConfig cfg;
+  cfg.hidden_dim = 4096;
+  EXPECT_EQ(cfg.ResidualWidth(), 4096u);
+  cfg.hyper_connection.count = 4;
+  EXPECT_EQ(cfg.ResidualWidth(), 4u * 4096u);
+}
+
 TEST(ParseGpuListTest, AcceptsOneDeviceOrAList) {
   using tessera::cli::ParseGpuList;
   EXPECT_EQ(ParseGpuList("0"), (std::vector<int>{0}));

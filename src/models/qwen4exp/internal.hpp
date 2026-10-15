@@ -104,7 +104,9 @@ struct Qwen4ExpGeometry {
 [[nodiscard]] std::expected<void, StatusCode> ForwardTrunkBatch(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const std::uint32_t> tokens, std::vector<float>* logits_out,
-    std::vector<float>* hidden_out, bool all_logits, const Buffer* embeddings);
+    std::vector<float>* hidden_out, bool all_logits, const Buffer* embeddings,
+    const std::vector<std::size_t>* capture_layers = nullptr,
+    std::vector<Buffer*>* capture = nullptr, bool snapshot_state = false);
 
 // The sparse mixture-of-experts FFN for one layer: route, run `top_k`
 // routed experts and the always-on shared expert, and write the block
