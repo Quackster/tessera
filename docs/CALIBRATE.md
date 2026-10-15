@@ -222,8 +222,11 @@ Remaining, with the reason:
   model (and MTP head) is on every rank, so the drafter runs per rank, and
   the batched full attention now combines per row across the ranks. The
   `--gpus --cp --speculate` CLI wiring is not landed yet.
-* All three parallel paths run MTP speculation at the library level; the
-  `calibrate --gpus ... --speculate` CLI wiring is landed for `--tp` only.
+* `calibrate --gpus ... --speculate` attaches MTP to any of `--tp`,
+  `--cp`, or `--pipeline` and sweeps the draft block, storing the winner
+  under the layout key.
+* The DFlash2 `--draft` checkpoint is still single-device only on the
+  parallel path; only MTP `--speculate` is swept there.
 * The parallel paths need a two-device run to verify.
 
 The diagnostic flags stay manual. The sweep names none of them.
