@@ -9,7 +9,7 @@ There are two modes. Use one mode per command. One command never runs both modes
 | Mode | Command | Result |
 | --- | --- | --- |
 | Single GPU speed sweep | `calibrate --model <path>` without `--gpus` | Best speed settings plus memory bound |
-| Parallel memory bound | `calibrate --model <path> --gpus 0,1 --tp` or `--cp` or `--pipeline` | Memory bound only, no speed settings |
+| Parallel speed and memory bound | `calibrate --model <path> --gpus 0,1 --tp` or `--cp` or `--pipeline` | Best layout speed settings plus memory bound |
 
 ## Mode 1: single GPU speed sweep
 
@@ -34,15 +34,23 @@ Example:
 Useful flags:
 
 * `--model <path>`: model file or directory. Required.
-* `--gpu <n>`: device index. Default is 0.
+* `--gpu <n>`: one device index. Default is 0. A list such as `0,1` reads as 0. Use `--gpus 0,1` for a multi GPU layout.
 * `--context <n>`: context length stored in the key. Default is 32768.
 * `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`: KV cache type. Default is int8.
 * `--draft <dir>`: DFlash2 draft checkpoint. It enables the draft sweeps.
 * `--speculate`: MTP draft from the target head. It enables the draft block sweep.
 * `--prompts <file>`: prompts for the sweep, one per line. Default is three fixed prompts.
 * `--calibrate-limit <n>`: run at most this many sweep measurements in total, in sweep order. Default is unlimited. Each point is one engine run with no warmup. A setting cut short keeps its fastest measured value with no confirmation; a setting with nothing measured keeps its default and shows as skipped. Stored rates are medians over the measured points. A limited run is a quick pass, not a final tuning.
+* `--concurrent`: also run the concurrent-session benchmark (2, 3, and 4 sessions). Off by default; it costs several model runs.
 * `--calibration <file>`: file to read and write. You can also set `TESSERA_CALIBRATION`. One of the two is required.
 * `--quiet`: hide progress logs.
+
+Paging and prompts:
+
+* `calibrate` sizes the paging itself from the free device memory, before the load. It does not take `--gpu-layers`. There is no override. So a user cannot force a layer count on `calibrate`.
+* `run` and `serve` take `--gpu-layers`. They also apply the layer count stored in the entry when the flag is absent. An explicit flag wins.
+* `calibrate` reads its prompts from `--prompts <file>`, one prompt per line. It does not take `--prompt-text`. `--prompt-text` is a `run` and `serve` flag, the text to generate from.
+* A flag that `calibrate` does not take is an error. The command exits with code 2 and prints the usage text.
 
 What it tunes:
 
@@ -52,8 +60,14 @@ What it tunes:
 | `mxfp4_split_cap` | `2`, `4`, `8` | ROCm only |
 | `prefill_chunk_tokens` | `512`, `768`, `1024`, `1536`, `2048` | Always |
 | `attention_split` | `4`, `8`, `16`, `32` | Only when prompts reach 1024 keys |
-| `draft_tokens` | `4`, `8`, plus checkpoint value | Only with `--draft` or `--speculate` |
+| `draft_tokens` | `1`, `2`, `3`, `4`, plus checkpoint value | Only with `--draft` or `--speculate` |
 | `draft_context` | `512`, `1024`, `2048` | Only with `--draft` |
+
+The draft block list covers `--draft-block 0` to `4`. Block `0` is the
+checkpoint value: it is the default candidate. The parallel path sweeps
+`mxfp4_split_target` and `mxfp4_split_cap` on ROCm, and `attention_split`
+on `--pipeline`. It does not sweep `prefill_chunk_tokens` (its prefill
+steps one token at a time) and it has no draft (see the TODO list).
 
 How it measures:
 
@@ -66,6 +80,11 @@ How it measures:
 * It keeps a value only when it beats the default by more than 0.03.
 * It confirms a winner with three interleaved re-measurements.
 * It warms the engine before the first point and warms each new value once.
+* It stops a setting early when three candidates in a row are slower than
+  the best value seen so far, then moves to the next setting.
+* `--concurrent` also benchmarks 2, 3, and 4 sessions together. It reports
+  the total and per-session tok/s for each count, and the largest count that
+  fits the requested context. This path is non-speculative.
 
 What it stores:
 
@@ -76,9 +95,10 @@ What it stores:
 * The layer count is the paging the sweep ran with. `run` and `serve` read it from the entry, so an explicit `--gpu-layers` is not needed. An explicit flag still wins.
 * The report prints each point, the chosen values, the layer count, and an example `run` command.
 
-## Mode 2: parallel memory bound
+## Mode 2: parallel memory bound and speed sweep
 
-Use this mode to find the largest KV context for a multi GPU layout.
+Use this mode to tune a multi GPU layout: the largest KV context it allows
+and the fastest speed settings it reaches.
 
 Example:
 
@@ -93,15 +113,16 @@ Rules:
 
 * `--gpus` needs at least two devices, for example `0,1`.
 * Pass exactly one route: `--tp`, `--cp`, or `--pipeline`.
-* Do not pass `--draft` or `--speculate`. The entry always stores strategy `none`.
+* Do not pass `--draft` or `--speculate`. No parallel layout attaches a draft. The entry always stores strategy `none`.
 * The entry stores one layout: `tp2`, `cp2`, or `pipe2`.
+* `--prompts <file>` and `--calibrate-limit <n>` work here too.
 
 How it measures:
 
 * It builds the route and measures free memory and weight bytes on each rank.
 * It combines the ranks. Tensor takes the minimum. Context multiplies the minimum by the rank count. Pipeline scales each stage by its layer share.
-* It runs one short validation generate of 8 tokens. It measures no speed.
-* It stores `max_context` and the date. Decode and prefill rates stay empty.
+* It runs one short validation generate of 8 tokens, then sweeps the speed knobs the layout honors (see the tuning table).
+* It stores the chosen settings, the median decode and prefill rates, `max_context`, and the date. Decode and prefill rates are empty only when the sweep could not measure them.
 
 ## Use a saved entry
 
@@ -129,16 +150,18 @@ Only `calibrate` writes the file. `run` and `serve` only read it. A missing file
 
 ## What calibration does not do
 
-* It does not tune speed for a parallel layout. The `--gpus` path stores memory only.
+* It does not take `--gpu-layers`. It sizes the paging itself from the free device memory.
+* It does not take `--prompt-text`. It reads the sweep prompts from `--prompts <file>`.
 * It does not size the layer count for a parallel layout. The `--gpus` path loads each rank in full.
-* It does not benchmark concurrent sessions. There is no sweep over 2, 3, or 4 sessions with tok/s per count.
-* It does not report max KV cache under concurrent load.
-* It does not store speed rates for parallel entries.
-* It does not sweep the draft on the parallel path.
+* It does not sweep the draft on the parallel path. No parallel layout attaches a draft, so `--draft` and `--speculate` are single-device only. The tool refuses them with `--gpus`. See the TODO list.
+* It does not sweep `prefill_chunk_tokens` on the parallel path. Its prefill steps one token at a time.
 * It does not select the KV cache type. The KV type is your choice. It changes numerics.
 * It does not select the backend. The backend is fixed at configure time.
 * It does not tune sampling. Sampling changes output.
 * It does not store model paths. The key stores the model name only.
+
+The concurrent benchmark runs under the scheduler without speculation. It
+skips when a draft is attached and says so.
 
 Note: `run` with two or more `--prompt-text` flags runs concurrent sessions on one device. That path is a functional run. It is not a calibration sweep. It writes no file.
 
@@ -162,18 +185,19 @@ Read it top to bottom:
 * Identity rows name the backend, device, model, KV type, strategy, key context, memory bound, and layer count.
 * `Sweep` lists each tested value with its tok/s. `(default)` marks the built-in value. `(kept)` marks the winner.
 * `Chosen` lists the values the run keeps.
+* `Concurrency` lists each measured session count with its total and per-session tok/s, and the largest count that fits the key context. It prints `not measured` when `--concurrent` is absent.
 * `Wrote` names the JSON file the entry went to.
 * `Example` shows two `run` commands that reuse the result. The first spells the flags. The second applies the saved entry with `--calibration`.
 
 ## TODO
 
-1. Add a speed sweep for parallel layouts. Sweep the same speed knobs through `--tp`, `--cp`, and `--pipeline` on the target GPUs. Store the winner under the layout key.
-2. Add the draft sweep to the parallel path. Cover `--draft` and `--speculate` for each layout.
-3. Add a concurrent session benchmark. Run 2, then 3, then 4 sessions on the calibrated model. Report total tok/s and per session tok/s for each count.
-4. Report max KV cache under concurrent load. Record the largest session count that fits the requested context.
-5. Store measured decode and prefill rates in parallel entries. Fill the rate fields that are empty today.
-6. Keep diagnostic flags out of the sweep. `TESSERA_MXFP4_WMMA`, `TESSERA_MXFP4_W4A8`, `TESSERA_TARGET_BF16`, tiled GEMM thresholds, and the prefill attention budget stay manual.
+1. Add the draft sweep to the parallel path. Cover `--draft` and `--speculate` for each layout. This needs speculative decoding on `TensorParallel`, `ContextParallel`, and `Pipeline`, which do not run a strategy today. The tool refuses `--draft` and `--speculate` with `--gpus` until then.
+
+The diagnostic flags stay manual. The sweep names none of them.
+`TESSERA_MXFP4_WMMA`, `TESSERA_MXFP4_W4A8`, `TESSERA_TARGET_BF16`, the
+tiled GEMM thresholds, and the prefill attention budget are set through the
+environment or their own flags, never through a sweep candidate.
 
 ## File format
 
-The file is JSON. It holds one entry per key. A missing file means no calibration yet. A malformed file is rejected. Old files without the `parallel` field still load as `none`.
+The file is JSON. It holds one entry per key. A missing file means no calibration yet. A malformed file is rejected. Old files without the `parallel` field still load as `none`. A parallel entry carries the same fields as a single-device entry: the chosen settings, the measured decode and prefill rates, the memory bound, and the date.

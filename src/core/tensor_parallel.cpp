@@ -46,7 +46,30 @@ struct TensorParallel::Impl {
   std::unique_ptr<Buffer> reduce_scratch;
   std::size_t hidden_dim = 0;
   std::size_t context = 0;
+  KvCacheType kv_type = KvCacheType::F32;
   std::vector<std::uint32_t> stops;
+
+  // Fresh decode caches for every rank, so one generation starts at position
+  // zero and the request's speed tuning and KV type take effect (the
+  // architecture state copies tuning when it is first built). The TP context
+  // is reattached to each new cache.
+  void ResetCaches(const GenerateOptions& options) {
+    for (std::size_t r = 0; r < ranks.size(); ++r) {
+      auto cache = std::make_unique<core::DecodeCache>();
+      cache->kv_type = options.kv_type;
+      cache->tuning.mxfp4_split_target = options.mxfp4_split_target;
+      cache->tuning.mxfp4_split_cap = options.mxfp4_split_cap;
+      cache->tuning.attention_split = options.attention_split;
+      cache->tp = contexts[r].get();
+      ranks[r].cache = std::move(cache);
+    }
+  }
+
+  // Greedy generation with `options` tuning, filling `produced`; the outcome
+  // carries the produced count and the prefill/decode wall times.
+  std::expected<GenerateOutcome, StatusCode> Run(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      std::vector<std::uint32_t>* produced);
 
   // Run one token through every rank on its own thread; the ranks rendezvous
   // at each FFN and attention all-reduce. When `want_token` rank 0 also runs
@@ -93,6 +116,56 @@ struct TensorParallel::Impl {
   }
 };
 
+std::expected<GenerateOutcome, StatusCode> TensorParallel::Impl::Run(
+    std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+    std::vector<std::uint32_t>* produced) {
+  if (prompt.empty() || prompt.size() > context) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  produced->clear();
+  ResetCaches(options);
+  GenerateOutcome outcome;
+  outcome.prompt_tokens = prompt.size();
+  std::uint32_t next = 0;
+  const auto prefill_started = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < prompt.size(); ++i) {
+    const bool last = (i + 1 == prompt.size());
+    auto token = Step(prompt[i], last);
+    if (!token) {
+      return std::unexpected(token.error());
+    }
+    if (last) {
+      next = *token;
+    }
+  }
+  outcome.prefill_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - prefill_started)
+                           .count();
+  const std::size_t budget =
+      options.max_completion_tokens == 0 ? context - prompt.size()
+                                         : options.max_completion_tokens;
+  bool stopped = false;
+  const auto decode_started = std::chrono::steady_clock::now();
+  for (std::size_t count = 0; count < budget; ++count) {
+    if (IsStop(next, stops)) {
+      stopped = true;
+      break;
+    }
+    produced->push_back(next);
+    auto token = Step(next, true);
+    if (!token) {
+      return std::unexpected(token.error());
+    }
+    next = *token;
+  }
+  outcome.decode_ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - decode_started)
+                          .count();
+  outcome.produced = produced->size();
+  outcome.reason = stopped ? FinishReason::Stop : FinishReason::Length;
+  return outcome;
+}
+
 TensorParallel::TensorParallel(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
@@ -113,6 +186,7 @@ TensorParallel::Create(const TensorParallelOptions& options) {
   auto impl = std::make_unique<Impl>();
   impl->hidden_dim = config->hidden_dim;
   impl->context = options.context;
+  impl->kv_type = options.kv_type;
   impl->barrier.world = static_cast<int>(options.devices.size());
   const int world = static_cast<int>(options.devices.size());
   impl->ranks.reserve(options.devices.size());
@@ -177,52 +251,34 @@ TensorParallel::Create(const TensorParallelOptions& options) {
 
 std::expected<std::vector<std::uint32_t>, StatusCode> TensorParallel::Generate(
     std::span<const std::uint32_t> prompt, std::size_t max_tokens) {
-  Impl& p = *impl_;
-  if (prompt.empty() || prompt.size() > p.context) {
-    return std::unexpected(StatusCode::InvalidArgument);
-  }
-  std::uint32_t next = 0;
-  for (std::size_t i = 0; i < prompt.size(); ++i) {
-    const bool last = (i + 1 == prompt.size());
-    auto token = p.Step(prompt[i], last);
-    if (!token) {
-      return std::unexpected(token.error());
-    }
-    if (last) {
-      next = *token;
-    }
-  }
-  const std::size_t budget =
-      max_tokens == 0 ? p.context - prompt.size() : max_tokens;
-  const auto decode_started = std::chrono::steady_clock::now();
+  GenerateOptions options;
+  options.max_completion_tokens = max_tokens;
+  options.kv_type = impl_->kv_type;
   std::vector<std::uint32_t> produced;
-  for (std::size_t count = 0; count < budget; ++count) {
-    if (IsStop(next, p.stops)) {
-      break;
-    }
-    produced.push_back(next);
-    auto token = p.Step(next, true);
-    if (!token) {
-      return std::unexpected(token.error());
-    }
-    next = *token;
+  auto outcome = impl_->Run(prompt, options, &produced);
+  if (!outcome) {
+    return std::unexpected(outcome.error());
   }
-  if (!produced.empty()) {
-    const long long decode_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - decode_started)
-            .count();
-    const long long tps =
-        decode_ms > 0
-            ? static_cast<long long>(produced.size()) * 1000 / decode_ms
-            : 0;
-    p.ranks[0].engine->Diagnostics().Info(
+  if (!produced.empty() && outcome->decode_ms > 0.0) {
+    const long long tps = static_cast<long long>(
+        static_cast<double>(produced.size()) * 1000.0 / outcome->decode_ms);
+    impl_->ranks[0].engine->Diagnostics().Info(
         "tp", std::string("decode: ") + std::to_string(produced.size()) +
-                  " token(s) in " + std::to_string(decode_ms) + " ms (" +
-                  std::to_string(tps) + " tok/s, ranks=" +
-                  std::to_string(p.ranks.size()) + ")");
+                  " token(s) in " + std::to_string(static_cast<long long>(
+                      outcome->decode_ms)) + " ms (" + std::to_string(tps) +
+                  " tok/s, ranks=" + std::to_string(impl_->ranks.size()) + ")");
   }
   return produced;
+}
+
+std::expected<GenerateOutcome, StatusCode> TensorParallel::GenerateTimed(
+    std::span<const std::uint32_t> prompt, const GenerateOptions& options) {
+  std::vector<std::uint32_t> produced;
+  auto outcome = impl_->Run(prompt, options, &produced);
+  if (!outcome) {
+    return std::unexpected(outcome.error());
+  }
+  return *outcome;
 }
 
 std::size_t TensorParallel::RankCount() const { return impl_->ranks.size(); }
