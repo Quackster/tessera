@@ -61,6 +61,23 @@ Here's an example of an SVG generation:
 
 <img width="1796" height="1115" alt="image" src="https://github.com/user-attachments/assets/1b60b164-f462-467f-b696-812b27020de2" />
 
+## Two R9700s with Qwen3.8-Flash-Next MTP
+
+Two AMD Radeon AI PRO R9700 cards run the Qwen3.8-Flash-Next IQ3_S target with MTP speculation on a layer split. This configuration works without Resizable BAR.
+
+Without Resizable BAR the BAR window is small. Tessera keeps part of each stage in system RAM and pages the rest on demand. `--gpu-layers 18` sizes the resident part so the last stage also fits the output head, the token embedding, and the MTP head. `--pipeline-split 24,24` puts 24 trunk blocks on each card.
+
+```sh
+./cmake-build-rocm/tessera-cli run \
+  --model ~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+  --mtp ~/models/Qwen3.8-Flash-Next-MTP \
+  --speculate --pipeline --pipeline-split 24,24 --gpus 0,1 \
+  --context 262144 --kv-q8 --gpu-layers 18 \
+  --prompt-text "write a cringe story"
+```
+
+The run prefills the whole prompt, streams each output token, and stops at the declared stop token. On this machine MTP decode runs about 12 tokens per second. The MTP head needs no draft checkpoint. `--speculate` drafts from the head in `--mtp`.
+
 ## Architecture
 
 Core code is backend agnostic. All device work goes through the `Backend` interface. Only `src/backends/vulkan/` includes Vulkan headers. Only `src/backends/rocm/` includes HIP and ROCm headers. No vendor type crosses the backend boundary.
