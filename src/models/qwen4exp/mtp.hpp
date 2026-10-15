@@ -23,8 +23,8 @@ namespace tessera::models::qwen4exp {
 // calls this from EnsureReady, before the expert cache sizes itself to the
 // free device memory, so the MTP weights get their share first.
 [[nodiscard]] std::expected<void, StatusCode> EnsureMtpReady(
-    Backend& backend, const Model& model, const Qwen4ExpGeometry& g,
-    Qwen4ExpState& h);
+    Backend& backend, const Model& model, const TransformerConfig& cfg,
+    const Qwen4ExpGeometry& g, Qwen4ExpState& h);
 
 // One MTP draft step: consume the target's final multi-stream residual
 // `hidden` (hc * hidden) and the anchor `token`, run the MTP block at KV

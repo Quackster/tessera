@@ -684,6 +684,8 @@ int main(int argc, char** argv) {
     split_options.kv_type = kv_type;
     split_options.draft_block = draft_block;
     split_options.prefill_chunk = prefill_chunk;
+    split_options.mtp_path = mtp_path;
+    split_options.gpu_layers = gpu_layers;
     auto split = tessera::SpecSplit::Create(split_options);
     if (!split) {
       std::fprintf(stderr, "cli: speculative-split create failed (%s)\n",

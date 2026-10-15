@@ -65,6 +65,7 @@ std::expected<std::unique_ptr<SpecSplit>, StatusCode> SpecSplit::Create(
     model_options.path = options.model_path;
     model_options.max_context_length = options.context;
     model_options.load_mtp_head = true;
+    model_options.gpu_layers = options.gpu_layers;
     auto model = impl->target_engine->LoadModel(model_options);
     if (!model) {
       return std::unexpected(model.error());
@@ -87,6 +88,9 @@ std::expected<std::unique_ptr<SpecSplit>, StatusCode> SpecSplit::Create(
     model_options.path = options.model_path;
     model_options.max_context_length = options.context;
     model_options.load_mtp_head = true;
+    // The draft device reads the separately fetched MTP head; the target
+    // does not, so only this load carries the path.
+    model_options.mtp_path = options.mtp_path;
     model_options.shard.enabled = true;
     model_options.shard.first_layer = trunk_layers;
     model_options.shard.last_layer = trunk_layers;

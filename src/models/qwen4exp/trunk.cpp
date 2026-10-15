@@ -876,7 +876,7 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::EnsureReady(
   // Load the MTP head now, before the expert cache sizes itself to the free
   // device memory, so the MTP weights get their share of VRAM first.
   if (!model.MtpPath().empty()) {
-    if (auto mtp = EnsureMtpReady(backend, model, *geom, **state); !mtp) {
+    if (auto mtp = EnsureMtpReady(backend, model, *config, *geom, **state); !mtp) {
       return std::unexpected(mtp.error());
     }
   }
