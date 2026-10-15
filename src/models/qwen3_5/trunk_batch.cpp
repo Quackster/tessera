@@ -174,15 +174,31 @@ std::expected<void, StatusCode> RunFfnBatch(Backend& backend,
     return std::unexpected(StatusCode::DeviceError);
   }
   InvalidateActivationPack(h);
+  // Tensor-parallel FFN: gate and up are column-parallel (ffn_dim/world
+  // output rows each) and down is row-parallel, its partial all-reduced
+  // across the ranks. Mirrors the single-token RunFfn.
+  const bool tp = h.tp != nullptr && h.tp->enabled;
+  const std::size_t world = tp ? static_cast<std::size_t>(h.tp->world) : 1;
+  const std::size_t ffn = cfg.ffn_dim / world;
+  Buffer& down_out = tp ? *h.tp->ffn_partial[static_cast<std::size_t>(h.tp->rank)]
+                        : *b.proj;
   if (!ProjectBatch(backend, h, (*fg)->manifest.dtype, *b.xn, *(*fg)->device,
-                    *b.fgate, rows, cfg.ffn_dim, cfg.hidden_dim) ||
+                    *b.fgate, rows, ffn, cfg.hidden_dim) ||
       !ProjectBatch(backend, h, (*fu)->manifest.dtype, *b.xn, *(*fu)->device,
-                    *b.fup, rows, cfg.ffn_dim, cfg.hidden_dim) ||
+                    *b.fup, rows, ffn, cfg.hidden_dim) ||
       !SiluMulDevice(backend, *h.silu_mul_kernel, *b.fgate, *b.fup, *b.fmlp,
-                     rows * cfg.ffn_dim) ||
+                     rows * ffn) ||
       !ProjectBatch(backend, h, (*fd)->manifest.dtype, *b.fmlp, *(*fd)->device,
-                    *b.proj, rows, cfg.hidden_dim, cfg.ffn_dim) ||
-      !AddDevice(backend, *h.add_kernel, *b.x, *b.proj, *b.x,
+                    down_out, rows, cfg.hidden_dim, ffn)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (tp) {
+    auto reduced = TpReduce(backend, h, rows * cfg.hidden_dim * 4);
+    if (!reduced) {
+      return std::unexpected(reduced.error());
+    }
+  }
+  if (!AddDevice(backend, *h.add_kernel, *b.x, down_out, *b.x,
                  rows * cfg.hidden_dim)) {
     return std::unexpected(StatusCode::DeviceError);
   }
@@ -201,8 +217,14 @@ std::expected<void, StatusCode> RunFullBlockBatch(
       h.profile != nullptr && h.profile->Deep() ? h.profile : nullptr;
   core::PhaseScope layer_scope(deep, core::Phase::kFullLayer);
   const std::size_t hidden = cfg.hidden_dim;
-  const std::size_t heads = cfg.attention.heads;
-  const std::size_t kv_heads = cfg.attention.kv_heads;
+  // Tensor-parallel attention: each rank owns heads/world query heads and
+  // kv_heads/world key/value heads; the output projection is row-parallel and
+  // its partial is all-reduced across the ranks. Mirrors the single-token
+  // RunFullBlock.
+  const bool tp = h.tp != nullptr && h.tp->enabled;
+  const std::size_t world = tp ? static_cast<std::size_t>(h.tp->world) : 1;
+  const std::size_t heads = cfg.attention.heads / world;
+  const std::size_t kv_heads = cfg.attention.kv_heads / world;
   const std::size_t head_dim = cfg.attention.head_dim;
   const std::size_t kv_dim = kv_heads * head_dim;
   const std::size_t rope_dim = cfg.attention.rope_dim;
@@ -285,12 +307,22 @@ std::expected<void, StatusCode> RunFullBlockBatch(
                             *b.attn, kv.rows, heads, kv_heads, head_dim, pos,
                             0, rows, kv.type == KvCacheType::F16)
                 .has_value();
+  Buffer& out_partial = tp ? *h.tp->ffn_partial[static_cast<std::size_t>(h.tp->rank)]
+                           : *b.proj;
   if (!attention_ok ||
       !SigmoidGateDevice(backend, *h.sigmoid_gate_kernel, *b.attn, *b.gate,
                          *b.attn, rows * heads * head_dim) ||
       !ProjectBatch(backend, h, (*wo)->manifest.dtype, *b.attn, *(*wo)->device,
-                    *b.proj, rows, hidden, heads * head_dim) ||
-      !AddDevice(backend, *h.add_kernel, *b.x, *b.proj, *b.x,
+                    out_partial, rows, hidden, heads * head_dim)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  if (tp) {
+    auto reduced = TpReduce(backend, h, rows * hidden * 4);
+    if (!reduced) {
+      return std::unexpected(reduced.error());
+    }
+  }
+  if (!AddDevice(backend, *h.add_kernel, *b.x, out_partial, *b.x,
                  rows * hidden)) {
     return std::unexpected(StatusCode::DeviceError);
   }

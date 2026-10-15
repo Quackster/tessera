@@ -193,6 +193,29 @@ Read it top to bottom:
 
 1. Add the draft sweep to the parallel path. Cover `--draft` and `--speculate` for each layout. This needs speculative decoding on `TensorParallel`, `ContextParallel`, and `Pipeline`, which do not run a strategy today. The tool refuses `--draft` and `--speculate` with `--gpus` until then.
 
+### Progress on TODO 1
+
+Landed:
+
+* One decode driver (`core::RunDecode`) behind a `SpecTarget` seam. The
+  single-device engine implements the seam, so greedy and speculative
+  decode share one loop.
+* Batched tensor-parallel all-reduce in the qwen3_5 `ForwardBatch` path for
+  the dense FFN and the attention output projection. The rank partial and
+  the rank-0 staging buffers cover a whole verify batch.
+
+Remaining, with the reason:
+
+* The batched MoE FFN (`RunMoeFfnBatch`) is not tensor-parallel aware, so a
+  batched verify on a MoE target is not correct yet.
+* The MTP head is tensor-parallel sliced (its block projections match the
+  FFN and attention names). The drafter runs on one rank today, so it needs
+  a full head on one rank or a collective draft.
+* `Pipeline` has no batched cross-stage forward or verify.
+* `ContextParallel` splits the key range, so a drafter cannot see the whole
+  context. Speculation there needs a design of its own.
+* The tensor-parallel and pipeline paths need a two-device run to verify.
+
 The diagnostic flags stay manual. The sweep names none of them.
 `TESSERA_MXFP4_WMMA`, `TESSERA_MXFP4_W4A8`, `TESSERA_TARGET_BF16`, the
 tiled GEMM thresholds, and the prefill attention budget are set through the

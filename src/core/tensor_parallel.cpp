@@ -28,6 +28,12 @@ bool IsStop(std::uint32_t token, std::span<const std::uint32_t> stops) {
   return false;
 }
 
+// Rows one batched tensor-parallel forward handles at once: a speculative
+// verify scores the anchor plus up to the checkpoint's draft block. The rank
+// partial and the rank-0 reduce staging buffers are sized for this many
+// hidden rows, so the batched all-reduce covers a whole verify batch.
+constexpr std::size_t kTpBatchRows = 16;
+
 }  // namespace
 
 struct TensorParallel::Impl {
@@ -210,9 +216,8 @@ TensorParallel::Create(const TensorParallelOptions& options) {
     Impl::Rank rank;
     rank.engine = std::move(*engine);
     rank.model = std::move(*model);
-    auto buffer =
-        rank.engine->Owner().AllocateBuffer(impl->hidden_dim * 4,
-                                            MemoryKind::Device);
+    auto buffer = rank.engine->Owner().AllocateBuffer(
+        kTpBatchRows * impl->hidden_dim * 4, MemoryKind::Device);
     if (!buffer) {
       return std::unexpected(buffer.error());
     }
@@ -227,7 +232,7 @@ TensorParallel::Create(const TensorParallelOptions& options) {
   }
   // Rank 0 stages each peer's partial here before accumulating it.
   auto scratch = impl->ranks[0].engine->Owner().AllocateBuffer(
-      impl->hidden_dim * 4, MemoryKind::Device);
+      kTpBatchRows * impl->hidden_dim * 4, MemoryKind::Device);
   if (!scratch) {
     return std::unexpected(scratch.error());
   }
