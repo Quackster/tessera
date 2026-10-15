@@ -34,7 +34,7 @@ Example:
 Useful flags:
 
 * `--model <path>`: model file or directory. Required.
-* `--gpu <n>`: one device index. Default is 0. A list such as `0,1` reads as 0. Use `--gpus 0,1` for a multi GPU layout.
+* `--gpus <a,b>`: one device index or a comma-separated list. Default is 0. A single index such as `--gpus 0` runs the single-device sweep. Two or more devices, such as `--gpus 0,1`, run the parallel layout with `--tp`, `--cp`, or `--pipeline`.
 * `--context <n>`: context length stored in the key. Default is 32768.
 * `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`: KV cache type. Default is int8.
 * `--draft <dir>`: DFlash2 draft checkpoint. It enables the draft sweeps.
@@ -213,11 +213,11 @@ Remaining, with the reason:
 
 * The batched MoE FFN (`RunMoeFfnBatch`) is not tensor-parallel aware, so a
   batched verify on a MoE target is not correct yet.
-* `Pipeline` needs a batched cross-stage forward and verify: the stage
-  handoff carries one row today, and a verify must roll each stage's cache
-  back to the accepted prefix, so the architecture needs a per-stage target
-  truncate (the MTP block already loads on the last stage; the shard loader
-  gives it to `last_stage`). Its draft sweep is not implemented yet.
+* `Pipeline` runs MTP speculation at the library level: a batched
+  cross-stage verify (every stage snapshots, the last stage scores and
+  accepts, each stage rolls back to the accepted prefix), with the drafter
+  on the last stage, which owns the MTP head. The `--gpus --pipeline
+  --speculate` CLI wiring is not landed yet.
 * `ContextParallel` splits the key range, so a drafter cannot see the whole
   context. Speculation there needs a design of its own.
 * The tensor-parallel and pipeline paths need a two-device run to verify.
