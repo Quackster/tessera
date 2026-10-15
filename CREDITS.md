@@ -30,7 +30,11 @@ project, the version, the license, and where it is used.
   fields in include/tessera/types.hpp and src/core/model.cpp, and
   ported to src/core/numerics/{quant,hyper,ngram,ple,qsa}.*, the
   qwen4exp module, and the backend kernels. The quant grids are
-  ultimately llama.cpp's, as the entry above records.
+  ultimately llama.cpp's, as the entry above records. The MTP head
+  fetch is ported from its tools/mtp_fetch.py to the C++ API in
+  include/tessera/mtp_fetch.hpp and the implementation in
+  src/models/qwen4exp/mtp_fetch.cpp, including the pinned checkpoint
+  revision and the per-tensor SHA256 digests.
 - llama.cpp src/models/qwen35.cpp (MIT License, same checkout):
   hybrid layer layout (recurrent gated-delta-net layers interleaved
   with full attention every full_attention_interval blocks, MTP

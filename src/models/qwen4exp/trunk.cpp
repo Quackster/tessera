@@ -12,6 +12,7 @@
 #include "core/numerics/qsa.hpp"
 #include "core/profile.hpp"
 #include "models/qwen4exp/architecture.hpp"
+#include "models/qwen4exp/mtp.hpp"
 #include "models/qwen4exp/ple_table.hpp"
 #include "models/qwen4exp/state.hpp"
 
@@ -119,20 +120,19 @@ std::expected<void, StatusCode> Project(Backend& backend, Qwen4ExpState& h,
   return ProjectDevice(backend, **gemm, a, w, out, m, n, k);
 }
 
-namespace {
-
 // One gated residual read: normalize the stack into the sub-block input
 // `mixed`, and (when `w_inject` is non-null) the per-stream injection.
 std::expected<void, StatusCode> HyperRead(
     Backend& backend, Qwen4ExpState& h, const TransformerConfig& cfg,
-    const Qwen4ExpGeometry& g, const DeviceTensor& w_norm,
-    const DeviceTensor& w_down, const DeviceTensor& w_up,
-    const DeviceTensor* w_inject, Buffer& r, Buffer& mixed, Buffer* inject) {
+    const Qwen4ExpGeometry& g, const Buffer& w_norm, const Buffer& w_down,
+    const Buffer& w_up, const Buffer* w_inject, Buffer& r, Buffer& mixed,
+    Buffer* inject) {
   const std::uint64_t eps = EpsBits(cfg.norm_eps);
   KernelLaunch norm;
   norm.grid_x = static_cast<std::uint32_t>(g.hc);
   norm.block_x = 256;
-  norm.buffers = {&r, w_norm.device.get(), h.hc_xn.get(), h.hc_xq.get()};
+  norm.buffers = {&r, const_cast<Buffer*>(&w_norm), h.hc_xn.get(),
+                  h.hc_xq.get()};
   norm.scalars = {g.hidden, g.hc, eps};
   if (!backend.LaunchKernel(*h.gr_norm, norm)) {
     return std::unexpected(StatusCode::DeviceError);
@@ -140,7 +140,7 @@ std::expected<void, StatusCode> HyperRead(
   KernelLaunch down;
   down.grid_x = static_cast<std::uint32_t>(g.hc_lr);
   down.block_x = 256;
-  down.buffers = {h.hc_xq.get(), w_down.device.get(), h.hc_lq.get()};
+  down.buffers = {h.hc_xq.get(), const_cast<Buffer*>(&w_down), h.hc_lq.get()};
   down.scalars = {g.hc_dim, g.hc_lr, g.hc};
   if (!backend.LaunchKernel(*h.gr_down, down)) {
     return std::unexpected(StatusCode::DeviceError);
@@ -148,7 +148,7 @@ std::expected<void, StatusCode> HyperRead(
   KernelLaunch gate;
   gate.grid_x = Grid(g.hc_dim);
   gate.block_x = 256;
-  gate.buffers = {h.hc_lq.get(), w_up.device.get(), h.hc_xn.get(),
+  gate.buffers = {h.hc_lq.get(), const_cast<Buffer*>(&w_up), h.hc_xn.get(),
                   h.hc_gated.get()};
   gate.scalars = {g.hc_dim, g.hc_lr};
   if (!backend.LaunchKernel(*h.gr_gate, gate)) {
@@ -166,7 +166,7 @@ std::expected<void, StatusCode> HyperRead(
     KernelLaunch inj;
     inj.grid_x = static_cast<std::uint32_t>(g.hc);
     inj.block_x = 256;
-    inj.buffers = {h.hc_xq.get(), w_inject->device.get(), inject};
+    inj.buffers = {h.hc_xq.get(), const_cast<Buffer*>(w_inject), inject};
     inj.scalars = {g.hc_dim, g.hc};
     if (!backend.LaunchKernel(*h.gr_inject, inj)) {
       return std::unexpected(StatusCode::DeviceError);
@@ -191,6 +191,8 @@ std::expected<void, StatusCode> HyperWrite(Backend& backend, Qwen4ExpState& h,
   }
   return {};
 }
+
+namespace {
 
 std::expected<void, StatusCode> LoadKernel(Backend& backend,
                                            std::unique_ptr<Kernel>& slot,
@@ -589,8 +591,9 @@ std::expected<void, StatusCode> RunHead(Backend& backend, const Model& model,
   if (!w_norm || !w_down || !w_up || !w_out) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  if (auto read = HyperRead(backend, h, cfg, g, **w_norm, **w_down, **w_up,
-                            nullptr, *h.R, *h.mixed, nullptr);
+  if (auto read = HyperRead(backend, h, cfg, g, *(*w_norm)->device,
+                            *(*w_down)->device, *(*w_up)->device, nullptr, *h.R,
+                            *h.mixed, nullptr);
       !read) {
     return read;
   }
@@ -870,6 +873,13 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::EnsureReady(
   if (!state) {
     return std::unexpected(state.error());
   }
+  // Load the MTP head now, before the expert cache sizes itself to the free
+  // device memory, so the MTP weights get their share of VRAM first.
+  if (!model.MtpPath().empty()) {
+    if (auto mtp = EnsureMtpReady(backend, model, *config, *geom, **state); !mtp) {
+      return std::unexpected(mtp.error());
+    }
+  }
   return {};
 }
 
@@ -953,8 +963,9 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
     if (!an || !ad || !au || !ai) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    if (auto read = HyperRead(backend, h, cfg, g, **an, **ad, **au, *ai, *h.R,
-                              *h.mixed, h.inject.get());
+    if (auto read = HyperRead(backend, h, cfg, g, *(*an)->device,
+                              *(*ad)->device, *(*au)->device, (*ai)->device.get(),
+                              *h.R, *h.mixed, h.inject.get());
         !read) {
       return read;
     }
@@ -978,8 +989,9 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
     if (!fn || !fd || !fu || !fi) {
       return std::unexpected(StatusCode::MalformedFile);
     }
-    if (auto read = HyperRead(backend, h, cfg, g, **fn, **fd, **fu, *fi, *h.R,
-                              *h.mixed, h.inject2.get());
+    if (auto read = HyperRead(backend, h, cfg, g, *(*fn)->device,
+                              *(*fd)->device, *(*fu)->device, (*fi)->device.get(),
+                              *h.R, *h.mixed, h.inject2.get());
         !read) {
       return read;
     }
@@ -999,7 +1011,10 @@ std::expected<void, StatusCode> Qwen4ExpArchitecture::Forward(
     }
   }
   if (hidden_out != nullptr) {
-    auto snap = DownloadF32(backend, *h.mixed);
+    // The MTP head consumes the final multi-stream residual stack (hc *
+    // hidden), not the single mixed activation: the anchor pairs the token
+    // with the stack at the position before it.
+    auto snap = DownloadF32(backend, *h.R);
     if (!snap) {
       return std::unexpected(snap.error());
     }
@@ -1130,26 +1145,36 @@ std::expected<std::uint32_t, StatusCode> Qwen4ExpArchitecture::Draft(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
     std::vector<float>* mtp_hidden_out) const {
-  (void)backend;
-  (void)model;
-  (void)cache;
-  (void)hidden;
-  (void)token;
-  (void)pos;
-  (void)mtp_hidden_out;
-  return std::unexpected(StatusCode::UnsupportedFeature);
+  auto config = model.Config();
+  if (!config) {
+    return std::unexpected(config.error());
+  }
+  auto geom = DeriveGeometry(*config);
+  if (!geom) {
+    return std::unexpected(geom.error());
+  }
+  auto ready = EnsureReady(backend, model, cache);
+  if (!ready) {
+    return std::unexpected(ready.error());
+  }
+  Qwen4ExpState& h = State(cache);
+  return RunMtpDraft(backend, model, *config, *geom, h, hidden, token, pos,
+                     mtp_hidden_out);
 }
 
 std::size_t Qwen4ExpArchitecture::DraftRows(
     const core::DecodeCache& cache) const {
-  (void)cache;
-  return 0;
+  if (cache.arch == nullptr) {
+    return 0;
+  }
+  return MtpDraftRows(*static_cast<const Qwen4ExpState*>(cache.arch.get()));
 }
 
 void Qwen4ExpArchitecture::DraftTruncate(core::DecodeCache& cache,
                                          std::size_t rows) const {
-  (void)cache;
-  (void)rows;
+  if (cache.arch != nullptr) {
+    MtpDraftTruncate(*static_cast<Qwen4ExpState*>(cache.arch.get()), rows);
+  }
 }
 
 }  // namespace tessera::models::qwen4exp

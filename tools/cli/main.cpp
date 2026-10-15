@@ -15,6 +15,7 @@
 #include "calibrate_command.hpp"
 #include "cli_common.hpp"
 #include "cli_helpers.hpp"
+#include "fetch_mtp_command.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/image.hpp"
@@ -108,12 +109,16 @@ int main(int argc, char** argv) {
   if (command == "calibrate") {
     return tessera::cli::RunCalibrateCommand(argc, argv);
   }
+  if (command == "fetch-mtp") {
+    return tessera::cli::RunFetchMtpCommand(argc, argv);
+  }
   if (command != "run" && command != "serve") {
     PrintUsage();
     return kExitUsage;
   }
   std::string model_path;
   std::string draft_path;
+  std::string mtp_path;
   std::vector<std::string> prompt_texts;
   std::string calibration_path;
   std::string mmproj_path;
@@ -161,6 +166,8 @@ int main(int argc, char** argv) {
       model_path = argv[++i];
     } else if (arg == "--draft" && i + 1 < argc) {
       draft_path = argv[++i];
+    } else if (arg == "--mtp" && i + 1 < argc) {
+      mtp_path = argv[++i];
     } else if (arg == "--prompt-text" && i + 1 < argc) {
       prompt_texts.emplace_back(argv[++i]);
     } else if (arg == "--mmproj" && i + 1 < argc) {
@@ -419,6 +426,7 @@ int main(int argc, char** argv) {
         }
         tessera::ModelOptions model_options{model_path, context};
         model_options.gpu_layers = gpu_layers;
+        model_options.mtp_path = mtp_path;
         auto model = engine_ptr->LoadModel(model_options);
         if (!model) {
           return std::unexpected(model.error());
@@ -676,6 +684,8 @@ int main(int argc, char** argv) {
     split_options.kv_type = kv_type;
     split_options.draft_block = draft_block;
     split_options.prefill_chunk = prefill_chunk;
+    split_options.mtp_path = mtp_path;
+    split_options.gpu_layers = gpu_layers;
     auto split = tessera::SpecSplit::Create(split_options);
     if (!split) {
       std::fprintf(stderr, "cli: speculative-split create failed (%s)\n",
@@ -810,6 +820,7 @@ int main(int argc, char** argv) {
   }
   tessera::ModelOptions model_options{model_path, context};
   model_options.gpu_layers = gpu_layers;
+  model_options.mtp_path = mtp_path;
   auto model = engine.LoadModel(model_options);
   if (!model) {
     std::fprintf(stderr, "cli: model load failed (%s)\n",

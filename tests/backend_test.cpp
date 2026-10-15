@@ -43,6 +43,7 @@
 #include "core/numerics/ngram.hpp"
 #include "core/numerics/ple.hpp"
 #include "core/numerics/qsa.hpp"
+#include "models/qwen4exp/mtp_weights.hpp"
 #include "models/qwen4exp/ple_table.hpp"
 #include "models/qwen3_5/internal.hpp"
 #include "models/qwen3_5/state.hpp"
@@ -8194,4 +8195,70 @@ TEST(BackendTest, CpuMoeExpertsForwardMatchesSingle) {
   for (std::size_t j = 0; j < kHidden; ++j) {
     EXPECT_FLOAT_EQ(got[j], expected[j]);
   }
+}
+
+TEST(MtpWeightsTest, LoadsManifestAndAppliesNormGamma) {
+  std::unique_ptr<Backend> backend;
+  MakeBackendOrSkip(backend);
+  using tessera::testing::FreshTempDir;
+  using tessera::testing::WriteBytes;
+  auto dir = FreshTempDir("tessera_tests_mtp_weights");
+  std::filesystem::create_directories(dir / "tensors");
+  auto write_f32 = [&](const std::string& name, const std::vector<float>& v) {
+    std::vector<std::byte> bytes(v.size() * 4);
+    std::memcpy(bytes.data(), v.data(), bytes.size());
+    WriteBytes(dir / "tensors" / (name + ".bin"), bytes);
+  };
+  write_f32("mtp.pre_fc_norm_embedding.weight", {1.0f, 2.0f, 3.0f, 4.0f});
+  write_f32("mtp.layers.0.mlp.shared_expert_gate.weight", {5.0f, 6.0f, 7.0f, 8.0f});
+  WriteBytes(dir / "tensors" / "mtp.layers.0.mlp.experts.gate_up_proj.bin",
+             std::vector<std::byte>(2 * 4 * 4 * 2, std::byte{0}));
+  WriteBytes(dir / "tensors" / "mtp.layers.0.mlp.experts.down_proj.bin",
+             std::vector<std::byte>(2 * 4 * 2 * 2, std::byte{0}));
+  const std::string manifest =
+      R"([{"name":"mtp.pre_fc_norm_embedding.weight","dtype":"F32","shape":[4],"bytes":16},)"
+      R"({"name":"mtp.layers.0.mlp.shared_expert_gate.weight","dtype":"F32","shape":[4],"bytes":16},)"
+      R"({"name":"mtp.layers.0.mlp.experts.gate_up_proj","dtype":"BF16","shape":[2,4,4],"bytes":64},)"
+      R"({"name":"mtp.layers.0.mlp.experts.down_proj","dtype":"BF16","shape":[2,4,2],"bytes":32}])";
+  std::vector<std::byte> manifest_bytes(manifest.size());
+  std::memcpy(manifest_bytes.data(), manifest.data(), manifest.size());
+  WriteBytes(dir / "mtp-manifest.json", manifest_bytes);
+
+  auto weights = tessera::models::qwen4exp::LoadMtpWeights(*backend, dir);
+  ASSERT_TRUE(weights.has_value()) << tessera::ToString(weights.error());
+  EXPECT_EQ(weights->experts, 2u);
+  EXPECT_EQ(weights->inter, 2u);
+  EXPECT_EQ(weights->hidden, 4u);
+
+  const tessera::Buffer* norm =
+      weights->Get("mtp.pre_fc_norm_embedding.weight");
+  ASSERT_NE(norm, nullptr);
+  std::vector<float> norm_out(4, 0.0f);
+  ASSERT_TRUE(backend->CopyD2H(*norm,
+                               reinterpret_cast<std::byte*>(norm_out.data()),
+                               norm_out.size() * 4));
+  // The RMSNorm gamma gains the Gemma +1.
+  for (std::size_t i = 0; i < norm_out.size(); ++i) {
+    EXPECT_FLOAT_EQ(norm_out[i], static_cast<float>(i + 2));
+  }
+  const tessera::Buffer* gate =
+      weights->Get("mtp.layers.0.mlp.shared_expert_gate.weight");
+  ASSERT_NE(gate, nullptr);
+  std::vector<float> gate_out(4, 0.0f);
+  ASSERT_TRUE(backend->CopyD2H(*gate,
+                               reinterpret_cast<std::byte*>(gate_out.data()),
+                               gate_out.size() * 4));
+  // The shared-expert gate is not a norm and keeps its value.
+  for (std::size_t i = 0; i < gate_out.size(); ++i) {
+    EXPECT_FLOAT_EQ(gate_out[i], static_cast<float>(i + 5));
+  }
+  const tessera::Buffer* gate_up =
+      weights->Get("mtp.layers.0.mlp.experts.gate_up_proj");
+  ASSERT_NE(gate_up, nullptr);
+  EXPECT_EQ(gate_up->Size(), 64u);
+  EXPECT_EQ(weights->Get("does.not.exist"), nullptr);
+
+  auto missing =
+      tessera::models::qwen4exp::LoadMtpWeights(*backend, dir / "absent");
+  EXPECT_EQ(missing.error(), StatusCode::FileNotFound);
 }

@@ -130,6 +130,15 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   // The speculative strategy (null on the plain greedy path). The engine owns
   // the target and the accept rule; the strategy owns the draft.
   SpeculativeStrategy* strategy = speculative_.get();
+  // A sampled request must not run through a greedy-only drafter: the
+  // greedy accept rule would decode the sampled request as greedy. Drop the
+  // strategy for this generation and sample normally.
+  if (strategy != nullptr && options.sample && !strategy->SupportsSampling()) {
+    diagnostics_.Info("engine", "request samples: strategy '" +
+                                    std::string(strategy->Name()) +
+                                    "' is greedy only; decoding without it");
+    strategy = nullptr;
+  }
   std::vector<std::size_t> capture_layers;
   std::vector<Buffer*> capture_buffers;
   if (strategy != nullptr) {

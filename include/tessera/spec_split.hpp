@@ -28,6 +28,12 @@ struct SpecSplitOptions {
   std::size_t draft_block = 0;
   // Prefill tokens per forward; 0 selects the automatic default.
   std::size_t prefill_chunk = 0;
+  // Directory of a separately fetched MTP head (tessera-cli fetch-mtp).
+  // The draft device reads it; the target does not.
+  std::string mtp_path;
+  // Layers kept in VRAM on the target device; 0 uploads all. A model too
+  // large for one device pages its trunk blocks from system RAM.
+  std::size_t gpu_layers = 0;
 };
 
 // MTP speculation with the draft head on a second device. The target

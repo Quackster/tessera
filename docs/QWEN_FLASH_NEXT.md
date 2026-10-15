@@ -301,7 +301,23 @@ architecture rules.
   serial token per forward, so it tracks decode; 100 tok/s needs a batched
   trunk. An intermittent non-finite logits fault remains (see the M6
   investigation below).
-- M7 (MTP): out of scope. No draft file is present.
+- M7 (MTP): done. The head is fetched over HTTP (the C++ port of Strata's
+  tools/mtp_fetch.py: `tessera-cli fetch-mtp --out DIR
+  [inventory|fetch|verify]`, with the pinned revision and per-tensor
+  SHA256, resumable and progress-logged). The module loads the fetched
+  tensors (`src/models/qwen4exp/mtp_weights.*`) and runs the draft block
+  (`src/models/qwen4exp/mtp.*`): the two input branches, the attention and
+  MLP hyper-connections, the dense QSA attention over the MTP's own FP16
+  cache, the routed plus shared MoE, the final mixer and the shared head.
+  `ModelOptions::mtp_path` carries the fetch directory; the CLI `--mtp DIR`
+  sets it. Verified on one R9700 (IQ3_S, `--gpu-layers 8`): with
+  `--temperature 0` the speculative output equals greedy without
+  speculation, and the draft accepts 40 of 46 tokens over 23 steps (about
+  15 tok/s). `--spec-split --gpus 0,1` runs the head on the second device
+  (the draft device loads the MTP weights and the MoE scratch it needs) and
+  produces the same output. A sampled request decodes without the
+  greedy-only drafter, so it is not silently decoded as greedy. The loader
+  is covered by `MtpWeightsTest`.
 
 Correctness evidence: with no completion cap and `--no-chat`, the prompt
 `The capital of France is` produces a reasoning block and the answer
