@@ -218,8 +218,12 @@ Remaining, with the reason:
   accepts, each stage rolls back to the accepted prefix), with the drafter
   on the last stage, which owns the MTP head. The `--gpus --pipeline
   --speculate` CLI wiring is not landed yet.
-* `ContextParallel` splits the key range, so a drafter cannot see the whole
-  context. Speculation there needs a design of its own.
+* `ContextParallel` loads the full model on every rank, so the MTP head is
+  present everywhere, and the drafter's own draft KV is replicated and
+  small. The missing piece is a context-parallel batched forward: the
+  batched `ForwardBatch` has no per-row cross-rank attention combine, so a
+  CP verify cannot run yet. A CP verify needs that combine (the drafter
+  itself can run per rank as on the tensor-parallel path).
 * The tensor-parallel and pipeline paths need a two-device run to verify.
 
 The diagnostic flags stay manual. The sweep names none of them.
