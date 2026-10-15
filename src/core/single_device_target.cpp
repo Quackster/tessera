@@ -71,18 +71,25 @@ std::expected<void, StatusCode> SingleDeviceTarget::Prefill(
     if (arch == nullptr) {
       return std::unexpected(StatusCode::UnsupportedFeature);
     }
+    // A capturing strategy (DFlash2) reads the target hidden at its layers,
+    // so the rank path passes the capture buffers when the drafter asked for
+    // them. MTP captures nothing and passes null.
+    const std::vector<std::size_t>* layers =
+        capture_layers_.empty() ? nullptr : &capture_layers_;
+    std::vector<Buffer*>* buffers =
+        capture_layers_.empty() ? nullptr : &capture_buffers_;
     for (std::size_t i = 0; i < prompt.size(); ++i) {
       const bool last = (i + 1 == prompt.size());
       if (last) {
         auto scored = arch->Logits(backend_, model_, cache_, prompt[i], hidden,
-                                   nullptr, nullptr, nullptr);
+                                   layers, buffers, nullptr);
         if (!scored) {
           return std::unexpected(scored.error());
         }
         *logits = std::move(*scored);
       } else {
         auto forwarded = arch->Forward(backend_, model_, cache_, prompt[i],
-                                       nullptr, nullptr, nullptr, nullptr);
+                                       nullptr, layers, buffers, nullptr);
         if (!forwarded) {
           return std::unexpected(forwarded.error());
         }
