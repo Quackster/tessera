@@ -1,5 +1,6 @@
 #include "tessera/spec_split.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -9,6 +10,7 @@
 
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
+#include "core/timing.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/engine.hpp"
@@ -145,12 +147,25 @@ std::expected<std::vector<std::uint32_t>, StatusCode> SpecSplit::Generate(
   SpeculativeStrategy& strategy = *p.strategy;
   // Target prefill; the last position's hidden seeds the first anchor.
   std::vector<float> hidden;
+  const auto prefill_started = std::chrono::steady_clock::now();
   auto prefill = core::PrefillTokens(target_backend, target, target_cache,
                                     prompt, &hidden, nullptr,
                                     p.prefill_chunk, nullptr);
   if (!prefill) {
     return std::unexpected(prefill.error());
   }
+  const long long prefill_ms = static_cast<long long>(
+      core::ElapsedMsDouble(prefill_started, std::chrono::steady_clock::now()));
+  if (prefill_ms > 0) {
+    const long long prompt_tps =
+        static_cast<long long>(prompt.size()) * 1000 / prefill_ms;
+    p.target_engine->Diagnostics().Info(
+        "spec-split", std::string("prefill: ") + std::to_string(prompt.size()) +
+                          " prompt token(s) in " + std::to_string(prefill_ms) +
+                          " ms (" + std::to_string(prompt_tps) +
+                          " prompt tok/s)");
+  }
+  const auto decode_started = std::chrono::steady_clock::now();
   std::uint32_t next = detail::ArgMax(*prefill);
   std::uint64_t position = prompt.size();
   const std::size_t block = strategy.DraftBlock();
@@ -243,6 +258,20 @@ std::expected<std::vector<std::uint32_t>, StatusCode> SpecSplit::Generate(
     }
     next = verify->next_token;
     position += 1 + verify->accepted;
+  }
+  const long long decode_ms = static_cast<long long>(
+      core::ElapsedMsDouble(decode_started, std::chrono::steady_clock::now()));
+  if (decode_ms > 0 && !produced.empty()) {
+    const long long decode_tps =
+        static_cast<long long>(produced.size()) * 1000 / decode_ms;
+    p.target_engine->Diagnostics().Info(
+        "spec-split",
+        std::string("decode: ") + std::to_string(produced.size()) +
+            " token(s) in " + std::to_string(decode_ms) + " ms (" +
+            std::to_string(decode_tps) + " tok/s, " +
+            std::to_string(decode_ms /
+                           static_cast<long long>(produced.size())) +
+            " ms/token)");
   }
   if (spec_steps > 0) {
     p.target_engine->Diagnostics().Info(
