@@ -88,6 +88,41 @@ Measured, even 24/24 layer split, two R9700s (31.86 GiB usable each):
 
 The output correctness at this context is tracked as BUG-3.
 
+## Largest even-split context with MTP (paged)
+
+Status: fits, no OOM; MTP output correctness is BUG-1/BUG-3.
+
+The even 24/24 split is memory-imbalanced: the last stage also carries the
+output head, the token embedding, and the MTP head (about 3.35 GB). At
+262144 tokens with MTP the last stage overflows, so offload the earliest
+trunk layers with `--gpu-layers` (shard-local: each stage keeps its own
+last N trunk layers).
+
+Command:
+
+```
+tessera-cli run \
+  --model ~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+  --mtp ~/models/Qwen3.8-Flash-Next-MTP \
+  --speculate --pipeline --pipeline-split 24,24 --gpus 0,1 \
+  --context 262144 --kv-q8 --gpu-layers 18 --max-completion-tokens 12 \
+  --prompt-text "The capital of France is"
+```
+
+`--gpu-layers 18` keeps each stage's last 17 trunk layers resident and
+pages the rest. It loads and decodes without OOM (about 8 tok/s with MTP).
+`--gpu-layers 20` (19 resident) still overflows the MTP head, so 18 or 19
+is the working boundary.
+
+Measured with `--gpu-layers 18`, even split, R9700 (31.86 GiB usable):
+
+- stage 0 device weights 17.71 GiB (17 resident of 24 layers), stage 1
+  device weights 19.74 GiB. The QSA cache adds about 3.59 GiB per stage.
+- The paged layers (7 per stage, about 14 GiB total) stay in system RAM.
+- The non-speculative paged run (`--gpu-layers 18`, no `--mtp`) at 262144
+  prints `The capital of France is **Paris**.`, so paging preserves the
+  result.
+
 ## Fixed
 
 - DFlash2 Prepare returned malformed_file on the pipeline because the
