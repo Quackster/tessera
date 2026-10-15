@@ -255,6 +255,17 @@ TEST(DeviceRoutingHintTest, ServeReportsReplicasAndFlags) {
             std::string::npos);
 }
 
+// serve splits one model only with --pipeline. When a split is active the
+// replica message is false, so the hint stays silent instead of claiming one
+// replica per gpu while --pipeline actually layer-splits.
+TEST(DeviceRoutingHintTest, ServeWithSplitIsSilent) {
+  using tessera::cli::DeviceRouteKind;
+  using tessera::cli::DeviceRoutingHint;
+  const std::vector<int> devices{0, 1};
+  EXPECT_TRUE(
+      DeviceRoutingHint(devices, DeviceRouteKind::kServeReplicas, true).empty());
+}
+
 TEST(MtpFetchTest, DigestsCoverEveryTensorOnce) {
   const auto digests = tessera::MtpTensorDigests();
   EXPECT_EQ(digests.size(), 31u);

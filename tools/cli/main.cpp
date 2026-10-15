@@ -377,6 +377,25 @@ int main(int argc, char** argv) {
                      "; continuing without speculative decoding");
     }
   };
+  // One PipelineOptions for both the run and serve pipeline paths, so
+  // both honor the same flags: --pipeline-split (stage_layers),
+  // --gpu-layers (paging), and the last stage's embedding for an attached
+  // drafter. A single builder stops the two paths from drifting, which
+  // silently dropped the paging and the split under serve.
+  auto make_pipeline_options = [&] {
+    tessera::PipelineOptions options;
+    options.model_path = model_path;
+    options.devices = device_indices;
+    options.context = context;
+    options.kv_type = kv_type;
+    options.mtp_path = mtp_path;
+    options.stage_layers = pipeline_split;
+    options.gpu_layers = gpu_layers;
+    // The drafter runs on the last stage and embeds the anchor tokens
+    // (DFlash2 and MTP both do), so it needs the target embedding there.
+    options.last_stage_embedding = speculate || !draft_path.empty();
+    return options;
+  };
 
   if (gpu_layers_help) {
     // Size the model without loading it: needs --model, one device for
@@ -433,12 +452,7 @@ int main(int argc, char** argv) {
       // Submit serializes turns.
       if (pipeline_mode) {
         report("loading the layer split across the gpus");
-        tessera::PipelineOptions pipeline_options;
-        pipeline_options.model_path = model_path;
-        pipeline_options.devices = device_indices;
-        pipeline_options.context = context;
-        pipeline_options.kv_type = kv_type;
-        pipeline_options.mtp_path = mtp_path;
+        tessera::PipelineOptions pipeline_options = make_pipeline_options();
         auto pipeline = tessera::Pipeline::Create(pipeline_options);
         if (!pipeline) {
           std::fprintf(stderr, "cli: pipeline create failed (%s)\n",
@@ -608,17 +622,7 @@ int main(int argc, char** argv) {
       return kExitUsage;
     }
     const std::string& prompt_text = prompt_texts.front();
-    tessera::PipelineOptions pipeline_options;
-    pipeline_options.model_path = model_path;
-    pipeline_options.devices = device_indices;
-    pipeline_options.context = context;
-    pipeline_options.kv_type = kv_type;
-    pipeline_options.mtp_path = mtp_path;
-    pipeline_options.stage_layers = pipeline_split;
-    pipeline_options.gpu_layers = gpu_layers;
-    // The drafter runs on the last stage and embeds the anchor tokens
-    // (DFlash2 and MTP both do), so it needs the target embedding there.
-    pipeline_options.last_stage_embedding = speculate || !draft_path.empty();
+    tessera::PipelineOptions pipeline_options = make_pipeline_options();
     auto pipeline = tessera::Pipeline::Create(pipeline_options);
     if (!pipeline) {
       std::fprintf(stderr, "cli: pipeline create failed (%s)\n",

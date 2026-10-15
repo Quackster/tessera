@@ -142,6 +142,11 @@ inline std::string DeviceRoutingHint(std::span<const int> devices,
   constexpr std::string_view kSplits =
       "--pipeline, --tp, --cp, --spec-split or --hybrid";
   if (kind == DeviceRouteKind::kServeReplicas) {
+    // serve splits one model only with --pipeline; when a split is active
+    // the replica message would be false, so stay silent.
+    if (split_active) {
+      return {};
+    }
     return "cli: --gpus " + list +
            " serves one model replica per gpu, so the devices answer "
            "requests in parallel. To split one model across the devices, "
