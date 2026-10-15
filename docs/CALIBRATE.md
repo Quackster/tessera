@@ -226,7 +226,11 @@ Remaining, with the reason:
   `--cp`, or `--pipeline` and sweeps the draft block, storing the winner
   under the layout key.
 * The DFlash2 `--draft` checkpoint is still single-device only on the
-  parallel path; only MTP `--speculate` is swept there.
+  parallel path; only MTP `--speculate` is swept there. The rank prefill
+  now forwards the drafter's capture to the target forward, but the
+  parallel prefill still steps one token at a time and does not drive the
+  strategy's per-chunk context append, and the CLI refuses `--draft` with
+  `--gpus`.
 * The parallel paths need a two-device run to verify.
 
 The diagnostic flags stay manual. The sweep names none of them.
