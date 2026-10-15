@@ -124,9 +124,32 @@ std::expected<void, StatusCode> InitScratch(Backend& backend,
   return {};
 }
 
+// Runs the output head (final norm plus the vocab projection) for the
+// current hidden h.x, leaving the logits in h.logits on the device.
+std::expected<void, StatusCode> RunOutputHead(Backend& backend,
+                                              const Model& model,
+                                              const TransformerConfig& cfg,
+                                              Qwen35State& h) {
+  const std::size_t hidden = cfg.hidden_dim;
+  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
+  auto output = NeedWeightAny(model, "output.weight");
+  if (!out_norm || !output) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
+                     *h.xn, 1, hidden, cfg.norm_eps) ||
+      !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
+                    *(*output)->device, *h.logits, 1, cfg.vocab_size, hidden)) {
+    return std::unexpected(StatusCode::DeviceError);
+  }
+  return {};
+}
+
+}  // namespace
+
 // Load the split-N kernels and (re)allocate the partial scratch for the
-// single-token path. The kernels and scratch live in the state and are
-// reused by every full-attention layer.
+// single-token path and the context-parallel combine. The kernels and
+// scratch live in the state and are reused by every full-attention layer.
 std::expected<void, StatusCode> EnsureSplitReady(Backend& backend,
                                                  const TransformerConfig& cfg,
                                                  Qwen35State& h,
@@ -175,29 +198,6 @@ std::expected<void, StatusCode> EnsureSplitReady(Backend& backend,
   }
   return {};
 }
-
-// Runs the output head (final norm plus the vocab projection) for the
-// current hidden h.x, leaving the logits in h.logits on the device.
-std::expected<void, StatusCode> RunOutputHead(Backend& backend,
-                                              const Model& model,
-                                              const TransformerConfig& cfg,
-                                              Qwen35State& h) {
-  const std::size_t hidden = cfg.hidden_dim;
-  auto out_norm = NeedWeight(model, "output_norm.weight", DType::F32);
-  auto output = NeedWeightAny(model, "output.weight");
-  if (!out_norm || !output) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  if (!RmsNormDevice(backend, *h.rmsnorm_kernel, *h.x, *(*out_norm)->device,
-                     *h.xn, 1, hidden, cfg.norm_eps) ||
-      !ProjectBatch(backend, h, (*output)->manifest.dtype, *h.xn,
-                    *(*output)->device, *h.logits, 1, cfg.vocab_size, hidden)) {
-    return std::unexpected(StatusCode::DeviceError);
-  }
-  return {};
-}
-
-}  // namespace
 
 // All-reduce the rank partials across the tensor-parallel ranks: every rank
 // writes its partial, then rank 0 pulls each peer's partial (a direct peer

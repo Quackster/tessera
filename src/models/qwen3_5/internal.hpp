@@ -67,6 +67,14 @@ inline std::expected<LinearGeometry, StatusCode> DeriveGeometry(
                                                        Qwen35State& h,
                                                        std::size_t bytes);
 
+// Load the split-N attention kernels and (re)allocate the partial scratch
+// used by the flash-decoding single-token path and the context-parallel
+// attention combine; idempotent. Shared by the single-token block and the
+// context-parallel batched block.
+[[nodiscard]] std::expected<void, StatusCode> EnsureSplitReady(
+    Backend& backend, const TransformerConfig& cfg, Qwen35State& h,
+    KvCacheType type);
+
 // One projection C = A x W^T for `m` rows of `a` (m x k fp32). For an
 // MXFP4 weight (F4E2M1) the activation is first quantize-dequantized per
 // token to FP8 E4M3 in place, the W4A8 contract the served Qwen3.8 target
