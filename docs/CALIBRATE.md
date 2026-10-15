@@ -218,13 +218,13 @@ Remaining, with the reason:
   accepts, each stage rolls back to the accepted prefix), with the drafter
   on the last stage, which owns the MTP head. The `--gpus --pipeline
   --speculate` CLI wiring is not landed yet.
-* `ContextParallel` loads the full model on every rank, so the MTP head is
-  present everywhere, and the drafter's own draft KV is replicated and
-  small. The missing piece is a context-parallel batched forward: the
-  batched `ForwardBatch` has no per-row cross-rank attention combine, so a
-  CP verify cannot run yet. A CP verify needs that combine (the drafter
-  itself can run per rank as on the tensor-parallel path).
-* The tensor-parallel and pipeline paths need a two-device run to verify.
+* `ContextParallel` runs MTP speculation at the library level: the full
+  model (and MTP head) is on every rank, so the drafter runs per rank, and
+  the batched full attention now combines per row across the ranks. The
+  `--gpus --cp --speculate` CLI wiring is not landed yet.
+* All three parallel paths run MTP speculation at the library level; the
+  `calibrate --gpus ... --speculate` CLI wiring is landed for `--tp` only.
+* The parallel paths need a two-device run to verify.
 
 The diagnostic flags stay manual. The sweep names none of them.
 `TESSERA_MXFP4_WMMA`, `TESSERA_MXFP4_W4A8`, `TESSERA_TARGET_BF16`, the
