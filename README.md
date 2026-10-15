@@ -323,8 +323,9 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--no-chat` | run | off | Do not apply the chat template. |
 | `--max-completion-tokens <n>` | run | 0 | Completion tokens. 0 fills the remaining context. |
 | `--max-thinking-tokens <n>` | run | 0 | Think-block budget per turn. 0 leaves thinking unlimited. |
-| `--enable-thinking` | run | off | Render the chat template with thinking enabled. |
-| `--reasoning-effort <level>` | run | unset | Thinking difficulty for the chat template (for example `xhigh`). Ignored with `--no-chat`. |
+| `--enable-thinking` | run | on | Render the chat template with thinking enabled. Thinking is on by default. |
+| `--no-thinking` | run | off | Render the chat template with thinking disabled. |
+| `--reasoning-effort <level>` | run | xhigh | Thinking difficulty for the chat template. Ignored with `--no-chat`. |
 | `--speculate` | both | off | MTP speculative decode from the target head. Needs no checkpoint. |
 | `--mtp <dir>` | both | unset | Directory of a separately fetched MTP head (from `tessera-cli fetch-mtp`) for a model whose GGUF ships none, such as the Flash-Next target. |
 | `--sample` | run | off | Sample instead of greedy decode. |

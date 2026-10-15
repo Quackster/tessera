@@ -11,6 +11,21 @@
 
 namespace tessera::serve {
 
+namespace {
+
+// True when `kwargs` already carries `key`.
+bool HasKwarg(const std::vector<jinja::Kwarg>& kwargs, std::string_view key) {
+  for (const auto& [name, value] : kwargs) {
+    (void)value;
+    if (name == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 std::vector<jinja::Kwarg> RequestTemplateKwargs(const core::Json& body) {
   std::vector<jinja::Kwarg> kwargs;
   bool has_reasoning = false;
@@ -126,11 +141,24 @@ std::string RenderPrompt(const Model& model, const core::Json& body,
   context.emplace_back("add_generation_prompt", jinja::Value::Bool(true));
   context.emplace_back("tools", tools == nullptr ? jinja::Value::None()
                                                  : ToJinja(*tools));
-  if (const core::Json* thinking = body.Find("enable_thinking");
-      thinking != nullptr &&
-      thinking->type() == core::Json::Type::Bool) {
-    context.emplace_back("enable_thinking",
-                         jinja::Value::Bool(thinking->AsBool()));
+  // Thinking is on unless the request turns it off. The reasoning effort
+  // defaults to the highest level the template accepts. A request overrides
+  // either one, so a template that gates on `enable_thinking` also sees the
+  // explicit default.
+  if (!HasKwarg(context, "enable_thinking")) {
+    const core::Json* thinking = body.Find("enable_thinking");
+    const bool thinking_on =
+        thinking == nullptr || thinking->type() != core::Json::Type::Bool ||
+        thinking->AsBool();
+    context.emplace_back("enable_thinking", jinja::Value::Bool(thinking_on));
+  }
+  if (!HasKwarg(context, "reasoning_effort")) {
+    const std::vector<std::string> levels = ReasoningEffortsFromTemplate(tmpl);
+    if (!levels.empty()) {
+      // The template lists its levels highest first.
+      context.emplace_back("reasoning_effort",
+                           jinja::Value::Str(levels.front()));
+    }
   }
   auto rendered = jinja::Render(tmpl, context);
   if (!rendered.ok) {

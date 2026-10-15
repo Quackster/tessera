@@ -48,6 +48,7 @@
 #include "serve/http.hpp"
 #include "serve/openai.hpp"
 #include "serve/openai_shared.hpp"
+#include "serve/render.hpp"
 
 using tessera::Engine;
 using tessera::EngineOptions;
@@ -285,6 +286,54 @@ TEST(EngineTest, ChatPromptThinkingFlags) {
   prompt = (*model)->ChatPrompt("hi", false, "low");
   ASSERT_TRUE(prompt.has_value()) << tessera::ToString(prompt.error());
   EXPECT_EQ(*prompt, "Flow");
+}
+
+// Serve renders every chat request through the model template with thinking
+// on by default and the highest reasoning effort. The Flash-Next template
+// gates its <think> block on these, so a request that passes neither still
+// gets thinking. A request that sets them overrides the defaults.
+TEST(EngineTest, ServeRenderPromptDefaultsThinkingAndEffort) {
+  std::unique_ptr<Engine> engine;
+  MakeEngineOrSkip(engine);
+  GgufBuilder builder;
+  builder.Header(0x46554747, 3, 1, 2);
+  builder.KvString("general.name", "test-model");
+  builder.KvString("tokenizer.chat_template",
+                   "{% if enable_thinking %}T{% else %}F{% endif %}"
+                   "{{ reasoning_effort }}");
+  builder.Tensor("w_a", 1, {4}, 0, 0);  // F32, 1x4, offset 0
+  builder.PadTo(((builder.bytes.size() + 31) & ~31u) + 16);
+  auto dir = FreshTempDir("tessera_tests_serve_render");
+  auto path = dir / "chat.gguf";
+  WriteBytes(path, builder.bytes);
+  auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
+  ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+
+  auto make_body = [](bool set_thinking, bool thinking) {
+    tessera::core::Json body = tessera::core::Json::Object();
+    tessera::core::Json messages = tessera::core::Json::Array();
+    tessera::core::Json message = tessera::core::Json::Object();
+    message.Set("role", tessera::core::Json::String("user"));
+    message.Set("content", tessera::core::Json::String("hi"));
+    messages.Push(std::move(message));
+    body.Set("messages", std::move(messages));
+    if (set_thinking) {
+      body.Set("enable_thinking", tessera::core::Json::Bool(thinking));
+    }
+    return body;
+  };
+
+  std::string error;
+  const std::string defaulted =
+      tessera::serve::RenderPrompt(**model, make_body(false, false), &error);
+  ASSERT_TRUE(error.empty()) << error;
+  EXPECT_EQ(defaulted, "Txhigh");
+
+  error.clear();
+  const std::string off =
+      tessera::serve::RenderPrompt(**model, make_body(true, false), &error);
+  ASSERT_TRUE(error.empty()) << error;
+  EXPECT_EQ(off, "Fxhigh");
 }
 
 TEST(EngineTest, LoadGgufModelUploadsWeights) {
