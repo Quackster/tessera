@@ -227,9 +227,12 @@ Remaining, with the reason:
   under the layout key.
 * DFlash2 `--draft` is swept on `--tp` and `--cp`: the rank target runs the
   batched capturing prefill, so the drafter builds its context during
-  prefill and reads the captured target hidden at its layers. The
-  `--pipeline` route still refuses `--draft` because its prefill steps one
-  token at a time and does not drive the drafter's context append.
+  prefill and reads the captured target hidden at its layers.
+* DFlash2 stays refused on `--pipeline`. Its prefill steps one token at a
+  time and does not drive the drafter's context append, and the drafter
+  captures several target layers (`target_layer_ids`) that a layer-split
+  pipeline owns on different stages and devices. DFlash2 there needs a
+  cross-stage capturing prefill plus cross-device capture copies.
 * The parallel paths need a two-device run to verify.
 
 The diagnostic flags stay manual. The sweep names none of them.
