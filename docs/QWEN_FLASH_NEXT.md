@@ -10,6 +10,59 @@ This file is a plan and a status report. It does not claim the port is
 complete. Below, "done" means the code is in the tree and tested on the
 configured backend. "Plan" means it is not written yet.
 
+## Open issue for the next session: MTP speculation on the two-GPU pipeline
+
+The two-GPU layer split works and the pipeline with MTP speculation loads
+and runs, but its output is wrong. This is the main open defect. It is
+tracked as BUG-1 and BUG-3 in `docs/BUG.md`.
+
+Reproduction:
+
+```
+tessera-cli run \
+  --model ~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+  --mtp ~/models/Qwen3.8-Flash-Next-MTP \
+  --speculate --pipeline --pipeline-split 24,24 --gpus 0,1 \
+  --context 262144 --kv-q8 --gpu-layers 18 \
+  --max-completion-tokens 12 --prompt-text "The capital of France is"
+```
+
+Observed: the same command without `--mtp --speculate` prints
+`The capital of France is **Paris**.`. With MTP it prints a markdown link
+(`[](https://...`), not the greedy tokens.
+
+The memory part is solved. With `--gpu-layers 18` the run fits: stage 0
+device weights 17.71 GiB, stage 1 device weights 19.74 GiB, the QSA cache
+about 3.59 GiB per stage, and the paged layers (7 per stage, about 14 GiB)
+in system RAM. `--gpu-layers 20` still overflows the MTP head, so 18 or 19
+is the boundary. The even 24/24 split is memory-imbalanced because the last
+stage also carries the output head, the token embedding, and the MTP head.
+
+Where to look. The speculative path uses code the plain path does not:
+
+- The verify runs a batched cross-stage forward
+  (`Pipeline::Impl::ForwardRows` calls `ForwardBatch` on each stage) and
+  then rolls each stage back with `TruncateTarget`. The plain path uses the
+  per-token `Step` only.
+- The MTP draft runs on the sharded last stage (`RunMtpDraft`), which needs
+  the target embedding (kept there by
+  `PipelineOptions::last_stage_embedding`).
+- The qwen4exp sharded `ForwardTrunkBatch` and the per-row gated-delta state
+  snapshots are new and are not covered by a same-path test.
+- Uneven splits (for example `--pipeline-split 27,21` or `28,20`) also
+  produce wrong output while even `24,24` is correct. This is unexplained
+  and may share the cause.
+
+Suggested next steps:
+
+1. Build a test that compares the two-stage pipeline MTP output to greedy on
+   a model that fits, or that compares a sharded `ForwardBatch` against the
+   per-token `Forward` on the same tokens.
+2. Check that `TruncateTarget` restores the exact pre-verify state.
+3. Re-check the `ForwardRows` capture and the residual handoff for the
+   batched case.
+4. Confirm the uneven-split defect with a same-path reference.
+
 ## Branch
 
 All work for this model goes to the branch `arch/qwen-flash-next`. Commit and
