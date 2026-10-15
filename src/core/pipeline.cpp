@@ -1,6 +1,7 @@
 #include "tessera/pipeline.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -11,9 +12,11 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/timing.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/engine.hpp"
+#include "tessera/log.hpp"
 #include "tessera/model.hpp"
 
 namespace tessera {
@@ -208,6 +211,8 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Pipeline::Generate(
     return std::unexpected(StatusCode::InvalidArgument);
   }
   p.Reset();
+  const log::Diagnostics& log = p.stages.back().engine->Diagnostics();
+  const auto prefill_started = std::chrono::steady_clock::now();
   std::expected<std::vector<float>, StatusCode> logits;
   for (std::size_t i = 0; i < prompt.size(); ++i) {
     const bool last = (i + 1 == prompt.size());
@@ -223,10 +228,21 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Pipeline::Generate(
   if (!logits) {
     return std::unexpected(logits.error());
   }
+  const long long prefill_ms = static_cast<long long>(
+      core::ElapsedMsDouble(prefill_started, std::chrono::steady_clock::now()));
+  if (prefill_ms > 0) {
+    const long long prompt_tps =
+        static_cast<long long>(prompt.size()) * 1000 / prefill_ms;
+    log.Info("pipeline",
+             std::string("prefill: ") + std::to_string(prompt.size()) +
+                 " prompt token(s) in " + std::to_string(prefill_ms) + " ms (" +
+                 std::to_string(prompt_tps) + " prompt tok/s)");
+  }
   const std::size_t budget =
       max_tokens == 0 ? p.context - prompt.size() : max_tokens;
   std::vector<std::uint32_t> produced;
   std::uint32_t next = ArgMax(*logits);
+  const auto decode_started = std::chrono::steady_clock::now();
   for (std::size_t count = 0; count < budget; ++count) {
     if (IsStop(next, p.stops)) {
       break;
@@ -237,6 +253,19 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Pipeline::Generate(
       return std::unexpected(step.error());
     }
     next = ArgMax(*step);
+  }
+  const long long decode_ms = static_cast<long long>(
+      core::ElapsedMsDouble(decode_started, std::chrono::steady_clock::now()));
+  if (decode_ms > 0 && !produced.empty()) {
+    const long long decode_tps =
+        static_cast<long long>(produced.size()) * 1000 / decode_ms;
+    log.Info("pipeline",
+             std::string("decode: ") + std::to_string(produced.size()) +
+                 " token(s) in " + std::to_string(decode_ms) + " ms (" +
+                 std::to_string(decode_tps) + " tok/s, " +
+                 std::to_string(decode_ms /
+                                static_cast<long long>(produced.size())) +
+                 " ms/token)");
   }
   return produced;
 }
