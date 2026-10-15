@@ -62,6 +62,10 @@ float reduce32(float v) {
   return subgroupClusteredAdd(v, 32u);
 }
 
+// Upper bound on top_k * inter (the model's 6400), cached once per block so
+// the block's output warps do not each re-read phi from L2.
+shared float s_phi[8192];
+
 
 void main() {
   uint hidden = pc.v[0];
@@ -69,6 +73,11 @@ void main() {
   uint top_k = pc.v[4];
   uint down_stride = pc.v[6];
   uint accumulate = pc.v[8];
+  uint phi_n = top_k * inter;
+  for (uint i = gl_LocalInvocationID.x; i < phi_n; i += gl_WorkGroupSize.x) {
+    s_phi[i] = phi[i];
+  }
+  barrier();
   uint warps = gl_WorkGroupSize.x / 32u;
   uint idx = gl_WorkGroupID.x * warps + (gl_LocalInvocationID.x / 32u);
   if (idx >= hidden) {
@@ -89,7 +98,7 @@ void main() {
     uint high = lane >> 4u;
     uint q = wbyte(wb + 2u + j0);
     uint nib = high > 0u ? (q >> 4u) : (q & 15u);
-    dot += phi[abase + b * 32u + lane] * (d * float(kValues[nib]));
+    dot += s_phi[abase + b * 32u + lane] * (d * float(kValues[nib]));
     }
     acc += wts[slot] * reduce32(dot);
   }

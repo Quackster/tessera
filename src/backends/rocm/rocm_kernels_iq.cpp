@@ -1369,14 +1369,26 @@ __device__ __forceinline__ void MoeExpertsGateUpIqBody(
   }
 }
 
+// Upper bound on the routed-expert activation the down kernel caches in
+// shared memory; the model's top_k * inter (6400) is well under it.
+constexpr unsigned kMoeDownMaxPhi = 8192;
+
 // Fused routed-expert down: out[j] = sum_slot wts[slot] * (D_e phi[slot])[j]
 // with e = ids[slot], each slice read straight from the staging tensor.
+// Every output warp re-reads the whole phi row set, so the block caches it
+// in shared memory once instead of hitting L2 for each of its warps.
 template <typename Codec>
 __device__ __forceinline__ void MoeExpertsDownIqBody(
     const float* phi, const unsigned char* down, const unsigned int* ids,
     const float* wts, float* out, unsigned long long hidden,
     unsigned long long inter, unsigned long long top_k,
     unsigned long long down_stride, unsigned long long accumulate) {
+  __shared__ float s_phi[kMoeDownMaxPhi];
+  const unsigned long long phi_n = top_k * inter;
+  for (unsigned long long i = threadIdx.x; i < phi_n; i += blockDim.x) {
+    s_phi[i] = phi[i];
+  }
+  __syncthreads();
   const unsigned long long warps = blockDim.x >> 5;
   const unsigned long long idx =
       static_cast<unsigned long long>(blockIdx.x) * warps + (threadIdx.x >> 5);
@@ -1390,7 +1402,7 @@ __device__ __forceinline__ void MoeExpertsDownIqBody(
     const unsigned long long expert = ids[slot];
     const unsigned char* d_row =
         down + expert * down_stride + idx * blocks * Codec::kBlockBytes;
-    float dot = Codec::Dot(phi + slot * inter, d_row, blocks, lane);
+    float dot = Codec::Dot(s_phi + slot * inter, d_row, blocks, lane);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
       dot += __shfl_down_sync(~0ull, dot, off, 32);
