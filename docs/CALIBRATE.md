@@ -225,12 +225,11 @@ Remaining, with the reason:
 * `calibrate --gpus ... --speculate` attaches MTP to any of `--tp`,
   `--cp`, or `--pipeline` and sweeps the draft block, storing the winner
   under the layout key.
-* The DFlash2 `--draft` checkpoint is still single-device only on the
-  parallel path; only MTP `--speculate` is swept there. The rank prefill
-  now forwards the drafter's capture to the target forward, but the
-  parallel prefill still steps one token at a time and does not drive the
-  strategy's per-chunk context append, and the CLI refuses `--draft` with
-  `--gpus`.
+* DFlash2 `--draft` is swept on `--tp` and `--cp`: the rank target runs the
+  batched capturing prefill, so the drafter builds its context during
+  prefill and reads the captured target hidden at its layers. The
+  `--pipeline` route still refuses `--draft` because its prefill steps one
+  token at a time and does not drive the drafter's context append.
 * The parallel paths need a two-device run to verify.
 
 The diagnostic flags stay manual. The sweep names none of them.
