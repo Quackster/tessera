@@ -12,79 +12,165 @@
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
+#include "tessera/pipeline.hpp"
 #include "tessera/scheduler.hpp"
 #include "tessera/tokenizer.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
 
-// One engine and its loaded model on one device, plus the lock that
-// serializes that device and the scheduler that shares it. The pool
-// owns runners; Submit time-slices turns on the scheduler while
-// Acquire still hands out the whole device for paths the scheduler
-// does not drive (speculation, thinking budgets, tools). The runner
-// also carries the KV cache storage type every turn on it decodes
+// One generation backend for the serve pool. A runner owns its devices;
+// Submit runs one turn to completion, streaming on the caller thread.
+// Two backends implement it: SingleDeviceRunner (one engine, one model,
+// one device, shared by the scheduler) and PipelineRunner (one model
+// layer-split across several devices). The serve layer drives only this
+// interface, so a split model needs no separate HTTP path.
+//
+// A runner carries the KV cache storage type every turn on it decodes
 // with; the serve layer reads it onto each request because the pool
 // outlives any single turn's options.
 //
 // Usage:
-//   auto runner = std::make_unique<Runner>(engine, model, 0);
+//   auto runner = std::make_unique<SingleDeviceRunner>(engine, model, 0);
 //   pool.Add(std::move(runner));
 class Runner {
  public:
-  Runner(std::unique_ptr<Engine> engine, std::unique_ptr<Model> model,
-         int device_index, CalibrationConfig calibration = {},
-         KvCacheType kv_type = KvCacheType::F32);
+  virtual ~Runner() = default;
   Runner(const Runner&) = delete;
   Runner& operator=(const Runner&) = delete;
 
-  [[nodiscard]] Engine& engine() const;
-  [[nodiscard]] Model& model() const;
-  [[nodiscard]] const Tokenizer* tokenizer() const;
-  [[nodiscard]] int device_index() const;
-  [[nodiscard]] const CalibrationConfig& calibration() const;
+  // The engine and model the serve layer reads for metadata: diagnostics,
+  // the tokenizer, chat rendering and the context length. A split runner
+  // returns its front stage, which carries the full model config.
+  [[nodiscard]] virtual Engine& engine() const = 0;
+  [[nodiscard]] virtual Model& model() const = 0;
+  [[nodiscard]] virtual const Tokenizer* tokenizer() const = 0;
+  [[nodiscard]] virtual int device_index() const = 0;
+  [[nodiscard]] virtual const CalibrationConfig& calibration() const = 0;
   // Storage type of the full-attention KV cache for turns on this
   // runner (F32 unless the launcher passed --kv-f16|--kv-q8|--kv-q4).
   //
   // Usage:
   //   GenerateOptions options;
   //   options.kv_type = pool.At(0).kv_type();
-  [[nodiscard]] KvCacheType kv_type() const;
+  [[nodiscard]] virtual KvCacheType kv_type() const = 0;
+  // True when one model spans several devices (the pipeline runner). The
+  // serve layer refuses tools, images and auto-title on such a runner,
+  // because those paths run a single device's engine directly.
+  [[nodiscard]] virtual bool is_split() const = 0;
+  // True when Submit alone can drive this request (the shared path). The
+  // single-device runner defers to CanSchedule(engine, ...); the split
+  // runner drives everything through Submit, so it always returns true.
+  [[nodiscard]] virtual bool CanSchedule(
+      const GenerateOptions& options) const = 0;
 
-  // Enqueue a turn on this device's scheduler and run it to
-  // completion, streaming on the caller thread. Applies this
-  // runner's calibration first. Safe for concurrent use; at most
-  // SchedulerOptions::max_concurrent turns decode at once.
+  // Run one turn to completion, streaming on the caller thread. Applies
+  // this runner's calibration first. Safe for concurrent use: the
+  // single-device runner time-slices on its scheduler, the split runner
+  // serializes on its device lock.
   //
   // Usage:
   //   auto outcome = runner.Submit(options, on_token);
+  [[nodiscard]] virtual std::expected<GenerateOutcome, StatusCode> Submit(
+      const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled = {}) const = 0;
+
+  // Jobs admitted and queued (leases excluded). For least-loaded routing
+  // and /metrics. Informational only; zero for a split runner.
+  [[nodiscard]] virtual std::size_t SchedulerActive() const = 0;
+  [[nodiscard]] virtual std::size_t SchedulerPending() const = 0;
+
+ protected:
+  Runner() = default;
+  friend class RunnerPool;
+  friend class RunnerLease;
+  // Held while a lease is active and around every exclusive turn; the
+  // only lock that serializes a runner's devices.
+  mutable std::mutex mutex_;
+  // Leases currently held or split turns running, for /metrics.
+  // Informational only; mutable so a const Submit can update it.
+  mutable std::atomic<std::size_t> active_{0};
+};
+
+// One engine and its loaded model on one device, shared by the scheduler
+// and handed out whole for paths the scheduler does not drive (thinking
+// budgets, tools). The pool owns runners.
+//
+// Usage:
+//   auto runner = std::make_unique<SingleDeviceRunner>(engine, model, 0);
+//   pool.Add(std::move(runner));
+class SingleDeviceRunner : public Runner {
+ public:
+  SingleDeviceRunner(std::unique_ptr<Engine> engine,
+                     std::unique_ptr<Model> model, int device_index,
+                     CalibrationConfig calibration = {},
+                     KvCacheType kv_type = KvCacheType::F32);
+
+  [[nodiscard]] Engine& engine() const override;
+  [[nodiscard]] Model& model() const override;
+  [[nodiscard]] const Tokenizer* tokenizer() const override;
+  [[nodiscard]] int device_index() const override;
+  [[nodiscard]] const CalibrationConfig& calibration() const override;
+  [[nodiscard]] KvCacheType kv_type() const override;
+  [[nodiscard]] bool is_split() const override;
+  [[nodiscard]] bool CanSchedule(
+      const GenerateOptions& options) const override;
   [[nodiscard]] std::expected<GenerateOutcome, StatusCode> Submit(
       const GenerateOptions& options,
       const std::function<bool(std::uint32_t)>& on_token,
-      const std::function<bool()>& cancelled = {}) const;
-
-  // Scheduler jobs admitted and queued (leases excluded). For
-  // least-loaded routing and /metrics. Informational only.
-  [[nodiscard]] std::size_t SchedulerActive() const;
-  [[nodiscard]] std::size_t SchedulerPending() const;
+      const std::function<bool()>& cancelled = {}) const override;
+  [[nodiscard]] std::size_t SchedulerActive() const override;
+  [[nodiscard]] std::size_t SchedulerPending() const override;
 
  private:
-  friend class RunnerPool;
-  friend class RunnerLease;
   std::unique_ptr<Engine> engine_;
   std::unique_ptr<Model> model_;
   int device_index_ = 0;
   CalibrationConfig calibration_;
   KvCacheType kv_type_ = KvCacheType::F32;
-  // Held while a lease is active and around every scheduler round;
-  // the only lock that serializes a device. Declared before the
-  // scheduler so it outlives the dispatcher thread that borrows it.
-  std::mutex mutex_;
-  // Destroyed before the engine, the model and the device lock, so
-  // its dispatcher joins while everything it borrows is still alive.
+  // Destroyed before the engine, the model and the device lock, so its
+  // dispatcher joins while everything it borrows is still alive.
   std::unique_ptr<Scheduler> scheduler_;
-  // Leases currently held, for /metrics. Informational only.
-  std::atomic<std::size_t> active_{0};
+};
+
+// One model layer-split across several devices, driven by the pipeline
+// decode target. Submit serializes turns on the runner's device lock and
+// runs the whole split generation, so the shared serve path works
+// unchanged. The front stage backs engine()/model() for metadata.
+//
+// Usage:
+//   auto runner = std::make_unique<PipelineRunner>(pipeline, 0);
+//   pool.Add(std::move(runner));
+class PipelineRunner : public Runner {
+ public:
+  PipelineRunner(std::unique_ptr<Pipeline> pipeline, int device_index,
+                 CalibrationConfig calibration = {},
+                 KvCacheType kv_type = KvCacheType::F32);
+
+  [[nodiscard]] Engine& engine() const override;
+  [[nodiscard]] Model& model() const override;
+  [[nodiscard]] const Tokenizer* tokenizer() const override;
+  [[nodiscard]] int device_index() const override;
+  [[nodiscard]] const CalibrationConfig& calibration() const override;
+  [[nodiscard]] KvCacheType kv_type() const override;
+  [[nodiscard]] bool is_split() const override;
+  [[nodiscard]] bool CanSchedule(
+      const GenerateOptions& options) const override;
+  [[nodiscard]] std::expected<GenerateOutcome, StatusCode> Submit(
+      const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled = {}) const override;
+  [[nodiscard]] std::size_t SchedulerActive() const override;
+  [[nodiscard]] std::size_t SchedulerPending() const override;
+
+ private:
+  std::unique_ptr<Pipeline> pipeline_;
+  Engine* facade_engine_ = nullptr;
+  Model* facade_model_ = nullptr;
+  int device_index_ = 0;
+  CalibrationConfig calibration_;
+  KvCacheType kv_type_ = KvCacheType::F32;
 };
 
 class RunnerPool;

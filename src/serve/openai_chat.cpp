@@ -67,12 +67,25 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   const bool shared = slot == nullptr;
   Model& model = shared ? pool.At(0).model() : lease.model();
   if (wants_tools) {
+    // The tool turn runs on the serving backend: a single-device lease
+    // holds its engine, a split runner shares the pool's Submit.
+    const KvCacheType tool_kv =
+        shared ? pool.At(0).kv_type() : lease.runner().kv_type();
+    const ToolGenerate generate =
+        [&](const GenerateOptions& options,
+            const std::function<bool(std::uint32_t)>& next)
+        -> std::expected<GenerateOutcome, StatusCode> {
+      if (shared) {
+        return pool.SubmitLeastLoaded(
+            options, next, [&writer] { return writer.IsPeerGone(); });
+      }
+      return lease.engine().GenerateStreaming(lease.model(), options, next);
+    };
     SessionMessage assistant;
     const bool ok =
-        ChatWithTools(lease.engine(), lease.model(), tokenizer, writer,
-                      prompt_body, default_max,
-                      session != nullptr ? &assistant : nullptr,
-                      lease.runner().kv_type());
+        ChatWithTools(generate, model, tokenizer, writer, prompt_body,
+                      default_max, session != nullptr ? &assistant : nullptr,
+                      tool_kv);
     if (session != nullptr && ok) {
       session->Append(std::move(assistant));
     }

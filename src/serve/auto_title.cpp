@@ -124,7 +124,7 @@ void MaybeAutoTitle(RunnerPool& pool,
     return;
   }
   GenerateOptions probe;
-  if (CanSchedule(pool.At(0).engine(), probe)) {
+  if (pool.At(0).CanSchedule(probe)) {
     Model& model = pool.At(0).model();
     NameSession(model, *tokenizer,
                 [&](const GenerateOptions& options,

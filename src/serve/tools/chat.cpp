@@ -61,14 +61,14 @@ core::Json StreamChunk(const std::string& model_name, core::Json delta,
   return chunk;
 }
 
-bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
-                   ResponseWriter& writer, const std::string& model_name,
-                   const GenerateOptions& options, std::size_t prompt_size,
-                   SessionMessage* out_turn) {
+bool ChatBuffered(const ToolGenerate& generate, const Tokenizer& tokenizer,
+                  ResponseWriter& writer, const std::string& model_name,
+                  const GenerateOptions& options, std::size_t prompt_size,
+                  SessionMessage* out_turn) {
   std::string text;
   const auto gen_started = std::chrono::steady_clock::now();
-  auto streamed = engine.GenerateStreaming(
-      model, options, [&](std::uint32_t token) {
+  auto streamed = generate(
+      options, [&](std::uint32_t token) {
         if (writer.IsPeerGone()) {
           return false;
         }
@@ -128,13 +128,13 @@ bool ChatBuffered(Engine& engine, Model& model, const Tokenizer& tokenizer,
 
 // The turn is generated first, then replayed as SSE: the client cannot
 // tell content apart from a tool call until the block is complete.
-bool ChatStreamed(Engine& engine, Model& model, const Tokenizer& tokenizer,
+bool ChatStreamed(const ToolGenerate& generate, const Tokenizer& tokenizer,
                   ResponseWriter& writer, const std::string& model_name,
                   const GenerateOptions& options, SessionMessage* out_turn) {
   std::string text;
   const auto gen_started = std::chrono::steady_clock::now();
-  auto streamed = engine.GenerateStreaming(
-      model, options, [&](std::uint32_t token) {
+  auto streamed = generate(
+      options, [&](std::uint32_t token) {
         if (writer.IsPeerGone()) {
           return false;
         }
@@ -214,10 +214,10 @@ bool WantsTools(const Json& body) {
   return EffectiveTools(body, &error) != nullptr;
 }
 
-bool ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
-                   ResponseWriter& writer, const Json& body,
-                   std::size_t default_max, SessionMessage* out_turn,
-                   KvCacheType kv_type) {
+bool ChatWithTools(const ToolGenerate& generate, Model& model,
+                   const Tokenizer& tokenizer, ResponseWriter& writer,
+                   const Json& body, std::size_t default_max,
+                   SessionMessage* out_turn, KvCacheType kv_type) {
   std::string error;
   const std::string prompt = RenderPrompt(model, body, &error);
   if (!error.empty()) {
@@ -240,10 +240,10 @@ bool ChatWithTools(Engine& engine, Model& model, const Tokenizer& tokenizer,
   }
   const std::string model_name(model.Name());
   if (WantsStream(body)) {
-    return ChatStreamed(engine, model, tokenizer, writer, model_name, options,
+    return ChatStreamed(generate, tokenizer, writer, model_name, options,
                         out_turn);
   }
-  return ChatBuffered(engine, model, tokenizer, writer, model_name, options,
+  return ChatBuffered(generate, tokenizer, writer, model_name, options,
                       ids->size(), out_turn);
 }
 

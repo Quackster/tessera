@@ -349,10 +349,12 @@ bool RouteDevice(RunnerPool& pool, std::size_t max_thinking_tokens,
   // Every other turn shares the scheduler (as plain greedy, which
   // equals the speculative output): a solo exclusive fast path would
   // hold the whole device while a second session starves behind its
-  // yields, so the serve layer never takes it.
+  // yields, so the serve layer never takes it. A layer-split runner has
+  // no scheduler and its Submit serializes, so tool turns share it too.
   GenerateOptions probe;
   probe.max_thinking_tokens = max_thinking_tokens;
-  if (wants_tools || !CanSchedule(pool.At(0).engine(), probe)) {
+  const bool split = pool.At(0).is_split();
+  if ((wants_tools && !split) || !pool.At(0).CanSchedule(probe)) {
     auto held = pool.Acquire(cancelled);
     if (!held) {
       return false;

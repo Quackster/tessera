@@ -15,9 +15,11 @@ constexpr int kAcquirePollMs = 10;
 
 }  // namespace
 
-Runner::Runner(std::unique_ptr<Engine> engine, std::unique_ptr<Model> model,
-               int device_index, CalibrationConfig calibration,
-               KvCacheType kv_type)
+SingleDeviceRunner::SingleDeviceRunner(std::unique_ptr<Engine> engine,
+                                       std::unique_ptr<Model> model,
+                                       int device_index,
+                                       CalibrationConfig calibration,
+                                       KvCacheType kv_type)
     : engine_(std::move(engine)),
       model_(std::move(model)),
       device_index_(device_index),
@@ -27,19 +29,29 @@ Runner::Runner(std::unique_ptr<Engine> engine, std::unique_ptr<Model> model,
       std::make_unique<Scheduler>(*engine_, *model_, mutex_, SchedulerOptions{});
 }
 
-Engine& Runner::engine() const { return *engine_; }
+Engine& SingleDeviceRunner::engine() const { return *engine_; }
 
-Model& Runner::model() const { return *model_; }
+Model& SingleDeviceRunner::model() const { return *model_; }
 
-const Tokenizer* Runner::tokenizer() const { return model_->GetTokenizer(); }
+const Tokenizer* SingleDeviceRunner::tokenizer() const {
+  return model_->GetTokenizer();
+}
 
-int Runner::device_index() const { return device_index_; }
+int SingleDeviceRunner::device_index() const { return device_index_; }
 
-const CalibrationConfig& Runner::calibration() const { return calibration_; }
+const CalibrationConfig& SingleDeviceRunner::calibration() const {
+  return calibration_;
+}
 
-KvCacheType Runner::kv_type() const { return kv_type_; }
+KvCacheType SingleDeviceRunner::kv_type() const { return kv_type_; }
 
-std::expected<GenerateOutcome, StatusCode> Runner::Submit(
+bool SingleDeviceRunner::is_split() const { return false; }
+
+bool SingleDeviceRunner::CanSchedule(const GenerateOptions& options) const {
+  return tessera::CanSchedule(*engine_, options);
+}
+
+std::expected<GenerateOutcome, StatusCode> SingleDeviceRunner::Submit(
     const GenerateOptions& options,
     const std::function<bool(std::uint32_t)>& on_token,
     const std::function<bool()>& cancelled) const {
@@ -48,11 +60,75 @@ std::expected<GenerateOutcome, StatusCode> Runner::Submit(
   return scheduler_->Submit(tuned, on_token, cancelled);
 }
 
-std::size_t Runner::SchedulerActive() const { return scheduler_->Active(); }
+std::size_t SingleDeviceRunner::SchedulerActive() const {
+  return scheduler_->Active();
+}
 
-std::size_t Runner::SchedulerPending() const {
+std::size_t SingleDeviceRunner::SchedulerPending() const {
   return scheduler_->Pending();
 }
+
+PipelineRunner::PipelineRunner(std::unique_ptr<Pipeline> pipeline,
+                               int device_index, CalibrationConfig calibration,
+                               KvCacheType kv_type)
+    : pipeline_(std::move(pipeline)),
+      device_index_(device_index),
+      calibration_(std::move(calibration)),
+      kv_type_(kv_type) {
+  if (pipeline_ != nullptr && pipeline_->StageCount() > 0) {
+    facade_engine_ = &pipeline_->StageEngine(0);
+    facade_model_ = &pipeline_->StageModel(0);
+  }
+}
+
+Engine& PipelineRunner::engine() const { return *facade_engine_; }
+
+Model& PipelineRunner::model() const { return *facade_model_; }
+
+const Tokenizer* PipelineRunner::tokenizer() const {
+  return facade_model_ != nullptr ? facade_model_->GetTokenizer() : nullptr;
+}
+
+int PipelineRunner::device_index() const { return device_index_; }
+
+const CalibrationConfig& PipelineRunner::calibration() const {
+  return calibration_;
+}
+
+KvCacheType PipelineRunner::kv_type() const { return kv_type_; }
+
+bool PipelineRunner::is_split() const { return true; }
+
+bool PipelineRunner::CanSchedule(const GenerateOptions& options) const {
+  (void)options;
+  return true;
+}
+
+std::expected<GenerateOutcome, StatusCode> PipelineRunner::Submit(
+    const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token,
+    const std::function<bool()>& cancelled) const {
+  GenerateOptions tuned = options;
+  ApplyToGenerateOptions(calibration_, tuned);
+  // One split model spans every stage, so a turn holds the whole runner.
+  // The serve on_token already watches for a dropped peer; also honor the
+  // explicit cancel between tokens.
+  const auto gated = [&](std::uint32_t token) {
+    if (cancelled && cancelled()) {
+      return false;
+    }
+    return on_token(token);
+  };
+  std::lock_guard<std::mutex> lock(mutex_);
+  active_.fetch_add(1, std::memory_order_relaxed);
+  auto outcome = pipeline_->GenerateStreaming(tuned, gated);
+  active_.fetch_sub(1, std::memory_order_relaxed);
+  return outcome;
+}
+
+std::size_t PipelineRunner::SchedulerActive() const { return 0; }
+
+std::size_t PipelineRunner::SchedulerPending() const { return 0; }
 
 RunnerLease::RunnerLease(Runner& runner, std::unique_lock<std::mutex> lock)
     : runner_(&runner), lock_(std::move(lock)) {

@@ -485,7 +485,7 @@ int RunCalibrateCommand(int argc, char** argv) {
       std::unique_ptr<Engine> engine_ptr = std::move(*created);
       std::unique_ptr<Model> model_ptr = std::move(*model);
       RunnerPool pool;
-      pool.Add(std::make_unique<Runner>(std::move(engine_ptr),
+      pool.Add(std::make_unique<SingleDeviceRunner>(std::move(engine_ptr),
                                         std::move(model_ptr), device,
                                         outcome->config, kv_type));
       for (const std::size_t sessions :
