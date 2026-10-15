@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "tessera/defaults.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
@@ -23,7 +24,7 @@ class Tokenizer;
 struct TensorParallelOptions {
   std::string model_path;
   std::vector<int> devices;  // one rank per device, in rank order
-  std::size_t context = 32768;
+  std::size_t context = kDefaultContext;
   KvCacheType kv_type = KvCacheType::F32;
 };
 

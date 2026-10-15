@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "tessera/backend.hpp"
+#include "tessera/defaults.hpp"
 #include "tessera/log.hpp"
 #include "tessera/model.hpp"
 #include "tessera/speculative.hpp"
@@ -35,16 +36,17 @@ struct EngineOptions {
   std::size_t prefill_chunk_tokens = 0;
 };
 
-// Sampling parameters, with the Qwen 3.8 27B defaults. Applied in this
-// order: repetition and presence penalties over the token history, then
-// temperature, then min_p, top_k and top_p. temperature 0 means greedy.
+// Sampling parameters, with the Qwen 3.8 27B defaults (see
+// tessera/defaults.hpp). Applied in this order: repetition and presence
+// penalties over the token history, then temperature, then min_p, top_k
+// and top_p. temperature 0 means greedy.
 struct SamplingOptions {
-  float temperature = 0.6f;
-  float top_p = 0.95f;
-  int top_k = 20;
-  float min_p = 0.0f;
-  float presence_penalty = 0.0f;
-  float repetition_penalty = 1.0f;
+  float temperature = kDefaultTemperature;
+  float top_p = kDefaultTopP;
+  int top_k = kDefaultTopK;
+  float min_p = kDefaultMinP;
+  float presence_penalty = kDefaultPresencePenalty;
+  float repetition_penalty = kDefaultRepetitionPenalty;
 };
 
 // Options for Engine::Generate.
@@ -122,15 +124,9 @@ struct GenerateOptions {
   std::function<void(std::size_t, std::size_t)> prefill_progress;
 };
 
-// Tokens per prefill forward when neither the engine nor the request
-// sets one (llama.cpp ubatch analog). Bounds one forward's scratch
-// (about rows x ffn_dim floats) so a 220k-token prompt prefills in
-// bounded memory instead of losing the device.
-constexpr std::size_t kDefaultPrefillChunkTokens = 512;
-
 // Resolve the prefill chunk for one request. The request value wins
 // when nonzero; otherwise the engine default wins; otherwise the
-// automatic default is used.
+// automatic default (kDefaultPrefillChunkTokens) is used.
 //
 // Usage:
 //   const std::size_t chunk = ResolvePrefillChunkTokens(

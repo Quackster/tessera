@@ -17,6 +17,7 @@
 #include "cli_common.hpp"
 #include "tessera/budget.hpp"
 #include "tessera/calibrate.hpp"
+#include "tessera/defaults.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
 #include "tessera/runner.hpp"
@@ -184,28 +185,32 @@ void PrintUsage() {
                "cache probes)\n"
                "  --no-chat         do not apply the chat template\n"
                "  --sample          sample instead of greedy decode\n"
-               "  --temperature <f> sampling temperature (default 0.6)\n"
-               "  --top-p <f>       nucleus probability (default 0.95)\n"
-               "  --top-k <n>       keep the top n tokens (default 20)\n"
-               "  --min-p <f>       minimum probability (default 0.0)\n"
-               "  --presence-penalty <f>   presence penalty (default 0.0)\n"
-               "  --repetition-penalty <f> repetition penalty (default 1.0)\n"
+               "  --temperature <f> sampling temperature (default %.1f)\n"
+               "  --top-p <f>       nucleus probability (default %.2f)\n"
+               "  --top-k <n>       keep the top n tokens (default %d)\n"
+               "  --min-p <f>       minimum probability (default %.1f)\n"
+               "  --presence-penalty <f>   presence penalty (default %.1f)\n"
+               "  --repetition-penalty <f> repetition penalty (default %.1f)\n"
                "  --seed <n>        sampling RNG seed (default 0)\n"
                "  --kv-f16          store the KV cache in fp16 (default fp32)\n"
                "  --kv-q8           store the KV cache in int8\n"
                "  --kv-q4           store the KV cache in 4-bit\n"
                "  --kv-fp8          store the KV cache in FP8 E4M3\n"
-                "  --host <ip>       serve bind address (default 127.0.0.1)\n"
-                "  --port <n>        serve port (default 8080)\n"
+                "  --host <ip>       serve bind address (default %s)\n"
+                "  --port <n>        serve port (default %u)\n"
                 "  --stats-interval <s> live tok/s cadence on streams and "
-                "console (default 5, 0 off)\n"
+                "console (default %zu, 0 off)\n"
                "  --no-auto-title   keep the first user line as the chat title "
                "instead of asking the model\n"
                "  --api-key <k>     accepted API key (repeatable; env "
                "TESSERA_API_KEY)\n"
                "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
                kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk,
-               kDefaultAttentionSplitChunks, kDefaultMaxCompletionTokens);
+               kDefaultAttentionSplitChunks, kDefaultMaxCompletionTokens,
+               kDefaultTemperature, kDefaultTopP, kDefaultTopK, kDefaultMinP,
+               kDefaultPresencePenalty, kDefaultRepetitionPenalty,
+               kDefaultServeHost, static_cast<unsigned>(kDefaultServePort),
+               kDefaultStatsIntervalSeconds);
 }
 
 CalibrationConfig ResolveCalibration(Engine& engine, Model& model,

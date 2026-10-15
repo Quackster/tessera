@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "tessera/defaults.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
@@ -22,7 +23,7 @@ class Tokenizer;
 struct SpecSplitOptions {
   std::string model_path;
   std::vector<int> devices;  // [target, draft], in that order
-  std::size_t context = 32768;
+  std::size_t context = kDefaultContext;
   KvCacheType kv_type = KvCacheType::F32;
   // Tokens per draft block; 0 uses the strategy default.
   std::size_t draft_block = 0;

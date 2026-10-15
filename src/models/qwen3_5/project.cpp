@@ -4,6 +4,7 @@
 
 #include "core/decode_internal.hpp"
 #include "models/qwen3_5/state.hpp"
+#include "tessera/defaults.hpp"
 
 // Qwen3.5 projection helper. With TESSERA_MXFP4_W4A8=1 an MXFP4 (F4E2M1)
 // weight runs as W4A8: its activation is quantize-dequantized per token to

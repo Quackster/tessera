@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "tessera/calibrate.hpp"
+#include "tessera/defaults.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
 #include "tessera/runner.hpp"
@@ -17,25 +18,11 @@
 
 namespace tessera {
 
-// Zero default completion length: a request that omits
-// max_completion_tokens fills the remaining context (see
-// Model::EffectiveMaxTokens) instead of stopping after a fixed budget.
-//
-// Usage:
-//   ServeOptions options;
-//   options.default_max_completion_tokens = kDefaultMaxCompletionTokens;
-constexpr std::size_t kDefaultMaxCompletionTokens = 0;
-
-// Default live speed cadence: streamed turns report tok/s to the
-// session SSE stream and the server log every this many seconds.
-// Zero disables both; --stats-interval overrides it per serve run.
-constexpr std::size_t kDefaultStatsIntervalSeconds = 5;
-
 // Options for Serve.
 struct ServeOptions {
   // Interface to bind (dotted IPv4 literal).
-  std::string host = "127.0.0.1";
-  std::uint16_t port = 8080;
+  std::string host = kDefaultServeHost;
+  std::uint16_t port = kDefaultServePort;
   // Default completion length when a request omits max_completion_tokens
   // (0 fills the remaining context).
   std::size_t default_max_completion_tokens = kDefaultMaxCompletionTokens;
