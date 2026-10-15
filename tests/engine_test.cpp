@@ -631,7 +631,7 @@ TEST(EngineTest, SchedulerSharesOneDeviceAcrossSessions) {
     expected.push_back(*solo);
   }
   tessera::RunnerPool pool;
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(engine), std::move(*model), TestDeviceIndex()));
   std::atomic<int> entered{0};
   std::atomic<std::size_t> max_active{0};
@@ -697,7 +697,7 @@ TEST(EngineTest, CliParallelSessionsStreamTogether) {
     expected.push_back(*solo);
   }
   tessera::RunnerPool pool;
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(engine), std::move(*model), TestDeviceIndex()));
   std::atomic<int> entered{0};
   std::atomic<std::size_t> max_active{0};
@@ -817,7 +817,7 @@ TEST(EngineTest, SchedulerRejectsBadRequests) {
   auto model = engine->LoadModel(ModelOptions{path.string(), 8});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   tessera::RunnerPool pool;
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(engine), std::move(*model), TestDeviceIndex()));
   const auto sink = [](std::uint32_t) { return true; };
   GenerateOptions too_long;
@@ -920,7 +920,7 @@ TEST(EngineTest, TryAcquireSkipsBusyDevice) {
   auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   tessera::RunnerPool pool;
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(engine), std::move(*model), TestDeviceIndex()));
   auto held = pool.Acquire();
   ASSERT_TRUE(held.has_value());
@@ -942,7 +942,7 @@ TEST(EngineTest, RunnerCarriesKvType) {
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   {
     tessera::RunnerPool pool;
-    pool.Add(std::make_unique<tessera::Runner>(
+    pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
         std::move(engine), std::move(*model), TestDeviceIndex()));
     EXPECT_EQ(pool.At(0).kv_type(), tessera::KvCacheType::F32);
   }
@@ -957,7 +957,7 @@ TEST(EngineTest, RunnerCarriesKvType) {
   auto solo = qengine->Generate(**qmodel, q8);
   ASSERT_TRUE(solo.has_value()) << tessera::ToString(solo.error());
   tessera::RunnerPool qpool;
-  qpool.Add(std::make_unique<tessera::Runner>(
+  qpool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(qengine), std::move(*qmodel), TestDeviceIndex(),
       tessera::CalibrationConfig{}, tessera::KvCacheType::Q8));
   EXPECT_EQ(qpool.At(0).kv_type(), tessera::KvCacheType::Q8);
@@ -978,7 +978,7 @@ TEST(EngineTest, LeaseYieldReleasesDevice) {
   auto model = engine->LoadModel(ModelOptions{path.string(), 1024});
   ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
   tessera::RunnerPool pool;
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(engine), std::move(*model), TestDeviceIndex()));
   auto held = pool.Acquire();
   ASSERT_TRUE(held.has_value());
@@ -1025,7 +1025,7 @@ TEST(EngineTest, StrategyBackedServeStreamsConcurrentSessions) {
   auto strategy = std::make_unique<NonProposingStrategy>();
   ASSERT_TRUE(engine->AttachSpeculative(std::move(strategy)).has_value());
   tessera::RunnerPool pool;
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(engine), std::move(*model), TestDeviceIndex()));
   const auto idle = [] { return false; };
   // A plain turn routes shared even on an idle strategy-backed
@@ -1201,10 +1201,10 @@ TEST(EngineTest, SubmitLeastLoadedSplitsAcrossRunners) {
   ASSERT_TRUE(expect_second.has_value())
       << tessera::ToString(expect_second.error());
   tessera::RunnerPool pool;
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(first_engine), std::move(*first_model),
       TestDeviceIndex()));
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(*second_engine), std::move(*second_model),
       TestDeviceIndex()));
   struct Turn {
@@ -1283,7 +1283,7 @@ TEST(EngineTest, OpenAiCompleteMatchesSoloThroughScheduler) {
   auto want = tokenizer.Decode(*solo);
   ASSERT_TRUE(want.has_value()) << tessera::ToString(want.error());
   tessera::RunnerPool pool;
-  pool.Add(std::make_unique<tessera::Runner>(
+  pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
       std::move(engine), std::move(*model), TestDeviceIndex()));
   tessera::serve::SessionStore sessions;
   tessera::core::Json body = tessera::core::Json::Object();
@@ -2067,6 +2067,10 @@ TEST(EngineTest, ShardKeepsHeadAndEmbeddingOnTheirStage) {
   EXPECT_TRUE(ShardKeepsTensor("blk.48.nextn.eh_proj.weight", last, kTrunk));
   EXPECT_FALSE(ShardKeepsTensor("token_embd.weight", last, kTrunk));
   EXPECT_FALSE(ShardKeepsTensor("blk.23.attn_q.weight", last, kTrunk));
+  // A drafter on the last stage can ask for the embedding there too.
+  ModelShard last_embed = last;
+  last_embed.last_stage_embedding = true;
+  EXPECT_TRUE(ShardKeepsTensor("token_embd.weight", last_embed, kTrunk));
 }
 
 TEST(EngineTest, ShardLayerRangeTracksTheShard) {

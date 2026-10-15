@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/decode_internal.hpp"
 #include "core/pipeline_impl.hpp"
 #include "core/timing.hpp"
 #include "tessera/architecture.hpp"
@@ -55,11 +56,18 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::Run(
   if (!logits) {
     return std::unexpected(logits.error());
   }
+  // The intermittent non-finite fault (a corrupt row) degenerates to token
+  // 0; stop instead of looping on `!`, like the non-pipeline decode path.
+  if (!core::detail::AllFinite(*logits)) {
+    outcome.reason = FinishReason::Aborted;
+    return outcome;
+  }
   const std::size_t budget =
       options.max_completion_tokens == 0 ? context - prompt.size()
                                          : options.max_completion_tokens;
   std::uint32_t next = pipeline_internal::ArgMax(*logits);
   bool stopped = false;
+  bool aborted = false;
   const auto decode_started = std::chrono::steady_clock::now();
   for (std::size_t count = 0; count < budget; ++count) {
     if (pipeline_internal::IsStop(next, stops)) {
@@ -71,12 +79,18 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::Run(
     if (!step) {
       return std::unexpected(step.error());
     }
+    if (!core::detail::AllFinite(*step)) {
+      aborted = true;
+      break;
+    }
     next = pipeline_internal::ArgMax(*step);
   }
   outcome.decode_ms = core::ElapsedMsDouble(decode_started,
                                             std::chrono::steady_clock::now());
   outcome.produced = produced->size();
-  outcome.reason = stopped ? FinishReason::Stop : FinishReason::Length;
+  outcome.reason = aborted  ? FinishReason::Aborted
+                   : stopped ? FinishReason::Stop
+                             : FinishReason::Length;
   return outcome;
 }
 
@@ -123,11 +137,13 @@ std::expected<std::unique_ptr<Pipeline>, StatusCode> Pipeline::Create(
     ModelOptions model_options;
     model_options.path = options.model_path;
     model_options.max_context_length = options.context;
+    model_options.gpu_layers = options.gpu_layers;
     model_options.shard.enabled = true;
     model_options.shard.first_layer = first;
     model_options.shard.last_layer = last;
     model_options.shard.first_stage = (i == 0);
     model_options.shard.last_stage = (i + 1 == stage_count);
+    model_options.shard.last_stage_embedding = options.last_stage_embedding;
     // A fetched MTP head loads on the last stage only, which owns it.
     if (i + 1 == stage_count) {
       model_options.mtp_path = options.mtp_path;

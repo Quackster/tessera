@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -42,6 +43,14 @@ struct PipelineOptions {
   // which owns the head for the attached drafter. Empty when the model's
   // own GGUF carries the nextn block.
   std::string mtp_path;
+  // Also keep the token embedding on the last stage. A drafter that runs
+  // there and embeds the anchor tokens (DFlash2) needs it; off by default
+  // because it duplicates the embedding.
+  bool last_stage_embedding = false;
+  // Trunk layers kept in VRAM per stage; the rest page from system RAM. 0
+  // (the default) uploads a stage's whole range. Counted within a stage's
+  // own layer range, so every stage pages its own earliest layers.
+  std::size_t gpu_layers = 0;
 };
 
 // A model split across devices by layer range. Each stage runs its own
@@ -88,6 +97,19 @@ class Pipeline {
   //   auto outcome = pipeline->GenerateTimed(prompt, tuning);
   std::expected<GenerateOutcome, StatusCode> GenerateTimed(
       std::span<const std::uint32_t> prompt, const GenerateOptions& options);
+
+  // Streaming generation over the stages, driven by the shared decode
+  // driver (core::RunDecode) so plain greedy, sampling, thinking budgets
+  // and an attached strategy all behave as on the single-device engine.
+  // The prompt comes from `options.prompt_tokens` (or `first_token`).
+  // `on_token` returns false to abort. Resets the per-stage caches first,
+  // so one Pipeline serves one request at a time; the caller serializes.
+  //
+  // Usage:
+  //   auto outcome = pipeline->GenerateStreaming(options, on_token);
+  [[nodiscard]] std::expected<GenerateOutcome, StatusCode> GenerateStreaming(
+      const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token);
 
   // Attach a speculative strategy (off by default). The factory is called
   // once; the drafter runs on the last stage, which owns the MTP head, while

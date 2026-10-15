@@ -43,12 +43,13 @@ namespace {
 
 // QSA paged KV capacity and geometry (the served artifact's contract).
 // The capacity must cover the context; raise it together with --context.
-constexpr std::size_t kQsaCells = 8192;
+// The QSA paged-cache capacity is the model context, floored at this and
+// rounded to a page, so a short context keeps the old buffer sizes and a
+// long one (up to the model maximum) covers every position.
+constexpr std::size_t kQsaMinCells = 8192;
 constexpr std::size_t kQsaPageSize = 4;
 constexpr std::size_t kQsaIdxBlock = 4;
 constexpr std::size_t kQsaNRot = 64;
-constexpr std::size_t kQsaPages = kQsaCells / kQsaPageSize;
-constexpr std::size_t kQsaPooledRows = kQsaCells / kQsaIdxBlock + 2;
 constexpr std::size_t kPleHeads = 16;  // (ngram_size - 1) * heads_per_ngram
 
 std::uint32_t Grid(std::size_t elements) {
@@ -60,6 +61,17 @@ std::uint32_t EpsBits(double eps) {
   std::uint32_t bits = 0;
   std::memcpy(&bits, &f, sizeof(bits));
   return bits;
+}
+
+// QSA paged-cache cell count: the model context, floored at the minimum and
+// rounded up to a page, so the page table and the pooled index divide evenly.
+std::size_t QsaCapacity(std::size_t context) {
+  std::size_t cells = context < kQsaMinCells ? kQsaMinCells : context;
+  const std::size_t rem = cells % kQsaPageSize;
+  if (rem != 0) {
+    cells += kQsaPageSize - rem;
+  }
+  return cells;
 }
 
 }  // namespace
@@ -834,6 +846,11 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
   const std::size_t hc_dim = g.hc_dim;
   const std::size_t q_dim = g.heads * g.head_dim;
   const std::size_t id_cap = cfg.indexer.top_k + kQsaIdxBlock - 1;
+  // The QSA paged cache covers the model context, so a 262144-token run
+  // allocates 262144 cells and a short run keeps the old buffers.
+  const std::size_t qsa_cells = QsaCapacity(model.MaxContextLength());
+  const std::size_t qsa_pages = qsa_cells / kQsaPageSize;
+  const std::size_t qsa_pooled = qsa_cells / kQsaIdxBlock + 2;
   if (!make(h.x, g.hidden * f) || !make(h.proj, g.hidden * f) ||
       !make(h.logits, cfg.vocab_size * f) || !make(h.R, hc_dim * f) ||
       !make(h.mixed, g.hidden * f) || !make(h.block_out, g.hidden * f) ||
@@ -854,31 +871,31 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
       !make(h.kcur, g.kv_dim * f) || !make(h.vcur, g.kv_dim * f) ||
       !make(h.idx_raw, g.idx_dim * f) ||
       !make(h.q_idx, g.idx_heads * g.idx_dim * f) ||
-      !make(h.cell_scores, kQsaCells * f) || !make(h.ids, id_cap * f) ||
+      !make(h.cell_scores, qsa_cells * f) || !make(h.ids, id_cap * f) ||
       !make(h.k_scratch, id_cap * g.kv_heads * g.head_dim * 2) ||
       !make(h.v_scratch, id_cap * g.kv_heads * g.head_dim * 2) ||
-      !make(h.idx_bias, (kQsaCells / kQsaIdxBlock + 2) * f) ||
+      !make(h.idx_bias, qsa_pooled * f) ||
       !make(h.attn_f16, q_dim * 2) || !make(h.attn_in, q_dim * f) ||
       !make(h.embed_ids, 4)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   {
-    std::vector<float> zeros(kQsaCells / kQsaIdxBlock + 2, 0.0f);
+    std::vector<float> zeros(qsa_pooled, 0.0f);
     if (!UploadF32(backend, *h.idx_bias, zeros)) {
       return std::unexpected(StatusCode::DeviceError);
     }
   }
 
   const std::size_t pool_bytes =
-      kQsaPages * g.kv_heads * kQsaPageSize * g.head_dim * 2;
+      qsa_pages * g.kv_heads * kQsaPageSize * g.head_dim * 2;
   // The paged K/V pools start empty. The indexer can select a cell in the
   // current block that the append has not written yet, so an unwritten pool
   // must read as zeros, never as whatever the allocator returned.
   const std::vector<std::byte> pool_zeros(pool_bytes, std::byte{0});
-  const std::size_t cos_elems = kQsaCells * (kQsaNRot / 2);
+  const std::size_t cos_elems = qsa_cells * (kQsaNRot / 2);
   std::vector<float> cos_tab(cos_elems);
   std::vector<float> sin_tab(cos_elems);
-  for (std::size_t p = 0; p < kQsaCells; ++p) {
+  for (std::size_t p = 0; p < qsa_cells; ++p) {
     for (std::size_t j = 0; j < kQsaNRot / 2; ++j) {
       const double freq =
           std::pow(g.rope_theta, -2.0 * static_cast<double>(j) /
@@ -895,10 +912,10 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
     if (cfg.IsFullAttentionLayer(l)) {
       Qwen4ExpState::QsaLayer& st = h.qsa[l];
       if (!make(st.k_pool, pool_bytes) || !make(st.v_pool, pool_bytes) ||
-          !make(st.page_table, kQsaPages * 4) ||
+          !make(st.page_table, qsa_pages * 4) ||
           !make(st.idx_tail, (kQsaIdxBlock - 1) * g.idx_dim * f) ||
           !make(st.idx_dead, g.idx_dim * f) ||
-          !make(st.idx_pooled, kQsaPooledRows * g.idx_dim * f) ||
+          !make(st.idx_pooled, qsa_pooled * g.idx_dim * f) ||
           !make(st.idx_cos, cos_elems * f) || !make(st.idx_sin, cos_elems * f) ||
           !make(st.block_pos, 4)) {
         return std::unexpected(StatusCode::OutOfMemory);
@@ -907,8 +924,8 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
           !backend.CopyH2D(*st.v_pool, pool_zeros)) {
         return std::unexpected(StatusCode::DeviceError);
       }
-      std::vector<std::int32_t> table(kQsaPages);
-      for (std::size_t p = 0; p < kQsaPages; ++p) {
+      std::vector<std::int32_t> table(qsa_pages);
+      for (std::size_t p = 0; p < qsa_pages; ++p) {
         table[p] = static_cast<std::int32_t>(p);
       }
       if (!backend.CopyH2D(
@@ -922,7 +939,7 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
           !UploadF32(backend, *st.idx_sin, sin_tab)) {
         return std::unexpected(StatusCode::DeviceError);
       }
-      std::vector<float> zeros_pooled(kQsaPooledRows * g.idx_dim, 0.0f);
+      std::vector<float> zeros_pooled(qsa_pooled * g.idx_dim, 0.0f);
       std::vector<float> zeros_tail((kQsaIdxBlock - 1) * g.idx_dim, 0.0f);
       std::vector<float> zeros_dead(g.idx_dim, 0.0f);
       if (!UploadF32(backend, *st.idx_pooled, zeros_pooled) ||

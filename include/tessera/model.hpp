@@ -30,13 +30,17 @@ enum class ModelFormat : int {
 // default) loads every tensor, the single-device case. Enabled restricts
 // the trunk blocks to `[first_layer, last_layer)`; `first_stage` also
 // gets the token embedding and `last_stage` the output head and the MTP
-// block. `last_layer` 0 means the last trunk layer.
+// block. `last_layer` 0 means the last trunk layer. `last_stage_embedding`
+// also keeps the token embedding on the last stage, for a drafter that runs
+// there and needs it (DFlash2); off by default because it duplicates the
+// embedding.
 struct ModelShard {
   bool enabled = false;
   std::size_t first_layer = 0;
   std::size_t last_layer = 0;
   bool first_stage = true;
   bool last_stage = true;
+  bool last_stage_embedding = false;
 };
 
 // Tensor-parallel shard: `rank` of `world` ranks. The architecture module

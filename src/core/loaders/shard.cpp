@@ -49,7 +49,8 @@ bool ShardKeepsTensor(std::string_view name, const ModelShard& shard,
     return true;
   }
   if (name == "token_embd.weight") {
-    return shard.first_stage;
+    return shard.first_stage ||
+           (shard.last_stage && shard.last_stage_embedding);
   }
   // The output head belongs to the last stage: the vocabulary projection,
   // the final norm, and any head-side weight named with the `output`

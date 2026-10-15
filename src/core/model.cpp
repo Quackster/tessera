@@ -696,6 +696,12 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
     chunk_bytes = 0;
     return {};
   };
+  // Paging is shard-local: a stage keeps its own last gpu_layers - 1 trunk
+  // layers resident and pages the rest, so every stage offloads the same
+  // fraction. Without a shard the boundary is the whole trunk.
+  const std::size_t resident_trunk =
+      (shard.enabled && shard.last_layer != 0) ? shard.last_layer
+                                               : trunk_layers;
   {
     core::PhaseTimer timer(log, "model", "allocate device buffers");
     for (std::size_t i = 0; i < tensors.size(); ++i) {
@@ -764,8 +770,8 @@ std::expected<SplitUpload, StatusCode> UploadWeights(
       // routed experts the dense block tensors stay resident too and only
       // the routed experts page (see PagedMoeDenseResident).
       bool resident =
-          core::GpuLayerResident(entry.name, gpu_layers, trunk_layers) ||
-          core::PagedMoeDenseResident(entry.name, gpu_layers, trunk_layers,
+          core::GpuLayerResident(entry.name, gpu_layers, resident_trunk) ||
+          core::PagedMoeDenseResident(entry.name, gpu_layers, resident_trunk,
                                       has_moe);
       std::size_t layer = 0;
       std::string block_kind;

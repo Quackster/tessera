@@ -315,15 +315,20 @@ int main(int argc, char** argv) {
   // is set. This tells the user the split flags when they forget one.
   const bool split_active = pipeline_mode || tp_mode || cp_mode ||
                             spec_split_mode || hybrid_mode;
-  // serve is replica-only by design: it loads one full model per --gpus
-  // device. The split layouts are run-only, so refuse them here instead of
-  // silently loading replicas the user did not ask for.
-  if (command == "serve" && split_active) {
+  // serve runs one model per --gpus group: a layer-split pipeline when
+  // --pipeline is set, else one full replica per device. The other split
+  // layouts are run-only, so refuse them here instead of silently loading
+  // replicas the user did not ask for.
+  const bool serve_split_unsupported =
+      command == "serve" &&
+      (tp_mode || cp_mode || spec_split_mode || hybrid_mode);
+  if (serve_split_unsupported) {
     std::fprintf(stderr,
-                 "cli: serve runs one model replica per --gpus device and "
-                 "cannot split one model across devices; --pipeline, --tp, "
-                 "--cp, --spec-split and --hybrid are run-only. Use `run` for "
-                 "a split layout, or `serve` with one --gpus device.\n");
+                 "cli: serve splits one model across devices only with "
+                 "--pipeline; --tp, --cp, --spec-split and --hybrid are "
+                 "run-only. Use `run` for those layouts, `serve --pipeline "
+                 "--gpus a,b` to layer-split, or `serve --gpus a,b` for one "
+                 "replica per device.\n");
     return kExitUsage;
   }
   const std::string routing_hint = tessera::cli::DeviceRoutingHint(
@@ -410,6 +415,11 @@ int main(int argc, char** argv) {
     serve_options.allow_origins = allow_origins;
     serve_options.auto_title = auto_title;
     serve_options.stats_interval_seconds = stats_interval_seconds;
+    if (pipeline_mode) {
+      // Auto-title runs a generation on one engine directly, which a split
+      // runner cannot back; keep the first user line as the chat title.
+      serve_options.auto_title = false;
+    }
     // Build one runner per device on the loader thread. Devices load and
     // warm one at a time, so only one model is in host memory at once.
     // The server binds first, so a client reaches /health while loading.
@@ -417,6 +427,57 @@ int main(int argc, char** argv) {
         -> std::expected<std::unique_ptr<tessera::RunnerPool>,
                          tessera::StatusCode> {
       auto pool = std::make_unique<tessera::RunnerPool>();
+      // A layer-split pipeline drives one model across every --gpus
+      // device. The serve layer sees a single runner, so the split needs
+      // no separate HTTP path; the pipeline resets its caches per turn and
+      // Submit serializes turns.
+      if (pipeline_mode) {
+        report("loading the layer split across the gpus");
+        tessera::PipelineOptions pipeline_options;
+        pipeline_options.model_path = model_path;
+        pipeline_options.devices = device_indices;
+        pipeline_options.context = context;
+        pipeline_options.kv_type = kv_type;
+        pipeline_options.mtp_path = mtp_path;
+        auto pipeline = tessera::Pipeline::Create(pipeline_options);
+        if (!pipeline) {
+          std::fprintf(stderr, "cli: pipeline create failed (%s)\n",
+                       tessera::ToString(pipeline.error()).data());
+          return std::unexpected(pipeline.error());
+        }
+        if (speculate || !draft_path.empty()) {
+          const bool dflash2 = !draft_path.empty();
+          const auto factory =
+              [dflash2]() -> std::unique_ptr<tessera::SpeculativeStrategy> {
+            return dflash2 ? tessera::CreateDFlash2Strategy()
+                           : tessera::CreateMtpStrategy();
+          };
+          auto attached = (*pipeline)->AttachSpeculative(
+              factory, tessera::StrategyOptions{draft_path, draft_block});
+          if (!attached) {
+            std::fprintf(stderr, "cli: pipeline strategy attach failed (%s)\n",
+                         tessera::ToString(attached.error()).data());
+            return std::unexpected(attached.error());
+          }
+        }
+        report("warming up kernels");
+        tessera::GenerateOptions warm;
+        warm.max_completion_tokens = 1;
+        warm.progress_every = 0;
+        warm.kv_type = kv_type;
+        auto warmed = (*pipeline)->GenerateStreaming(
+            warm, [](std::uint32_t) { return true; });
+        if (!warmed) {
+          std::fprintf(stderr, "cli: kernel warmup failed (%s)\n",
+                       tessera::ToString(warmed.error()).data());
+          return std::unexpected(warmed.error());
+        }
+        pool->Add(std::make_unique<tessera::PipelineRunner>(
+            std::move(*pipeline), device_indices.front(),
+            tessera::CalibrationConfig{}, kv_type));
+        report("ready");
+        return pool;
+      }
       tessera::CalibrationConfig calibration;
       // Paged weights are private host RAM per replica, so the pool holds
       // the sum across the devices. The device check above never sees it.
@@ -524,9 +585,9 @@ int main(int argc, char** argv) {
         // The pool carries the launcher's KV storage type (--kv-q8 and
         // friends); the serve layer reads it onto every turn, so an
         // unlimited turn reserves quantized rows and fits the device.
-        pool->Add(std::make_unique<tessera::Runner>(std::move(engine_ptr),
-                                                    std::move(*model), device,
-                                                    calibration, kv_type));
+        pool->Add(std::make_unique<tessera::SingleDeviceRunner>(
+            std::move(engine_ptr), std::move(*model), device, calibration,
+            kv_type));
       }
       report("ready");
       return pool;
@@ -554,6 +615,10 @@ int main(int argc, char** argv) {
     pipeline_options.kv_type = kv_type;
     pipeline_options.mtp_path = mtp_path;
     pipeline_options.stage_layers = pipeline_split;
+    pipeline_options.gpu_layers = gpu_layers;
+    // The drafter runs on the last stage and embeds the anchor tokens
+    // (DFlash2 and MTP both do), so it needs the target embedding there.
+    pipeline_options.last_stage_embedding = speculate || !draft_path.empty();
     auto pipeline = tessera::Pipeline::Create(pipeline_options);
     if (!pipeline) {
       std::fprintf(stderr, "cli: pipeline create failed (%s)\n",
@@ -1018,7 +1083,7 @@ int main(int argc, char** argv) {
         std::move(*engine_result);
     std::unique_ptr<tessera::Model> model_ptr = std::move(*model);
     tessera::RunnerPool pool;
-    pool.Add(std::make_unique<tessera::Runner>(
+    pool.Add(std::make_unique<tessera::SingleDeviceRunner>(
         std::move(engine_ptr), std::move(model_ptr),
         device_indices.front()));
     const tessera::Tokenizer* stream_tokenizer = pool.At(0).tokenizer();
