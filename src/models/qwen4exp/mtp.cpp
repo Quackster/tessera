@@ -11,6 +11,7 @@
 #include "core/profile.hpp"
 #include "models/qwen4exp/mtp_weights.hpp"
 #include "models/qwen4exp/state.hpp"
+#include "tessera/log.hpp"
 
 // The qwen4exp MTP draft block. See mtp.hpp for the contract. The attention
 // is dense over the MTP's own paged FP16 cache (the sparse indexer only
@@ -81,6 +82,7 @@ std::expected<void, StatusCode> ScaleAdd(Backend& backend, Qwen4ExpState& h,
 // Load the MTP weights and allocate the draft cache and scratch once.
 std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
                                                const Model& model,
+                                               const TransformerConfig& cfg,
                                                const Qwen4ExpGeometry& g,
                                                Qwen4ExpState& h) {
   if (h.mtp_ready) {
@@ -88,6 +90,11 @@ std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
   }
   if (model.MtpPath().empty()) {
     return std::unexpected(StatusCode::UnsupportedFeature);
+  }
+  if (const auto* log = backend.Diagnostics()) {
+    log->Info("mtp", "loading MTP head from '" + model.MtpPath() +
+                         "' on device " +
+                         std::to_string(backend.DeviceIndex()));
   }
   auto weights = LoadMtpWeights(backend, model.MtpPath());
   if (!weights) {
@@ -108,6 +115,25 @@ std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
              2 * h.mtp_weights->inter * h.mtp_weights->hidden * 2) ||
       !Alloc(backend, h.mtp_hidden_branch, g.hc_dim * 4) ||
       !Alloc(backend, h.mtp_streams, g.hc_dim * 4)) {
+    return std::unexpected(StatusCode::OutOfMemory);
+  }
+  // The MTP MoE reuses the trunk's shared MoE scratch. On a head-only draft
+  // device the trunk never ran, so those buffers were never grown; allocate
+  // them here with the sizes the MTP and the trunk both use.
+  const std::size_t ne = h.mtp_weights->experts;
+  const std::size_t inter = h.mtp_weights->inter;
+  const std::size_t hidden = h.mtp_weights->hidden;
+  const std::size_t top_k = cfg.experts_per_tok;
+  if (!Alloc(backend, h.moe_logits, ne * 4) ||
+      !Alloc(backend, h.moe_ids, top_k * 4) ||
+      !Alloc(backend, h.moe_vals, top_k * 4) ||
+      !Alloc(backend, h.moe_wts, top_k * 4) || !Alloc(backend, h.moe_sig, 4) ||
+      !Alloc(backend, h.moe_acc, hidden * 4) ||
+      !Alloc(backend, h.moe_shared, hidden * 4) ||
+      !Alloc(backend, h.moe_gate_out, inter * 4) ||
+      !Alloc(backend, h.moe_up_out, inter * 4) ||
+      !Alloc(backend, h.moe_inter, inter * 4) ||
+      !Alloc(backend, h.moe_phi, top_k * inter * 4)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   std::vector<std::int32_t> table(kMtpPages);
@@ -342,7 +368,7 @@ std::expected<std::uint32_t, StatusCode> RunMtpDraft(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::span<const float> hidden,
     std::uint32_t token, std::uint64_t pos, std::vector<float>* mtp_hidden_out) {
-  if (auto ready = EnsureMtpReady(backend, model, g, h); !ready) {
+  if (auto ready = EnsureMtpReady(backend, model, cfg, g, h); !ready) {
     return std::unexpected(ready.error());
   }
   const MtpWeights& w = *h.mtp_weights;
