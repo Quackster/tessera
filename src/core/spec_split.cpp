@@ -113,10 +113,13 @@ class SpecSplitTarget final : public core::SpecTarget {
   std::expected<DraftVerification, StatusCode> Verify(
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
-      std::vector<float>* hidden) override {
+      std::vector<float>* hidden, const SampledVerify* sampled) override {
     return core::VerifyDraft(target_backend_, target_, target_cache_, draft,
-                             prefix_logits, anchor, hidden, nullptr, nullptr);
+                             prefix_logits, anchor, hidden, nullptr, nullptr,
+                             sampled);
   }
+
+  [[nodiscard]] bool SupportsSampledVerify() const override { return true; }
 
   void ReportDiagnostics(std::size_t loop_steps) override {
     (void)loop_steps;

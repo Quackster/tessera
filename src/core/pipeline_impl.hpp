@@ -209,7 +209,8 @@ struct Pipeline::Impl {
       std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
       std::vector<float>* hidden_out, std::size_t prefix_position,
       const std::vector<std::size_t>* capture_layers = nullptr,
-      const std::vector<Buffer*>* capture_out = nullptr);
+      const std::vector<Buffer*>* capture_out = nullptr,
+      const SampledVerify* sampled = nullptr);
 
   // Run one batched cross-stage forward over `tokens` (rows) with the
   // boundary handoff. `capture_layers`, when non-null, are target block ids

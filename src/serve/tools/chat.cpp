@@ -234,6 +234,7 @@ bool ChatWithTools(const ToolGenerate& generate, Model& model,
   options.prompt_tokens = *ids;
   options.kv_type = kv_type;
   options.kv_offload = kv_offload;
+  ApplyRequestSampling(body, &options);
   if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return false;
   }

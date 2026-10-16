@@ -368,8 +368,9 @@ architecture rules.
   speculation, and the draft accepts 40 of 46 tokens over 23 steps (about
   15 tok/s). `--spec-split --gpus 0,1` runs the head on the second device
   (the draft device loads the MTP weights and the MoE scratch it needs) and
-  produces the same output. A sampled request decodes without the
-  greedy-only drafter, so it is not silently decoded as greedy. The loader
+  produces the same output. A sampled request keeps the drafter: the
+  verifier draws the target token at each drafted position and accepts the
+  matching prefix, so the output equals plain sampling. The loader
   is covered by `MtpWeightsTest`.
 
 Layer split: `--pipeline --gpus 0,1` splits the 48 trunk blocks into two

@@ -106,7 +106,9 @@ Json SessionPromptBody(const Json& body, const SessionView& view) {
   prompt_body.Set("messages", SessionHistoryJson(view));
   for (const char* key : {"system", "tools", "tool_choice", "enable_thinking",
                           "reasoning_effort", "stream", "max_completion_tokens",
-                          "max_thinking_tokens", "chat_template_kwargs"}) {
+                          "max_thinking_tokens", "chat_template_kwargs",
+                          "temperature", "top_p", "top_k", "min_p",
+                          "presence_penalty", "repetition_penalty", "seed"}) {
     if (const Json* value = body.Find(key)) {
       prompt_body.Set(key, *value);
     }
@@ -204,6 +206,7 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
   }
+  ApplyRequestSampling(body, &options);
   if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;
   }

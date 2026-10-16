@@ -71,12 +71,13 @@ struct CliOptions {
 
   // Decode shape.
   tessera::SamplingOptions sampling;
-  bool sample = false;  // --sample
+  bool sample = true;  // --sample (sampling is on by default)
   bool sampling_explicit = false;
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   bool kv_type_set = false;
   bool kv_offload = false;  // --kv-offload
   std::uint64_t seed = 0;
+  bool seed_set = false;  // --seed
   std::size_t max_completion_tokens = 0;
   std::size_t max_thinking_tokens = 0;
   std::size_t context = kDefaultContext;
@@ -441,6 +442,7 @@ namespace detail {
         return std::unexpected(value.error());
       }
       options->seed = *value;
+      options->seed_set = true;
     } else if (arg == "--max-completion-tokens") {
       auto value = SizeValue(args, i, arg);
       if (!value) {

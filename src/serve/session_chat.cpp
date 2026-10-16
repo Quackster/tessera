@@ -298,6 +298,7 @@ void SessionHandler::RunTurn(RunnerLease* lease,
   if (lease != nullptr) {
     ApplyToGenerateOptions(lease->runner().calibration(), options);
   }
+  ApplyRequestSampling(request, &options);
   ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
   std::string reasoning_text;
   std::string content_text;

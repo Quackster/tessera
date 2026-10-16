@@ -85,7 +85,9 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   cache.profile = profiling ? &profile : nullptr;
   core::SingleDeviceTarget target(*backend_, model, cache, diagnostics_,
                                   prefill_chunk_tokens_,
-                                  profiling ? &profile : nullptr);
+                                  profiling ? &profile : nullptr,
+                                  /*single_token_prefill=*/false,
+                                  /*supports_sampled_verify=*/true);
   return core::RunDecode(target, speculative_.get(), options, on_token);
 }
 

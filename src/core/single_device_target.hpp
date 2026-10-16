@@ -28,9 +28,13 @@ class SingleDeviceTarget : public SpecTarget {
   // `single_token_prefill` selects a one-token-at-a-time prefill (the
   // tensor-parallel rank path, where the collective forward runs per token)
   // instead of the chunked batched prefill of the single-device engine.
+  // `supports_sampled_verify` is true for the single-device engine, whose
+  // logits are the full target distribution, so a sampled request can keep
+  // its drafter (see SupportsSampledVerify); the rank paths leave it false.
   SingleDeviceTarget(Backend& backend, Model& model, DecodeCache& cache,
                      log::Diagnostics& diagnostics, std::size_t prefill_chunk,
-                     Profile* profile, bool single_token_prefill = false);
+                     Profile* profile, bool single_token_prefill = false,
+                     bool supports_sampled_verify = false);
   SingleDeviceTarget(const SingleDeviceTarget&) = delete;
   SingleDeviceTarget& operator=(const SingleDeviceTarget&) = delete;
 
@@ -55,7 +59,10 @@ class SingleDeviceTarget : public SpecTarget {
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits,
       std::optional<std::uint32_t> anchor,
-      std::vector<float>* hidden) override;
+      std::vector<float>* hidden, const SampledVerify* sampled) override;
+  [[nodiscard]] bool SupportsSampledVerify() const override {
+    return supports_sampled_verify_;
+  }
   void ReportDiagnostics(std::size_t loop_steps) override;
 
  private:
@@ -66,6 +73,7 @@ class SingleDeviceTarget : public SpecTarget {
   std::size_t prefill_chunk_ = 0;
   Profile* profile_ = nullptr;
   bool single_token_prefill_ = false;
+  bool supports_sampled_verify_ = false;
   SpeculativeStrategy* strategy_ = nullptr;
   std::vector<std::size_t> capture_layers_;
   std::vector<Buffer*> capture_buffers_;

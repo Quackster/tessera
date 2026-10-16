@@ -31,6 +31,11 @@ void SendError(ResponseWriter& writer, int status, const std::string& message);
                                                  std::size_t fallback);
 // Positive `max_thinking_tokens` from the body, else 0 (unlimited).
 [[nodiscard]] std::size_t MaxThinkingTokensFrom(const core::Json& body);
+// Apply the request's OpenAI-style sampling fields to `options`. Requests
+// sample by default with the model-card defaults; a field in the body
+// overrides its default. `seed` sets the RNG seed and defaults to a fresh
+// random value, so a request without a seed differs each time.
+void ApplyRequestSampling(const core::Json& body, GenerateOptions* options);
 // Session id from the body (`session_id` string); empty when the
 // request is stateless. OpenAI clients ignore the unknown field, so
 // passing it is compatible with other servers.

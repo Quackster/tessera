@@ -73,11 +73,11 @@ void WarnInertServeFlags(const CliOptions& options) {
   if (!options.image_path.empty() || !options.mmproj_path.empty()) {
     WarnIgnoredFlag("--image/--mmproj", "images arrive with each chat request");
   }
-  if (options.sample || options.sampling_explicit) {
-    WarnIgnoredFlag("--sample/--temperature/...",
+  if (options.sampling_explicit) {
+    WarnIgnoredFlag("--temperature/...",
                     "sampling is per request in the HTTP API");
   }
-  if (options.seed != 0) {
+  if (options.seed_set) {
     WarnIgnoredFlag("--seed", "the seed is per request in the HTTP API");
   }
   if (options.max_thinking_tokens != 0) {

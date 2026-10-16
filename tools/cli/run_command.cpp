@@ -58,10 +58,26 @@ void WarnInertFlags(const CliOptions& options) {
   }
 }
 
+// Fill the sampling and seed of a split-route request: the architecture's
+// recommended sampler unless the user set sampling flags, and a random seed
+// when none was given. Shared by the layouts so they sample alike and all
+// differ run to run.
+void FillSampling(const CliOptions& options, const Model& model,
+                  GenerateOptions* gen) {
+  bool sample = options.sample;
+  SamplingOptions sampling = options.sampling;
+  if (ApplyRecommendedSampling(model, options.enable_thinking,
+                               options.sampling_explicit, &sampling)) {
+    sample = true;
+  }
+  gen->sample = sample;
+  gen->sampling = sampling;
+  gen->seed = options.seed_set ? options.seed : RandomSeed();
+}
+
 // One greedy generation through a split layout's streaming face, decoded
 // to stdout as it arrives. Shared by the pipeline and spec-split routes.
-int StreamLayout(
-    GenerateOptions& request,
+int StreamLayout(    GenerateOptions& request,
     const std::function<std::expected<GenerateOutcome, StatusCode>(
         GenerateOptions&, const std::function<bool(std::uint32_t)>&)>& run,
     const Tokenizer& tokenizer) {
@@ -154,6 +170,7 @@ int RunRunCommand(const CliOptions& options) {
     gen.max_completion_tokens = options.max_completion_tokens;
     gen.kv_type = options.kv_type;
     gen.kv_offload = options.kv_offload;
+    FillSampling(options, (*pipeline)->StageModel(0), &gen);
     // Stream over the pipeline so each token reaches the console as it is
     // generated. A blocking Generate would return only after every step
     // (by default the whole remaining context), which looks hung after
@@ -223,6 +240,7 @@ int RunRunCommand(const CliOptions& options) {
     gen.max_completion_tokens = options.max_completion_tokens;
     gen.kv_type = options.kv_type;
     gen.kv_offload = options.kv_offload;
+    FillSampling(options, (*tp)->RankModel(0), &gen);
     return StreamLayout(
         gen,
         [&](GenerateOptions& request,
@@ -288,6 +306,7 @@ int RunRunCommand(const CliOptions& options) {
     gen.max_completion_tokens = options.max_completion_tokens;
     gen.kv_type = options.kv_type;
     gen.kv_offload = options.kv_offload;
+    FillSampling(options, (*cp)->RankModel(0), &gen);
     return StreamLayout(
         gen,
         [&](GenerateOptions& request,
@@ -343,6 +362,7 @@ int RunRunCommand(const CliOptions& options) {
     gen.max_completion_tokens = options.max_completion_tokens;
     gen.kv_type = options.kv_type;
     gen.kv_offload = options.kv_offload;
+    FillSampling(options, (*split)->TargetModel(), &gen);
     return StreamLayout(
         gen,
         [&](GenerateOptions& request,

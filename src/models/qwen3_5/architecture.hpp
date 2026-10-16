@@ -68,8 +68,8 @@ class Qwen35Architecture final : public Architecture {
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
       std::vector<float>* hidden_out,
-      const std::vector<std::size_t>* capture_layers,
-      std::vector<Buffer*>* capture) const override;
+      const std::vector<std::size_t>* capture_layers, std::vector<Buffer*>* capture,
+      const SampledVerify* sampled) const override;
 
   [[nodiscard]] std::expected<std::uint32_t, StatusCode> Draft(
       Backend& backend, const Model& model, core::DecodeCache& cache,

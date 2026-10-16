@@ -325,7 +325,10 @@ std::expected<GenerateOutcome, StatusCode> TensorParallel::Impl::RunSpeculative(
           // The batched prefill, now that ForwardBatch all-reduces across the
           // ranks: it captures the target hidden for a DFlash2 drafter and
           // drives the strategy's context append. MTP captures nothing.
-          /*single_token_prefill=*/false);
+          /*single_token_prefill=*/false,
+          // The head is replicated, so every rank's logits are the full
+          // target distribution; a sampled verify stays in lockstep.
+          /*supports_sampled_verify=*/true);
       const bool emit = (r == 0);
       auto streamed = [emit, &on_token, &stream_stopped](std::uint32_t token) {
         if (emit && !stream_stopped.load(std::memory_order_relaxed) &&

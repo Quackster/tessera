@@ -15,6 +15,7 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/pipeline_impl.hpp"
+#include "core/sampling.hpp"
 #include "core/spec_driver.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
@@ -132,20 +133,22 @@ struct Pipeline::Impl::Target : public core::SpecTarget {
   std::expected<DraftVerification, StatusCode> Verify(
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
-      std::vector<float>* hidden) override {
+      std::vector<float>* hidden, const SampledVerify* sampled) override {
     const std::size_t prefix = position_;
     const std::vector<std::size_t>* cap =
         capture_layers_.empty() ? nullptr : &capture_layers_;
     std::vector<Buffer*>* cap_out =
         capture_layers_.empty() ? nullptr : &capture_buffers_;
     auto verified = impl_.VerifyBatch(draft, prefix_logits, anchor, hidden,
-                                      prefix, cap, cap_out);
+                                      prefix, cap, cap_out, sampled);
     if (!verified) {
       return std::unexpected(verified.error());
     }
     position_ += (anchor.has_value() ? 1 : 0) + verified->accepted;
     return verified;
   }
+
+  [[nodiscard]] bool SupportsSampledVerify() const override { return true; }
 
   void ReportDiagnostics(std::size_t loop_steps) override {
     (void)loop_steps;
@@ -303,11 +306,12 @@ std::expected<void, StatusCode> Pipeline::Impl::ForwardRows(
   return {};
 }
 
-std::expected<DraftVerification, StatusCode> Pipeline::Impl::VerifyBatch(
-    std::span<const std::uint32_t> draft, std::span<const float> prefix_logits,
-    std::optional<std::uint32_t> anchor, std::vector<float>* hidden_out,
-    std::size_t prefix_position, const std::vector<std::size_t>* capture_layers,
-    const std::vector<Buffer*>* capture_out) {
+  std::expected<DraftVerification, StatusCode> Pipeline::Impl::VerifyBatch(
+      std::span<const std::uint32_t> draft, std::span<const float> prefix_logits,
+      std::optional<std::uint32_t> anchor, std::vector<float>* hidden_out,
+      std::size_t prefix_position,
+      const std::vector<std::size_t>* capture_layers,
+      const std::vector<Buffer*>* capture_out, const SampledVerify* sampled) {
   const std::size_t lead = anchor.has_value() ? 1 : 0;
   std::vector<std::uint32_t> tokens;
   tokens.reserve(draft.size() + lead);
@@ -338,7 +342,29 @@ std::expected<DraftVerification, StatusCode> Pipeline::Impl::VerifyBatch(
   const auto logits_row = [&](std::size_t row) {
     return std::span<const float>(flat.data() + row * vocab, vocab);
   };
-  if (lead == 1) {
+  const bool sample = sampled != nullptr && sampled->sampling != nullptr &&
+                      sampled->rng != nullptr;
+  if (sample) {
+    // Draw the target's token at each scored row and accept the matching
+    // prefix; the emitted prefix equals plain sampling for the same seed.
+    core::SampledMatch match;
+    if (lead == 1) {
+      match = core::AcceptSampledPrefix(
+          draft, *sampled->sampling, sampled->history, *sampled->rng,
+          [&](std::size_t i) { return logits_row(i); },
+          [&] { return logits_row(draft.size()); });
+    } else {
+      match = core::AcceptSampledPrefix(
+          draft, *sampled->sampling, sampled->history, *sampled->rng,
+          [&](std::size_t i) {
+            return i == 0 ? prefix_logits : logits_row(i - 1);
+          },
+          [&] { return logits_row(draft.size() - 1); });
+    }
+    accepted = match.accepted;
+    result.accepted = accepted;
+    result.next_token = match.next_token;
+  } else if (lead == 1) {
     for (std::size_t i = 0; i < draft.size(); ++i) {
       if (core::detail::ArgMax(logits_row(i)) != draft[i]) {
         break;

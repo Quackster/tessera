@@ -1,12 +1,20 @@
 #include "tessera/engine.hpp"
 
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 
 #include "core/timing.hpp"
 
 namespace tessera {
+
+std::uint64_t RandomSeed() {
+  // Two draws cover the full 64-bit width on a 32-bit random_device.
+  std::random_device device;
+  return (static_cast<std::uint64_t>(device()) << 32) ^
+         static_cast<std::uint64_t>(device());
+}
 
 Engine::Engine(std::unique_ptr<Backend> backend, log::Diagnostics diagnostics,
                std::size_t prefill_chunk_tokens)

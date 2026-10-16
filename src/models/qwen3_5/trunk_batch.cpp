@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -7,6 +8,7 @@
 
 #include "core/decode_internal.hpp"
 #include "core/profile.hpp"
+#include "core/sampling.hpp"
 #include "core/numerics/conv.hpp"
 #include "models/qwen3_5/architecture.hpp"
 #include "models/qwen3_5/internal.hpp"
@@ -874,6 +876,22 @@ std::expected<void, StatusCode> Qwen35Architecture::TruncateTarget(
   return {};
 }
 
+namespace {
+
+// Accept the leading drafts that match the target's drawn token: one
+// vocab-wide logits row per scored position, in scoring order (row i scores
+// draft[i], the last row scores the bonus token).
+core::SampledMatch MatchRows(std::span<const float> rows, std::size_t vocab,
+                       std::span<const std::uint32_t> draft,
+                       const SampledVerify& sampled) {
+  return core::AcceptSampledPrefix(
+      draft, *sampled.sampling, sampled.history, *sampled.rng,
+      [&](std::size_t i) { return rows.subspan(i * vocab, vocab); },
+      [&] { return rows.subspan(draft.size() * vocab, vocab); });
+}
+
+}  // namespace
+
 // Score a multi-token draft in one batched forward and roll the cache
 // back to the accepted prefix (full-attention KV rows, linear-attention
 // state, conv history and position).
@@ -883,7 +901,7 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
     std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture) const {
+    std::vector<Buffer*>* capture, const SampledVerify* sampled) const {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -909,13 +927,15 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     tokens = anchored;
   }
   const std::size_t vocab = config->vocab_size;
+  const bool sample = sampled != nullptr && sampled->sampling != nullptr &&
+                      sampled->rng != nullptr;
   DraftVerification result;
   std::size_t accepted = 0;
   if (lead == 1) {
-    // The anchor rides the batch. The engine reads only `accepted` and
-    // `next_token`, so argmax every scored row on the device and read back
-    // `rows` ids instead of downloading rows x vocab floats and scanning them
-    // on the host (about 9 MB per step at the draft size).
+    // The anchor rides the batch. Greedy reads only `accepted` and
+    // `next_token`, so it argmaxes every scored row on the device and reads
+    // back `rows` ids instead of downloading rows x vocab floats. A sampled
+    // verify downloads every scored row and draws the target token per row.
     auto status = ForwardBatch(backend, model, cache, tokens, nullptr, nullptr,
                                /*all_logits=*/true, nullptr, capture_layers,
                                capture);
@@ -927,19 +947,32 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     if (!head) {
       return std::unexpected(head.error());
     }
-    auto best =
-        DeviceRowArgMax(backend, h, *h.batch->logits, tokens.size(), vocab);
-    if (!best) {
-      return std::unexpected(best.error());
-    }
-    for (std::size_t i = 0; i < draft.size(); ++i) {
-      if ((*best)[i] != draft[i]) {
-        break;
+    if (sample) {
+      auto rows = DownloadF32(backend, *h.batch->logits);
+      if (!rows) {
+        return std::unexpected(rows.error());
       }
-      ++accepted;
+      const core::SampledMatch match = MatchRows(
+          std::span<const float>(rows->data(), (draft.size() + 1) * vocab),
+          vocab, draft, *sampled);
+      result.accepted = match.accepted;
+      result.next_token = match.next_token;
+      accepted = result.accepted;
+    } else {
+      auto best =
+          DeviceRowArgMax(backend, h, *h.batch->logits, tokens.size(), vocab);
+      if (!best) {
+        return std::unexpected(best.error());
+      }
+      for (std::size_t i = 0; i < draft.size(); ++i) {
+        if ((*best)[i] != draft[i]) {
+          break;
+        }
+        ++accepted;
+      }
+      result.accepted = accepted;
+      result.next_token = (*best)[accepted];
     }
-    result.accepted = accepted;
-    result.next_token = (*best)[accepted];
   } else {
     // No anchor: the caller's prefix logits score draft[0], and the caller
     // reads `result.logits` as the continuation row, so keep the host path.
@@ -950,18 +983,31 @@ std::expected<DraftVerification, StatusCode> Qwen35Architecture::Verify(
     if (!status) {
       return std::unexpected(status.error());
     }
-    std::span<const float> last =
-        std::span<const float>(prefix_logits.begin(), prefix_logits.end());
-    for (std::size_t i = 0; i < draft.size(); ++i) {
-      if (detail::ArgMax(last) != draft[i]) {
-        break;
+    if (sample) {
+      // Scoring order: prefix_logits scores draft[0]; flat row j scores
+      // draft[j + 1] and the last flat row is the bonus.
+      std::vector<float> rows((draft.size() + 1) * vocab);
+      std::copy(prefix_logits.begin(), prefix_logits.end(), rows.begin());
+      std::copy(flat.begin(), flat.begin() + draft.size() * vocab,
+                rows.begin() + vocab);
+      const core::SampledMatch match = MatchRows(rows, vocab, draft, *sampled);
+      result.accepted = match.accepted;
+      result.next_token = match.next_token;
+      accepted = result.accepted;
+    } else {
+      std::span<const float> last =
+          std::span<const float>(prefix_logits.begin(), prefix_logits.end());
+      for (std::size_t i = 0; i < draft.size(); ++i) {
+        if (detail::ArgMax(last) != draft[i]) {
+          break;
+        }
+        ++accepted;
+        last = std::span<const float>(flat.data() + (i + lead) * vocab, vocab);
       }
-      ++accepted;
-      last = std::span<const float>(flat.data() + (i + lead) * vocab, vocab);
+      result.accepted = accepted;
+      result.logits.assign(last.begin(), last.end());
+      result.next_token = detail::ArgMax(result.logits);
     }
-    result.accepted = accepted;
-    result.logits.assign(last.begin(), last.end());
-    result.next_token = detail::ArgMax(result.logits);
   }
   // Keep the anchor (when present) plus the accepted drafts; drop the rest.
   // The restore always runs: the batched verify advances the recurrent state

@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "core/decode_internal.hpp"
+#include "core/sampling.hpp"
 #include "core/timing.hpp"
 
 namespace tessera::core {
@@ -264,7 +265,7 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
     std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
     std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture) {
+    std::vector<Buffer*>* capture, const SampledVerify* sampled) {
   if (!anchor.has_value() && prefix_logits.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -280,7 +281,13 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   const Architecture* arch = model.Arch();
   if (arch != nullptr && (draft.size() > 1 || anchor.has_value())) {
     return arch->Verify(backend, model, cache, draft, prefix_logits, anchor,
-                        hidden_out, capture_layers, capture);
+                        hidden_out, capture_layers, capture, sampled);
+  }
+  const bool sample = sampled != nullptr && sampled->sampling != nullptr &&
+                      sampled->rng != nullptr;
+  std::vector<std::uint32_t> hist;
+  if (sample) {
+    hist.assign(sampled->history.begin(), sampled->history.end());
   }
   DraftVerification result;
   if (anchor.has_value()) {
@@ -297,18 +304,31 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   } else {
     result.logits.assign(prefix_logits.begin(), prefix_logits.end());
   }
+  bool all = true;
   for (const std::uint32_t token : draft) {
-    if (detail::ArgMax(result.logits) != token) {
+    const std::uint32_t y =
+        sample ? SampleToken(result.logits, *sampled->sampling, hist,
+                             *sampled->rng)
+               : detail::ArgMax(result.logits);
+    if (y != token) {
+      result.next_token = y;
+      all = false;
       break;
     }
+    ++result.accepted;
+    hist.push_back(y);
     auto logits = DecodeLogits(backend, model, cache, token, hidden_out);
     if (!logits) {
       return std::unexpected(logits.error());
     }
     result.logits = std::move(*logits);
-    ++result.accepted;
   }
-  result.next_token = detail::ArgMax(result.logits);
+  if (all) {
+    result.next_token =
+        sample ? SampleToken(result.logits, *sampled->sampling, hist,
+                             *sampled->rng)
+               : detail::ArgMax(result.logits);
+  }
   return result;
 }
 

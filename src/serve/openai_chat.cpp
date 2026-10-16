@@ -120,6 +120,7 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
   }
+  ApplyRequestSampling(prompt_body, &options);
   if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;
   }

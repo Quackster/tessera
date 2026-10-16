@@ -33,14 +33,14 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | CLI | Done | One flag set for `run`, `serve` and `calibrate`. Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit and concurrent benchmark. `serve` honors every layout: replicas, `--pipeline`, `--tp`, `--cp`, `--spec-split` and `--hybrid`. |
 | Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
 | KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. `--kv-offload` keeps the full-attention cache in pinned system RAM so a long context fits on a small device. |
-| Sampling | Done | Seeded sampling with Qwen 27B defaults. |
+| Sampling | Done | On by default with the model-card defaults (temperature, top_p, top_k, min_p, presence and repetition penalties). The HTTP API reads `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repetition_penalty` and `seed` from each request; `temperature` 0 is greedy. The seed defaults to a fresh random value per request, and to random per run on the CLI. |
 | GEMM | Done | Q4_K to IQ, FP8/MXFP4, bf16, fp32. Tensor core paths for decode and verify. |
 | Activation quant | Done | Per-token FP8 E4M3 quant-dequant. W4A8 opt-in. |
 | Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. |
 | Weight upload | Done | Manifest to device buffers. One batched upload per load. |
 | Decode loop | Done | Single-token vanilla and hybrid GGUF loops. |
 | Hybrid SSM | Done | Load, kernels, both decode paths, MTP head done. |
-| Speculative decode | Done | MTP and DFlash2 end to end. Output equals greedy. GGUF MTP reaches 31-37 tok/s on the 27B target (ROCm). DFlash2 about 60 vs 23 tok/s. |
+| Speculative decode | Done | MTP and DFlash2 end to end. Greedy output equals greedy without speculation; a sampled request keeps the drafter, since the verifier draws the target token at each drafted position and accepts the matching prefix, so the output equals plain sampling. GGUF MTP reaches 31-37 tok/s on the 27B target (ROCm). DFlash2 about 60 vs 23 tok/s. |
 | MXFP4 path | Done | Parse, kernels, HF config, tokenizer. Matches GGUF greedy output. |
 | DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |
 | Baseline pinning | Done | Fixed-seed fixtures identical on Vulkan and ROCm. |
@@ -134,7 +134,7 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3, single files and `-00001-of-00005` splits. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, Q2_0, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS and IQ2_S. Checks bounds. |
 | Qwen4-Exp split GGUF | Partial | Qwen3.8-Flash-Next GSQ-RCO loads and decodes: split shards merge, config parses, and the 51B n-gram table streams rows from SSD. The QSA indexer, hyper-connection mixer, PLE gather and GDN output-norm kernels run on both backends. Paged weights are held in system RAM. The expert cache is sized to the free device memory. On one R9700 at a 4K context, fp32 KV, `--gpu-layers 8`, the layer-major batched prefill lifts prefill from about 18 to about 33 tok/s on a 515-token prompt, and MTP speculative decode runs about 19 tok/s. The 48 tok/s target is not reached. `--pipeline --gpus 0,1` splits the 48 trunk blocks 24/24 across two R9700s (the hc-stream residual crosses the stage boundary) and reproduces the single-device greedy token ids. The engine stops on non-finite logits instead of looping on `!`; that intermittent fault is still open. |
-| Flash-Next MTP head | Done | The GSQ-RCO GGUF ships no MTP head. `tessera-cli fetch-mtp` reads the BF16 checkpoint's safetensors headers over HTTP and downloads only the 31 `mtp.*` tensors, resumable and checked against the pinned SHA256. The qwen4exp module loads them and runs the draft block (`--mtp DIR --speculate`). Verified on one R9700: greedy output equals greedy without speculation (40 of 46 drafts accepted, about 15 tok/s), and `--spec-split` runs the head on the second GPU with the same output. A sampled request decodes without the greedy-only drafter. |
+| Flash-Next MTP head | Done | The GSQ-RCO GGUF ships no MTP head. `tessera-cli fetch-mtp` reads the BF16 checkpoint's safetensors headers over HTTP and downloads only the 31 `mtp.*` tensors, resumable and checked against the pinned SHA256. The qwen4exp module loads them and runs the draft block (`--mtp DIR --speculate`). Verified on one R9700: greedy output equals greedy without speculation (40 of 46 drafts accepted, about 15 tok/s), and `--spec-split` runs the head on the second GPU with the same output. A sampled request keeps the drafter: the verifier draws the target token at each drafted position and accepts the matching prefix, so the output equals plain sampling. |
 | MXFP4 safetensors | Done | Parses the map and packs the weights. config.json drives the decode config. |
 | NVFP4 MoE | Done | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. |
 | DFlash2 FP8 draft | Done | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. |
@@ -357,14 +357,14 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--reasoning-effort <level>` | run, serve | xhigh | Thinking difficulty for the chat template. Ignored with `--no-chat`. `serve` uses it as the request default. |
 | `--speculate` | both | off | MTP speculative decode from the target head. Needs no checkpoint. |
 | `--mtp <dir>` | both | unset | Directory of a separately fetched MTP head (from `tessera-cli fetch-mtp`) for a model whose GGUF ships none, such as the Flash-Next target. |
-| `--sample` | run | off | Sample instead of greedy decode. |
-| `--temperature <f>` | run | 0.6 | Sampling temperature. |
+| `--sample` | run | on | Sampling is on by default; this flag is a no-op. Set `--temperature 0` for greedy decode. |
+| `--temperature <f>` | run | 0.6 | Sampling temperature. 0 decodes greedily. |
 | `--top-p <f>` | run | 0.95 | Nucleus probability. |
 | `--top-k <n>` | run | 20 | Keep the top n tokens. |
 | `--min-p <f>` | run | 0.0 | Minimum probability. |
 | `--presence-penalty <f>` | run | 0.0 | Presence penalty. |
 | `--repetition-penalty <f>` | run | 1.0 | Repetition penalty. |
-| `--seed <n>` | run | 0 | Sampling RNG seed. |
+| `--seed <n>` | run | random | Sampling RNG seed. A run without it draws a fresh random seed. |
 | `--kv-f16` | run | off | Store the KV cache in fp16. |
 | `--kv-q8` | run | off | Store the KV cache in int8. |
 | `--kv-q4` | run | off | Store the KV cache in 4-bit. |

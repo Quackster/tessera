@@ -33,7 +33,8 @@ constexpr int kExitUsage = 2;
 // parallel-session loop and the one-shot path.
 GenerateOptions BuildGenerateOptions(const CliOptions& options, bool sample,
                                      const SamplingOptions& sampling,
-                                     const CalibrationConfig& applied) {
+                                     const CalibrationConfig& applied,
+                                     std::uint64_t seed) {
   GenerateOptions gen;
   // Zero (the default) fills the remaining context; an explicit budget
   // caps the completion instead.
@@ -41,7 +42,7 @@ GenerateOptions BuildGenerateOptions(const CliOptions& options, bool sample,
   gen.max_thinking_tokens = options.max_thinking_tokens;
   gen.sample = sample;
   gen.sampling = sampling;
-  gen.seed = options.seed;
+  gen.seed = seed;
   gen.draft_tokens = applied.draft_tokens;
   gen.prefill_chunk_tokens = applied.prefill_chunk_tokens;
   gen.mxfp4_split_target = applied.mxfp4_split_target;
@@ -211,6 +212,9 @@ int RunSingleDeviceGeneration(const CliOptions& options) {
         ResolveCalibration(engine, loaded, options.context, options.kv_type,
                            strategy, options.calibration_path, applied);
   }
+  // A random seed by default, so a sampled run differs each time; an
+  // explicit --seed keeps the run reproducible.
+  const std::uint64_t seed = options.seed_set ? options.seed : RandomSeed();
   if (options.prompt_texts.size() >= 2) {
     // Parallel sessions: each --prompt-text is one session. The pool
     // time-slices the device, so both decode and stream together.
@@ -229,7 +233,7 @@ int RunSingleDeviceGeneration(const CliOptions& options) {
       return kExitUsage;
     }
     GenerateOptions base =
-        BuildGenerateOptions(options, sample, sampling, applied);
+        BuildGenerateOptions(options, sample, sampling, applied, seed);
     if (!options.quiet) {
       log.Info("cli", "kv cache: " + std::string(ToString(options.kv_type)));
       log.Info("cli", sample ? "sampling: sampled" : "sampling: greedy");
@@ -313,7 +317,7 @@ int RunSingleDeviceGeneration(const CliOptions& options) {
                                       ? std::string()
                                       : options.prompt_texts.front();
   GenerateOptions gen =
-      BuildGenerateOptions(options, sample, sampling, applied);
+      BuildGenerateOptions(options, sample, sampling, applied, seed);
   if (!options.quiet) {
     log.Info("cli", "kv cache: " + std::string(ToString(options.kv_type)));
     if (options.enable_thinking || !options.reasoning_effort.empty()) {
@@ -324,7 +328,7 @@ int RunSingleDeviceGeneration(const CliOptions& options) {
                    ? std::string()
                    : " (reasoning_effort=" + options.reasoning_effort + ")"));
     }
-    if (options.sample) {
+    if (sample) {
       log.Info(
           "cli",
           "sampling: temperature=" + std::to_string(sampling.temperature) +
@@ -334,7 +338,7 @@ int RunSingleDeviceGeneration(const CliOptions& options) {
               " presence_penalty=" + std::to_string(sampling.presence_penalty) +
               " repetition_penalty=" +
               std::to_string(sampling.repetition_penalty) +
-              " seed=" + std::to_string(options.seed));
+              " seed=" + std::to_string(gen.seed));
     } else {
       log.Info("cli", "sampling: greedy");
     }

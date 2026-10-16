@@ -64,6 +64,7 @@ void NameSession(Model& model, const Tokenizer& tokenizer,
   }
   GenerateOptions options;
   options.max_completion_tokens = kAutoTitleTokens;
+  options.sample = false;
   options.prompt_tokens = *ids;
   options.kv_type = kv_type;
   options.kv_offload = kv_offload;

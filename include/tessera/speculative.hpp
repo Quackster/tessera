@@ -30,9 +30,10 @@ struct StrategyOptions {
 // loop. The engine owns the target, the KV/recurrent state and the accept
 // rule; the strategy owns the draft model, the draft policy and the target
 // hidden capture buffers it reads. With no strategy attached the same loop
-// is plain greedy. This mirrors hipfire's Speculator/SpecTarget seam: one
-// acceptance window per `Draft`, one greedy accept rule (`VerifyDraft`)
-// shared by every drafter.
+// is plain decoding. This mirrors hipfire's Speculator/SpecTarget seam: one
+// acceptance window per `Draft`, one accept rule (`VerifyDraft`) shared by
+// every drafter. The rule is the greedy argmax match, or the target-sample
+// match when the request samples, so the output equals plain decoding.
 //
 // Thread-safety: a strategy is owned by one Engine and called from the
 // generation thread only; externally synchronized.
@@ -55,13 +56,6 @@ class SpeculativeStrategy {
 
   // Maximum draft tokens proposed per window (0 = strategy default).
   [[nodiscard]] virtual std::size_t DraftBlock() const = 0;
-
-  // True when the draft and accept path is correct under sampling
-  // (speculative sampling: the drafter's distribution feeds the accept
-  // rule). False (the default) means greedy only. The engine runs a
-  // sampled request without a greedy-only strategy, so a sampled request
-  // is never silently decoded as greedy.
-  [[nodiscard]] virtual bool SupportsSampling() const { return false; }
 
   // True when the drafter reads the target's MTP (next-token-prediction)
   // head and therefore needs its weights loaded. The engine skips the
@@ -144,7 +138,7 @@ class SpeculativeStrategy {
 
   // Propose up to `drafts.size()` tokens after `anchor`, given the target's
   // current logits. Returns the number of drafts written (0 = no proposal,
-  // the loop falls back to the target's greedy token).
+  // the loop falls back to the target's own token).
   virtual std::expected<std::size_t, StatusCode> Draft(
       Backend& backend, Model& target, core::DecodeCache& cache,
       std::span<const float> current_logits, std::uint32_t anchor,

@@ -382,7 +382,10 @@ using PrefillProgress = std::function<void(std::size_t, std::size_t)>;
 // accepted drafts, `prefix_logits` is ignored, and row 0 of `capture` is
 // the anchor's hidden. When `hidden_out` is non-null it receives the final
 // hidden state of the last accepted token (unchanged when nothing is
-// accepted), so an MTP drafter can chain on it.
+// accepted), so an MTP drafter can chain on it. When `sampled` is non-null
+// the target draws its token per row and matches it instead of the argmax
+// (see SampledVerify); the output then equals plain sampling for the same
+// seed.
 [[nodiscard]] std::expected<DraftVerification, StatusCode> VerifyDraft(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> draft,
@@ -390,6 +393,7 @@ using PrefillProgress = std::function<void(std::size_t, std::size_t)>;
     std::optional<std::uint32_t> anchor = std::nullopt,
     std::vector<float>* hidden_out = nullptr,
     const std::vector<std::size_t>* capture_layers = nullptr,
-    std::vector<Buffer*>* capture = nullptr);
+    std::vector<Buffer*>* capture = nullptr,
+    const SampledVerify* sampled = nullptr);
 
 }  // namespace tessera::core

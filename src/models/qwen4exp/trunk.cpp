@@ -12,6 +12,7 @@
 #include "core/numerics/ngram.hpp"
 #include "core/numerics/qsa.hpp"
 #include "core/profile.hpp"
+#include "core/sampling.hpp"
 #include "models/qwen4exp/architecture.hpp"
 #include "models/qwen4exp/mtp.hpp"
 #include "models/qwen4exp/ple_table.hpp"
@@ -1271,9 +1272,15 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
     std::span<const std::uint32_t> draft, std::span<const float> prefix_logits,
     std::optional<std::uint32_t> anchor, std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture) const {
+    std::vector<Buffer*>* capture, const SampledVerify* sampled) const {
   if (!anchor.has_value() && prefix_logits.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
+  }
+  const bool sample = sampled != nullptr && sampled->sampling != nullptr &&
+                      sampled->rng != nullptr;
+  std::vector<std::uint32_t> hist;
+  if (sample) {
+    hist.assign(sampled->history.begin(), sampled->history.end());
   }
   DraftVerification result;
   if (anchor.has_value()) {
@@ -1286,11 +1293,19 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
   } else {
     result.logits.assign(prefix_logits.begin(), prefix_logits.end());
   }
+  bool all = true;
   for (const std::uint32_t token : draft) {
-    if (static_cast<std::uint32_t>(ArgMaxToken(result.logits)) != token) {
+    const std::uint32_t y =
+        sample ? core::SampleToken(result.logits, *sampled->sampling, hist,
+                                   *sampled->rng)
+               : static_cast<std::uint32_t>(ArgMaxToken(result.logits));
+    if (y != token) {
+      result.next_token = y;
+      all = false;
       break;
     }
     ++result.accepted;
+    hist.push_back(y);
     auto logits = Logits(backend, model, cache, token, hidden_out,
                          capture_layers, capture, nullptr);
     if (!logits) {
@@ -1298,7 +1313,12 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
     }
     result.logits = std::move(*logits);
   }
-  result.next_token = static_cast<std::uint32_t>(ArgMaxToken(result.logits));
+  if (all) {
+    result.next_token =
+        sample ? core::SampleToken(result.logits, *sampled->sampling, hist,
+                                   *sampled->rng)
+               : static_cast<std::uint32_t>(ArgMaxToken(result.logits));
+  }
   return result;
 }
 
