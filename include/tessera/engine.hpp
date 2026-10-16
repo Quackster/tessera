@@ -98,6 +98,10 @@ struct GenerateOptions {
   std::size_t progress_every = 64;
   // Storage type of the full-attention KV cache (default fp32).
   KvCacheType kv_type = KvCacheType::F32;
+  // Keep the full-attention KV cache in pinned system RAM instead of
+  // device memory. The attention kernels read the cache over the host
+  // mapping, so a long context fits on a small device. Off by default.
+  bool kv_offload = false;
   // Extra stop token ids for this request, added to the model's declared
   // stop tokens (Model::StopTokens). Generation ends when it samples one
   // of them, and the stop token is not emitted. Use this for a chat

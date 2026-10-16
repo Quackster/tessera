@@ -37,6 +37,7 @@ Useful flags:
 * `--gpus <a,b>`: one device index or a comma-separated list. Default is 0. A single index such as `--gpus 0` runs the single-device sweep. Two or more devices, such as `--gpus 0,1`, run the parallel layout with `--tp`, `--cp`, or `--pipeline`.
 * `--context <n>`: context length stored in the key. Default is 32768.
 * `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8`: KV cache type. Default is int8.
+* `--kv-offload`: not honored. Calibration sizes the device-resident cache. The run and serve commands honor the flag. When the flag is set, calibrate warns and ignores it.
 * `--draft <dir>`: DFlash2 draft checkpoint. It enables the draft sweeps.
 * `--speculate`: MTP draft from the target head. It enables the draft block sweep.
 * `--prompts <file>`: prompts for the sweep, one per line. Default is three fixed prompts.

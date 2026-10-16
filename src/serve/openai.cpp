@@ -199,6 +199,8 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   // friends); without it every serve turn would decode F32 and an
   // unlimited turn would never fit the device.
   options.kv_type = shared ? pool.At(0).kv_type() : lease.runner().kv_type();
+  options.kv_offload =
+      shared ? pool.At(0).kv_offload() : lease.runner().kv_offload();
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
   }

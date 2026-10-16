@@ -526,9 +526,9 @@ inline std::expected<void, StatusCode> AppendKv(
     const std::size_t new_capacity =
         kv.capacity == 0 ? kInitialKvRows : kv.capacity * 2;
     auto grown_k = backend.AllocateBuffer(new_capacity * row_bytes,
-                                          MemoryKind::Device);
+                                          kv.memory);
     auto grown_v = backend.AllocateBuffer(new_capacity * row_bytes,
-                                          MemoryKind::Device);
+                                          kv.memory);
     if (!grown_k || !grown_v) {
       return std::unexpected(StatusCode::OutOfMemory);
     }
@@ -541,10 +541,8 @@ inline std::expected<void, StatusCode> AppendKv(
     kv.k = std::move(*grown_k);
     kv.v = std::move(*grown_v);
     if (quantized) {
-      auto grown_ks = backend.AllocateBuffer(new_capacity * 4,
-                                             MemoryKind::Device);
-      auto grown_vs = backend.AllocateBuffer(new_capacity * 4,
-                                             MemoryKind::Device);
+      auto grown_ks = backend.AllocateBuffer(new_capacity * 4, kv.memory);
+      auto grown_vs = backend.AllocateBuffer(new_capacity * 4, kv.memory);
       if (!grown_ks || !grown_vs) {
         return std::unexpected(StatusCode::OutOfMemory);
       }

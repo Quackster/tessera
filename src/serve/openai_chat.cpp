@@ -71,6 +71,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     // holds its engine, a split runner shares the pool's Submit.
     const KvCacheType tool_kv =
         shared ? pool.At(0).kv_type() : lease.runner().kv_type();
+    const bool tool_offload =
+        shared ? pool.At(0).kv_offload() : lease.runner().kv_offload();
     const ToolGenerate generate =
         [&](const GenerateOptions& options,
             const std::function<bool(std::uint32_t)>& next)
@@ -84,7 +86,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     SessionMessage assistant;
     const bool ok = ChatWithTools(
         generate, model, tokenizer, writer, prompt_body, default_max,
-        session != nullptr ? &assistant : nullptr, tool_kv, defaults);
+        session != nullptr ? &assistant : nullptr, tool_kv, tool_offload,
+        defaults);
     if (session != nullptr && ok) {
       session->Append(std::move(assistant));
     }
@@ -112,6 +115,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   // friends); without it every serve turn would decode F32 and an
   // unlimited turn would never fit the device.
   options.kv_type = shared ? pool.At(0).kv_type() : lease.runner().kv_type();
+  options.kv_offload =
+      shared ? pool.At(0).kv_offload() : lease.runner().kv_offload();
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
   }

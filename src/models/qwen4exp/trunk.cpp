@@ -227,8 +227,8 @@ std::expected<void, StatusCode> LoadKernel(Backend& backend,
 
 std::expected<void, StatusCode> Alloc(Backend& backend,
                                       std::unique_ptr<Buffer>& slot,
-                                      std::size_t bytes) {
-  auto buf = backend.AllocateBuffer(bytes, MemoryKind::Device);
+                                      std::size_t bytes, MemoryKind memory) {
+  auto buf = backend.AllocateBuffer(bytes, memory);
   if (!buf) {
     return std::unexpected(buf.error());
   }
@@ -841,7 +841,7 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
   const std::size_t f = 4;
   auto make = [&](std::unique_ptr<Buffer>& slot,
                   std::size_t bytes) -> std::expected<void, StatusCode> {
-    return Alloc(backend, slot, bytes);
+    return Alloc(backend, slot, bytes, MemoryKind::Device);
   };
   const std::size_t hc_dim = g.hc_dim;
   const std::size_t q_dim = g.heads * g.head_dim;
@@ -888,6 +888,10 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
 
   const std::size_t pool_bytes =
       qsa_pages * g.kv_heads * kQsaPageSize * g.head_dim * 2;
+  // An offloaded cache keeps the paged K/V pools in system RAM; everything
+  // else stays in device memory. The MTP draft shares the choice.
+  h.kv_memory =
+      cache.kv_offload ? MemoryKind::HostVisible : MemoryKind::Device;
   // The paged K/V pools start empty. The indexer can select a cell in the
   // current block that the append has not written yet, so an unwritten pool
   // must read as zeros, never as whatever the allocator returned.
@@ -911,7 +915,8 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
   for (std::size_t l = range.first; l < range.last; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
       Qwen4ExpState::QsaLayer& st = h.qsa[l];
-      if (!make(st.k_pool, pool_bytes) || !make(st.v_pool, pool_bytes) ||
+      if (!Alloc(backend, st.k_pool, pool_bytes, h.kv_memory) ||
+          !Alloc(backend, st.v_pool, pool_bytes, h.kv_memory) ||
           !make(st.page_table, qsa_pages * 4) ||
           !make(st.idx_tail, (kQsaIdxBlock - 1) * g.idx_dim * f) ||
           !make(st.idx_dead, g.idx_dim * f) ||

@@ -44,6 +44,7 @@ TEST(CliOptionsTest, DefaultsMatchTheDocumentedOnes) {
   EXPECT_EQ(options.prefill_chunk, tessera::kDefaultPrefillChunk);
   EXPECT_EQ(options.kv_type, tessera::KvCacheType::F32);
   EXPECT_FALSE(options.kv_type_set);
+  EXPECT_FALSE(options.kv_offload);
   EXPECT_TRUE(options.enable_thinking);
   EXPECT_FALSE(options.thinking_flag_set);
   EXPECT_EQ(options.reasoning_effort, "xhigh");
@@ -142,7 +143,8 @@ TEST(CliOptionsTest, EveryFlagLandsInItsField) {
                                          "--calibrate-limit",
                                          "5",
                                          "--concurrent",
-                                         "--kv-q8"});
+                                         "--kv-q8",
+                                         "--kv-offload"});
   EXPECT_EQ(options.model_path, "m.gguf");
   EXPECT_EQ(options.draft_path, "d");
   EXPECT_EQ(options.mtp_path, "mtp");
@@ -196,6 +198,7 @@ TEST(CliOptionsTest, EveryFlagLandsInItsField) {
   EXPECT_TRUE(options.concurrent);
   EXPECT_EQ(options.kv_type, tessera::KvCacheType::Q8);
   EXPECT_TRUE(options.kv_type_set);
+  EXPECT_TRUE(options.kv_offload);
 }
 
 TEST(CliOptionsTest, KvFlagsSelectAndMarkTheType) {

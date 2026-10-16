@@ -140,6 +140,7 @@ struct Pipeline::Impl {
   std::size_t hidden_dim = 0;
   std::size_t context = 0;
   KvCacheType kv_type = KvCacheType::F32;
+  bool kv_offload = false;
   std::vector<std::uint32_t> stops;
   // One sequence per concurrent turn; [0] is the single-turn default the
   // CLI run and calibrate paths use. The rest are the serve pool.
@@ -239,6 +240,7 @@ struct Pipeline::Impl {
     for (std::unique_ptr<core::DecodeCache>& cache : sequence.caches) {
       cache = std::make_unique<core::DecodeCache>();
       cache->kv_type = options.kv_type;
+      cache->kv_offload = options.kv_offload;
       cache->tuning.mxfp4_split_target = options.mxfp4_split_target;
       cache->tuning.mxfp4_split_cap = options.mxfp4_split_cap;
       cache->tuning.attention_split = options.attention_split;

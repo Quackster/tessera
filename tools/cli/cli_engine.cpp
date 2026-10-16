@@ -74,6 +74,7 @@ PipelineOptions MakeCliPipelineOptions(const CliOptions& options,
   pipeline.devices.assign(devices.begin(), devices.end());
   pipeline.context = options.context;
   pipeline.kv_type = options.kv_type;
+  pipeline.kv_offload = options.kv_offload;
   pipeline.mtp_path = options.mtp_path;
   pipeline.stage_layers = options.pipeline_split;
   pipeline.gpu_layers = options.gpu_layers;
@@ -96,7 +97,8 @@ std::optional<int> HandleGpuLayersHelp(const CliOptions& options) {
   }
   std::unique_ptr<Engine> engine = std::move(*engine_result);
   return LogGpuLayersAdvice(*engine, options.model_path, options.context,
-                            options.kv_type, CliStrategyLabel(options)) == 0
+                            options.kv_type, CliStrategyLabel(options),
+                            options.kv_offload) == 0
              ? 0
              : 1;
 }

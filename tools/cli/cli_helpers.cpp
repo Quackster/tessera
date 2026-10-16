@@ -215,6 +215,7 @@ void PrintUsage() {
       "  --kv-q8           store the KV cache in int8\n"
       "  --kv-q4           store the KV cache in 4-bit\n"
       "  --kv-fp8          store the KV cache in FP8 E4M3\n"
+      "  --kv-offload      keep the KV cache in system RAM, not VRAM\n"
       "  --host <ip>       serve bind address (default %s)\n"
       "  --port <n>        serve port (default %u)\n"
       "  --stats-interval <s> live tok/s cadence on streams and "
@@ -345,7 +346,7 @@ std::uint64_t ToMiB(std::uint64_t bytes) {
 
 int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
                        std::size_t context, KvCacheType kv_type,
-                       std::string_view strategy) {
+                       std::string_view strategy, bool kv_offload) {
   auto& log = engine.Diagnostics();
   const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
   // Vulkan reports the device total but no free figure; size against the
@@ -354,7 +355,7 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
   const std::uint64_t budget =
       budget_is_total ? memory.total_bytes : memory.free_bytes;
   auto advice = core::RecommendGpuLayers(model_path, context, kv_type, budget,
-                                         std::string(strategy));
+                                         std::string(strategy), kv_offload);
   if (!advice) {
     log.Warn("cli", std::string("cannot size --gpu-layers for '") + model_path +
                         "' (" + std::string(ToString(advice.error())) +
@@ -369,7 +370,10 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
                       std::to_string(advice->total_layers) +
                       " offloadable layers, 0 keeps every layer)");
   log.Info("cli", "context " + std::to_string(context) + ", kv " +
-                      std::string(ToString(kv_type)) + ": cache about " +
+                      std::string(ToString(kv_type)) +
+                      (advice->kv_offload ? " offloaded to system RAM"
+                                          : "") +
+                      ": cache about " +
                       std::to_string(ToMiB(advice->kv_bytes)) + " MiB (" +
                       std::to_string(advice->full_layers) + " full, " +
                       std::to_string(advice->linear_layers) +
@@ -409,7 +413,7 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
 bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
                        std::size_t context, KvCacheType kv_type,
                        std::string_view strategy, std::size_t gpu_layers,
-                       int device) {
+                       int device, bool kv_offload) {
   auto& log = engine.Diagnostics();
   const DeviceMemoryInfo memory = engine.Owner().MemoryInfo();
   // Vulkan reports the device total but no free figure; judge against
@@ -421,7 +425,7 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
     return true;
   }
   auto fit = core::FitGpuLayers(model_path, context, kv_type, budget,
-                                std::string(strategy), gpu_layers);
+                                std::string(strategy), gpu_layers, kv_offload);
   if (!fit) {
     log.Warn("cli", std::string("cannot size --gpu-layers for '") + model_path +
                         "' (" + std::string(ToString(fit.error())) +
@@ -435,15 +439,28 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
   const std::string budget_label =
       std::to_string(ToMiB(fit->budget_bytes)) +
       (fit->budget_is_total ? " MiB device total" : " MiB free");
-  log.Warn("cli",
-           "gpu " + std::to_string(device) + " cannot hold --gpu-layers " +
-               std::to_string(gpu_layers) + ": resident about " +
-               std::to_string(ToMiB(fit->resident_bytes)) + " MiB plus " +
-               std::to_string(ToMiB(fit->staging_bytes)) +
-               " MiB staging plus " + std::to_string(ToMiB(fit->kv_bytes)) +
-               " MiB KV cache exceeds " + budget_label +
-               "; lower --gpu-layers (try --gpu-layers help), "
-               "lower --context, or quantize the KV cache");
+  if (fit->kv_offload) {
+    // The offloaded cache is not a device cost, so the refusal names only
+    // the resident weights and the staging buffers.
+    log.Warn("cli",
+             "gpu " + std::to_string(device) + " cannot hold --gpu-layers " +
+                 std::to_string(gpu_layers) + ": resident about " +
+                 std::to_string(ToMiB(fit->resident_bytes)) + " MiB plus " +
+                 std::to_string(ToMiB(fit->staging_bytes)) +
+                 " MiB staging exceeds " + budget_label +
+                 "; lower --gpu-layers (try --gpu-layers help). The KV "
+                 "cache is offloaded to system RAM and is not counted");
+  } else {
+    log.Warn("cli",
+             "gpu " + std::to_string(device) + " cannot hold --gpu-layers " +
+                 std::to_string(gpu_layers) + ": resident about " +
+                 std::to_string(ToMiB(fit->resident_bytes)) + " MiB plus " +
+                 std::to_string(ToMiB(fit->staging_bytes)) +
+                 " MiB staging plus " + std::to_string(ToMiB(fit->kv_bytes)) +
+                 " MiB KV cache exceeds " + budget_label +
+                 "; lower --gpu-layers (try --gpu-layers help), "
+                 "lower --context, or quantize the KV cache");
+  }
   return false;
 }
 

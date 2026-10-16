@@ -134,6 +134,7 @@ std::expected<std::unique_ptr<Pipeline>, StatusCode> Pipeline::Create(
   impl->hidden_dim = config->ResidualWidth();
   impl->context = options.context;
   impl->kv_type = options.kv_type;
+  impl->kv_offload = options.kv_offload;
   impl->stages.reserve(stage_count);
   for (std::size_t i = 0; i < stage_count; ++i) {
     // Contiguous ranges, balanced unless the caller supplied counts.
@@ -192,6 +193,7 @@ std::expected<std::vector<std::uint32_t>, StatusCode> Pipeline::Generate(
   GenerateOptions options;
   options.max_completion_tokens = max_tokens;
   options.kv_type = impl_->kv_type;
+  options.kv_offload = impl_->kv_offload;
   std::vector<std::uint32_t> produced;
   auto outcome = impl_->HasStrategy()
                      ? impl_->RunSpeculative(prompt, options, &produced)

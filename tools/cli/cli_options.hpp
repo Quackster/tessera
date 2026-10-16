@@ -75,6 +75,7 @@ struct CliOptions {
   bool sampling_explicit = false;
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   bool kv_type_set = false;
+  bool kv_offload = false;  // --kv-offload
   std::uint64_t seed = 0;
   std::size_t max_completion_tokens = 0;
   std::size_t max_thinking_tokens = 0;
@@ -390,6 +391,8 @@ namespace detail {
       options->sample = true;
     } else if (MatchKvType(arg, options->kv_type)) {
       options->kv_type_set = true;
+    } else if (arg == "--kv-offload") {
+      options->kv_offload = true;
     } else if (arg == "--temperature") {
       auto value = RealValue(args, i, arg);
       if (!value) {

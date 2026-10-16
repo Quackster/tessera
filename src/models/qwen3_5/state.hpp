@@ -187,6 +187,9 @@ struct Qwen35State final : core::ArchState {
     // Allocated row capacity; grows geometrically (see DeviceDecodeState).
     std::size_t capacity = 0;
     KvCacheType type = KvCacheType::F32;
+    // Where the rows live: Device, or HostVisible when the cache is
+    // offloaded to system RAM (see DeviceDecodeState::Kv).
+    MemoryKind memory = MemoryKind::Device;
   };
   struct LinearState {
     std::unique_ptr<Buffer> conv_hist;

@@ -181,6 +181,11 @@ struct DecodeCache {
   // Storage type of the full-attention KV cache (default fp32). Set
   // before the first step.
   KvCacheType kv_type = KvCacheType::F32;
+  // Keep the full-attention KV cache in pinned system RAM instead of
+  // device memory (default false). The attention kernels read the cache
+  // over the host mapping, so a long context costs no VRAM. Set before
+  // the first step.
+  bool kv_offload = false;
   // Request tuning the architecture module reads from its state (copied
   // when the state is created). Set before the first step.
   RequestTuning tuning;
@@ -214,6 +219,9 @@ struct DeviceDecodeState {
     // one row instead of reallocating the whole cache.
     std::size_t capacity = 0;
     KvCacheType type = KvCacheType::F32;
+    // Where the rows live: Device, or HostVisible when the cache is
+    // offloaded to system RAM.
+    MemoryKind memory = MemoryKind::Device;
   };
   std::unique_ptr<Kernel> rmsnorm_kernel;
   std::unique_ptr<Kernel> add_kernel;

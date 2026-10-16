@@ -46,6 +46,7 @@ bool HybridHasSplitGroup(const CliOptions& options) {
       options.cp_mode ? HybridMpKind::Context : HybridMpKind::Tensor;
   hybrid_options.context = options.context;
   hybrid_options.kv_type = options.kv_type;
+  hybrid_options.kv_offload = options.kv_offload;
   auto groups = HybridGroups(hybrid_options);
   if (!groups) {
     return false;
@@ -124,11 +125,12 @@ CalibrationConfig ResolveServeCalibration(const CliOptions& options,
 // calibration applied, so the first real turn pays no first-touch cost.
 std::expected<void, StatusCode> WarmSplitRunner(
     const Runner& runner, const CalibrationConfig& calibration,
-    KvCacheType kv_type) {
+    KvCacheType kv_type, bool kv_offload) {
   GenerateOptions warm;
   warm.max_completion_tokens = 1;
   warm.progress_every = 0;
   warm.kv_type = kv_type;
+  warm.kv_offload = kv_offload;
   ApplyToGenerateOptions(calibration, warm);
   auto warmed = runner.Submit(warm, [](std::uint32_t) { return true; });
   if (!warmed) {
@@ -199,7 +201,7 @@ std::expected<void, StatusCode> AddReplica(const CliOptions& options,
   if (state->gpu_layers != 0) {
     if (!CheckGpuLayersFit(*engine_ptr, options.model_path, options.context,
                            options.kv_type, strategy, state->gpu_layers,
-                           device)) {
+                           device, options.kv_offload)) {
       return std::unexpected(StatusCode::OutOfMemory);
     }
   }
@@ -235,6 +237,7 @@ std::expected<void, StatusCode> AddReplica(const CliOptions& options,
   // Warm the kernels with the serve-wide KV storage type, so the first
   // real turn pays no first-touch cost on another type.
   warm.kv_type = options.kv_type;
+  warm.kv_offload = options.kv_offload;
   ApplyToGenerateOptions(state->calibration, warm);
   auto warmed = engine_ptr->Generate(**model, warm);
   if (!warmed) {
@@ -247,7 +250,7 @@ std::expected<void, StatusCode> AddReplica(const CliOptions& options,
   // turn reserves quantized rows and fits the device.
   pool.Add(std::make_unique<SingleDeviceRunner>(
       std::move(engine_ptr), std::move(*model), device, state->calibration,
-      options.kv_type));
+      options.kv_type, options.kv_offload));
   return {};
 }
 
@@ -284,8 +287,10 @@ std::expected<void, StatusCode> AddSplitRunner(
   const CalibrationConfig calibration =
       ResolveServeCalibration(options, engine0, model0);
   auto runner = make_runner(std::move(layout), first_device, calibration,
-                            options.kv_type);
-  if (auto warmed = WarmSplitRunner(*runner, calibration, options.kv_type);
+                            options.kv_type, options.kv_offload);
+  if (auto warmed =
+          WarmSplitRunner(*runner, calibration, options.kv_type,
+                          options.kv_offload);
       !warmed) {
     return warmed;
   }
@@ -309,6 +314,7 @@ std::expected<void, StatusCode> LoadHybridPool(const CliOptions& options,
       options.cp_mode ? HybridMpKind::Context : HybridMpKind::Tensor;
   hybrid_options.context = options.context;
   hybrid_options.kv_type = options.kv_type;
+  hybrid_options.kv_offload = options.kv_offload;
   auto groups = HybridGroups(hybrid_options);
   if (!groups) {
     std::fprintf(stderr, "cli: hybrid layout invalid (%s)\n",
@@ -334,6 +340,7 @@ std::expected<void, StatusCode> LoadHybridPool(const CliOptions& options,
       cp_options.devices = group.devices;
       cp_options.context = options.context;
       cp_options.kv_type = options.kv_type;
+      cp_options.kv_offload = options.kv_offload;
       auto cp = ContextParallel::Create(cp_options);
       if (!cp) {
         std::fprintf(stderr,
@@ -357,9 +364,11 @@ std::expected<void, StatusCode> LoadHybridPool(const CliOptions& options,
       if (auto added = AddSplitRunner(
               options, std::move(*cp), group.devices.front(), report,
               [](std::unique_ptr<ContextParallel> layout, int device,
-                 const CalibrationConfig& calibration, KvCacheType kv_type) {
+                 const CalibrationConfig& calibration, KvCacheType kv_type,
+                 bool kv_offload) {
                 return MakeContextParallelRunner(std::move(layout), device,
-                                                 calibration, kv_type);
+                                                 calibration, kv_type,
+                                                 kv_offload);
               },
               pool);
           !added) {
@@ -372,6 +381,7 @@ std::expected<void, StatusCode> LoadHybridPool(const CliOptions& options,
     tp_options.devices = group.devices;
     tp_options.context = options.context;
     tp_options.kv_type = options.kv_type;
+    tp_options.kv_offload = options.kv_offload;
     auto tp = TensorParallel::Create(tp_options);
     if (!tp) {
       std::fprintf(stderr,
@@ -394,9 +404,11 @@ std::expected<void, StatusCode> LoadHybridPool(const CliOptions& options,
     if (auto added = AddSplitRunner(
             options, std::move(*tp), group.devices.front(), report,
             [](std::unique_ptr<TensorParallel> layout, int device,
-               const CalibrationConfig& calibration, KvCacheType kv_type) {
+               const CalibrationConfig& calibration, KvCacheType kv_type,
+               bool kv_offload) {
               return MakeTensorParallelRunner(std::move(layout), device,
-                                              calibration, kv_type);
+                                              calibration, kv_type,
+                                              kv_offload);
             },
             pool);
         !added) {
@@ -483,6 +495,7 @@ int RunServeCommand(const CliOptions& options) {
       warm.max_completion_tokens = 1;
       warm.progress_every = 0;
       warm.kv_type = options.kv_type;
+      warm.kv_offload = options.kv_offload;
       auto warmed = (*pipeline)->GenerateStreaming(
           warm, [](std::uint32_t) { return true; });
       if (!warmed) {
@@ -492,7 +505,7 @@ int RunServeCommand(const CliOptions& options) {
       }
       pool->Add(std::make_unique<PipelineRunner>(
           std::move(*pipeline), devices.front(), CalibrationConfig{},
-          options.kv_type));
+          options.kv_type, options.kv_offload));
       report("ready");
       return pool;
     }
@@ -506,6 +519,7 @@ int RunServeCommand(const CliOptions& options) {
       split_options.devices = devices;
       split_options.context = options.context;
       split_options.kv_type = options.kv_type;
+      split_options.kv_offload = options.kv_offload;
       split_options.draft_block = options.draft_block;
       split_options.prefill_chunk = options.prefill_chunk;
       split_options.mtp_path = options.mtp_path;
@@ -521,8 +535,11 @@ int RunServeCommand(const CliOptions& options) {
       const CalibrationConfig calibration = ResolveServeCalibration(
           options, (*split)->TargetEngine(), (*split)->TargetModel());
       auto runner = MakeSpecSplitRunner(std::move(*split), devices.front(),
-                                        calibration, options.kv_type);
-      if (auto warmed = WarmSplitRunner(*runner, calibration, options.kv_type);
+                                        calibration, options.kv_type,
+                                        options.kv_offload);
+      if (auto warmed =
+              WarmSplitRunner(*runner, calibration, options.kv_type,
+                              options.kv_offload);
           !warmed) {
         return std::unexpected(warmed.error());
       }
@@ -541,6 +558,7 @@ int RunServeCommand(const CliOptions& options) {
       tp_options.devices = devices;
       tp_options.context = options.context;
       tp_options.kv_type = options.kv_type;
+      tp_options.kv_offload = options.kv_offload;
       auto tp = TensorParallel::Create(tp_options);
       if (!tp) {
         std::fprintf(stderr, "cli: tensor-parallel create failed (%s)\n",
@@ -562,9 +580,11 @@ int RunServeCommand(const CliOptions& options) {
       if (auto added = AddSplitRunner(
               options, std::move(*tp), devices.front(), report,
               [](std::unique_ptr<TensorParallel> layout, int device,
-                 const CalibrationConfig& calibration, KvCacheType kv_type) {
+                 const CalibrationConfig& calibration, KvCacheType kv_type,
+                 bool kv_offload) {
                 return MakeTensorParallelRunner(std::move(layout), device,
-                                                calibration, kv_type);
+                                                calibration, kv_type,
+                                                kv_offload);
               },
               *pool);
           !added) {
@@ -582,6 +602,7 @@ int RunServeCommand(const CliOptions& options) {
       cp_options.devices = devices;
       cp_options.context = options.context;
       cp_options.kv_type = options.kv_type;
+      cp_options.kv_offload = options.kv_offload;
       auto cp = ContextParallel::Create(cp_options);
       if (!cp) {
         std::fprintf(stderr, "cli: context-parallel create failed (%s)\n",
@@ -603,9 +624,11 @@ int RunServeCommand(const CliOptions& options) {
       if (auto added = AddSplitRunner(
               options, std::move(*cp), devices.front(), report,
               [](std::unique_ptr<ContextParallel> layout, int device,
-                 const CalibrationConfig& calibration, KvCacheType kv_type) {
+                 const CalibrationConfig& calibration, KvCacheType kv_type,
+                 bool kv_offload) {
                 return MakeContextParallelRunner(std::move(layout), device,
-                                                 calibration, kv_type);
+                                                 calibration, kv_type,
+                                                 kv_offload);
               },
               *pool);
           !added) {

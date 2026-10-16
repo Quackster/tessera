@@ -403,7 +403,11 @@ struct Scheduler::Impl {
             FinishLocked(job, FinishReason::Aborted, StatusCode::Ok);
             continue;
           }
-          const std::size_t bound = MemoryBound(job->cache.kv_type);
+          // An offloaded cache spends no device memory, so it needs no
+          // device-memory gate (bound 0 admits without one).
+          const std::size_t bound = job->cache.kv_offload
+                                        ? 0
+                                        : MemoryBound(job->cache.kv_type);
           if (bound > 0 && job->Rows() > bound &&
               ReservedLocked() == 0) {
             pending.pop_front();
@@ -508,6 +512,7 @@ std::expected<GenerateOutcome, StatusCode> Scheduler::Submit(
                                         options.prefill_chunk_tokens,
                                         model.MaxContextLength());
   job->cache.kv_type = options.kv_type;
+  job->cache.kv_offload = options.kv_offload;
   job->cache.tuning.mxfp4_split_target = options.mxfp4_split_target;
   job->cache.tuning.mxfp4_split_cap = options.mxfp4_split_cap;
   job->cache.tuning.attention_split = options.attention_split;

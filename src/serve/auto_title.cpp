@@ -31,7 +31,7 @@ using TitleGenerate = std::function<std::expected<GenerateOutcome, StatusCode>(
 void NameSession(Model& model, const Tokenizer& tokenizer,
                  TitleGenerate generate,
                  const std::shared_ptr<Session>& session, bool enabled,
-                 KvCacheType kv_type) {
+                 KvCacheType kv_type, bool kv_offload) {
   const SessionView view = session->View();
   if (view.title != kDefaultTitle) {
     return;
@@ -66,6 +66,7 @@ void NameSession(Model& model, const Tokenizer& tokenizer,
   options.max_completion_tokens = kAutoTitleTokens;
   options.prompt_tokens = *ids;
   options.kv_type = kv_type;
+  options.kv_offload = kv_offload;
   std::vector<std::uint32_t> produced;
   auto streamed = generate(options, [&](std::uint32_t token) {
     produced.push_back(token);
@@ -105,13 +106,13 @@ core::Json TitlePromptBody(const std::string& user_text) {
 
 void MaybeAutoTitle(Engine& engine, Model& model, const Tokenizer& tokenizer,
                     const std::shared_ptr<Session>& session, bool enabled,
-                    KvCacheType kv_type) {
+                    KvCacheType kv_type, bool kv_offload) {
   NameSession(model, tokenizer,
               [&](const GenerateOptions& options,
                   const std::function<bool(std::uint32_t)>& on_token) {
                 return engine.GenerateStreaming(model, options, on_token);
               },
-              session, enabled, kv_type);
+              session, enabled, kv_type, kv_offload);
 }
 
 void MaybeAutoTitle(RunnerPool& pool,
@@ -131,15 +132,16 @@ void MaybeAutoTitle(RunnerPool& pool,
                     const std::function<bool(std::uint32_t)>& on_token) {
                   return pool.SubmitLeastLoaded(options, on_token);
                 },
-                session, enabled, pool.At(0).kv_type());
+                session, enabled, pool.At(0).kv_type(),
+                pool.At(0).kv_offload());
     return;
   }
   auto lease = pool.Acquire();
   if (!lease) {
     return;
   }
-  MaybeAutoTitle(lease->engine(), lease->model(), *tokenizer, session,
-                 enabled);
+  MaybeAutoTitle(lease->engine(), lease->model(), *tokenizer, session, enabled,
+                 lease->runner().kv_type(), lease->runner().kv_offload());
 }
 
 }  // namespace tessera::serve

@@ -74,6 +74,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     const std::function<bool(std::uint32_t)>& on_token) {
   core::DecodeCache cache;
   cache.kv_type = options.kv_type;
+  cache.kv_offload = options.kv_offload;
   cache.tuning.mxfp4_split_target = options.mxfp4_split_target;
   cache.tuning.mxfp4_split_cap = options.mxfp4_split_cap;
   cache.tuning.attention_split = options.attention_split;

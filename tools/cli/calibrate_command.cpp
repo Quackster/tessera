@@ -119,6 +119,11 @@ void WarnInertCalibrateFlags(const CliOptions& options) {
     WarnIgnoredFlag("--mtp",
                     "calibrate drafts from the target's own nextn head");
   }
+  if (options.kv_offload) {
+    WarnIgnoredFlag("--kv-offload",
+                    "calibrate sizes the device-resident cache; run and "
+                    "serve honor the flag");
+  }
   if (options.max_completion_tokens != 0) {
     WarnIgnoredFlag("--max-completion-tokens",
                     "calibration measures its own decode length");

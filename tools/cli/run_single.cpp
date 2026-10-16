@@ -49,6 +49,7 @@ GenerateOptions BuildGenerateOptions(const CliOptions& options, bool sample,
   gen.attention_split = applied.attention_split;
   gen.draft_context = applied.draft_context;
   gen.kv_type = options.kv_type;
+  gen.kv_offload = options.kv_offload;
   gen.progress_every = options.quiet ? 0 : 64;
   return gen;
 }
@@ -162,7 +163,8 @@ int RunSingleDeviceGeneration(const CliOptions& options) {
     // Refuse a paged load whose resident set plus KV cache cannot fit,
     // before the weights start moving.
     if (!CheckGpuLayersFit(engine, options.model_path, options.context,
-                           options.kv_type, strategy, gpu_layers, device)) {
+                           options.kv_type, strategy, gpu_layers, device,
+                           options.kv_offload)) {
       return kExitError;
     }
   }

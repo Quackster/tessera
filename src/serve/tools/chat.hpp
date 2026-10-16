@@ -40,8 +40,9 @@ using ToolGenerate = std::function<std::expected<GenerateOutcome, StatusCode>(
 // (buffered or SSE). Falls back to a plain text answer when the model
 // emits no tool call. `generate` runs the turn on the serving backend
 // (single device or layer split); `model` backs the chat template and the
-// context limit. `kv_type` is the runner's KV storage type, read onto the
-// request like every other serve turn. `out_turn` (null to skip) receives
+// context limit. `kv_type` is the runner's KV storage type and
+// `kv_offload` its KV cache location, read onto the request like every
+// other serve turn. `out_turn` (null to skip) receives
 // the assistant turn for session history: text content, reasoning and the
 // OpenAI-form tool_calls dump. True when the turn generated (and
 // `out_turn`, when given, is valid); the error response is already sent
@@ -51,6 +52,7 @@ using ToolGenerate = std::function<std::expected<GenerateOutcome, StatusCode>(
                                  ResponseWriter& writer, const core::Json& body,
                                  std::size_t default_max,
                                  SessionMessage* out_turn, KvCacheType kv_type,
+                                 bool kv_offload = false,
                                  const TemplateDefaults& defaults = {});
 
 }  // namespace serve

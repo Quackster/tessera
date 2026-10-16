@@ -530,6 +530,14 @@ std::expected<void, StatusCode> EnsureHybridReady(
       // type, and the first MTP step fails.
       h.mtp_kv.type = cache.kv_type;
     }
+    // The cache location applies to every full-attention cache, including
+    // the MTP head's.
+    const MemoryKind kv_memory =
+        cache.kv_offload ? MemoryKind::HostVisible : MemoryKind::Device;
+    for (auto& kv : h.full) {
+      kv.memory = kv_memory;
+    }
+    h.mtp_kv.memory = kv_memory;
     h.ready = true;
   }
   return {};

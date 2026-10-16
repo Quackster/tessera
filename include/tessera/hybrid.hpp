@@ -32,6 +32,9 @@ struct HybridOptions {
   HybridMpKind mp_kind = HybridMpKind::Tensor;
   std::size_t context = kDefaultContext;
   KvCacheType kv_type = KvCacheType::F32;
+  // Keep the full-attention KV cache in pinned system RAM instead of
+  // device memory. See GenerateOptions::kv_offload.
+  bool kv_offload = false;
 };
 
 // One data-parallel group of a hybrid layout: its index and its devices

@@ -5244,7 +5244,8 @@ TEST(BackendTest, AttentionWindowDeviceMatchesRef) {
 
 // Device: the shared KV append grows the cache geometrically and keeps
 // every appended row. A struct with the same shape as the decode caches
-// exercises the growth boundary (4 -> 8 -> 16).
+// exercises the growth boundary (4 -> 8 -> 16), with the cache in device
+// memory and in pinned host memory (the kv_offload location).
 TEST(BackendTest, AppendKvGrowsGeometrically) {
   std::unique_ptr<Backend> backend;
   MakeBackendOrSkip(backend);
@@ -5256,48 +5257,55 @@ TEST(BackendTest, AppendKvGrowsGeometrically) {
     std::size_t rows = 0;
     std::size_t capacity = 0;
     tessera::KvCacheType type = tessera::KvCacheType::F32;
+    tessera::MemoryKind memory = tessera::MemoryKind::Device;
   };
-  Kv kv;
   constexpr std::size_t kElems = 3;
   constexpr std::size_t kKvBytes = kElems * 4;
-  std::vector<float> want_k, want_v;
-  for (std::size_t r = 0; r < 10; ++r) {
-    std::vector<float> k_row(kElems), v_row(kElems);
-    for (std::size_t e = 0; e < kElems; ++e) {
-      k_row[e] = static_cast<float>(r * 10 + e);
-      v_row[e] = static_cast<float>(1000 + r * 10 + e);
+  const auto run = [&](tessera::MemoryKind memory) {
+    Kv kv;
+    kv.memory = memory;
+    std::vector<float> want_k, want_v;
+    for (std::size_t r = 0; r < 10; ++r) {
+      std::vector<float> k_row(kElems), v_row(kElems);
+      for (std::size_t e = 0; e < kElems; ++e) {
+        k_row[e] = static_cast<float>(r * 10 + e);
+        v_row[e] = static_cast<float>(1000 + r * 10 + e);
+      }
+      auto k_buf = backend->AllocateBuffer(kKvBytes, MemoryKind::Device);
+      auto v_buf = backend->AllocateBuffer(kKvBytes, MemoryKind::Device);
+      ASSERT_TRUE(k_buf && v_buf);
+      const auto upload = [&backend](auto& buf,
+                                     const std::vector<float>& data) {
+        return backend->CopyH2D(
+            **buf, std::span<const std::byte>(
+                       reinterpret_cast<const std::byte*>(data.data()),
+                       data.size() * 4));
+      };
+      ASSERT_TRUE(upload(k_buf, k_row).has_value());
+      ASSERT_TRUE(upload(v_buf, v_row).has_value());
+      auto status =
+          core::detail::AppendKv(*backend, nullptr, nullptr, nullptr, nullptr,
+                                 nullptr, kv, **k_buf, **v_buf, kElems);
+      ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
+      want_k.insert(want_k.end(), k_row.begin(), k_row.end());
+      want_v.insert(want_v.end(), v_row.begin(), v_row.end());
     }
-    auto k_buf = backend->AllocateBuffer(kKvBytes, MemoryKind::Device);
-    auto v_buf = backend->AllocateBuffer(kKvBytes, MemoryKind::Device);
-    ASSERT_TRUE(k_buf && v_buf);
-    const auto upload = [&backend](auto& buf, const std::vector<float>& data) {
-      return backend->CopyH2D(
-          **buf, std::span<const std::byte>(
-                     reinterpret_cast<const std::byte*>(data.data()),
-                     data.size() * 4));
-    };
-    ASSERT_TRUE(upload(k_buf, k_row).has_value());
-    ASSERT_TRUE(upload(v_buf, v_row).has_value());
-    auto status =
-        core::detail::AppendKv(*backend, nullptr, nullptr, nullptr, nullptr,
-                             nullptr, kv, **k_buf, **v_buf, kElems);
-    ASSERT_TRUE(status.has_value()) << tessera::ToString(status.error());
-    want_k.insert(want_k.end(), k_row.begin(), k_row.end());
-    want_v.insert(want_v.end(), v_row.begin(), v_row.end());
-  }
-  EXPECT_EQ(kv.rows, 10u);
-  EXPECT_GE(kv.capacity, 10u);
-  std::vector<float> got_k(want_k.size()), got_v(want_v.size());
-  ASSERT_TRUE(backend->CopyD2H(*kv.k,
-                                reinterpret_cast<std::byte*>(got_k.data()),
-                                got_k.size() * 4)
-                  .has_value());
-  ASSERT_TRUE(backend->CopyD2H(*kv.v,
-                                reinterpret_cast<std::byte*>(got_v.data()),
-                                got_v.size() * 4)
-                  .has_value());
-  EXPECT_EQ(got_k, want_k);
-  EXPECT_EQ(got_v, want_v);
+    EXPECT_EQ(kv.rows, 10u);
+    EXPECT_GE(kv.capacity, 10u);
+    std::vector<float> got_k(want_k.size()), got_v(want_v.size());
+    ASSERT_TRUE(backend->CopyD2H(*kv.k,
+                                 reinterpret_cast<std::byte*>(got_k.data()),
+                                 got_k.size() * 4)
+                    .has_value());
+    ASSERT_TRUE(backend->CopyD2H(*kv.v,
+                                 reinterpret_cast<std::byte*>(got_v.data()),
+                                 got_v.size() * 4)
+                    .has_value());
+    EXPECT_EQ(got_k, want_k);
+    EXPECT_EQ(got_v, want_v);
+  };
+  run(tessera::MemoryKind::Device);
+  run(tessera::MemoryKind::HostVisible);
 }
 
 // Device: the plain fp32 GEMM (unquantized weights) matches the reference.

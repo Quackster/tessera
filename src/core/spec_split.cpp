@@ -156,6 +156,7 @@ struct SpecSplit::Impl {
   std::size_t context = 0;
   std::size_t prefill_chunk = 0;
   KvCacheType kv_type = KvCacheType::F32;
+  bool kv_offload = false;
 };
 
 SpecSplit::SpecSplit(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -178,6 +179,7 @@ std::expected<std::unique_ptr<SpecSplit>, StatusCode> SpecSplit::Create(
   impl->context = options.context;
   impl->prefill_chunk = options.prefill_chunk;
   impl->kv_type = options.kv_type;
+  impl->kv_offload = options.kv_offload;
   // Target first, then draft: one model load at a time, so only one
   // checkpoint is in host memory at once.
   {
@@ -257,6 +259,7 @@ std::expected<GenerateOutcome, StatusCode> SpecSplit::GenerateStreaming(
   // head's decode state on the fresh draft cache.
   p.target_cache = std::make_unique<core::DecodeCache>();
   p.target_cache->kv_type = options.kv_type;
+  p.target_cache->kv_offload = options.kv_offload;
   p.draft_cache = std::make_unique<core::DecodeCache>();
   SpecSplitTarget target(p.target_engine->Owner(), *p.target, *p.target_cache,
                          p.draft_engine->Owner(), *p.draft, *p.draft_cache,
@@ -277,6 +280,7 @@ std::expected<std::vector<std::uint32_t>, StatusCode> SpecSplit::Generate(
   GenerateOptions options;
   options.max_completion_tokens = max_tokens;
   options.kv_type = impl_->kv_type;
+  options.kv_offload = impl_->kv_offload;
   std::vector<std::uint32_t> produced;
   auto outcome =
       GenerateStreaming(prompt, options, [&produced](std::uint32_t token) {

@@ -153,6 +153,7 @@ int RunRunCommand(const CliOptions& options) {
     gen.prompt_tokens = std::move(*ids);
     gen.max_completion_tokens = options.max_completion_tokens;
     gen.kv_type = options.kv_type;
+    gen.kv_offload = options.kv_offload;
     // Stream over the pipeline so each token reaches the console as it is
     // generated. A blocking Generate would return only after every step
     // (by default the whole remaining context), which looks hung after
@@ -181,6 +182,7 @@ int RunRunCommand(const CliOptions& options) {
     tp_options.devices = devices;
     tp_options.context = options.context;
     tp_options.kv_type = options.kv_type;
+    tp_options.kv_offload = options.kv_offload;
     auto tp = TensorParallel::Create(tp_options);
     if (!tp) {
       std::fprintf(stderr, "cli: tensor-parallel create failed (%s)\n",
@@ -220,6 +222,7 @@ int RunRunCommand(const CliOptions& options) {
     gen.prompt_tokens = std::move(*ids);
     gen.max_completion_tokens = options.max_completion_tokens;
     gen.kv_type = options.kv_type;
+    gen.kv_offload = options.kv_offload;
     return StreamLayout(
         gen,
         [&](GenerateOptions& request,
@@ -244,6 +247,7 @@ int RunRunCommand(const CliOptions& options) {
     cp_options.devices = devices;
     cp_options.context = options.context;
     cp_options.kv_type = options.kv_type;
+    cp_options.kv_offload = options.kv_offload;
     auto cp = ContextParallel::Create(cp_options);
     if (!cp) {
       std::fprintf(stderr, "cli: context-parallel create failed (%s)\n",
@@ -283,6 +287,7 @@ int RunRunCommand(const CliOptions& options) {
     gen.prompt_tokens = std::move(*ids);
     gen.max_completion_tokens = options.max_completion_tokens;
     gen.kv_type = options.kv_type;
+    gen.kv_offload = options.kv_offload;
     return StreamLayout(
         gen,
         [&](GenerateOptions& request,
@@ -307,6 +312,7 @@ int RunRunCommand(const CliOptions& options) {
     split_options.devices = devices;
     split_options.context = options.context;
     split_options.kv_type = options.kv_type;
+    split_options.kv_offload = options.kv_offload;
     split_options.draft_block = options.draft_block;
     split_options.prefill_chunk = options.prefill_chunk;
     split_options.mtp_path = options.mtp_path;
@@ -336,6 +342,7 @@ int RunRunCommand(const CliOptions& options) {
     gen.prompt_tokens = std::move(*ids);
     gen.max_completion_tokens = options.max_completion_tokens;
     gen.kv_type = options.kv_type;
+    gen.kv_offload = options.kv_offload;
     return StreamLayout(
         gen,
         [&](GenerateOptions& request,
@@ -363,6 +370,7 @@ int RunRunCommand(const CliOptions& options) {
         options.cp_mode ? HybridMpKind::Context : HybridMpKind::Tensor;
     hybrid_options.context = options.context;
     hybrid_options.kv_type = options.kv_type;
+    hybrid_options.kv_offload = options.kv_offload;
     auto hybrid = Hybrid::Create(hybrid_options);
     if (!hybrid) {
       std::fprintf(stderr, "cli: hybrid create failed (%s)\n",
