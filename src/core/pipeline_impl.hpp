@@ -144,6 +144,11 @@ struct Pipeline::Impl {
   // One sequence per concurrent turn; [0] is the single-turn default the
   // CLI run and calibrate paths use. The rest are the serve pool.
   std::vector<std::unique_ptr<SequenceState>> sequences;
+  // The attached draft strategy factory and its options. AttachSpeculative
+  // builds one strategy per sequence from them; a sequence built later (a new
+  // pool entry) gets its own too.
+  std::function<std::unique_ptr<SpeculativeStrategy>()> strategy_factory;
+  StrategyOptions strategy_options;
   // Serializes all pipeline device work. A turn holds it for its whole
   // generation and releases it between tokens (see GenerateStreamingOn), so
   // concurrent turns interleave instead of running one to completion.
@@ -155,10 +160,9 @@ struct Pipeline::Impl {
   // pipeline_spec.cpp). Nested so it can reach the stage list.
   struct Target;
 
-  // True when a speculative strategy is attached to the single-turn
-  // default sequence.
+  // True when a speculative strategy factory is attached.
   [[nodiscard]] bool HasStrategy() const {
-    return !sequences.empty() && sequences.front()->strategy != nullptr;
+    return strategy_factory != nullptr;
   }
 
   // Point every stage at `sequence`'s cache and boundary buffers. Call while
@@ -241,10 +245,29 @@ struct Pipeline::Impl {
     }
   }
 
+  // Drain every stage's device work. The stages share per-model state across
+  // turns: the MoE expert staging views and their cache live on the Model, not
+  // on a turn's cache. A turn may hand the device lock to another turn only
+  // after its own device work completes, or the next turn overwrites the
+  // shared staging while the previous turn's kernels still read it. The same
+  // drain is required before freeing a turn's caches, whose buffers in-flight
+  // kernels still reference.
+  void SynchronizeStages() {
+    for (Stage& stage : stages) {
+      if (stage.engine != nullptr) {
+        stage.engine->Owner().Synchronize();
+      }
+    }
+  }
+
   // Free `sequence`'s per-turn caches so an idle sequence holds no KV or
   // draft state. The next turn on it rebuilds them in ResetSequence. The
   // boundary buffers stay (small, and reused every turn).
   void ReleaseSequenceCaches(SequenceState& sequence) {
+    // Drain before freeing: the last step's kernels and copies are
+    // asynchronous and still reference these buffers, and the next turn's
+    // allocations reuse the freed addresses.
+    SynchronizeStages();
     for (std::unique_ptr<core::DecodeCache>& cache : sequence.caches) {
       cache.reset();
     }

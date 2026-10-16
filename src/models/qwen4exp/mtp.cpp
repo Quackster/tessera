@@ -9,6 +9,7 @@
 
 #include "core/decode_internal.hpp"
 #include "core/profile.hpp"
+#include "models/qwen4exp/architecture.hpp"
 #include "models/qwen4exp/mtp_weights.hpp"
 #include "models/qwen4exp/state.hpp"
 #include "tessera/log.hpp"
@@ -91,16 +92,16 @@ std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
   if (model.MtpPath().empty()) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  if (const auto* log = backend.Diagnostics()) {
-    log->Info("mtp", "loading MTP head from '" + model.MtpPath() +
-                         "' on device " +
-                         std::to_string(backend.DeviceIndex()));
+  const auto* module =
+      static_cast<const Qwen4ExpArchitecture*>(model.Arch());
+  if (module == nullptr) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  auto weights = LoadMtpWeights(backend, model.MtpPath());
-  if (!weights) {
-    return std::unexpected(weights.error());
+  auto shared = module->SharedMtpWeights(backend, model);
+  if (!shared) {
+    return std::unexpected(shared.error());
   }
-  h.mtp_weights = std::make_unique<MtpWeights>(std::move(*weights));
+  h.mtp_weights = *shared;
   const std::size_t pool_bytes =
       kMtpPages * g.kv_heads * kMtpPageSize * g.head_dim * 2;
   const std::size_t attend_bytes =
@@ -520,6 +521,28 @@ std::size_t MtpDraftRows(const Qwen4ExpState& h) {
 
 void MtpDraftTruncate(Qwen4ExpState& h, std::size_t rows) {
   h.mtp_rows = rows;
+}
+
+std::expected<const MtpWeights*, StatusCode>
+Qwen4ExpArchitecture::SharedMtpWeights(Backend& backend,
+                                       const Model& model) const {
+  std::lock_guard<std::mutex> lock(mtp_mutex_);
+  if (shared_mtp_weights_ == nullptr) {
+    if (model.MtpPath().empty()) {
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
+    if (const auto* log = backend.Diagnostics()) {
+      log->Info("mtp", "loading shared MTP head from '" + model.MtpPath() +
+                           "' on device " +
+                           std::to_string(backend.DeviceIndex()));
+    }
+    auto weights = LoadMtpWeights(backend, model.MtpPath());
+    if (!weights) {
+      return std::unexpected(weights.error());
+    }
+    shared_mtp_weights_ = std::make_unique<MtpWeights>(std::move(*weights));
+  }
+  return shared_mtp_weights_.get();
 }
 
 }  // namespace tessera::models::qwen4exp

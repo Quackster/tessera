@@ -459,23 +459,29 @@ int main(int argc, char** argv) {
       if (pipeline_mode) {
         report("loading the layer split across the gpus");
         tessera::PipelineOptions pipeline_options = make_pipeline_options();
-        // A served layer split runs several turns at once, and concurrent
-        // turns decode without the draft (the single-device Scheduler drops
-        // it for shared turns too, because interleaving draft state corrupts
-        // it). Do not attach the drafter or load its head: the head loads
-        // per decode cache, so a second turn would not fit the device.
-        if (speculate || !draft_path.empty()) {
-          std::fprintf(stderr,
-                       "cli: serve --pipeline serves plain turns; the draft "
-                       "is not used across concurrent turns\n");
-        }
-        pipeline_options.mtp_path.clear();
-        pipeline_options.last_stage_embedding = false;
+        // Attach the drafter to every sequence: a split serve runs several
+        // turns at once, each with its own draft state, over one shared
+        // read-only MTP head.
         auto pipeline = tessera::Pipeline::Create(pipeline_options);
         if (!pipeline) {
           std::fprintf(stderr, "cli: pipeline create failed (%s)\n",
                        tessera::ToString(pipeline.error()).data());
           return std::unexpected(pipeline.error());
+        }
+        if (speculate || !draft_path.empty()) {
+          const bool dflash2 = !draft_path.empty();
+          const auto factory =
+              [dflash2]() -> std::unique_ptr<tessera::SpeculativeStrategy> {
+            return dflash2 ? tessera::CreateDFlash2Strategy()
+                           : tessera::CreateMtpStrategy();
+          };
+          auto attached = (*pipeline)->AttachSpeculative(
+              factory, tessera::StrategyOptions{draft_path, draft_block});
+          if (!attached) {
+            std::fprintf(stderr, "cli: pipeline strategy attach failed (%s)\n",
+                         tessera::ToString(attached.error()).data());
+            return std::unexpected(attached.error());
+          }
         }
         report("warming up kernels");
         tessera::GenerateOptions warm;

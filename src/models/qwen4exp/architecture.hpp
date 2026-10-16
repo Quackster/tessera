@@ -4,11 +4,13 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
 
+#include "models/qwen4exp/mtp_weights.hpp"
 #include "tessera/architecture.hpp"
 
 namespace tessera {
@@ -83,6 +85,17 @@ class Qwen4ExpArchitecture final : public Architecture {
 
   [[nodiscard]] ParallelKind TensorParallelKind(
       std::string_view internal_name) const override;
+
+  // The MTP head weights, loaded once and cached on this model's module.
+  // Every decode cache of the model reads the same read-only copy, so a
+  // second concurrent turn does not load a second ~1.6 GiB head. The mutex
+  // guards the first load.
+  [[nodiscard]] std::expected<const MtpWeights*, StatusCode> SharedMtpWeights(
+      Backend& backend, const Model& model) const;
+
+ private:
+  mutable std::mutex mtp_mutex_;
+  mutable std::unique_ptr<MtpWeights> shared_mtp_weights_;
 };
 
 // Build the module (registered for general.architecture "qwen4exp").

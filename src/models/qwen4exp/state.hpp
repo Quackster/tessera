@@ -115,9 +115,10 @@ struct Qwen4ExpState final : core::ArchState {
   // position to its slot.
   std::uint64_t batch_snapshot_start = 0;
 
-  // MTP draft head: the fetched weights (loaded lazily on first draft), its
-  // own paged FP16 QSA cache, dense-attention scratch and expert scratch.
-  std::unique_ptr<MtpWeights> mtp_weights;
+  // MTP draft head: the shared read-only weights (owned by the model's
+  // module, loaded once), this turn's paged FP16 QSA cache, dense-attention
+  // scratch and expert scratch.
+  const MtpWeights* mtp_weights = nullptr;
   std::unique_ptr<Buffer> mtp_k_pool, mtp_v_pool, mtp_page_table, mtp_ids,
       mtp_k_scratch, mtp_v_scratch, mtp_expert_scratch, mtp_hidden_branch,
       mtp_streams;
