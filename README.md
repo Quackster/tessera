@@ -329,6 +329,86 @@ curl http://127.0.0.1:8080/health
 
 With `--api-key` set, requests need `Authorization: Bearer <key>`. `GET /health` and `GET /metrics` stay public.
 
+## Docker
+
+The repository ships a `Dockerfile` and `docker/entrypoint.sh`. One image uses one backend. The entrypoint runs `serve` and reads every flag from the environment, so a container needs no command line. Model weights stay outside the image and are mounted read only.
+
+Build the ROCm image:
+
+```sh
+docker build -t tessera:rocm .
+```
+
+Build the Vulkan image:
+
+```sh
+docker build -t tessera:vulkan --build-arg TESSERA_BACKEND=vulkan .
+```
+
+The ROCm image uses `rocm/dev-ubuntu-24.04:7.2`. Keep it at the host driver version. Change it with `--build-arg ROCM_IMAGE=...`. A card other than the R9700 needs its own ISA: `--build-arg GPU_ARCH=gfx1100`.
+
+The build uses gcc-15, from the Ubuntu toolchain test PPA. gcc-13 and gcc-14 internal-compiler-error on this code. CMake disables C++ module scanning, because the code uses no modules. The build runs two compile jobs, because the project documents compiler crashes under heavy parallel load. Raise the jobs on a large machine with `--build-arg BUILD_JOBS=8`.
+
+Run the server. Mount the models directory and pass the GPUs through.
+
+```sh
+docker run --rm -it \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add render \
+  --ipc=host --security-opt seccomp=unconfined \
+  -v ~/models:/models:ro -p 8080:8080 \
+  -e TESSERA_MODEL=/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  -e TESSERA_GPUS=0 \
+  -e TESSERA_SPECULATE=1 -e TESSERA_DRAFT_BLOCK=2 \
+  -e TESSERA_CONTEXT=262144 -e TESSERA_KV=q8 \
+  tessera:rocm
+```
+
+A Vulkan container needs only `--device=/dev/dri`. It does not need `/dev/kfd`.
+
+Each `TESSERA_*` variable becomes one `serve` flag. An unset variable keeps the CLI default. The container binds `0.0.0.0` and port 8080 by default.
+
+| Variable | Flag | Default |
+| --- | --- | --- |
+| `TESSERA_MODEL` | `--model` | required |
+| `TESSERA_DRAFT` | `--draft` | none |
+| `TESSERA_MTP` | `--mtp` | none |
+| `TESSERA_GPUS` | `--gpus` | 0 |
+| `TESSERA_CONTEXT` | `--context` | 32768 |
+| `TESSERA_KV` | `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8` | fp32 |
+| `TESSERA_KV_OFFLOAD` | `--kv-offload` | off |
+| `TESSERA_GPU_LAYERS` | `--gpu-layers` | 0 |
+| `TESSERA_SPECULATE` | `--speculate` | off |
+| `TESSERA_DRAFT_BLOCK` | `--draft-block` | 0 |
+| `TESSERA_PIPELINE` | `--pipeline` | off |
+| `TESSERA_PIPELINE_SPLIT` | `--pipeline-split` | none |
+| `TESSERA_TP` | `--tp` | off |
+| `TESSERA_CP` | `--cp` | off |
+| `TESSERA_SPEC_SPLIT` | `--spec-split` | off |
+| `TESSERA_HYBRID` | `--hybrid` | off |
+| `TESSERA_HOST` | `--host` | 0.0.0.0 |
+| `TESSERA_PORT` | `--port` | 8080 |
+| `TESSERA_API_KEY` | `--api-key` | none |
+| `TESSERA_CALIBRATION` | `--calibration` | none |
+| `TESSERA_ARGS` | raw extra flags | none |
+
+Set a boolean variable to `1`, `true`, `yes`, or `on` to add its flag. `TESSERA_ARGS` holds raw flags for a setting with no variable. `TESSERA_COMMAND` selects the subcommand and defaults to `serve`.
+
+The launch examples above map to the environment as follows.
+
+```sh
+# Flash-Next, MTP, two GPU pipeline.
+-e TESSERA_MODEL=/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
+-e TESSERA_MTP=/models/Qwen3.8-Flash-Next-MTP -e TESSERA_GPUS=0,1 \
+-e TESSERA_SPECULATE=1 -e TESSERA_PIPELINE=1 -e TESSERA_PIPELINE_SPLIT=24,24 \
+-e TESSERA_CONTEXT=262144 -e TESSERA_KV=q8 -e TESSERA_GPU_LAYERS=24
+
+# MXFP4 target with the DFlash2 draft.
+-e TESSERA_MODEL=/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+-e TESSERA_DRAFT=/models/Qwen3.8-27B-DFlash2-FP8 \
+-e TESSERA_GPUS=0 -e TESSERA_DRAFT_BLOCK=2 -e TESSERA_CONTEXT=262144 -e TESSERA_KV=q8
+```
+
 ## Command-line arguments
 
 The first argument selects the mode: `run` decodes a prompt, `serve` starts the HTTP server, `calibrate` sweeps the machine, `fetch-mtp` fetches an MTP head, and `--list-gpus` lists the devices and exits. Every mode accepts the same flag set, so one parser covers every command. A flag a command cannot honor is reported as ignored and the run continues; a conflicting combination of layout flags is an error. The table gives every flag, the modes that honor it, and its default.

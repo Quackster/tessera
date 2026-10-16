@@ -1,0 +1,8 @@
+.git
+.gitignore
+.gitattributes
+.rocprofv3
+cmake-build-*
+docs
+tools/harness
+*.md
