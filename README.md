@@ -144,8 +144,8 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | Format | State | Detail |
 | --- | --- | --- |
 | GGUF | Done | Parses v2 and v3, single files and `-00001-of-00005` splits. Supports Q4_K, Q3_K, Q5_K, Q6_K, Q8_0, Q2_0, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS and IQ2_S. Checks bounds. |
-| Qwen4-Exp split GGUF | Partial | Qwen3.8-Flash-Next GSQ-RCO loads and decodes: split shards merge, config parses, and the 51B n-gram table streams rows from SSD. The QSA indexer, hyper-connection mixer, PLE gather and GDN output-norm kernels run on both backends. Paged weights are held in system RAM. The expert cache is sized to the free device memory. On one R9700 at a 4K context, fp32 KV, `--gpu-layers 8`, the layer-major batched prefill lifts prefill from about 18 to about 33 tok/s on a 515-token prompt, and MTP speculative decode runs about 19 tok/s. The 48 tok/s target is not reached. `--pipeline --gpus 0,1` splits the 48 trunk blocks 24/24 across two R9700s (the hc-stream residual crosses the stage boundary) and reproduces the single-device greedy token ids. The engine stops on non-finite logits instead of looping on `!`; that intermittent fault is still open. |
-| Flash-Next MTP head | Done | The GSQ-RCO GGUF ships no MTP head. `tessera-cli fetch-mtp` reads the BF16 checkpoint's safetensors headers over HTTP and downloads only the 31 `mtp.*` tensors, resumable and checked against the pinned SHA256. The qwen4exp module loads them and runs the draft block (`--mtp DIR --speculate`). Verified on one R9700: greedy output equals greedy without speculation (40 of 46 drafts accepted, about 15 tok/s), and `--spec-split` runs the head on the second GPU with the same output. A sampled request keeps the drafter and uses rejection sampling, so the output stays lossless for the target distribution. |
+| GSQ-RCO | Partial | Qwen3.8-Flash-Next GSQ-RCO loads and decodes: split shards merge, config parses, and the 51B n-gram table streams rows from SSD. The QSA indexer, hyper-connection mixer, PLE gather and GDN output-norm kernels run on both backends. Paged weights are held in system RAM. |
+| Flash-Next MTP head | Done | The GSQ-RCO GGUF ships no MTP head. `tessera-cli fetch-mtp` reads the BF16 checkpoint's safetensors headers over HTTP and downloads only the 31 `mtp.*` tensors, resumable and checked against the pinned SHA256. |
 | MXFP4 safetensors | Done | Parses the map and packs the weights. config.json drives the decode config. |
 | NVFP4 MoE | Done | GGUF mixture-of-experts (Ornith-1.5) loads and decodes on Vulkan and ROCm. |
 | DFlash2 FP8 draft | Done | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. |
@@ -372,7 +372,40 @@ docker run --rm -it \
 
 A Vulkan container needs only `--device=/dev/dri`. It does not need `/dev/kfd`.
 
-Each `TESSERA_*` variable becomes one `serve` flag. An unset variable keeps the CLI default. The container binds `0.0.0.0` and port 8080 by default.
+</details>
+
+<details>
+<summary>Pull a prebuilt image</summary>
+
+Prebuilt images are published to the GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/quackster/tessera:rocm    # AMD ROCm, also tagged latest
+docker pull ghcr.io/quackster/tessera:vulkan  # Vulkan
+```
+
+Run a pulled image with your own settings. The pulled image name replaces `tessera:rocm` in the run command above. Pass the `-e` flags for the settings you want. The entrypoint reads the environment on every start, so new `-e` values change the settings for that run and need no rebuild.
+
+```sh
+docker run --rm -it \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add render \
+  --ipc=host --security-opt seccomp=unconfined \
+  -v ~/models:/models:ro -p 8080:8080 \
+  -e TESSERA_MODEL=/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  -e TESSERA_DRAFT=/models/Qwen3.8-27B-DFlash2-FP8 \
+  -e TESSERA_GPUS=0 -e TESSERA_DRAFT_BLOCK=2 \
+  -e TESSERA_CONTEXT=262144 -e TESSERA_KV=q8 \
+  ghcr.io/quackster/tessera:rocm
+```
+
+An image whose environment is already baked in is edited by overriding the same variables at run time, or by rebuilding with new defaults. The environment section below lists every variable.
+
+</details>
+
+### Docker environment
+
+Each `TESSERA_*` variable becomes one `serve` flag. An unset variable keeps the CLI default. The container binds `0.0.0.0` and port 8080 by default. The list below applies to both the built and the pulled image.
 
 | Variable | Flag | Default |
 | --- | --- | --- |
@@ -414,22 +447,6 @@ The launch examples above map to the environment as follows.
 -e TESSERA_DRAFT=/models/Qwen3.8-27B-DFlash2-FP8 \
 -e TESSERA_GPUS=0 -e TESSERA_DRAFT_BLOCK=2 -e TESSERA_CONTEXT=262144 -e TESSERA_KV=q8
 ```
-
-</details>
-
-<details>
-<summary>Pull a prebuilt image</summary>
-
-Prebuilt images are published to the GitHub Container Registry:
-
-```sh
-docker pull ghcr.io/quackster/tessera:rocm    # AMD ROCm, also tagged latest
-docker pull ghcr.io/quackster/tessera:vulkan  # Vulkan
-```
-
-Use the pulled name in place of `tessera:rocm` in the run command above.
-
-</details>
 
 ## Command-line arguments
 
