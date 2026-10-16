@@ -65,7 +65,7 @@ Here's an example of an SVG generation:
 
 Two AMD Radeon AI PRO R9700 cards and 64 GB of DDR4 system RAM run the Qwen3.8-Flash-Next IQ3_S target with MTP speculation on a layer split. This configuration works without Resizable BAR. Expect about 13 tokens per second.
 
-Without Resizable BAR the BAR window is small. Tessera keeps part of each stage in system RAM and pages the rest on demand. `--gpu-layers 18` sizes the resident part so the last stage also fits the output head, the token embedding, and the MTP head. `--pipeline-split 24,24` puts 24 trunk blocks on each card.
+Without Resizable BAR the BAR window is small. Tessera keeps part of each stage in system RAM and pages the rest on demand. `--gpu-layers 24` sizes the resident part so the last stage also fits the output head, the token embedding, and the MTP head. `--pipeline-split 24,24` puts 24 trunk blocks on each card.
 
 Example launch command:
 
@@ -74,7 +74,7 @@ Example launch command:
   --model ~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
   --mtp ~/models/Qwen3.8-Flash-Next-MTP \
   --speculate --pipeline --pipeline-split 24,24 --gpus 0,1 \
-  --context 262144 --kv-q8 --gpu-layers 18 --host 0.0.0.0
+  --context 262144 --kv-q8 --gpu-layers 24
 ```
 
 The serve command starts the HTTP server, and every served turn uses MTP speculation. On this machine decode runs about 13 tokens per second. The MTP head needs no draft checkpoint. `--speculate` drafts from the head in `--mtp`.
