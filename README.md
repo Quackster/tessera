@@ -88,6 +88,7 @@ Example launch command with MTP speculation on the GGUF target:
 ```sh
 ./cmake-build-rocm/tessera-cli serve \
   --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --gpus 0 \
   --draft-block 2 \
   --speculate --context 262144 --kv-q8 \
   --host 0.0.0.0 --port 8080
@@ -98,6 +99,7 @@ Example launch command with the DFlash2 draft on the MXFP4 target:
 ```sh
 ./cmake-build-rocm/tessera-cli serve \
   --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --gpus 0 \
   --draft ~/models/Qwen3.8-27B-DFlash2-FP8 \
   --draft-block 2 \
   --context 262144 --kv-q8 --host 0.0.0.0 --port 8080
