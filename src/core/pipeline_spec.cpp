@@ -481,6 +481,10 @@ namespace {
 // Tokens between device yields: small enough that concurrent turns stream
 // together, large enough to keep the per-yield bookkeeping off the hot path.
 constexpr int kYieldTokens = 4;
+// Pause after releasing the device so a waiting turn actually acquires it.
+// A bare yield() does not: the releasing thread can reacquire before the
+// woken waiter runs.
+constexpr int kYieldQuantumMs = 1;
 // Poll cadence while a turn waits for a free sequence slot.
 constexpr int kSlotPollMs = 10;
 
@@ -504,6 +508,7 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::RunSpeculative(
         produced->push_back(token);
         return true;
       });
+  ReleaseSequenceCaches(sequence);
   if (!outcome) {
     return std::unexpected(outcome.error());
   }
@@ -536,17 +541,6 @@ std::unique_ptr<Pipeline::Impl::SequenceState> Pipeline::Impl::NewSequence() {
       }
       sequence->outgoing[i] = std::move(*buffer);
     }
-  }
-  if (strategy_factory) {
-    auto strategy = strategy_factory();
-    if (strategy == nullptr) {
-      return nullptr;
-    }
-    auto attached = strategy->Attach(strategy_options);
-    if (!attached) {
-      return nullptr;
-    }
-    sequence->strategy = std::move(strategy);
   }
   return sequence;
 }
@@ -584,7 +578,10 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::GenerateStreaming(
   Impl::SequenceState& sequence = impl_->DefaultSequence();
   impl_->Activate(sequence);
   Impl::Target target(*impl_, sequence);
-  return core::RunDecode(target, sequence.strategy.get(), options, on_token);
+  auto outcome =
+      core::RunDecode(target, sequence.strategy.get(), options, on_token);
+  impl_->ReleaseSequenceCaches(sequence);
+  return outcome;
 }
 
 std::expected<GenerateOutcome, StatusCode>
@@ -608,15 +605,19 @@ Pipeline::GenerateStreamingConcurrent(
     if (++since_yield >= kYieldTokens) {
       since_yield = 0;
       lock.unlock();
-      std::this_thread::yield();
+      std::this_thread::sleep_for(std::chrono::milliseconds(kYieldQuantumMs));
       lock.lock();
       impl_->Activate(*sequence);
     }
     return cont;
   };
   Impl::Target target(*impl_, *sequence);
-  auto outcome =
-      core::RunDecode(target, sequence->strategy.get(), options, gated);
+  // Concurrent turns decode plainly: interleaving two draft strategies
+  // corrupts the draft and verify state, and the single-device Scheduler
+  // drops the strategy for shared turns for the same reason. The plain
+  // output equals the speculative greedy output, only slower per turn.
+  auto outcome = core::RunDecode(target, nullptr, options, gated);
+  impl_->ReleaseSequenceCaches(*sequence);
   impl_->ReleaseSequence(*sequence);
   return outcome;
 }
@@ -627,29 +628,17 @@ std::expected<void, StatusCode> Pipeline::AttachSpeculative(
   if (!factory) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
-  // One strategy per sequence: a strategy owns draft state, so concurrent
-  // turns must not share one. The first build validates the checkpoint.
-  std::vector<std::unique_ptr<SpeculativeStrategy>> built;
-  built.reserve(impl_->sequences.size());
-  for (std::size_t i = 0; i < impl_->sequences.size(); ++i) {
-    auto strategy = factory();
-    if (strategy == nullptr) {
-      return std::unexpected(StatusCode::InvalidArgument);
-    }
-    auto attached = strategy->Attach(options);
-    if (!attached) {
-      return std::unexpected(attached.error());
-    }
-    built.push_back(std::move(strategy));
+  auto strategy = factory();
+  if (strategy == nullptr) {
+    return std::unexpected(StatusCode::InvalidArgument);
   }
-  // Keep the factory for a sequence created later; store the built
-  // strategies now. HasStrategy() reports the factory, so the single-turn
-  // path picks the speculative drive as soon as this returns.
-  impl_->strategy_factory = factory;
-  impl_->strategy_options = options;
-  for (std::size_t i = 0; i < impl_->sequences.size(); ++i) {
-    impl_->sequences[i]->strategy = std::move(built[i]);
+  auto attached = strategy->Attach(options);
+  if (!attached) {
+    return std::unexpected(attached.error());
   }
+  // Only the single-turn default sequence carries a strategy; the concurrent
+  // pool decodes plainly (see GenerateStreamingConcurrent), so it needs none.
+  impl_->DefaultSequence().strategy = std::move(strategy);
   return {};
 }
 

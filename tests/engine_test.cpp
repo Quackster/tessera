@@ -2297,6 +2297,13 @@ TEST(EngineTest, ShardedPipelineServesTwoTurnsAtOnceWhenProvided) {
   options.kv_type = tessera::KvCacheType::Q8;
   auto pipe = tessera::Pipeline::Create(options);
   ASSERT_TRUE(pipe.has_value()) << tessera::ToString(pipe.error());
+  // A draft strategy attached to the pipeline is dropped for concurrent
+  // turns (interleaving draft state corrupts it), so the two concurrent
+  // turns still equal the single-device greedy baseline.
+  auto attached = (*pipe)->AttachSpeculative(
+      [] { return std::make_unique<NonProposingStrategy>(); },
+      tessera::StrategyOptions{});
+  ASSERT_TRUE(attached.has_value()) << tessera::ToString(attached.error());
   auto run = [&](std::vector<std::uint32_t>* produced,
                  tessera::StatusCode* status) {
     tessera::GenerateOptions gen;

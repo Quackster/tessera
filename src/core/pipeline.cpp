@@ -101,6 +101,7 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::Run(
   outcome.reason = aborted  ? FinishReason::Aborted
                    : stopped ? FinishReason::Stop
                              : FinishReason::Length;
+  ReleaseSequenceCaches(DefaultSequence());
   return outcome;
 }
 

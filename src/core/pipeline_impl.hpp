@@ -144,11 +144,6 @@ struct Pipeline::Impl {
   // One sequence per concurrent turn; [0] is the single-turn default the
   // CLI run and calibrate paths use. The rest are the serve pool.
   std::vector<std::unique_ptr<SequenceState>> sequences;
-  // Creates a fresh draft strategy per sequence when a speculative strategy
-  // is attached (null when none). The drafter runs on the last stage, which
-  // owns the MTP head.
-  std::function<std::unique_ptr<SpeculativeStrategy>()> strategy_factory;
-  StrategyOptions strategy_options;
   // Serializes all pipeline device work. A turn holds it for its whole
   // generation and releases it between tokens (see GenerateStreamingOn), so
   // concurrent turns interleave instead of running one to completion.
@@ -160,9 +155,10 @@ struct Pipeline::Impl {
   // pipeline_spec.cpp). Nested so it can reach the stage list.
   struct Target;
 
-  // True when a speculative strategy factory is attached.
+  // True when a speculative strategy is attached to the single-turn
+  // default sequence.
   [[nodiscard]] bool HasStrategy() const {
-    return strategy_factory != nullptr;
+    return !sequences.empty() && sequences.front()->strategy != nullptr;
   }
 
   // Point every stage at `sequence`'s cache and boundary buffers. Call while
@@ -243,6 +239,17 @@ struct Pipeline::Impl {
       cache->tuning.mxfp4_split_cap = options.mxfp4_split_cap;
       cache->tuning.attention_split = options.attention_split;
     }
+  }
+
+  // Free `sequence`'s per-turn caches so an idle sequence holds no KV or
+  // draft state. The next turn on it rebuilds them in ResetSequence. The
+  // boundary buffers stay (small, and reused every turn).
+  void ReleaseSequenceCaches(SequenceState& sequence) {
+    for (std::unique_ptr<core::DecodeCache>& cache : sequence.caches) {
+      cache.reset();
+    }
+    // Point the stages at null so a stale pointer never outlives the cache.
+    Activate(sequence);
   }
 
   // Greedy generation with `options` tuning, filling `produced`; the outcome
