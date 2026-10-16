@@ -345,21 +345,42 @@ std::expected<void, StatusCode> Pipeline::Impl::ForwardRows(
   const bool sample = sampled != nullptr && sampled->sampling != nullptr &&
                       sampled->rng != nullptr;
   if (sample) {
-    // Draw the target's token at each scored row and accept the matching
-    // prefix; the emitted prefix equals plain sampling for the same seed.
+    // Score each row against the target. A draft distribution selects
+    // rejection sampling; otherwise the target's drawn token is matched.
+    const bool rejection =
+        sampled->draft_probs != nullptr && sampled->draft_vocab == vocab &&
+        sampled->draft_probs->size() >= draft.size() * vocab;
+    const auto row_logits = [&](std::size_t i) -> std::span<const float> {
+      if (lead == 1) {
+        return logits_row(i);
+      }
+      return i == 0 ? prefix_logits : logits_row(i - 1);
+    };
+    const auto bonus_logits = [&]() -> std::span<const float> {
+      return lead == 1 ? logits_row(draft.size())
+                       : logits_row(draft.size() - 1);
+    };
     core::SampledMatch match;
-    if (lead == 1) {
-      match = core::AcceptSampledPrefix(
-          draft, *sampled->sampling, sampled->history, *sampled->rng,
-          [&](std::size_t i) { return logits_row(i); },
-          [&] { return logits_row(draft.size()); });
+    if (rejection) {
+      const std::vector<double>& q = *sampled->draft_probs;
+      match = core::AcceptRejectionPrefix(
+          draft, sampled->history, *sampled->rng,
+          [&](std::size_t i, std::span<const std::uint32_t> hist) {
+            return core::BuildDenseDistribution(row_logits(i),
+                                                *sampled->sampling, hist);
+          },
+          [&](std::size_t i) {
+            return std::span<const double>(q.data() + i * vocab, vocab);
+          },
+          [&](std::span<const std::uint32_t> hist) {
+            return core::BuildDenseDistribution(bonus_logits(),
+                                                *sampled->sampling, hist);
+          });
     } else {
       match = core::AcceptSampledPrefix(
           draft, *sampled->sampling, sampled->history, *sampled->rng,
-          [&](std::size_t i) {
-            return i == 0 ? prefix_logits : logits_row(i - 1);
-          },
-          [&] { return logits_row(draft.size() - 1); });
+          [&](std::size_t i) { return row_logits(i); },
+          [&] { return bonus_logits(); });
     }
     accepted = match.accepted;
     result.accepted = accepted;

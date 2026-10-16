@@ -122,9 +122,23 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
   const auto pick = [&](std::span<const float> logits) {
     return PickToken(logits, options.sample, options.sampling, history, rng);
   };
+  // The sampled draft's distribution, filled by Draft and read by the
+  // verifier for rejection sampling. Empty for a greedy draft.
+  DraftDistribution draft_dist;
+  // Sampling state for a sampled draft; null when the request is greedy.
+  const auto draft_sampling = [&]() {
+    DraftSampling sampling;
+    if (strategy != nullptr && options.sample) {
+      sampling.sampling = &options.sampling;
+      sampling.rng = &rng;
+      sampling.history = history;
+    }
+    return sampling;
+  };
   // Verify one draft. A sampled request passes the sampling state so the
   // target draws its token per row and matches it; the emitted prefix then
-  // equals plain sampling for the same seed.
+  // equals plain sampling for the same seed. With a draft distribution the
+  // verifier uses rejection sampling instead.
   const auto verify_draft = [&](std::span<const std::uint32_t> proposal,
                                 std::span<const float> prefix_logits,
                                 std::optional<std::uint32_t> anchor,
@@ -134,6 +148,10 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
       sampled.sampling = &options.sampling;
       sampled.rng = &rng;
       sampled.history = history;
+      if (draft_dist.rows > 0 && draft_dist.vocab > 0) {
+        sampled.draft_probs = &draft_dist.probs;
+        sampled.draft_vocab = draft_dist.vocab;
+      }
     }
     const SampledVerify* sampled_ptr =
         sampled.sampling != nullptr ? &sampled : nullptr;
@@ -255,8 +273,12 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
     // is read once per step. The drafter context already excludes this anchor:
     // OnAnchor runs after the verify and appends the anchor it produced.
     if (strategy != nullptr && block > 0 && strategy->FoldsAnchor()) {
+      draft_dist = DraftDistribution{};
+      DraftSampling ds = draft_sampling();
       auto count = strategy->Draft(target.backend(), model, target.cache(), {},
-                                   next, drafts);
+                                   next, drafts,
+                                   ds.sampling != nullptr ? &ds : nullptr,
+                                   &draft_dist);
       if (!count) {
         return std::unexpected(count.error());
       }
@@ -354,8 +376,12 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
       if (!anchored) {
         return std::unexpected(anchored.error());
       }
+      draft_dist = DraftDistribution{};
+      DraftSampling ds = draft_sampling();
       auto count = strategy->Draft(target.backend(), model, target.cache(),
-                                   *logits, next, drafts);
+                                   *logits, next, drafts,
+                                   ds.sampling != nullptr ? &ds : nullptr,
+                                   &draft_dist);
       if (!count) {
         return std::unexpected(count.error());
       }

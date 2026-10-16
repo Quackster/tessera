@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/types.hpp"
 
@@ -138,11 +139,16 @@ class SpeculativeStrategy {
 
   // Propose up to `drafts.size()` tokens after `anchor`, given the target's
   // current logits. Returns the number of drafts written (0 = no proposal,
-  // the loop falls back to the target's own token).
+  // the loop falls back to the target's own token). When `sampling` is
+  // non-null the drafter draws each proposal from its own distribution and
+  // fills `distribution` (rows x vocab); the verifier then uses rejection
+  // sampling. When null the proposals are greedy and `distribution` is
+  // left empty.
   virtual std::expected<std::size_t, StatusCode> Draft(
       Backend& backend, Model& target, core::DecodeCache& cache,
       std::span<const float> current_logits, std::uint32_t anchor,
-      std::span<std::uint32_t> drafts) = 0;
+      std::span<std::uint32_t> drafts, const DraftSampling* sampling = nullptr,
+      DraftDistribution* distribution = nullptr) = 0;
 
   // The verifier accepted the first `accepted` drafts. The capture buffers
   // hold the accepted positions' residual hidden (`accepted` rows each);

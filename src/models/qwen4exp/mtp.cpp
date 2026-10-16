@@ -375,7 +375,8 @@ std::expected<void, StatusCode> RunMtpMoe(Backend& backend,
 std::expected<std::uint32_t, StatusCode> RunMtpDraft(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::span<const float> hidden,
-    std::uint32_t token, std::uint64_t pos, std::vector<float>* mtp_hidden_out) {
+    std::uint32_t token, std::uint64_t pos, std::vector<float>* mtp_hidden_out,
+    std::vector<float>* logits_out) {
   if (auto ready = EnsureMtpReady(backend, model, cfg, g, h); !ready) {
     return std::unexpected(ready.error());
   }
@@ -512,6 +513,9 @@ std::expected<std::uint32_t, StatusCode> RunMtpDraft(
     if ((*logits)[i] > (*logits)[best]) {
       best = i;
     }
+  }
+  if (logits_out != nullptr) {
+    *logits_out = std::move(*logits);
   }
   h.mtp_rows = pos + 1;
   return best;

@@ -304,19 +304,39 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   } else {
     result.logits.assign(prefix_logits.begin(), prefix_logits.end());
   }
+  const bool rejection =
+      sample && sampled->draft_probs != nullptr &&
+      sampled->draft_vocab == result.logits.size() &&
+      sampled->draft_probs->size() >= draft.size() * sampled->draft_vocab;
   bool all = true;
-  for (const std::uint32_t token : draft) {
-    const std::uint32_t y =
-        sample ? SampleToken(result.logits, *sampled->sampling, hist,
-                             *sampled->rng)
-               : detail::ArgMax(result.logits);
-    if (y != token) {
-      result.next_token = y;
-      all = false;
-      break;
+  for (std::size_t i = 0; i < draft.size(); ++i) {
+    const std::uint32_t token = draft[i];
+    if (rejection) {
+      const std::vector<double> target =
+          BuildDenseDistribution(result.logits, *sampled->sampling, hist);
+      const std::span<const double> q(
+          sampled->draft_probs->data() + i * sampled->draft_vocab,
+          sampled->draft_vocab);
+      const RejectionResult step =
+          RejectionStep(target, q, token, *sampled->rng);
+      if (!step.accepted) {
+        result.next_token = step.token;
+        all = false;
+        break;
+      }
+    } else {
+      const std::uint32_t y =
+          sample ? SampleToken(result.logits, *sampled->sampling, hist,
+                               *sampled->rng)
+                 : detail::ArgMax(result.logits);
+      if (y != token) {
+        result.next_token = y;
+        all = false;
+        break;
+      }
     }
     ++result.accepted;
-    hist.push_back(y);
+    hist.push_back(token);
     auto logits = DecodeLogits(backend, model, cache, token, hidden_out);
     if (!logits) {
       return std::unexpected(logits.error());
@@ -325,9 +345,13 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   }
   if (all) {
     result.next_token =
-        sample ? SampleToken(result.logits, *sampled->sampling, hist,
-                             *sampled->rng)
-               : detail::ArgMax(result.logits);
+        rejection ? SampleFromDense(BuildDenseDistribution(result.logits,
+                                                           *sampled->sampling,
+                                                           hist),
+                                    *sampled->rng)
+        : sample  ? SampleToken(result.logits, *sampled->sampling, hist,
+                                *sampled->rng)
+                  : detail::ArgMax(result.logits);
   }
   return result;
 }

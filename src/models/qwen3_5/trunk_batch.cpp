@@ -878,12 +878,34 @@ std::expected<void, StatusCode> Qwen35Architecture::TruncateTarget(
 
 namespace {
 
-// Accept the leading drafts that match the target's drawn token: one
-// vocab-wide logits row per scored position, in scoring order (row i scores
-// draft[i], the last row scores the bonus token).
+// Accept the leading drafts against the target's distribution. `rows` holds
+// draft.size()+1 vocab-wide logits rows in scoring order (row i scores
+// draft[i], the last row scores the bonus token). With a draft distribution
+// the verifier uses rejection sampling; otherwise it draws the target token
+// per row and matches it.
 core::SampledMatch MatchRows(std::span<const float> rows, std::size_t vocab,
-                       std::span<const std::uint32_t> draft,
-                       const SampledVerify& sampled) {
+                             std::span<const std::uint32_t> draft,
+                             const SampledVerify& sampled) {
+  const bool rejection = sampled.draft_probs != nullptr &&
+                         sampled.draft_vocab == vocab &&
+                         sampled.draft_probs->size() >= draft.size() * vocab;
+  if (rejection) {
+    const std::vector<double>& q = *sampled.draft_probs;
+    return core::AcceptRejectionPrefix(
+        draft, sampled.history, *sampled.rng,
+        [&](std::size_t i, std::span<const std::uint32_t> hist) {
+          return core::BuildDenseDistribution(rows.subspan(i * vocab, vocab),
+                                              *sampled.sampling, hist);
+        },
+        [&](std::size_t i) {
+          return std::span<const double>(q.data() + i * vocab, vocab);
+        },
+        [&](std::span<const std::uint32_t> hist) {
+          return core::BuildDenseDistribution(
+              rows.subspan(draft.size() * vocab, vocab), *sampled.sampling,
+              hist);
+        });
+  }
   return core::AcceptSampledPrefix(
       draft, *sampled.sampling, sampled.history, *sampled.rng,
       [&](std::size_t i) { return rows.subspan(i * vocab, vocab); },

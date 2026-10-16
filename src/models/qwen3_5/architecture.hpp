@@ -74,7 +74,8 @@ class Qwen35Architecture final : public Architecture {
   [[nodiscard]] std::expected<std::uint32_t, StatusCode> Draft(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-      std::vector<float>* mtp_hidden_out) const override;
+      std::vector<float>* mtp_hidden_out,
+      std::vector<float>* logits_out) const override;
 
   [[nodiscard]] std::size_t DraftRows(
       const core::DecodeCache& cache) const override;

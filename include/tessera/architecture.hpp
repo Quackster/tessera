@@ -48,6 +48,30 @@ struct SampledVerify {
   const SamplingOptions* sampling = nullptr;
   std::mt19937_64* rng = nullptr;
   std::span<const std::uint32_t> history;
+  // The draft's sampling distribution, one dense row per proposed token
+  // (rows x vocab), when the drafter sampled. Null for a greedy draft; the
+  // verifier then matches the drawn target token instead of using rejection.
+  const std::vector<double>* draft_probs = nullptr;
+  std::size_t draft_vocab = 0;
+};
+
+// Sampling state for a sampled draft. When null the drafter proposes
+// greedily and records no distribution. `history` is the penalty history
+// before the draft window; the drafter extends it with the drafts it draws,
+// so each draft distribution matches the target's scale.
+struct DraftSampling {
+  const SamplingOptions* sampling = nullptr;
+  std::mt19937_64* rng = nullptr;
+  std::span<const std::uint32_t> history;
+};
+
+// The draft's sampling distribution, one dense row per proposed token
+// (rows x vocab), row-major. The drafter fills it when it sampled the
+// drafts; a greedy draft leaves it empty.
+struct DraftDistribution {
+  std::vector<double> probs;
+  std::size_t rows = 0;
+  std::size_t vocab = 0;
 };
 
 // The outcome of verifying a draft against the target model. In the greedy
@@ -200,11 +224,14 @@ class Architecture {
   // One multi-token-prediction draft step: fuse the token embedding and
   // the backbone hidden, run the draft block and return the drafted
   // token. `mtp_hidden_out`, when non-null, receives the draft hidden to
-  // chain the next draft step.
+  // chain the next draft step. `logits_out`, when non-null, receives the
+  // draft's vocab-wide logits so a caller can sample the draft and keep its
+  // distribution.
   [[nodiscard]] virtual std::expected<std::uint32_t, StatusCode> Draft(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-      std::vector<float>* mtp_hidden_out) const = 0;
+      std::vector<float>* mtp_hidden_out,
+      std::vector<float>* logits_out = nullptr) const = 0;
 
   // Rows currently committed in the draft key/value cache (0 when there is
   // none). Draft chaining appends a row per draft; after a partial accept

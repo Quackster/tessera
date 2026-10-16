@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/sampling.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/model.hpp"
 
@@ -101,34 +102,57 @@ class MtpStrategy final : public SpeculativeStrategy {
   std::expected<std::size_t, StatusCode> Draft(
       Backend& backend, Model& target, core::DecodeCache& cache,
       std::span<const float> current_logits, std::uint32_t anchor,
-      std::span<std::uint32_t> drafts) override {
+      std::span<std::uint32_t> drafts, const DraftSampling* sampling,
+      DraftDistribution* distribution) override {
     (void)current_logits;
+    const bool sample = sampling != nullptr && sampling->sampling != nullptr &&
+                        sampling->rng != nullptr &&
+                        sampling->sampling->temperature > 0.0f;
     std::vector<float> chain = chain_hidden_;
     std::uint32_t tok = anchor;
     std::size_t count = 0;
+    std::vector<std::uint32_t> hist;
+    if (sample) {
+      hist.assign(sampling->history.begin(), sampling->history.end());
+    }
+    std::vector<float> logits;
     for (std::size_t i = 0; i < block_ && i < drafts.size(); ++i) {
       // The last draft in the step is not chained, so skip its hidden-state
       // download: only the draft token is needed from it.
       const bool last = (i + 1 >= block_) || (i + 1 >= drafts.size());
       std::vector<float> next_chain;
+      std::vector<float>* chain_out = last ? nullptr : &next_chain;
       // Slot `anchor_pos_ + i`: the first step writes the anchor's own
       // slot with (anchor token, hidden at anchor_pos_ - 1) and predicts
       // the next token; later steps chain the previous MTP output hidden,
       // exactly like the reference cycle.
-      auto draft =
-          core::MtpDraftStep(backend, target, cache, chain, tok,
-                             anchor_pos_ + i, last ? nullptr : &next_chain);
+      std::vector<float>* logits_out = sample ? &logits : nullptr;
+      auto draft = core::MtpDraftStep(backend, target, cache, chain, tok,
+                                      anchor_pos_ + i, chain_out, logits_out);
       if (!draft) {
         if (draft.error() == StatusCode::UnsupportedFeature) {
           break;
         }
         return std::unexpected(draft.error());
       }
-      drafts[i] = *draft;
+      std::uint32_t chosen = *draft;
+      if (sample) {
+        // Draw the draft from its own distribution at the request's
+        // temperature and keep q, so the verifier can use rejection.
+        std::vector<double> q = core::BuildDenseDistribution(
+            logits, *sampling->sampling, hist);
+        chosen = core::SampleFromDense(q, *sampling->rng);
+        distribution->probs.insert(distribution->probs.end(), q.begin(),
+                                   q.end());
+        distribution->rows = count + 1;
+        distribution->vocab = q.size();
+        hist.push_back(chosen);
+      }
+      drafts[i] = chosen;
       if (!last) {
         chain = std::move(next_chain);
       }
-      tok = *draft;
+      tok = chosen;
       ++count;
       ++chain_rows_;
     }

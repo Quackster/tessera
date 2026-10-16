@@ -1293,19 +1293,39 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
   } else {
     result.logits.assign(prefix_logits.begin(), prefix_logits.end());
   }
+  const bool rejection =
+      sample && sampled->draft_probs != nullptr &&
+      sampled->draft_vocab == result.logits.size() &&
+      sampled->draft_probs->size() >= draft.size() * sampled->draft_vocab;
   bool all = true;
-  for (const std::uint32_t token : draft) {
-    const std::uint32_t y =
-        sample ? core::SampleToken(result.logits, *sampled->sampling, hist,
-                                   *sampled->rng)
-               : static_cast<std::uint32_t>(ArgMaxToken(result.logits));
-    if (y != token) {
-      result.next_token = y;
-      all = false;
-      break;
+  for (std::size_t i = 0; i < draft.size(); ++i) {
+    const std::uint32_t token = draft[i];
+    if (rejection) {
+      const std::vector<double> target = core::BuildDenseDistribution(
+          result.logits, *sampled->sampling, hist);
+      const std::span<const double> q(sampled->draft_probs->data() +
+                                          i * sampled->draft_vocab,
+                                      sampled->draft_vocab);
+      const core::RejectionResult step =
+          core::RejectionStep(target, q, token, *sampled->rng);
+      if (!step.accepted) {
+        result.next_token = step.token;
+        all = false;
+        break;
+      }
+    } else {
+      const std::uint32_t y =
+          sample ? core::SampleToken(result.logits, *sampled->sampling, hist,
+                                     *sampled->rng)
+                 : static_cast<std::uint32_t>(ArgMaxToken(result.logits));
+      if (y != token) {
+        result.next_token = y;
+        all = false;
+        break;
+      }
     }
     ++result.accepted;
-    hist.push_back(y);
+    hist.push_back(token);
     auto logits = Logits(backend, model, cache, token, hidden_out,
                          capture_layers, capture, nullptr);
     if (!logits) {
@@ -1314,10 +1334,16 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
     result.logits = std::move(*logits);
   }
   if (all) {
-    result.next_token =
-        sample ? core::SampleToken(result.logits, *sampled->sampling, hist,
-                                   *sampled->rng)
-               : static_cast<std::uint32_t>(ArgMaxToken(result.logits));
+    if (rejection) {
+      result.next_token = core::SampleFromDense(
+          core::BuildDenseDistribution(result.logits, *sampled->sampling, hist),
+          *sampled->rng);
+    } else {
+      result.next_token =
+          sample ? core::SampleToken(result.logits, *sampled->sampling, hist,
+                                     *sampled->rng)
+                 : static_cast<std::uint32_t>(ArgMaxToken(result.logits));
+    }
   }
   return result;
 }
@@ -1325,7 +1351,7 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
 std::expected<std::uint32_t, StatusCode> Qwen4ExpArchitecture::Draft(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-    std::vector<float>* mtp_hidden_out) const {
+    std::vector<float>* mtp_hidden_out, std::vector<float>* logits_out) const {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -1340,7 +1366,7 @@ std::expected<std::uint32_t, StatusCode> Qwen4ExpArchitecture::Draft(
   }
   Qwen4ExpState& h = State(cache);
   return RunMtpDraft(backend, model, *config, *geom, h, hidden, token, pos,
-                     mtp_hidden_out);
+                     mtp_hidden_out, logits_out);
 }
 
 std::size_t Qwen4ExpArchitecture::DraftRows(

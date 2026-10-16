@@ -278,11 +278,13 @@ struct DeviceDecodeState {
 // architecture module, which fuses the token embedding and the backbone
 // hidden (`hidden`, hidden_dim floats), runs its draft block and returns
 // the drafted token. `pos` is the sequence position for the draft block's
-// RoPE. UnsupportedFeature when the architecture has no draft head.
+// RoPE. `logits_out`, when non-null, receives the draft's vocab-wide
+// logits. UnsupportedFeature when the architecture has no draft head.
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraftStep(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-    std::vector<float>* mtp_hidden_out = nullptr);
+    std::vector<float>* mtp_hidden_out = nullptr,
+    std::vector<float>* logits_out = nullptr);
 
 // The full vocab logits for one device-resident vanilla step.
 [[nodiscard]] std::expected<std::vector<float>, StatusCode>
