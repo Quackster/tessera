@@ -38,6 +38,9 @@ add_library(tessera STATIC
     src/models/qwen4exp/mtp_fetch.cpp
     src/models/qwen4exp/mtp_weights.cpp
     src/models/qwen4exp/mtp.cpp
+    src/models/glm5_next/config.cpp
+    src/models/glm5_next/weights.cpp
+    src/models/glm5_next/trunk.cpp
     src/core/engine.cpp
     src/core/runner.cpp
     src/core/pipeline.cpp

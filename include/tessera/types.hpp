@@ -222,6 +222,19 @@ struct AttentionParams {
   double rope_theta = 10000.0;
 };
 
+// Multi-head latent attention (MLA) dimensions of a definition whose
+// full-attention layers compress keys and values into a low-rank latent.
+// kv_lora_rank == 0 means the definition uses plain GQA instead (then
+// every field is zero).
+struct MlaParams {
+  std::size_t q_lora_rank = 0;       // query compression width
+  std::size_t kv_lora_rank = 0;      // key/value latent width (the cache row)
+  std::size_t qk_nope_head_dim = 0;  // per-head q/k width without rotary dims
+  std::size_t qk_rope_head_dim = 0;  // per-head rotary width (0 for NoPE)
+  std::size_t v_head_dim = 0;        // per-head value width
+  [[nodiscard]] bool IsPresent() const { return kv_lora_rank > 0; }
+};
+
 // Recurrent linear-attention dimensions of a hybrid model definition.
 // They size the fused qkv/gate projections, the causal conv1d and the
 // recurrent state; generic kernels take them as launch data, never as
@@ -234,13 +247,35 @@ struct SsmParams {
   std::size_t inner_size = 0;      // fused qkv/gate projection width
 };
 
+// KDA (gated delta-rule linear attention) dimensions of a hybrid
+// definition whose recurrent layers keep per-head delta-rule states.
+// head_dim == 0 means the definition has no KDA layers (then every field
+// is zero). The projection width is heads * head_dim; q, k and v each
+// pass their own causal conv of width conv_kernel. The log decay gate is
+// g = gate_lower_bound * sigmoid(...) so the per-step decay is in
+// [exp(gate_lower_bound), 1].
+struct KdaParams {
+  std::size_t heads = 0;
+  std::size_t head_dim = 0;
+  std::size_t conv_kernel = 0;
+  double gate_lower_bound = -5.0;
+  [[nodiscard]] bool IsPresent() const { return head_dim > 0; }
+};
+
 // Hyper-connection dimensions of a definition that carries a gated
 // residual stack instead of one residual stream. `count` is the number
-// of streams; `low_rank` is the mixer bottleneck width. count == 0 means
-// the definition has no hyper-connections.
+// of streams. `low_rank` is the mixer bottleneck width for the gated
+// residual variant; 0 selects the manifold-constrained variant (mHC),
+// which mixes with pre/post/combination weights projected from the
+// normalized input and projects the combination matrix onto the doubly
+// stochastic manifold with `sinkhorn_iterations` Sinkhorn steps and
+// `epsilon`. count == 0 means the definition has no hyper-connections.
 struct HyperConnectionParams {
   std::size_t count = 0;
   std::size_t low_rank = 0;
+  std::size_t sinkhorn_iterations = 0;
+  double epsilon = 0.0;
+  [[nodiscard]] bool IsManifold() const { return count > 0 && low_rank == 0; }
 };
 
 // Per-layer-embedding (PLE) dimensions of a definition whose token
@@ -262,11 +297,28 @@ struct PleParams {
 
 // Sparse-attention indexer dimensions of a definition that selects a
 // subset of the key/value cells before attention. heads == 0 means the
-// definition has no indexer.
+// definition has no indexer. `kpool` is the pool size of the compressed
+// key index (1 disables pooling); `select_tail` always appends the last
+// visible tokens so the query attends to its own neighborhood. Each
+// value-selection round keeps top_k / kpool pools. norm_eps is the
+// epsilon of the indexer's layer norm (0 when the definition carries
+// none).
 struct IndexerParams {
   std::size_t heads = 0;
   std::size_t key_length = 0;
   std::size_t top_k = 0;
+  std::size_t kpool = 1;
+  bool select_tail = false;
+  double norm_eps = 0.0;
+};
+
+// Routed-expert gating function as encoded in the model definition (the
+// GGUF expert_gating_func values). kSoftmax scores all experts with a
+// softmax over the full expert axis and keeps the top-k; kSigmoid scores
+// each expert independently and keeps the top-k scores.
+enum class MoeGating : std::uint8_t {
+  kSoftmax = 1,
+  kSigmoid = 2,
 };
 
 // Transformer hyper-parameters from the model definition. The decode
@@ -274,6 +326,9 @@ struct IndexerParams {
 // architecture.
 struct TransformerConfig {
   AttentionParams attention;
+  // MLA dimensions of the full-attention layers; all-zero when the
+  // definition uses plain GQA attention.
+  MlaParams mla;
   std::size_t layers = 0;  // trunk blocks (excludes MTP draft blocks)
   std::size_t hidden_dim = 0;
   std::size_t ffn_dim = 0;
@@ -288,17 +343,40 @@ struct TransformerConfig {
   std::size_t experts_per_tok = 0;
   std::size_t moe_intermediate = 0;
   std::size_t shared_expert_intermediate = 0;
+  // Routed-expert scoring and combination. moe_gating is the score
+  // function; moe_weights_norm renormalizes the kept weights to sum to
+  // one before scaling; moe_weights_scale multiplies the final mixture
+  // (0 = no scaling).
+  MoeGating moe_gating = MoeGating::kSoftmax;
+  bool moe_weights_norm = false;
+  double moe_weights_scale = 0.0;
+  // Trunk layers [0, leading_dense_layers) run a dense FFN sized by
+  // ffn_dim even when the definition is an MoE; later layers run the
+  // mixture.
+  //
+  // Usage:
+  //   const bool dense = l < config.leading_dense_layers;
+  std::size_t leading_dense_layers = 0;
   // True for hybrid attention/SSM definitions (recurrent linear layers
   // interleaved with full attention). The vanilla decode path rejects
   // these as UnsupportedFeature until the recurrent kernels land.
   bool hybrid = false;
   // SSM dimensions, valid only when hybrid is true.
   SsmParams ssm;
+  // KDA dimensions of the recurrent layers, valid when KdaParams::
+  // IsPresent() (a hybrid variant); head_dim stays 0 for SSM hybrids.
+  KdaParams kda;
   // True when the feed-forward is a sparse mixture of experts.
   //
   // Usage:
   //   if (config.IsMoe()) { /* routed experts plus shared expert */ }
   [[nodiscard]] bool IsMoe() const { return num_experts > 0; }
+  // Explicit per-layer full-attention flags parsed from a definition
+  // that carries a per-layer head-count array (0 = recurrent layer).
+  // Empty when the definition carries none; the interval below then
+  // selects the full-attention layers. `layer_full_attention[l]` is
+  // valid for l < layers.
+  std::vector<std::uint8_t> layer_full_attention;
   // Trunk layer l is full attention iff (l + 1) % interval == 0.
   // Zero means every layer is full attention (vanilla).
   std::size_t full_attention_interval = 0;
@@ -306,8 +384,12 @@ struct TransformerConfig {
   // vanilla configs, where the interval is zero).
   //
   // Usage:
-  //   if (config.IsFullAttentionLayer(l)) { /* GQA path */ }
+  //   if (config.IsFullAttentionLayer(l)) { /* full attention path */ }
   [[nodiscard]] bool IsFullAttentionLayer(std::size_t layer) const {
+    if (!layer_full_attention.empty()) {
+      return layer < layer_full_attention.size() &&
+             layer_full_attention[layer] != 0;
+    }
     if (!hybrid || full_attention_interval == 0) {
       return true;
     }
@@ -332,6 +414,12 @@ struct TransformerConfig {
   PleParams ple;
   // Sparse-attention indexer. heads == 0 when absent.
   IndexerParams indexer;
+  // Per-trunk-layer SwiGLU clamp on the gate and up activations (0 = no
+  // clamp). Empty when the definition carries none. The shared expert
+  // uses `swiglu_clamp_shared`, which falls back to `swiglu_clamp` when
+  // empty.
+  std::vector<float> swiglu_clamp;
+  std::vector<float> swiglu_clamp_shared;
 };
 
 // Dense tensor shape, at most 4 dimensions, row-major.

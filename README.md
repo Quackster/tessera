@@ -48,6 +48,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. Capability harness (`tools/harness/probe_harness.py`) drives task steering, long-horizon context and session memory over the API on both backends. |
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
+| GLM-5.3-Flash | Partial | `glm5-next` module registered: GGUF and HF config parse, weight-name map. Decode kernels pending; the module rejects decode with `UnsupportedFeature`. |
 | MoE, MLP, norms | Done | Norms and MLP kernels done. Ornith-1.5 MoE decodes on both backends (84 tok/s ROCm, 88 Vulkan). |
 | Calibration | Done | Measures speed settings per machine and keeps the fastest. Covers split target and cap (ROCm), prefill chunk, attention split, and the draft block with a strategy attached. A parallel layout (`--tp`, `--cp`, `--pipeline`) runs both MTP (`--speculate`) and DFlash2 (`--draft`), sweeps the knobs it honors, and stores the chosen settings with the measured decode and prefill rates. `--concurrent` benchmarks 2, 3, and 4 sessions and the largest count that fits the context. Sizes and stores the layer count from free device memory, so an MoE model larger than VRAM loads paged, and `run` and `serve` apply it. `--calibrate-limit N` caps a run at N measurements. Writes JSON keyed by backend, device, model, context, KV type, strategy, and layout. |
 

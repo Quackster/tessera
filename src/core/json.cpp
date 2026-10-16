@@ -12,6 +12,10 @@ namespace {
 constexpr int kMaxDepth = 64;
 constexpr std::size_t kMaxValues = 1 << 20;
 
+// JSON numbers above 2^53 cannot hold every integer exactly; the cap
+// keeps the conversion to uint64 exact and rejects absurd dimensions.
+constexpr double kMaxExactInteger = 1e15;
+
 struct Parser {
   std::string_view text;
   std::size_t pos = 0;
@@ -402,6 +406,56 @@ std::unique_ptr<Json> Json::Parse(std::string_view text) {
     return nullptr;
   }
   return value;
+}
+
+std::expected<std::uint64_t, StatusCode> JsonU64(const Json& object,
+                                                 std::string_view key) {
+  const Json* value = object.Find(key);
+  if (value == nullptr || value->type() != Json::Type::Number) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const double number = value->AsNumber();
+  if (!(number > 0.0) || number != std::floor(number) ||
+      number > kMaxExactInteger) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  return static_cast<std::uint64_t>(number);
+}
+
+std::expected<double, StatusCode> JsonReal(const Json& object,
+                                           std::string_view key) {
+  const Json* value = object.Find(key);
+  if (value == nullptr || value->type() != Json::Type::Number ||
+      !(value->AsNumber() > 0.0)) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  return value->AsNumber();
+}
+
+std::expected<bool, StatusCode> JsonBool(const Json& object,
+                                         std::string_view key) {
+  const Json* value = object.Find(key);
+  if (value == nullptr || value->type() != Json::Type::Bool) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  return value->AsBool();
+}
+
+std::expected<std::string_view, StatusCode> JsonString(const Json& object,
+                                                       std::string_view key) {
+  const Json* value = object.Find(key);
+  if (value == nullptr || value->type() != Json::Type::String) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  return value->AsString();
+}
+
+const Json& JsonTextConfig(const Json& root) {
+  const Json* text = root.Find("text_config");
+  if (text != nullptr && text->isObject()) {
+    return *text;
+  }
+  return root;
 }
 
 }  // namespace tessera::core

@@ -69,12 +69,61 @@ std::string GgufName(const core::GgufFile& gguf) {
   return name != nullptr ? *name : std::string{};
 }
 
+// Read a retained integer array metadata value; nullopt when the key is
+// absent. MalformedFile when any entry is not integral.
+std::expected<std::optional<std::vector<std::uint64_t>>, StatusCode>
+ReadU64Array(const core::GgufFile& gguf, const std::string& key) {
+  const auto it = gguf.small_arrays.find(key);
+  if (it == gguf.small_arrays.end()) {
+    return std::optional<std::vector<std::uint64_t>>{};
+  }
+  std::vector<std::uint64_t> out;
+  out.reserve(it->second.size());
+  for (const auto& entry : it->second) {
+    const auto value = AsU64(entry);
+    if (!value) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    out.push_back(*value);
+  }
+  return std::optional<std::vector<std::uint64_t>>{std::move(out)};
+}
+
+// Read a retained float array metadata value; nullopt when the key is
+// absent. Integral entries widen; MalformedFile on any other entry type.
+std::expected<std::optional<std::vector<float>>, StatusCode> ReadF32Array(
+    const core::GgufFile& gguf, const std::string& key) {
+  const auto it = gguf.small_arrays.find(key);
+  if (it == gguf.small_arrays.end()) {
+    return std::optional<std::vector<float>>{};
+  }
+  std::vector<float> out;
+  out.reserve(it->second.size());
+  for (const auto& entry : it->second) {
+    const auto value = AsDouble(entry);
+    if (!value) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    out.push_back(static_cast<float>(*value));
+  }
+  return std::optional<std::vector<float>>{std::move(out)};
+}
+
 // Attention parameters from GGUF metadata; nullopt without keys.
 // Explicit key/value lengths set head dim (hybrid); else embed/heads.
-std::expected<std::optional<AttentionParams>, StatusCode>
-ParseAttention(const core::GgufFile& gguf, std::string_view architecture) {
+// An MLA definition (attention.q_lora_rank / kv_lora_rank /
+// key_length_mla keys) keeps its latent cache row in AttentionParams
+// (kv_heads 1, head_dim = kv_lora_rank + rotary dims) and reports the
+// per-head widths through MlaParams instead.
+struct AttentionDef {
+  AttentionParams attention;
+  MlaParams mla;
+};
+
+std::expected<std::optional<AttentionDef>, StatusCode> ParseAttention(
+    const core::GgufFile& gguf, std::string_view architecture) {
   if (architecture.empty()) {
-    return std::optional<AttentionParams>{};
+    return std::optional<AttentionDef>{};
   }
   const std::string prefix = std::string(architecture);
   const auto* heads = gguf.Find(prefix + ".attention.head_count");
@@ -82,21 +131,117 @@ ParseAttention(const core::GgufFile& gguf, std::string_view architecture) {
   const auto* embed = gguf.Find(prefix + ".embedding_length");
   const auto* rope_dim = gguf.Find(prefix + ".rope.dimension_count");
   const auto* theta = gguf.Find(prefix + ".rope.freq_base");
+  const auto* q_lora = gguf.Find(prefix + ".attention.q_lora_rank");
+  const auto* kv_lora = gguf.Find(prefix + ".attention.kv_lora_rank");
+  const auto* k_mla = gguf.Find(prefix + ".attention.key_length_mla");
+  const auto* v_mla = gguf.Find(prefix + ".attention.value_length_mla");
+  const bool has_kv_array =
+      gguf.small_arrays.find(prefix + ".attention.head_count_kv") !=
+      gguf.small_arrays.end();
+  const bool mla = q_lora != nullptr || kv_lora != nullptr ||
+                   k_mla != nullptr || v_mla != nullptr;
   if (heads == nullptr && kv == nullptr && embed == nullptr &&
-      rope_dim == nullptr && theta == nullptr) {
-    return std::optional<AttentionParams>{};
+      rope_dim == nullptr && theta == nullptr && !has_kv_array && !mla) {
+    return std::optional<AttentionDef>{};
   }
-  if (heads == nullptr || kv == nullptr || embed == nullptr ||
-      rope_dim == nullptr || theta == nullptr) {
+  if (heads == nullptr || embed == nullptr) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   const auto h = AsU64(*heads);
-  const auto k = AsU64(*kv);
   const auto e = AsU64(*embed);
-  const auto r = AsU64(*rope_dim);
-  const auto t = AsDouble(*theta);
-  if (!h || !k || !e || !r || !t || *h == 0 || *k == 0 || *e == 0 ||
-      *r == 0 || !(*t > 0.0) || (*h % *k) != 0) {
+  if (!h || !e || *h == 0 || *e == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  // The per-layer head-count array marks recurrent layers with 0; every
+  // nonzero entry must agree (one attention shape per definition).
+  std::uint64_t kv_heads = 0;
+  if (has_kv_array) {
+    auto entries = ReadU64Array(gguf, prefix + ".attention.head_count_kv");
+    if (!entries || !*entries || (*entries)->empty()) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    for (const std::uint64_t entry : **entries) {
+      if (entry == 0) {
+        continue;
+      }
+      if (kv_heads != 0 && entry != kv_heads) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+      kv_heads = entry;
+    }
+  }
+  if (kv != nullptr) {
+    if (has_kv_array) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    const auto parsed = AsU64(*kv);
+    if (!parsed || *parsed == 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    kv_heads = *parsed;
+  }
+  std::size_t rope = 0;
+  if (rope_dim != nullptr) {
+    const auto r = AsU64(*rope_dim);
+    if (!r) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    rope = static_cast<std::size_t>(*r);
+  }
+  double rope_theta = 10000.0;
+  if (theta != nullptr) {
+    const auto t = AsDouble(*theta);
+    if (!t || !(*t > 0.0)) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    rope_theta = *t;
+  }
+  AttentionDef def;
+  if (mla) {
+    if (q_lora == nullptr || kv_lora == nullptr || k_mla == nullptr ||
+        v_mla == nullptr) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    const auto qr = AsU64(*q_lora);
+    const auto kr = AsU64(*kv_lora);
+    const auto qk = AsU64(*k_mla);
+    const auto vd = AsU64(*v_mla);
+    if (!qr || !kr || !qk || !vd || *qr == 0 || *kr == 0 || *qk == 0 ||
+        *vd == 0 || (kv_heads != 0 && kv_heads != 1) || rope > *qk ||
+        (rope % 2) != 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    // Explicit key/value lengths (when present) must agree with the
+    // latent geometry: key = latent + rotary, value = latent.
+    const std::uint64_t latent_key = *kr + rope;
+    const auto* key_len = gguf.Find(prefix + ".attention.key_length");
+    if (key_len != nullptr) {
+      const auto kl = AsU64(*key_len);
+      if (!kl || *kl != latent_key) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+    }
+    const auto* value_len = gguf.Find(prefix + ".attention.value_length");
+    if (value_len != nullptr) {
+      const auto vl = AsU64(*value_len);
+      if (!vl || *vl != *kr) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+    }
+    def.mla.q_lora_rank = static_cast<std::size_t>(*qr);
+    def.mla.kv_lora_rank = static_cast<std::size_t>(*kr);
+    def.mla.qk_nope_head_dim = static_cast<std::size_t>(*qk - rope);
+    def.mla.qk_rope_head_dim = rope;
+    def.mla.v_head_dim = static_cast<std::size_t>(*vd);
+    def.attention.heads = static_cast<std::size_t>(*h);
+    def.attention.kv_heads = 1;
+    def.attention.head_dim = static_cast<std::size_t>(latent_key);
+    def.attention.rope_dim = rope;
+    def.attention.rope_theta = rope_theta;
+    return std::optional<AttentionDef>{def};
+  }
+  if (kv_heads == 0 || (*h % kv_heads) != 0 || rope_dim == nullptr ||
+      theta == nullptr || rope == 0) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   std::uint64_t head_dim = 0;
@@ -121,16 +266,15 @@ ParseAttention(const core::GgufFile& gguf, std::string_view architecture) {
     }
     head_dim = *e / *h;
   }
-  if (*r > head_dim || (*r % 2) != 0) {
+  if (rope > head_dim || (rope % 2) != 0) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  AttentionParams params;
-  params.heads = static_cast<std::size_t>(*h);
-  params.kv_heads = static_cast<std::size_t>(*k);
-  params.head_dim = static_cast<std::size_t>(head_dim);
-  params.rope_dim = static_cast<std::size_t>(*r);
-  params.rope_theta = *t;
-  return std::optional<AttentionParams>{params};
+  def.attention.heads = static_cast<std::size_t>(*h);
+  def.attention.kv_heads = static_cast<std::size_t>(kv_heads);
+  def.attention.head_dim = static_cast<std::size_t>(head_dim);
+  def.attention.rope_dim = rope;
+  def.attention.rope_theta = rope_theta;
+  return std::optional<AttentionDef>{def};
 }
 
 // Hybrid recurrent definition (ssm.* plus full_attention_interval).
@@ -149,8 +293,13 @@ std::expected<std::optional<HybridDef>, StatusCode> ParseHybrid(
   const auto* rank = gguf.Find(prefix + ".ssm.time_step_rank");
   const auto* inner = gguf.Find(prefix + ".ssm.inner_size");
   const auto* interval = gguf.Find(prefix + ".full_attention_interval");
-  if (conv == nullptr && state == nullptr && groups == nullptr &&
-      rank == nullptr && inner == nullptr && interval == nullptr) {
+  // The KDA hybrid carries only the shared ssm.conv_kernel (the KDA
+  // geometry lives under kda.*); a full SSM hybrid carries the state
+  // shape and the attention interval as well.
+  const bool has_ssm_shape =
+      state != nullptr || groups != nullptr || rank != nullptr ||
+      inner != nullptr || interval != nullptr;
+  if (!has_ssm_shape) {
     return std::optional<HybridDef>{};
   }
   if (conv == nullptr || state == nullptr || groups == nullptr ||
@@ -175,6 +324,89 @@ std::expected<std::optional<HybridDef>, StatusCode> ParseHybrid(
   def.ssm.inner_size = static_cast<std::size_t>(*n);
   def.interval = *v;
   return std::optional<HybridDef>{def};
+}
+
+// KDA recurrent definition (kda.* plus the shared short conv). Nullopt
+// without kda.head_dim; MalformedFile when a required key is missing or
+// invalid. The projection width is the definition's attention head count
+// times kda.head_dim.
+std::expected<std::optional<KdaParams>, StatusCode> ParseKda(
+    const core::GgufFile& gguf, std::string_view architecture,
+    std::size_t attention_heads) {
+  const std::string prefix = std::string(architecture);
+  const auto* head_dim = gguf.Find(prefix + ".kda.head_dim");
+  if (head_dim == nullptr) {
+    return std::optional<KdaParams>{};
+  }
+  const auto* conv = gguf.Find(prefix + ".ssm.conv_kernel");
+  if (conv == nullptr || attention_heads == 0) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const auto d = AsU64(*head_dim);
+  const auto c = AsU64(*conv);
+  if (!d || !c || *d == 0 || *c < 2) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  KdaParams kda;
+  kda.heads = attention_heads;
+  kda.head_dim = static_cast<std::size_t>(*d);
+  kda.conv_kernel = static_cast<std::size_t>(*c);
+  if (const auto* bound = gguf.Find(prefix + ".kda.gate_lower_bound")) {
+    const auto value = AsDouble(*bound);
+    if (!value || !(*value < 0.0)) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    kda.gate_lower_bound = *value;
+  }
+  return std::optional<KdaParams>{kda};
+}
+
+// Routed-expert scoring extras (expert_weights_scale / _norm /
+// expert_gating_func). Nullopt when the definition carries none;
+// MalformedFile when a value is out of range. Absent defaults mean no
+// rescaling and softmax gating, the convention of definitions that omit
+// the keys.
+struct MoeExtras {
+  MoeGating gating = MoeGating::kSoftmax;
+  bool weights_norm = false;
+  double weights_scale = 0.0;
+};
+
+std::expected<std::optional<MoeExtras>, StatusCode> ParseMoeExtras(
+    const core::GgufFile& gguf, std::string_view architecture) {
+  const std::string prefix = std::string(architecture);
+  const auto* scale = gguf.Find(prefix + ".expert_weights_scale");
+  const auto* norm = gguf.Find(prefix + ".expert_weights_norm");
+  const auto* gating = gguf.Find(prefix + ".expert_gating_func");
+  if (scale == nullptr && norm == nullptr && gating == nullptr) {
+    return std::optional<MoeExtras>{};
+  }
+  MoeExtras extras;
+  if (scale != nullptr) {
+    const auto value = AsDouble(*scale);
+    if (!value || !(*value >= 0.0)) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    extras.weights_scale = *value;
+  }
+  if (norm != nullptr) {
+    const auto* value = std::get_if<bool>(norm);
+    if (value == nullptr) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    extras.weights_norm = *value;
+  }
+  if (gating != nullptr) {
+    const auto value = AsU64(*gating);
+    if (value == static_cast<std::uint64_t>(MoeGating::kSoftmax)) {
+      extras.gating = MoeGating::kSoftmax;
+    } else if (value == static_cast<std::uint64_t>(MoeGating::kSigmoid)) {
+      extras.gating = MoeGating::kSigmoid;
+    } else {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+  }
+  return std::optional<MoeExtras>{extras};
 }
 
 // Sparse mixture-of-experts definition (expert_count and friends).
@@ -254,60 +486,74 @@ ParseRopeSections(const core::GgufFile& gguf, std::string_view architecture,
   return std::optional<std::vector<std::uint64_t>>{sections};
 }
 
-// Read a retained integer array metadata value; nullopt when the key is
-// absent. MalformedFile when any entry is not integral.
-std::expected<std::optional<std::vector<std::uint64_t>>, StatusCode>
-ReadU64Array(const core::GgufFile& gguf, const std::string& key) {
-  const auto it = gguf.small_arrays.find(key);
-  if (it == gguf.small_arrays.end()) {
-    return std::optional<std::vector<std::uint64_t>>{};
-  }
-  std::vector<std::uint64_t> out;
-  out.reserve(it->second.size());
-  for (const auto& entry : it->second) {
-    const auto value = AsU64(entry);
-    if (!value) {
-      return std::unexpected(StatusCode::MalformedFile);
-    }
-    out.push_back(*value);
-  }
-  return std::optional<std::vector<std::uint64_t>>{std::move(out)};
-}
-
-// Gated residual stack dimensions (hyper_connection.count / low_rank).
-// Nullopt when the definition carries none; MalformedFile when partial.
+// Gated residual stack dimensions (hyper_connection.*). Nullopt when the
+// definition carries none; MalformedFile when partial or invalid. The
+// gated variant carries a low_rank mixer; the manifold variant (mHC)
+// carries sinkhorn_iterations and epsilon instead.
 std::expected<std::optional<HyperConnectionParams>, StatusCode>
 ParseHyperConnection(const core::GgufFile& gguf,
                      std::string_view architecture) {
   const std::string prefix = std::string(architecture);
   const auto* count = gguf.Find(prefix + ".hyper_connection.count");
   const auto* rank = gguf.Find(prefix + ".hyper_connection.low_rank");
-  if (count == nullptr && rank == nullptr) {
+  const auto* iters =
+      gguf.Find(prefix + ".hyper_connection.sinkhorn_iterations");
+  const auto* eps = gguf.Find(prefix + ".hyper_connection.epsilon");
+  if (count == nullptr && rank == nullptr && iters == nullptr &&
+      eps == nullptr) {
     return std::optional<HyperConnectionParams>{};
   }
-  if (count == nullptr || rank == nullptr) {
+  if (count == nullptr) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   const auto c = AsU64(*count);
-  const auto r = AsU64(*rank);
-  if (!c || !r || *c == 0 || *r == 0) {
+  if (!c || *c == 0) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   HyperConnectionParams params;
   params.count = static_cast<std::size_t>(*c);
-  params.low_rank = static_cast<std::size_t>(*r);
+  if (rank != nullptr) {
+    const auto r = AsU64(*rank);
+    if (!r || *r == 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    params.low_rank = static_cast<std::size_t>(*r);
+  }
+  if (iters != nullptr) {
+    const auto i = AsU64(*iters);
+    if (!i || *i == 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    params.sinkhorn_iterations = static_cast<std::size_t>(*i);
+  }
+  if (eps != nullptr) {
+    const auto value = AsDouble(*eps);
+    if (!value || !(*value > 0.0) || !(*value < 1.0)) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    params.epsilon = *value;
+  }
+  if (params.low_rank == 0 &&
+      (params.sinkhorn_iterations == 0 || params.epsilon == 0.0)) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
   return std::optional<HyperConnectionParams>{params};
 }
 
 // Sparse-attention indexer dimensions (attention.indexer.*). Nullopt when
-// the definition carries none; MalformedFile when partial.
+// the definition carries none; MalformedFile when partial or invalid.
+// The k-pool size and tail-selection flag belong to definitions that
+// compress the index keys into pools; the norm epsilon comes from the
+// definition's layer_norm_epsilon (0 when absent).
 std::expected<std::optional<IndexerParams>, StatusCode> ParseIndexer(
     const core::GgufFile& gguf, std::string_view architecture) {
   const std::string prefix = std::string(architecture);
   const auto* heads = gguf.Find(prefix + ".attention.indexer.head_count");
   const auto* key = gguf.Find(prefix + ".attention.indexer.key_length");
   const auto* topk = gguf.Find(prefix + ".attention.indexer.top_k");
-  if (heads == nullptr && key == nullptr && topk == nullptr) {
+  const auto* kpool = gguf.Find(prefix + ".attention.indexer.kpool");
+  if (heads == nullptr && key == nullptr && topk == nullptr &&
+      kpool == nullptr) {
     return std::optional<IndexerParams>{};
   }
   if (heads == nullptr || key == nullptr || topk == nullptr) {
@@ -323,6 +569,30 @@ std::expected<std::optional<IndexerParams>, StatusCode> ParseIndexer(
   params.heads = static_cast<std::size_t>(*h);
   params.key_length = static_cast<std::size_t>(*k);
   params.top_k = static_cast<std::size_t>(*t);
+  if (kpool != nullptr) {
+    const auto p = AsU64(*kpool);
+    if (!p || *p == 0 || (*t % *p) != 0) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    params.kpool = static_cast<std::size_t>(*p);
+  }
+  const auto* tail =
+      gguf.Find(prefix + ".attention.indexer.kpool_select_tail");
+  if (tail != nullptr) {
+    const auto* value = std::get_if<bool>(tail);
+    if (value == nullptr) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    params.select_tail = *value;
+  }
+  const auto* ln_eps = gguf.Find(prefix + ".attention.layer_norm_epsilon");
+  if (ln_eps != nullptr) {
+    const auto value = AsDouble(*ln_eps);
+    if (!value || !(*value > 0.0)) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    params.norm_eps = *value;
+  }
   return std::optional<IndexerParams>{params};
 }
 
@@ -490,8 +760,16 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
   if (!hybrid) {
     return std::unexpected(hybrid.error());
   }
+  auto kda = ParseKda(gguf, architecture, (*attention)->attention.heads);
+  if (!kda) {
+    return std::unexpected(kda.error());
+  }
+  if (*kda && *hybrid) {
+    return std::unexpected(StatusCode::MalformedFile);
+  }
+  const bool recurrent = *hybrid || *kda;
   std::uint64_t trunk = *layers;
-  if (*hybrid) {
+  if (recurrent) {
     std::uint64_t nextn = 0;
     if (const auto* nextn_key = gguf.Find(prefix + ".nextn_predict_layers");
         nextn_key != nullptr) {
@@ -523,7 +801,8 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
     return std::unexpected(StatusCode::MalformedFile);
   }
   TransformerConfig config;
-  config.attention = **attention;
+  config.attention = (*attention)->attention;
+  config.mla = (*attention)->mla;
   config.layers = static_cast<std::size_t>(trunk);
   config.hidden_dim = static_cast<std::size_t>(*hidden);
   config.ffn_dim = ffn ? static_cast<std::size_t>(*ffn) : 0;
@@ -542,16 +821,90 @@ std::expected<std::optional<TransformerConfig>, StatusCode> ParseConfig(
     config.full_attention_interval =
         static_cast<std::size_t>((*hybrid)->interval);
   }
+  if (*kda) {
+    config.hybrid = true;
+    config.kda = **kda;
+  }
+  // An explicit head-count array defines the full-attention layers
+  // directly (0 marks a recurrent layer). The array covers the trunk
+  // alone or the trunk plus the MTP blocks.
+  auto kv_array = ReadU64Array(gguf, prefix + ".attention.head_count_kv");
+  if (!kv_array) {
+    return std::unexpected(kv_array.error());
+  }
+  if (*kv_array) {
+    const auto& entries = **kv_array;
+    if (entries.size() != trunk && entries.size() != *layers) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    config.layer_full_attention.reserve(trunk);
+    for (std::size_t l = 0; l < trunk; ++l) {
+      config.layer_full_attention.push_back(entries[l] != 0 ? 1 : 0);
+      if (entries[l] == 0) {
+        config.hybrid = true;
+      }
+    }
+  }
   auto sections = ParseRopeSections(gguf, architecture,
                                      config.attention.rope_dim);
   if (!sections) {
     return std::unexpected(sections.error());
   }
-  if (*hybrid && !sections->has_value()) {
+  if (recurrent && config.attention.rope_dim > 0 &&
+      !sections->has_value()) {
     return std::unexpected(StatusCode::MalformedFile);
   }
   if (sections->has_value()) {
     config.rope_sections = **sections;
+  }
+  if (const auto* dense_lead =
+          gguf.Find(prefix + ".leading_dense_block_count")) {
+    const auto value = AsU64(*dense_lead);
+    if (!value || *value > trunk) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    config.leading_dense_layers = static_cast<std::size_t>(*value);
+  }
+  auto extras = ParseMoeExtras(gguf, architecture);
+  if (!extras) {
+    return std::unexpected(extras.error());
+  }
+  if (*extras) {
+    config.moe_gating = (*extras)->gating;
+    config.moe_weights_norm = (*extras)->weights_norm;
+    config.moe_weights_scale = (*extras)->weights_scale;
+  }
+  auto clamp = ReadF32Array(gguf, prefix + ".swiglu_clamp_exp");
+  if (!clamp) {
+    return std::unexpected(clamp.error());
+  }
+  if (*clamp) {
+    if ((*clamp)->size() != *layers) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    for (const float value : **clamp) {
+      if (!(value > 0.0f)) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+    }
+    config.swiglu_clamp.assign((*clamp)->begin(),
+                               (*clamp)->begin() + trunk);
+  }
+  auto clamp_shared = ReadF32Array(gguf, prefix + ".swiglu_clamp_shexp");
+  if (!clamp_shared) {
+    return std::unexpected(clamp_shared.error());
+  }
+  if (*clamp_shared) {
+    if ((*clamp_shared)->size() != *layers) {
+      return std::unexpected(StatusCode::MalformedFile);
+    }
+    for (const float value : **clamp_shared) {
+      if (!(value > 0.0f)) {
+        return std::unexpected(StatusCode::MalformedFile);
+      }
+    }
+    config.swiglu_clamp_shared.assign((*clamp_shared)->begin(),
+                                      (*clamp_shared)->begin() + trunk);
   }
   auto hc = ParseHyperConnection(gguf, architecture);
   if (!hc) {
@@ -1039,8 +1392,9 @@ std::expected<std::unique_ptr<Model>, StatusCode> Model::Load(
     std::vector<std::uint32_t> stop_tokens = core::GgufStopTokens(*gguf);
     return std::unique_ptr<Model>(new Model(
         backend, options, ModelFormat::Gguf, std::move(gguf->tensors),
-        std::move(name), std::move(architecture), std::move(*attention),
-        std::move(*config), std::move(uploaded->resident),
+        std::move(name), std::move(architecture),
+        std::move((*attention)->attention), std::move(*config),
+        std::move(uploaded->resident),
         std::move(*tokenizer), std::move(chat_template),
         std::move(stop_tokens), std::move(uploaded->paged), std::move(*staged),
         std::move(file_backing), std::move(retained_backing)));

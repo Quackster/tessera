@@ -20,38 +20,9 @@ namespace tessera::models::qwen3_5 {
 namespace {
 
 using core::Json;
-
-std::expected<std::uint64_t, StatusCode> U64(const Json& object,
-                                             std::string_view key) {
-  const Json* value = object.Find(key);
-  if (value == nullptr || value->type() != Json::Type::Number) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  const double number = value->AsNumber();
-  if (!(number > 0.0) || number != std::floor(number) || number > 1e15) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  return static_cast<std::uint64_t>(number);
-}
-
-std::expected<double, StatusCode> Real(const Json& object,
-                                       std::string_view key) {
-  const Json* value = object.Find(key);
-  if (value == nullptr || value->type() != Json::Type::Number ||
-      !(value->AsNumber() > 0.0)) {
-    return std::unexpected(StatusCode::MalformedFile);
-  }
-  return value->AsNumber();
-}
-
-// The text-model sub-object; the root when the config is text-only.
-const Json& TextConfig(const Json& root) {
-  const Json* text = root.Find("text_config");
-  if (text != nullptr && text->isObject()) {
-    return *text;
-  }
-  return root;
-}
+using core::JsonReal;
+using core::JsonTextConfig;
+using core::JsonU64;
 
 // mRoPE section pair counts: three integers, or four with a zero pad (the
 // file convention). The leading three cover at most rope_dim/2 pairs.
@@ -93,19 +64,19 @@ Qwen35Architecture::ParseConfigJson(std::string_view json) const {
   if (!document || !document->isObject()) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  const Json& text = TextConfig(*document);
+  const Json& text = JsonTextConfig(*document);
 
-  auto hidden = U64(text, "hidden_size");
-  auto layers = U64(text, "num_hidden_layers");
-  auto heads = U64(text, "num_attention_heads");
-  auto kv_heads = U64(text, "num_key_value_heads");
-  auto head_dim = U64(text, "head_dim");
-  auto vocab = U64(text, "vocab_size");
+  auto hidden = JsonU64(text, "hidden_size");
+  auto layers = JsonU64(text, "num_hidden_layers");
+  auto heads = JsonU64(text, "num_attention_heads");
+  auto kv_heads = JsonU64(text, "num_key_value_heads");
+  auto head_dim = JsonU64(text, "head_dim");
+  auto vocab = JsonU64(text, "vocab_size");
   // A dense definition carries intermediate_size; an MoE definition
   // carries moe_intermediate_size plus the expert counts instead.
   std::optional<std::uint64_t> ffn;
   if (text.Find("intermediate_size") != nullptr) {
-    auto parsed = U64(text, "intermediate_size");
+    auto parsed = JsonU64(text, "intermediate_size");
     if (!parsed) {
       return std::unexpected(StatusCode::MalformedFile);
     }
@@ -118,10 +89,10 @@ Qwen35Architecture::ParseConfigJson(std::string_view json) const {
   const bool moe = text.Find("num_experts") != nullptr ||
                    text.Find("moe_intermediate_size") != nullptr;
   if (moe) {
-    auto mi = U64(text, "moe_intermediate_size");
-    auto ne = U64(text, "num_experts");
-    auto nt = U64(text, "num_experts_per_tok");
-    auto si = U64(text, "shared_expert_intermediate_size");
+    auto mi = JsonU64(text, "moe_intermediate_size");
+    auto ne = JsonU64(text, "num_experts");
+    auto nt = JsonU64(text, "num_experts_per_tok");
+    auto si = JsonU64(text, "shared_expert_intermediate_size");
     if (!mi || !ne || !nt || !si || *nt > *ne) {
       return std::unexpected(StatusCode::MalformedFile);
     }
@@ -132,14 +103,14 @@ Qwen35Architecture::ParseConfigJson(std::string_view json) const {
   } else if (!ffn) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto eps = Real(text, "rms_norm_eps");
-  auto interval = U64(text, "full_attention_interval");
-  auto partial = Real(text, "partial_rotary_factor");
-  auto conv = U64(text, "linear_conv_kernel_dim");
-  auto state = U64(text, "linear_key_head_dim");
-  auto key_heads = U64(text, "linear_num_key_heads");
-  auto value_heads = U64(text, "linear_num_value_heads");
-  auto value_dim = U64(text, "linear_value_head_dim");
+  auto eps = JsonReal(text, "rms_norm_eps");
+  auto interval = JsonU64(text, "full_attention_interval");
+  auto partial = JsonReal(text, "partial_rotary_factor");
+  auto conv = JsonU64(text, "linear_conv_kernel_dim");
+  auto state = JsonU64(text, "linear_key_head_dim");
+  auto key_heads = JsonU64(text, "linear_num_key_heads");
+  auto value_heads = JsonU64(text, "linear_num_value_heads");
+  auto value_dim = JsonU64(text, "linear_value_head_dim");
   if (!hidden || !layers || !heads || !kv_heads || !head_dim ||
       !vocab || !eps || !interval || !partial || !conv || !state ||
       !key_heads || !value_heads || !value_dim) {
@@ -159,7 +130,7 @@ Qwen35Architecture::ParseConfigJson(std::string_view json) const {
   if (rope == nullptr || !rope->isObject()) {
     return std::unexpected(StatusCode::MalformedFile);
   }
-  auto theta = Real(*rope, "rope_theta");
+  auto theta = JsonReal(*rope, "rope_theta");
   if (!theta) {
     return std::unexpected(StatusCode::MalformedFile);
   }

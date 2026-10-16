@@ -2,6 +2,7 @@
 
 #include <string_view>
 
+#include "models/glm5_next/architecture.hpp"
 #include "models/qwen3_5/architecture.hpp"
 #include "models/qwen4exp/architecture.hpp"
 
@@ -25,6 +26,12 @@ std::unique_ptr<Architecture> CreateArchitecture(std::string_view arch) {
   }
   if (arch == "qwen4exp") {
     return models::qwen4exp::MakeQwen4ExpArchitecture();
+  }
+  // The GGUF uses "glm5-next"; the HuggingFace config uses the
+  // "glm5_next" model_type ("Glm5NextForConditionalGeneration").
+  if (arch == "glm5-next" || arch == "glm5_next" ||
+      arch == "Glm5NextForConditionalGeneration") {
+    return models::glm5_next::MakeGlm5NextArchitecture();
   }
   return nullptr;
 }
