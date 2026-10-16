@@ -111,6 +111,22 @@ class Pipeline {
       const GenerateOptions& options,
       const std::function<bool(std::uint32_t)>& on_token);
 
+  // Streaming generation for a concurrent serve turn. Takes a free sequence
+  // from the pool, holds the pipeline's device lock for the turn, and yields
+  // the device between tokens so another in-flight turn advances beside it.
+  // Safe for concurrent use by several caller threads; the pool bounds the
+  // in-flight turns. `cancelled`, when set, stops a turn that is waiting for
+  // a free sequence. Returns InvalidArgument when the caller cancels while
+  // waiting for a sequence.
+  //
+  // Usage:
+  //   pool.SubmitLeastLoaded(options, on_token);
+  [[nodiscard]] std::expected<GenerateOutcome, StatusCode>
+  GenerateStreamingConcurrent(
+      const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled = {});
+
   // Attach a speculative strategy (off by default). The factory is called
   // once; the drafter runs on the last stage, which owns the MTP head, while
   // the target forward runs across every stage.

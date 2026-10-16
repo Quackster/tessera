@@ -2237,6 +2237,93 @@ TEST(EngineTest, ShardedPipelineMatchesSingleDeviceWhenProvided) {
   EXPECT_EQ(speculative, baseline);
 }
 
+// The serve path drives a layer-split model through
+// GenerateStreamingConcurrent with several turns at once; each concurrent
+// turn must equal the single-device greedy output. Set TESSERA_TEST_MODEL,
+// TESSERA_TEST_SHARD and, for a model too large for one device,
+// TESSERA_TEST_GPU_LAYERS.
+TEST(EngineTest, ShardedPipelineServesTwoTurnsAtOnceWhenProvided) {
+  const char* path = std::getenv("TESSERA_TEST_MODEL");
+  if (path == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_MODEL not set";
+  }
+  if (std::getenv("TESSERA_TEST_SHARD") == nullptr) {
+    GTEST_SKIP() << "TESSERA_TEST_SHARD not set";
+  }
+  auto names = tessera::ListGpuNames();
+  if (!names || names->size() < 2) {
+    GTEST_SKIP() << "needs two devices";
+  }
+  const int gpu = TestDeviceIndex();
+  if (gpu + 1 >= static_cast<int>(names->size())) {
+    GTEST_SKIP() << "need a second device above TESSERA_TEST_GPU";
+  }
+  std::size_t gpu_layers = 0;
+  if (const char* value = std::getenv("TESSERA_TEST_GPU_LAYERS")) {
+    gpu_layers = static_cast<std::size_t>(std::atoi(value));
+  }
+  const std::size_t count = 8;
+  std::vector<std::uint32_t> prompt;
+  std::vector<std::uint32_t> baseline;
+  {
+    tessera::EngineOptions engine_options;
+    engine_options.device_index = gpu;
+    engine_options.prefill_chunk_tokens = 1;
+    auto engine = tessera::Engine::Create(engine_options);
+    ASSERT_TRUE(engine.has_value());
+    tessera::ModelOptions model_options{path, 512};
+    model_options.gpu_layers = gpu_layers;
+    auto model = (*engine)->LoadModel(model_options);
+    ASSERT_TRUE(model.has_value()) << tessera::ToString(model.error());
+    const tessera::Tokenizer* tokenizer = (*model)->GetTokenizer();
+    ASSERT_NE(tokenizer, nullptr);
+    auto rendered = (*model)->ChatPrompt("The capital of France is", false, "");
+    ASSERT_TRUE(rendered.has_value());
+    auto ids = tokenizer->Encode(*rendered);
+    ASSERT_TRUE(ids.has_value());
+    prompt = *ids;
+    tessera::GenerateOptions options;
+    options.prompt_tokens = prompt;
+    options.max_completion_tokens = count;
+    options.kv_type = tessera::KvCacheType::Q8;
+    auto out = (*engine)->Generate(**model, options);
+    ASSERT_TRUE(out.has_value()) << tessera::ToString(out.error());
+    baseline = *out;
+  }
+  tessera::PipelineOptions options;
+  options.model_path = path;
+  options.devices = {gpu, gpu + 1};
+  options.context = 512;
+  options.kv_type = tessera::KvCacheType::Q8;
+  auto pipe = tessera::Pipeline::Create(options);
+  ASSERT_TRUE(pipe.has_value()) << tessera::ToString(pipe.error());
+  auto run = [&](std::vector<std::uint32_t>* produced,
+                 tessera::StatusCode* status) {
+    tessera::GenerateOptions gen;
+    gen.prompt_tokens = prompt;
+    gen.max_completion_tokens = count;
+    gen.kv_type = tessera::KvCacheType::Q8;
+    auto outcome = (*pipe)->GenerateStreamingConcurrent(
+        gen, [produced](std::uint32_t token) {
+          produced->push_back(token);
+          return true;
+        });
+    *status = outcome ? tessera::StatusCode::Ok : outcome.error();
+  };
+  std::vector<std::uint32_t> first;
+  std::vector<std::uint32_t> second;
+  tessera::StatusCode first_status = tessera::StatusCode::DeviceError;
+  tessera::StatusCode second_status = tessera::StatusCode::DeviceError;
+  std::thread a(run, &first, &first_status);
+  std::thread b(run, &second, &second_status);
+  a.join();
+  b.join();
+  EXPECT_EQ(first_status, tessera::StatusCode::Ok);
+  EXPECT_EQ(second_status, tessera::StatusCode::Ok);
+  EXPECT_EQ(first, baseline);
+  EXPECT_EQ(second, baseline);
+}
+
 // WithPrompt folds a separately-passed prompt into the decode options, so a
 // parallel entry point (pipeline, tensor-parallel, context-parallel) prefills
 // the whole prompt instead of falling back to the single first_token. The

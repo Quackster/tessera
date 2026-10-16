@@ -110,18 +110,19 @@ std::expected<GenerateOutcome, StatusCode> PipelineRunner::Submit(
     const std::function<bool()>& cancelled) const {
   GenerateOptions tuned = options;
   ApplyToGenerateOptions(calibration_, tuned);
-  // One split model spans every stage, so a turn holds the whole runner.
   // The serve on_token already watches for a dropped peer; also honor the
-  // explicit cancel between tokens.
+  // explicit cancel between tokens. The pipeline holds its own device lock
+  // and interleaves concurrent turns between tokens, so Submit does not
+  // serialize the whole turn; the pool bounds the in-flight turns.
   const auto gated = [&](std::uint32_t token) {
     if (cancelled && cancelled()) {
       return false;
     }
     return on_token(token);
   };
-  std::lock_guard<std::mutex> lock(mutex_);
   active_.fetch_add(1, std::memory_order_relaxed);
-  auto outcome = pipeline_->GenerateStreaming(tuned, gated);
+  auto outcome =
+      pipeline_->GenerateStreamingConcurrent(tuned, gated, cancelled);
   active_.fetch_sub(1, std::memory_order_relaxed);
   return outcome;
 }

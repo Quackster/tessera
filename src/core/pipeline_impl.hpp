@@ -1,9 +1,12 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <utility>
@@ -105,9 +108,13 @@ struct Pipeline::Impl {
   struct Stage {
     std::unique_ptr<Engine> engine;
     std::unique_ptr<Model> model;
-    std::unique_ptr<core::DecodeCache> cache;
-    std::unique_ptr<Buffer> incoming;  // null on the first stage
-    std::unique_ptr<Buffer> outgoing;  // null on the last stage
+    // The active turn's cache and boundary buffers. They are owned by the
+    // SequenceState that Activate() points the stages at, so several turns
+    // share the weights and the device while each keeps its own KV and
+    // boundary state. Null until the first Activate.
+    core::DecodeCache* cache = nullptr;
+    Buffer* incoming = nullptr;  // null on the first stage
+    Buffer* outgoing = nullptr;  // null on the last stage
     // The last trunk layer this stage owns; the boundary capture reads the
     // residual hidden after it.
     std::size_t boundary_layer = 0;
@@ -116,20 +123,75 @@ struct Pipeline::Impl {
     std::size_t last_layer = 0;
   };
 
+  // One turn's private state: a cache per stage, the boundary handoff
+  // buffers, and its own draft strategy. The pipeline shares the weights and
+  // the device; at most one sequence is active at a time (the serve path
+  // holds the device lock and yields between tokens), so the stage pointers
+  // carry one sequence's state at a time.
+  struct SequenceState {
+    std::vector<std::unique_ptr<core::DecodeCache>> caches;
+    std::vector<std::unique_ptr<Buffer>> incoming;  // null on stage 0
+    std::vector<std::unique_ptr<Buffer>> outgoing;  // null on the last stage
+    std::unique_ptr<SpeculativeStrategy> strategy;
+    bool in_use = false;
+  };
+
   std::vector<Stage> stages;
   std::size_t hidden_dim = 0;
   std::size_t context = 0;
   KvCacheType kv_type = KvCacheType::F32;
   std::vector<std::uint32_t> stops;
-  // The speculative strategy (null when none is attached). The drafter runs
-  // on the last stage, which owns the MTP head.
-  std::unique_ptr<SpeculativeStrategy> strategy;
+  // One sequence per concurrent turn; [0] is the single-turn default the
+  // CLI run and calibrate paths use. The rest are the serve pool.
+  std::vector<std::unique_ptr<SequenceState>> sequences;
+  // Creates a fresh draft strategy per sequence when a speculative strategy
+  // is attached (null when none). The drafter runs on the last stage, which
+  // owns the MTP head.
+  std::function<std::unique_ptr<SpeculativeStrategy>()> strategy_factory;
+  StrategyOptions strategy_options;
+  // Serializes all pipeline device work. A turn holds it for its whole
+  // generation and releases it between tokens (see GenerateStreamingOn), so
+  // concurrent turns interleave instead of running one to completion.
+  mutable std::mutex device;
+  // Guards the sequence pool's in_use flags and its wait queue.
+  std::mutex pool;
+  std::condition_variable pool_cv;
   // The single-thread decode target over the stages (defined in
   // pipeline_spec.cpp). Nested so it can reach the stage list.
   struct Target;
 
-  // True when a speculative strategy is attached.
-  [[nodiscard]] bool HasStrategy() const { return strategy != nullptr; }
+  // True when a speculative strategy factory is attached.
+  [[nodiscard]] bool HasStrategy() const {
+    return strategy_factory != nullptr;
+  }
+
+  // Point every stage at `sequence`'s cache and boundary buffers. Call while
+  // the device lock is held, before driving the stages for that turn.
+  void Activate(SequenceState& sequence) {
+    for (std::size_t i = 0; i < stages.size(); ++i) {
+      stages[i].cache = sequence.caches[i].get();
+      stages[i].incoming =
+          sequence.incoming.empty() ? nullptr : sequence.incoming[i].get();
+      stages[i].outgoing =
+          sequence.outgoing.empty() ? nullptr : sequence.outgoing[i].get();
+    }
+  }
+
+  // Build one sequence: a cache per stage, the boundary buffers, and a draft
+  // strategy from the attached factory when one is set. Null on allocation
+  // failure.
+  std::unique_ptr<SequenceState> NewSequence();
+
+  // Take a free sequence from the pool, blocking until one is free. Returns
+  // the default sequence [0] never; the pool starts at index 1. Null when
+  // `cancelled` reports a cancel while the caller waits.
+  SequenceState* AcquireSequence(const std::function<bool()>& cancelled = {});
+
+  // Return a sequence taken by AcquireSequence to the pool.
+  void ReleaseSequence(SequenceState& sequence);
+
+  // The single-turn default sequence the CLI run and calibrate paths use.
+  SequenceState& DefaultSequence() { return *sequences.front(); }
 
   // One speculative generation: the decode driver runs on one thread and the
   // target drives the stages in order (the drafter on the last stage).
@@ -170,16 +232,16 @@ struct Pipeline::Impl {
       const GenerateOptions& options, std::vector<float>* hidden_out,
       std::vector<float>* logits_out, std::size_t* position_out);
 
-  // Fresh caches for every stage, so a new sequence starts at position zero
-  // and the request's speed tuning and KV type take effect (the architecture
+  // Fresh caches for `sequence`, so a new turn starts at position zero and
+  // the request's speed tuning and KV type take effect (the architecture
   // state copies tuning when it is first built).
-  void ResetCaches(const GenerateOptions& options) {
-    for (Stage& stage : stages) {
-      stage.cache = std::make_unique<core::DecodeCache>();
-      stage.cache->kv_type = options.kv_type;
-      stage.cache->tuning.mxfp4_split_target = options.mxfp4_split_target;
-      stage.cache->tuning.mxfp4_split_cap = options.mxfp4_split_cap;
-      stage.cache->tuning.attention_split = options.attention_split;
+  void ResetSequence(SequenceState& sequence, const GenerateOptions& options) {
+    for (std::unique_ptr<core::DecodeCache>& cache : sequence.caches) {
+      cache = std::make_unique<core::DecodeCache>();
+      cache->kv_type = options.kv_type;
+      cache->tuning.mxfp4_split_target = options.mxfp4_split_target;
+      cache->tuning.mxfp4_split_cap = options.mxfp4_split_cap;
+      cache->tuning.attention_split = options.attention_split;
     }
   }
 
@@ -204,7 +266,7 @@ struct Pipeline::Impl {
         return std::unexpected(StatusCode::UnsupportedFeature);
       }
       Backend& backend = stage.engine->Owner();
-      const Buffer* incoming = stage.incoming.get();
+      const Buffer* incoming = stage.incoming;
       if (i + 1 == n) {
         if (!want_logits) {
           auto forwarded = arch->Forward(backend, *stage.model, *stage.cache,
@@ -219,7 +281,7 @@ struct Pipeline::Impl {
                             hidden_out, nullptr, nullptr, incoming);
       }
       std::vector<std::size_t> capture_layers{stage.boundary_layer};
-      std::vector<Buffer*> capture{stage.outgoing.get()};
+      std::vector<Buffer*> capture{stage.outgoing};
       auto forwarded =
           arch->Forward(backend, *stage.model, *stage.cache, token, nullptr,
                         &capture_layers, &capture, incoming);

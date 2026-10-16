@@ -1,10 +1,14 @@
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -28,7 +32,8 @@ namespace tessera {
 
 // The single-thread pipeline decode target.
 struct Pipeline::Impl::Target : public core::SpecTarget {
-  explicit Target(Impl& impl) : impl_(impl) {}
+  Target(Impl& impl, Impl::SequenceState& sequence)
+      : impl_(impl), sequence_(sequence) {}
 
   log::Diagnostics& diagnostics() override {
     return impl_.stages.back().engine->Diagnostics();
@@ -39,7 +44,8 @@ struct Pipeline::Impl::Target : public core::SpecTarget {
 
   std::expected<void, StatusCode> Prepare(
       SpeculativeStrategy* strategy, const GenerateOptions& options) override {
-    impl_.ResetCaches(options);
+    impl_.ResetSequence(sequence_, options);
+    impl_.Activate(sequence_);
     strategy_ = strategy;
     if (strategy != nullptr) {
       auto prepared = strategy->Prepare(backend(), model());
@@ -147,6 +153,7 @@ struct Pipeline::Impl::Target : public core::SpecTarget {
 
  private:
   Impl& impl_;
+  Impl::SequenceState& sequence_;
   std::size_t position_ = 0;
   SpeculativeStrategy* strategy_ = nullptr;
   std::vector<std::size_t> capture_layers_;
@@ -469,6 +476,16 @@ std::expected<void, StatusCode> Pipeline::Impl::PrefillCapturing(
   return {};
 }
 
+namespace {
+
+// Tokens between device yields: small enough that concurrent turns stream
+// together, large enough to keep the per-yield bookkeeping off the hot path.
+constexpr int kYieldTokens = 4;
+// Poll cadence while a turn waits for a free sequence slot.
+constexpr int kSlotPollMs = 10;
+
+}  // namespace
+
 std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::RunSpeculative(
     std::span<const std::uint32_t> prompt, const GenerateOptions& options,
     std::vector<std::uint32_t>* produced) {
@@ -476,11 +493,13 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::RunSpeculative(
     return std::unexpected(StatusCode::InvalidArgument);
   }
   produced->clear();
-  Target target(*this);
+  SequenceState& sequence = DefaultSequence();
+  Activate(sequence);
+  Target target(*this, sequence);
   // The prompt arrives separately from the options; fold it in so the
   // driver prefills it instead of the single first_token.
   auto outcome = core::RunDecode(
-      target, strategy.get(), core::WithPrompt(options, prompt),
+      target, sequence.strategy.get(), core::WithPrompt(options, prompt),
       [produced](std::uint32_t token) {
         produced->push_back(token);
         return true;
@@ -491,11 +510,115 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::RunSpeculative(
   return *outcome;
 }
 
+std::unique_ptr<Pipeline::Impl::SequenceState> Pipeline::Impl::NewSequence() {
+  auto sequence = std::make_unique<SequenceState>();
+  const std::size_t n = stages.size();
+  sequence->caches.resize(n);
+  for (std::unique_ptr<core::DecodeCache>& cache : sequence->caches) {
+    cache = std::make_unique<core::DecodeCache>();
+  }
+  sequence->incoming.resize(n);
+  sequence->outgoing.resize(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    if (i > 0) {
+      auto buffer = stages[i].engine->Owner().AllocateBuffer(
+          hidden_dim * 4, MemoryKind::Device);
+      if (!buffer) {
+        return nullptr;
+      }
+      sequence->incoming[i] = std::move(*buffer);
+    }
+    if (i + 1 < n) {
+      auto buffer = stages[i].engine->Owner().AllocateBuffer(
+          hidden_dim * 4, MemoryKind::Device);
+      if (!buffer) {
+        return nullptr;
+      }
+      sequence->outgoing[i] = std::move(*buffer);
+    }
+  }
+  if (strategy_factory) {
+    auto strategy = strategy_factory();
+    if (strategy == nullptr) {
+      return nullptr;
+    }
+    auto attached = strategy->Attach(strategy_options);
+    if (!attached) {
+      return nullptr;
+    }
+    sequence->strategy = std::move(strategy);
+  }
+  return sequence;
+}
+
+Pipeline::Impl::SequenceState* Pipeline::Impl::AcquireSequence(
+    const std::function<bool()>& cancelled) {
+  std::unique_lock<std::mutex> lock(pool);
+  for (;;) {
+    // Index 0 is the single-turn default; the concurrent pool starts at 1.
+    for (std::size_t i = 1; i < sequences.size(); ++i) {
+      SequenceState& sequence = *sequences[i];
+      if (!sequence.in_use) {
+        sequence.in_use = true;
+        return &sequence;
+      }
+    }
+    if (cancelled && cancelled()) {
+      return nullptr;
+    }
+    pool_cv.wait_for(lock, std::chrono::milliseconds(kSlotPollMs));
+  }
+}
+
+void Pipeline::Impl::ReleaseSequence(SequenceState& sequence) {
+  {
+    std::lock_guard<std::mutex> lock(pool);
+    sequence.in_use = false;
+  }
+  pool_cv.notify_one();
+}
+
 std::expected<GenerateOutcome, StatusCode> Pipeline::GenerateStreaming(
     const GenerateOptions& options,
     const std::function<bool(std::uint32_t)>& on_token) {
-  Impl::Target target(*impl_);
-  return core::RunDecode(target, impl_->strategy.get(), options, on_token);
+  Impl::SequenceState& sequence = impl_->DefaultSequence();
+  impl_->Activate(sequence);
+  Impl::Target target(*impl_, sequence);
+  return core::RunDecode(target, sequence.strategy.get(), options, on_token);
+}
+
+std::expected<GenerateOutcome, StatusCode>
+Pipeline::GenerateStreamingConcurrent(
+    const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token,
+    const std::function<bool()>& cancelled) {
+  Impl::SequenceState* sequence = impl_->AcquireSequence(cancelled);
+  if (sequence == nullptr) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  // The device lock serializes pipeline work; the turn releases it between
+  // tokens so a queued turn advances beside it instead of behind a whole
+  // generation. Activate after every reacquire, because the other turn
+  // repointed the stages at its own sequence while the lock was free.
+  std::unique_lock<std::mutex> lock(impl_->device);
+  impl_->Activate(*sequence);
+  int since_yield = 0;
+  const auto gated = [&](std::uint32_t token) {
+    const bool cont = on_token(token);
+    if (++since_yield >= kYieldTokens) {
+      since_yield = 0;
+      lock.unlock();
+      std::this_thread::yield();
+      lock.lock();
+      impl_->Activate(*sequence);
+    }
+    return cont;
+  };
+  Impl::Target target(*impl_, *sequence);
+  auto outcome =
+      core::RunDecode(target, sequence->strategy.get(), options, gated);
+  impl_->ReleaseSequence(*sequence);
+  return outcome;
 }
 
 std::expected<void, StatusCode> Pipeline::AttachSpeculative(
@@ -504,15 +627,29 @@ std::expected<void, StatusCode> Pipeline::AttachSpeculative(
   if (!factory) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
-  auto strategy = factory();
-  if (strategy == nullptr) {
-    return std::unexpected(StatusCode::InvalidArgument);
+  // One strategy per sequence: a strategy owns draft state, so concurrent
+  // turns must not share one. The first build validates the checkpoint.
+  std::vector<std::unique_ptr<SpeculativeStrategy>> built;
+  built.reserve(impl_->sequences.size());
+  for (std::size_t i = 0; i < impl_->sequences.size(); ++i) {
+    auto strategy = factory();
+    if (strategy == nullptr) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    auto attached = strategy->Attach(options);
+    if (!attached) {
+      return std::unexpected(attached.error());
+    }
+    built.push_back(std::move(strategy));
   }
-  auto attached = strategy->Attach(options);
-  if (!attached) {
-    return std::unexpected(attached.error());
+  // Keep the factory for a sequence created later; store the built
+  // strategies now. HasStrategy() reports the factory, so the single-turn
+  // path picks the speculative drive as soon as this returns.
+  impl_->strategy_factory = factory;
+  impl_->strategy_options = options;
+  for (std::size_t i = 0; i < impl_->sequences.size(); ++i) {
+    impl_->sequences[i]->strategy = std::move(built[i]);
   }
-  impl_->strategy = std::move(strategy);
   return {};
 }
 

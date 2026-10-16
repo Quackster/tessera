@@ -28,6 +28,15 @@
 
 namespace tessera {
 
+namespace {
+
+// Concurrent serve turns the pipeline keeps sequences for. Each sequence
+// keeps its own KV cache, so the per-stage cache memory multiplies by this
+// count at a long context.
+constexpr std::size_t kMaxConcurrentTurns = 2;
+
+}  // namespace
+
 std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::Run(
     std::span<const std::uint32_t> prompt, const GenerateOptions& options,
     std::vector<std::uint32_t>* produced) {
@@ -35,7 +44,8 @@ std::expected<GenerateOutcome, StatusCode> Pipeline::Impl::Run(
     return std::unexpected(StatusCode::InvalidArgument);
   }
   produced->clear();
-  ResetCaches(options);
+  ResetSequence(DefaultSequence(), options);
+  Activate(DefaultSequence());
   GenerateOutcome outcome;
   outcome.prompt_tokens = prompt.size();
   std::expected<std::vector<float>, StatusCode> logits;
@@ -158,27 +168,21 @@ std::expected<std::unique_ptr<Pipeline>, StatusCode> Pipeline::Create(
     stage.boundary_layer = last - 1;
     stage.first_layer = first;
     stage.last_layer = last;
-    if (i > 0) {
-      auto buffer = stage.engine->Owner().AllocateBuffer(impl->hidden_dim * 4,
-                                                         MemoryKind::Device);
-      if (!buffer) {
-        return std::unexpected(buffer.error());
-      }
-      stage.incoming = std::move(*buffer);
-    }
-    if (i + 1 < stage_count) {
-      auto buffer = stage.engine->Owner().AllocateBuffer(impl->hidden_dim * 4,
-                                                         MemoryKind::Device);
-      if (!buffer) {
-        return std::unexpected(buffer.error());
-      }
-      stage.outgoing = std::move(*buffer);
-    }
     impl->stages.push_back(std::move(stage));
   }
   const std::span<const std::uint32_t> stops =
       impl->stages.back().model->StopTokens();
   impl->stops.assign(stops.begin(), stops.end());
+  // One default sequence for the single-turn run and calibrate paths, plus
+  // the pool the serve path draws concurrent turns from.
+  for (std::size_t i = 0; i <= kMaxConcurrentTurns; ++i) {
+    auto sequence = impl->NewSequence();
+    if (!sequence) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    impl->sequences.push_back(std::move(sequence));
+  }
+  impl->Activate(impl->DefaultSequence());
   return std::unique_ptr<Pipeline>(new Pipeline(std::move(impl)));
 }
 
