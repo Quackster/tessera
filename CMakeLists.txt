@@ -306,8 +306,12 @@ endif()
 add_executable(tessera-cli tools/cli/main.cpp
                             tools/cli/calibrate_command.cpp
                             tools/cli/calibrate_parallel.cpp
+                            tools/cli/cli_engine.cpp
                             tools/cli/cli_helpers.cpp
-                            tools/cli/fetch_mtp_command.cpp)
+                            tools/cli/fetch_mtp_command.cpp
+                            tools/cli/run_command.cpp
+                            tools/cli/run_single.cpp
+                            tools/cli/serve_command.cpp)
 target_link_libraries(tessera-cli PRIVATE tessera)
 
 enable_testing()
@@ -333,6 +337,8 @@ add_executable(tessera-tests
     tests/spec_test.cpp
     tests/calibrate_test.cpp
     tests/calibrate_sweep_test.cpp
+    tests/cli_test.cpp
+    tools/cli/cli_helpers.cpp
 )
 target_link_libraries(tessera-tests PRIVATE tessera GTest::gtest GTest::gtest_main)
 target_include_directories(tessera-tests PRIVATE src tools/cli)

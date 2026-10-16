@@ -5,6 +5,7 @@
 
 #include "core/json.hpp"
 #include "serve/http.hpp"
+#include "serve/render.hpp"
 #include "serve/session.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/runner.hpp"
@@ -32,12 +33,14 @@ namespace serve {
 void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
                     SessionStore& sessions, ResponseWriter& writer,
                     const core::Json& body, std::size_t default_max,
-                    std::size_t stats_interval_seconds);
+                    std::size_t stats_interval_seconds,
+                    const TemplateDefaults& defaults = {});
 
 void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
                 SessionStore& sessions, ResponseWriter& writer,
-                const core::Json& body, std::size_t default_max,
-                bool anthropic, std::size_t stats_interval_seconds);
+                const core::Json& body, std::size_t default_max, bool anthropic,
+                std::size_t stats_interval_seconds,
+                const TemplateDefaults& defaults = {});
 
 }  // namespace serve
 

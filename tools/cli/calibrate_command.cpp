@@ -14,11 +14,11 @@
 #include <vector>
 
 #include "calibrate_parallel.hpp"
-#include "tessera/calibrate_sweep.hpp"
-#include "cli_common.hpp"
+#include "cli_engine.hpp"
 #include "cli_helpers.hpp"
 #include "tessera/budget.hpp"
 #include "tessera/calibrate.hpp"
+#include "tessera/calibrate_sweep.hpp"
 #include "tessera/defaults.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/model.hpp"
@@ -66,8 +66,8 @@ std::string FormatRate(double rate) {
   } else if (memory.total_bytes > model_bytes) {
     available = memory.total_bytes - model_bytes;
   }
-  available = available > kMemoryReserveBytes ? available - kMemoryReserveBytes
-                                              : 0;
+  available =
+      available > kMemoryReserveBytes ? available - kMemoryReserveBytes : 0;
   auto model_config = loaded.Config();
   std::size_t max_context =
       model_config ? MaxContextForKv(available, *model_config, kv_type) : 0;
@@ -85,6 +85,62 @@ std::string FormatRate(double rate) {
   return max_context;
 }
 
+// The flags calibrate cannot honor: it sweeps the single-device, --tp,
+// --cp and --pipeline routes with fixed prompts and greedy decode, and
+// sizes the paging itself. Reported once instead of ignored in silence.
+void WarnInertCalibrateFlags(const CliOptions& options) {
+  if (options.hybrid_mode || options.spec_split_mode ||
+      options.dp_groups != 1) {
+    WarnIgnoredFlag("--hybrid/--spec-split/--dp",
+                    "calibrate sweeps the single-device, --tp, --cp and "
+                    "--pipeline routes");
+  }
+  if (!options.image_path.empty() || !options.mmproj_path.empty() ||
+      !options.prompt_texts.empty() || options.no_chat) {
+    WarnIgnoredFlag("--image/--mmproj/--prompt-text/--no-chat",
+                    "calibration uses fixed prompts or --prompts");
+  }
+  if (options.sample || options.sampling_explicit || options.seed != 0) {
+    WarnIgnoredFlag("--sample/--temperature/.../--seed",
+                    "calibration decodes greedy");
+  }
+  if (options.thinking_flag_set || options.reasoning_effort_set ||
+      options.max_thinking_tokens != 0) {
+    WarnIgnoredFlag(
+        "--enable-thinking/--no-thinking/--reasoning-effort/"
+        "--max-thinking-tokens",
+        "calibration decodes greedy without thinking");
+  }
+  if (options.gpu_layers != 0 || options.gpu_layers_help) {
+    WarnIgnoredFlag("--gpu-layers",
+                    "calibrate sizes the paging from the free device memory");
+  }
+  if (!options.mtp_path.empty()) {
+    WarnIgnoredFlag("--mtp",
+                    "calibrate drafts from the target's own nextn head");
+  }
+  if (options.max_completion_tokens != 0) {
+    WarnIgnoredFlag("--max-completion-tokens",
+                    "calibration measures its own decode length");
+  }
+  if (!options.pipeline_split.empty()) {
+    WarnIgnoredFlag("--pipeline-split",
+                    "calibrate stages the model evenly across --pipeline "
+                    "devices");
+  }
+  if (!options.api_keys.empty() || !options.allow_origins.empty() ||
+      !options.auto_title ||
+      options.stats_interval_seconds != kDefaultStatsIntervalSeconds ||
+      options.host != kDefaultServeHost || options.port != kDefaultServePort) {
+    WarnIgnoredFlag(
+        "--api-key/--allow-origin/--no-auto-title/--stats-interval/"
+        "--host/--port",
+        "those are serve options");
+  }
+}
+
+}  // namespace
+
 void PrintCalibrateUsage() {
   std::fprintf(
       stderr,
@@ -100,15 +156,15 @@ void PrintCalibrateUsage() {
       "  --context <n>     maximum context length (default %zu)\n"
       "  --kv-f16|--kv-q8|--kv-q4|--kv-fp8   KV cache type (default int8, "
       "kv8)\n"
-       "  --calibration <file> calibration file to read and write (env "
-       "TESSERA_CALIBRATION)\n"
-       "  --gpus <a,b>      one GPU index or a list (default 0); two or more\n"
-       "                    run the parallel max-context over every device\n"
-       "  --tp | --cp | --pipeline  parallel route for --gpus (exactly one)\n"
-       "  --prompts <file>  fixed prompts, one per non-empty line\n"
-       "  --calibrate-limit <n> measure at most n sweep points in total,\n"
-       "                    in sweep order (default unlimited)\n"
-       "  --concurrent      also benchmark 2, 3 and 4 concurrent sessions\n"
+      "  --calibration <file> calibration file to read and write (env "
+      "TESSERA_CALIBRATION)\n"
+      "  --gpus <a,b>      one GPU index or a list (default 0); two or more\n"
+      "                    run the parallel max-context over every device\n"
+      "  --tp | --cp | --pipeline  parallel route for --gpus (exactly one)\n"
+      "  --prompts <file>  fixed prompts, one per non-empty line\n"
+      "  --calibrate-limit <n> measure at most n sweep points in total,\n"
+      "                    in sweep order (default unlimited)\n"
+      "  --concurrent      also benchmark 2, 3 and 4 concurrent sessions\n"
       "  --wmma|--no-wmma  fp8 tensor-core MXFP4 GEMM (diagnostic)\n"
       "  --w4a8            MXFP4 W4A8 activation quant (diagnostic)\n"
       "  --target-bf16     round projection outputs to bf16 (diagnostic)\n"
@@ -119,110 +175,64 @@ void PrintCalibrateUsage() {
       kDefaultContext);
 }
 
-// Resolve the calibration file path: the flag, else TESSERA_CALIBRATION.
-std::string ResolveCalibrationPath(const std::string& flag_value) {
-  if (!flag_value.empty()) {
-    return flag_value;
-  }
-  if (const char* env = std::getenv("TESSERA_CALIBRATION");
-      env != nullptr && *env != '\0') {
-    return env;
-  }
-  return {};
-}
-
-}  // namespace
-
-int RunCalibrateCommand(int argc, char** argv) {
-  std::string model_path;
-  std::string draft_path;
-  std::string calibration_path;
-  std::string prompts_path;
-  std::size_t calibrate_limit = 0;
-  std::size_t context = kDefaultContext;
-  // int8 (kv8) is the default KvType for calibration, the memory-efficient
-  // cache the maximum context is found for.
-  KvCacheType kv_type = KvCacheType::Q8;
-  std::vector<int> gpus;
-  bool quiet = false;
-  bool concurrent = false;
-  bool speculate = false;
-  bool tp_mode = false;
-  bool cp_mode = false;
-  bool pipeline_mode = false;
-  for (int i = 2; i < argc; ++i) {
-    const std::string_view arg = argv[i];
-    if (arg == "--model" && i + 1 < argc) {
-      model_path = argv[++i];
-    } else if (arg == "--draft" && i + 1 < argc) {
-      draft_path = argv[++i];
-    } else if (arg == "--speculate") {
-      speculate = true;
-    } else if (arg == "--calibration" && i + 1 < argc) {
-      calibration_path = argv[++i];
-    } else if (arg == "--prompts" && i + 1 < argc) {
-      prompts_path = argv[++i];
-    } else if (arg == "--calibrate-limit" && i + 1 < argc) {
-      calibrate_limit = std::stoul(argv[++i]);
-    } else if (arg == "--context" && i + 1 < argc) {
-      context = std::stoul(argv[++i]);
-    } else if (arg == "--gpus" && i + 1 < argc) {
-      gpus = ParseGpuList(argv[++i]);
-    } else if (arg == "--tp") {
-      tp_mode = true;
-    } else if (arg == "--cp") {
-      cp_mode = true;
-    } else if (arg == "--pipeline") {
-      pipeline_mode = true;
-    } else if (arg == "--quiet") {
-      quiet = true;
-    } else if (arg == "--concurrent") {
-      concurrent = true;
-    } else if (MatchKvType(arg, kv_type)) {
-      // handled by MatchKvType
-    } else if (ApplyDiagnosticFlag(arg, i, argv, argc)) {
-      // handled by ApplyDiagnosticFlag (sets the diagnostic env var)
-    } else {
-      std::fprintf(stderr, "cli: unknown or unterminated argument '%s'\n",
-                   arg.data());
-      PrintCalibrateUsage();
-      return kExitUsage;
-    }
-  }
-  if (model_path.empty()) {
+int RunCalibrateCommand(const CliOptions& options) {
+  if (options.model_path.empty()) {
     std::fprintf(stderr, "cli: calibrate requires --model\n");
     PrintCalibrateUsage();
     return kExitUsage;
   }
-  const std::string calibration_file = ResolveCalibrationPath(calibration_path);
-  if (calibration_file.empty()) {
+  WarnInertCalibrateFlags(options);
+  if (options.calibration_path.empty()) {
     std::fprintf(stderr,
                  "cli: calibrate needs --calibration <file> or "
                  "TESSERA_CALIBRATION\n");
     return kExitUsage;
   }
-  // Two or more devices, or an explicit split flag, select the parallel
-  // sweep. One device (or none) runs the single-device sweep.
-  const bool parallel = tp_mode || cp_mode || pipeline_mode || gpus.size() >= 2;
+  // int8 (kv8) is the default KV type for calibration, the
+  // memory-efficient cache the maximum context is found for; run and
+  // serve keep F32 unless asked otherwise.
+  const KvCacheType kv_type =
+      options.kv_type_set ? options.kv_type : KvCacheType::Q8;
+  const std::vector<int> devices = SelectedDevices(options);
+  // --tp, --cp and --pipeline select the parallel sweep; at most one
+  // route. Two or more devices default to the parallel max-context run.
+  const int routes = (options.tp_mode ? 1 : 0) + (options.cp_mode ? 1 : 0) +
+                     (options.pipeline_mode ? 1 : 0);
+  if (routes > 1) {
+    std::fprintf(stderr,
+                 "cli: --tp, --cp and --pipeline are mutually exclusive\n");
+    return kExitUsage;
+  }
+  const bool parallel = options.tp_mode || options.cp_mode ||
+                        options.pipeline_mode || devices.size() >= 2;
   if (parallel) {
     // Parallel calibration: the speed sweep runs through the layout and the
     // entry also carries the largest KV-cache context the layout allows.
     ParallelCalibrateOptions parallel_options;
-    parallel_options.model_path = model_path;
-    parallel_options.devices = gpus;
-    parallel_options.tp = tp_mode;
-    parallel_options.cp = cp_mode;
-    parallel_options.pipeline = pipeline_mode;
-    parallel_options.context = context;
+    parallel_options.model_path = options.model_path;
+    parallel_options.devices = devices;
+    parallel_options.tp = options.tp_mode;
+    parallel_options.cp = options.cp_mode;
+    parallel_options.pipeline = options.pipeline_mode;
+    parallel_options.context = options.context;
     parallel_options.kv_type = kv_type;
-    parallel_options.calibration_file = calibration_file;
-    parallel_options.prompts_path = prompts_path;
-    parallel_options.calibrate_limit = calibrate_limit;
-    parallel_options.speculate = speculate;
-    parallel_options.draft_path = draft_path;
-    parallel_options.quiet = quiet;
+    parallel_options.calibration_file = options.calibration_path;
+    parallel_options.prompts_path = options.prompts_path;
+    parallel_options.calibrate_limit = options.calibrate_limit;
+    parallel_options.speculate = options.speculate;
+    parallel_options.draft_path = options.draft_path;
+    parallel_options.quiet = options.quiet;
     return RunParallelCalibrate(parallel_options);
   }
+  const std::string& model_path = options.model_path;
+  const std::string& draft_path = options.draft_path;
+  const std::string& prompts_path = options.prompts_path;
+  const std::string& calibration_file = options.calibration_path;
+  const std::size_t calibrate_limit = options.calibrate_limit;
+  const std::size_t context = options.context;
+  const bool quiet = options.quiet;
+  const bool concurrent = options.concurrent;
+  const bool speculate = options.speculate;
   std::vector<std::string> prompts = DefaultCalibrationPrompts();
   if (!prompts_path.empty()) {
     auto loaded_prompts = CalibrationPromptsFromFile(prompts_path);
@@ -234,7 +244,7 @@ int RunCalibrateCommand(int argc, char** argv) {
     prompts = std::move(*loaded_prompts);
   }
 
-  const int device = gpus.empty() ? 0 : gpus.front();
+  const int device = devices.front();
   EngineOptions engine_options;
   engine_options.device_index = device;
   auto created = Engine::Create(engine_options);
@@ -244,6 +254,7 @@ int RunCalibrateCommand(int argc, char** argv) {
     return kExitError;
   }
   Engine& engine = **created;
+  ApplyCliLogLevel(engine, options);
   auto& log = engine.Diagnostics();
 
   // DFlash2 attaches from its checkpoint; MTP drafts from the target's own
@@ -262,9 +273,8 @@ int RunCalibrateCommand(int argc, char** argv) {
     }
     auto attached = engine.AttachSpeculative(std::move(strategy));
     if (!attached) {
-      log.Error("calibrate",
-                std::string("strategy attach failed (") +
-                    std::string(ToString(attached.error())) + ")");
+      log.Error("calibrate", std::string("strategy attach failed (") +
+                                 std::string(ToString(attached.error())) + ")");
       return kExitError;
     }
     draft_attached = true;
@@ -303,11 +313,10 @@ int RunCalibrateCommand(int argc, char** argv) {
                                   std::to_string(advice->full_bytes) +
                                   " resident bytes)");
       } else {
-        log.Info("calibrate", "paging: --gpu-layers " +
-                                  std::to_string(gpu_layers) + " (resident " +
-                                  std::to_string(advice->best_bytes) +
-                                  " bytes of " + std::to_string(budget) +
-                                  " budget)");
+        log.Info("calibrate",
+                 "paging: --gpu-layers " + std::to_string(gpu_layers) +
+                     " (resident " + std::to_string(advice->best_bytes) +
+                     " bytes of " + std::to_string(budget) + " budget)");
       }
     }
   }
@@ -347,13 +356,13 @@ int RunCalibrateCommand(int argc, char** argv) {
   }
 
   // The single-device route: the engine streams one greedy generation.
-  const TimedGenerateFn generate =
-      [&](std::span<const std::uint32_t> prompt, const GenerateOptions& gen) {
-        GenerateOptions options = gen;
-        options.prompt_tokens.assign(prompt.begin(), prompt.end());
-        return engine.GenerateStreaming(loaded, options,
-                                        [](std::uint32_t) { return true; });
-      };
+  const TimedGenerateFn generate = [&](std::span<const std::uint32_t> prompt,
+                                       const GenerateOptions& gen) {
+    GenerateOptions options = gen;
+    options.prompt_tokens.assign(prompt.begin(), prompt.end());
+    return engine.GenerateStreaming(loaded, options,
+                                    [](std::uint32_t) { return true; });
+  };
   const MeasureFn measure = BuildSweepMeasure(generate, prompt_set, kv_type);
 
   // Warm the engine once before the first measurement (kernel compile and
@@ -391,10 +400,10 @@ int RunCalibrateCommand(int argc, char** argv) {
             ? ", max " + std::to_string(sweep.max_points) + " points"
             : "";
     log.Info("calibrate", std::string("sweeping on ") + backend + " (" +
-                               std::string(engine.Owner().DeviceName()) +
-                               "), " + std::to_string(sweep.prompt_count) +
-                               " prompt(s)" + budget + ", greedy decode, " +
-                               std::string(ToString(kv_type)) + " KV");
+                              std::string(engine.Owner().DeviceName()) + "), " +
+                              std::to_string(sweep.prompt_count) +
+                              " prompt(s)" + budget + ", greedy decode, " +
+                              std::string(ToString(kv_type)) + " KV");
   }
   auto outcome = RunCalibrationSweep(sweep, measure);
   if (!outcome) {
@@ -441,8 +450,7 @@ int RunCalibrateCommand(int argc, char** argv) {
   // Report the maximum context length the device allows for this KV
   // cache type, measured after the sweep so the draft weights are
   // resident. KV-only and informational; the run used --context.
-  const std::size_t max_context =
-      LogMaxContext(engine, loaded, kv_type, quiet);
+  const std::size_t max_context = LogMaxContext(engine, loaded, kv_type, quiet);
 
   const std::string device_name(engine.Owner().DeviceName());
   const std::string model_id =
@@ -467,9 +475,8 @@ int RunCalibrateCommand(int argc, char** argv) {
     } else if (memory.total_bytes > model_bytes) {
       available = memory.total_bytes - model_bytes;
     }
-    available = available > kMemoryReserveBytes
-                    ? available - kMemoryReserveBytes
-                    : 0;
+    available =
+        available > kMemoryReserveBytes ? available - kMemoryReserveBytes : 0;
     auto model_config = loaded.Config();
     if (model_config) {
       max_concurrent = MaxConcurrentSessions(
@@ -485,9 +492,9 @@ int RunCalibrateCommand(int argc, char** argv) {
       std::unique_ptr<Engine> engine_ptr = std::move(*created);
       std::unique_ptr<Model> model_ptr = std::move(*model);
       RunnerPool pool;
-      pool.Add(std::make_unique<SingleDeviceRunner>(std::move(engine_ptr),
-                                        std::move(model_ptr), device,
-                                        outcome->config, kv_type));
+      pool.Add(std::make_unique<SingleDeviceRunner>(
+          std::move(engine_ptr), std::move(model_ptr), device, outcome->config,
+          kv_type));
       for (const std::size_t sessions :
            {std::size_t{2}, std::size_t{3}, std::size_t{4}}) {
         std::vector<GenerateOptions> requests;

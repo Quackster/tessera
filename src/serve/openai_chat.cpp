@@ -1,5 +1,3 @@
-#include "serve/openai.hpp"
-
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -11,6 +9,7 @@
 
 #include "core/json.hpp"
 #include "serve/http.hpp"
+#include "serve/openai.hpp"
 #include "serve/openai_shared.hpp"
 #include "serve/render.hpp"
 #include "serve/respond.hpp"
@@ -32,7 +31,8 @@ using core::Json;
 void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
                 SessionStore& sessions, ResponseWriter& writer,
                 const Json& body, std::size_t default_max, bool anthropic,
-                std::size_t stats_interval_seconds) {
+                std::size_t stats_interval_seconds,
+                const TemplateDefaults& defaults) {
   const std::string session_id = SessionIdFrom(body);
   std::shared_ptr<Session> session;
   SessionTurn turn;
@@ -56,12 +56,12 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   // time-slice; thinking budgets and tool calls stay queued exclusive
   // (see RouteDevice).
   const bool wants_tools = !anthropic && WantsTools(prompt_body);
-  const std::size_t max_thinking_tokens =
-      MaxThinkingTokensFrom(prompt_body);
+  const std::size_t max_thinking_tokens = MaxThinkingTokensFrom(prompt_body);
   RunnerLease lease;
   RunnerLease* slot = nullptr;
-  if (!RouteDevice(pool, max_thinking_tokens, wants_tools,
-                   [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
+  if (!RouteDevice(
+          pool, max_thinking_tokens, wants_tools,
+          [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
     return;
   }
   const bool shared = slot == nullptr;
@@ -82,17 +82,16 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
       return lease.engine().GenerateStreaming(lease.model(), options, next);
     };
     SessionMessage assistant;
-    const bool ok =
-        ChatWithTools(generate, model, tokenizer, writer, prompt_body,
-                      default_max, session != nullptr ? &assistant : nullptr,
-                      tool_kv);
+    const bool ok = ChatWithTools(
+        generate, model, tokenizer, writer, prompt_body, default_max,
+        session != nullptr ? &assistant : nullptr, tool_kv, defaults);
     if (session != nullptr && ok) {
       session->Append(std::move(assistant));
     }
     return;
   }
   std::string error;
-  const std::string prompt = RenderPrompt(model, prompt_body, &error);
+  const std::string prompt = RenderPrompt(model, prompt_body, &error, defaults);
   if (!error.empty()) {
     SendError(writer, 422, error);
     return;
@@ -112,8 +111,7 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   // The pool carries the launcher's KV storage type (--kv-q8 and
   // friends); without it every serve turn would decode F32 and an
   // unlimited turn would never fit the device.
-  options.kv_type =
-      shared ? pool.At(0).kv_type() : lease.runner().kv_type();
+  options.kv_type = shared ? pool.At(0).kv_type() : lease.runner().kv_type();
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
   }
@@ -125,8 +123,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   // while yielding every few tokens (see MaybeYieldExclusive).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (shared) {
-      return pool.SubmitLeastLoaded(
-          options, next, [&writer] { return writer.IsPeerGone(); });
+      return pool.SubmitLeastLoaded(options, next,
+                                    [&writer] { return writer.IsPeerGone(); });
     }
     return lease.engine().GenerateStreaming(lease.model(), options, next);
   };
@@ -136,9 +134,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   // Console tok/s for this turn, every stats interval (zero off).
   // The OpenAI stream shape stays pure: no speed deltas on the wire.
   const std::string speed_label =
-      session != nullptr
-          ? "session " + session->Id()
-          : (anthropic ? "messages" : "chat completions");
+      session != nullptr ? "session " + session->Id()
+                         : (anthropic ? "messages" : "chat completions");
   log::Diagnostics& speed_log =
       shared ? pool.At(0).engine().Diagnostics() : lease.engine().Diagnostics();
   TurnSpeedometer speedometer(std::chrono::seconds(stats_interval_seconds),
@@ -148,14 +145,11 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   // a queued scheduler turn streams beside them instead of behind
   // them.
   int yield_count = 0;
-  // Thinking is on unless the request turns it off. The chat template
-  // then opens the <think> block in the prompt, so the model streams
-  // reasoning with no opening tag in its output; ThinkExpected tells
-  // the streamer to treat that leading text as reasoning.
-  const Json* thinking_flag = prompt_body.Find("enable_thinking");
-  const bool enable_thinking =
-      thinking_flag == nullptr ||
-      thinking_flag->type() != Json::Type::Bool || thinking_flag->AsBool();
+  // Thinking defaults to on (or the serve option's value). The chat
+  // template then opens the <think> block in the prompt, so the model
+  // streams reasoning with no opening tag in its output; ThinkExpected
+  // tells the streamer to treat that leading text as reasoning.
+  const bool enable_thinking = RequestEnableThinking(prompt_body, defaults);
   if (anthropic) {
     if (!stream) {
       // GenerateStreaming with a liveness hook instead of Generate:
@@ -174,8 +168,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
         (void)speedometer.NoteToken();
         return true;
       });
-      stats.elapsed_ms = MillisBetween(gen_started,
-                                       std::chrono::steady_clock::now());
+      stats.elapsed_ms =
+          MillisBetween(gen_started, std::chrono::steady_clock::now());
       if (!streamed) {
         // A gone peer fails here only on a real error (abort returns a
         // count); anything else is reported when someone listens.
@@ -205,10 +199,10 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
       response.Set("role", Json::String("assistant"));
       response.Set("model", Json::String(model_name));
       response.Set("content", std::move(content));
-      response.Set("stop_reason",
-                   Json::String(streamed->reason == FinishReason::Length
-                                    ? "max_tokens"
-                                    : "end_turn"));
+      response.Set(
+          "stop_reason",
+          Json::String(streamed->reason == FinishReason::Length ? "max_tokens"
+                                                                : "end_turn"));
       response.Set("usage", std::move(usage));
       SendJson(writer, 200, response);
       return;
@@ -237,8 +231,7 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
       if (writer.IsPeerGone()) {
         return false;
       }
-      auto piece =
-          tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
+      auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
       if (piece) {
         text += *piece;
       }
@@ -257,8 +250,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
       (void)speedometer.NoteToken();
       return true;
     });
-    stats.elapsed_ms = MillisBetween(gen_started,
-                                     std::chrono::steady_clock::now());
+    stats.elapsed_ms =
+        MillisBetween(gen_started, std::chrono::steady_clock::now());
     stats.completion_tokens = count;
     if (session != nullptr) {
       session->Append(AssistantTurn(text, writer.IsPeerGone(), stats));
@@ -299,8 +292,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
       (void)speedometer.NoteToken();
       return true;
     });
-    stats.elapsed_ms = MillisBetween(chat_started,
-                                     std::chrono::steady_clock::now());
+    stats.elapsed_ms =
+        MillisBetween(chat_started, std::chrono::steady_clock::now());
     if (!streamed) {
       // A gone peer fails here only on a real error (abort returns a
       // count); anything else is reported when someone listens.
@@ -336,7 +329,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     Json choice = Json::Object();
     choice.Set("index", Json::Number(0));
     choice.Set("message", std::move(message));
-    choice.Set("finish_reason", Json::String(FinishReasonName(streamed->reason)));
+    choice.Set("finish_reason",
+               Json::String(FinishReasonName(streamed->reason)));
     Json choices = Json::Array();
     choices.Push(std::move(choice));
     Json response = Json::Object();
@@ -394,8 +388,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     return true;
   });
   stream_piece(streamer.Finish());
-  stats.elapsed_ms = MillisBetween(chat_started,
-                                   std::chrono::steady_clock::now());
+  stats.elapsed_ms =
+      MillisBetween(chat_started, std::chrono::steady_clock::now());
   stats.completion_tokens = count;
   if (session != nullptr) {
     session->Append(AssistantTurn(text, writer.IsPeerGone(), stats));
@@ -407,9 +401,9 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   Json end_choice = Json::Object();
   end_choice.Set("index", Json::Number(0));
   end_choice.Set("delta", std::move(end_delta));
-  end_choice.Set("finish_reason",
-                 Json::String(streamed ? FinishReasonName(streamed->reason)
-                                       : "length"));
+  end_choice.Set(
+      "finish_reason",
+      Json::String(streamed ? FinishReasonName(streamed->reason) : "length"));
   Json end_choices = Json::Array();
   end_choices.Push(std::move(end_choice));
   Json end_chunk = Json::Object();

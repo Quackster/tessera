@@ -8,6 +8,7 @@
 
 #include "core/json.hpp"
 #include "serve/http.hpp"
+#include "serve/render.hpp"
 #include "serve/session.hpp"
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
@@ -31,9 +32,9 @@ namespace tessera::serve {
 // must be a string (null reads as empty); anything else is a 422.
 // Never fails on tool shapes: they store verbatim and NormalizeToolHistory
 // validates them at render time.
-[[nodiscard]] bool SessionMessagesFromJson(
-    const core::Json& messages, std::vector<SessionMessage>* out,
-    std::string* error);
+[[nodiscard]] bool SessionMessagesFromJson(const core::Json& messages,
+                                           std::vector<SessionMessage>* out,
+                                           std::string* error);
 
 // Read-only session JSON for GET responses (message tool turns included).
 [[nodiscard]] core::Json SessionJson(const SessionView& view);
@@ -45,7 +46,8 @@ class SessionHandler {
   SessionHandler(RunnerPool& pool, const Tokenizer& tokenizer,
                  SessionStore& sessions,
                  std::size_t default_max_completion_tokens, bool auto_title,
-                 std::size_t stats_interval_seconds);
+                 std::size_t stats_interval_seconds,
+                 TemplateDefaults defaults = {});
 
   // Session CRUD over JSON bodies; 404 for an unknown id.
   void HandleList(ResponseWriter& writer) const;
@@ -53,12 +55,12 @@ class SessionHandler {
   void HandleGet(ResponseWriter& writer, std::string_view id) const;
   void HandleDelete(ResponseWriter& writer, std::string_view id) const;
   void HandleRename(ResponseWriter& writer, std::string_view id,
-                     const core::Json& body) const;
+                    const core::Json& body) const;
   // Append a user message and generate the turn (SSE when
   // body["stream"] is true, default). 409 when the session is busy;
   // another session's generation queues on the device.
   void HandleChat(ResponseWriter& writer, std::string_view id,
-                   const core::Json& body) const;
+                  const core::Json& body) const;
   // Regenerate after dropping trailing assistant messages.
   void HandleRetry(ResponseWriter& writer, std::string_view id,
                    const core::Json& body) const;
@@ -67,7 +69,7 @@ class SessionHandler {
   void HandlePause(ResponseWriter& writer, std::string_view id) const;
   void HandleResume(ResponseWriter& writer, std::string_view id) const;
 
-  private:
+ private:
   // Shared turn core for chat and retry (see the .cpp for the flow).
   // A null lease runs the turn on the shared scheduler; otherwise the
   // lease's device runs it exclusively (thinking budgets only) and
@@ -90,6 +92,7 @@ class SessionHandler {
   std::size_t default_max_completion_tokens_;
   bool auto_title_;
   std::size_t stats_interval_seconds_;
+  TemplateDefaults template_defaults_;
 };
 
 }  // namespace tessera::serve

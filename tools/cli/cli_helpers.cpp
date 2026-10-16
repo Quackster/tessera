@@ -22,6 +22,7 @@
 #include "tessera/model.hpp"
 #include "tessera/runner.hpp"
 #include "tessera/serve.hpp"
+#include "tessera/tokenizer.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera::cli {
@@ -113,8 +114,8 @@ void LogModelSummary(Engine& engine, Model& model) {
   if (!model.Paged().empty()) {
     std::size_t paged_bytes = 0;
     for (const auto& paged : model.Paged()) {
-      auto sized = TensorBytes(paged.manifest.dtype,
-                               paged.manifest.shape.Numel());
+      auto sized =
+          TensorBytes(paged.manifest.dtype, paged.manifest.shape.Numel());
       if (sized) {
         paged_bytes += *sized;
       }
@@ -130,104 +131,142 @@ void LogModelSummary(Engine& engine, Model& model) {
 }
 
 void PrintUsage() {
-  std::fprintf(stderr,
-               "usage: tessera-cli run --model <path> [--draft <dir>]\n"
-               "       [--context <n>] [--draft-block <n>]\n"
-               "       [--prefill-chunk <n>]\n"
-                "       [--gpus <a,b>] [--pipeline] [--pipeline-split <a,b>]\n"
-                "       [--tp] [--cp]\n"
-                "       [--speculate] [--spec-split] [--hybrid] [--dp <n>]\n"
-               "       --prompt-text <str> [--max-completion-tokens <n>]\n"
-               "       tessera-cli serve --model <path> [--host <ip>] "
-               "[--port <n>]\n"
-               "       tessera-cli calibrate --model <path> [--draft <dir>]\n"
-               "       [--context <n>] [--calibration <file>] [--gpus <a,b>]\n"
-               "       [--prompts <file>]\n"
-               "       tessera-cli fetch-mtp --out <dir> [inventory|fetch|"
-               "verify]\n"
-               "       tessera-cli --list-gpus\n"
-               "  --list-gpus       list the GPUs the backend sees and exit\n"
-               "  --model <path>    a .gguf file or an MXFP4 model directory\n"
-               "  --draft <dir>     DFlash2 draft checkpoint directory\n"
-               "  --mtp <dir>       MTP head directory (tessera-cli fetch-mtp)\n"
-                "  --context <n>     maximum context length (default %zu)\n"
-                "  --gpu-layers <n|all> layers kept in VRAM (0 uploads all, "
-                "default 0)\n"
-                "  --gpu-layers help   size the model for --gpu-layers "
-                "without loading it\n"
-                "  --gpus <a,b>      one GPU index or a comma-separated list "
-                "(default 0)\n"
-               "  --pipeline        run the model split across --gpus devices "
-                "(layer pipeline)\n"
-                "  --pipeline-split <a,b>  trunk layers per stage, in order "
-                "(default even)\n"
-                "  --calibration <file> calibrated settings to apply (env "
-               "TESSERA_CALIBRATION)\n"
-               "  --draft-block <n> draft block tokens (0 = checkpoint "
-               "default, %zu)\n"
-               "  --prefill-chunk <n> prefill tokens per forward (0 = auto, "
-               "%zu)\n"
-               "  --split-target <n> fp8 MXFP4 split-K workgroup target (0 = "
-               "built-in, ROCm only)\n"
-               "  --split-cap <n>    fp8 MXFP4 split-K factor cap (0 = built-in, "
-               "ROCm only)\n"
-               "  --attention-split <n> single-token flash-decoding chunks (0 = "
-               "built-in, %zu)\n"
-               "  --draft-context <n> DFlash2 draft context window in rows (0 = "
-               "checkpoint)\n"
-               "  --wmma | --no-wmma   fp8 tensor-core MXFP4 GEMM (default on; "
-               "diagnostic)\n"
-               "  --w4a8             MXFP4 W4A8 activation quant (diagnostic)\n"
-               "  --target-bf16      round projection outputs to bf16 "
-               "(diagnostic)\n"
-               "  --tiled-min-rows <n> | --tiled-min-cols <n>  tiled-GEMM "
-               "dispatch thresholds (diagnostic)\n"
-               "  --prefill-attn-pairs <n>  prefill attention work budget "
-               "(diagnostic)\n"
-                "  --prompt-text <s> text prompt, repeatable for parallel\n"
-                "                sessions (tokenized; needs a tokenizer)\n"
-               "  --max-completion-tokens <n> completion tokens (0 fills the "
-               "remaining context, default %zu)\n"
-               "  --max-thinking-tokens <n> think-block budget per turn (0 "
-               "leaves thinking unlimited, default 0)\n"
-               "  --enable-thinking | --no-thinking  render the chat "
-               "template with thinking (default on)\n"
-               "  --reasoning-effort <level> thinking difficulty for the "
-               "chat template (default xhigh; ignored with --no-chat)\n"
-               "  --speculate       draft with the MTP head (run and serve)\n"
-               "  --mmproj <path>   vision projector (mmproj) GGUF\n"
-               "  --image <path>    image (binary PPM) to prepend as tokens\n"
-               "  --quiet           suppress progress and info logs\n"
-               "  --verbose         enable debug logs (weight transfers, "
-               "cache probes)\n"
-               "  --no-chat         do not apply the chat template\n"
-               "  --sample          sample instead of greedy decode\n"
-               "  --temperature <f> sampling temperature (default %.1f)\n"
-               "  --top-p <f>       nucleus probability (default %.2f)\n"
-               "  --top-k <n>       keep the top n tokens (default %d)\n"
-               "  --min-p <f>       minimum probability (default %.1f)\n"
-               "  --presence-penalty <f>   presence penalty (default %.1f)\n"
-               "  --repetition-penalty <f> repetition penalty (default %.1f)\n"
-               "  --seed <n>        sampling RNG seed (default 0)\n"
-               "  --kv-f16          store the KV cache in fp16 (default fp32)\n"
-               "  --kv-q8           store the KV cache in int8\n"
-               "  --kv-q4           store the KV cache in 4-bit\n"
-               "  --kv-fp8          store the KV cache in FP8 E4M3\n"
-                "  --host <ip>       serve bind address (default %s)\n"
-                "  --port <n>        serve port (default %u)\n"
-                "  --stats-interval <s> live tok/s cadence on streams and "
-                "console (default %zu, 0 off)\n"
-               "  --no-auto-title   keep the first user line as the chat title "
-               "instead of asking the model\n"
-               "  --api-key <k>     accepted API key (repeatable; env "
-               "TESSERA_API_KEY)\n"
-               "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
-               kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk,
-               kDefaultAttentionSplitChunks, kDefaultMaxCompletionTokens,
-               kDefaultTemperature, kDefaultTopP, kDefaultTopK, kDefaultMinP,
-               kDefaultPresencePenalty, kDefaultRepetitionPenalty,
-               kDefaultServeHost, static_cast<unsigned>(kDefaultServePort),
-               kDefaultStatsIntervalSeconds);
+  std::fprintf(
+      stderr,
+      "usage: tessera-cli run --model <path> [--draft <dir>]\n"
+      "       [--context <n>] [--draft-block <n>]\n"
+      "       [--prefill-chunk <n>]\n"
+      "       [--gpus <a,b>] [--pipeline] [--pipeline-split <a,b>]\n"
+      "       [--tp] [--cp]\n"
+      "       [--speculate] [--spec-split] [--hybrid] [--dp <n>]\n"
+      "       --prompt-text <str> [--max-completion-tokens <n>]\n"
+      "       tessera-cli serve --model <path> [--host <ip>] "
+      "[--port <n>]\n"
+      "       tessera-cli calibrate --model <path> [--draft <dir>]\n"
+      "       [--context <n>] [--calibration <file>] [--gpus <a,b>]\n"
+      "       [--prompts <file>]\n"
+      "       tessera-cli fetch-mtp --out <dir> [inventory|fetch|"
+      "verify]\n"
+      "       tessera-cli --list-gpus\n"
+      "  --list-gpus       list the GPUs the backend sees and exit\n"
+      "  --model <path>    a .gguf file or an MXFP4 model directory\n"
+      "  --draft <dir>     DFlash2 draft checkpoint directory\n"
+      "  --mtp <dir>       MTP head directory (tessera-cli fetch-mtp)\n"
+      "  --context <n>     maximum context length (default %zu)\n"
+      "  --gpu-layers <n|all> layers kept in VRAM (0 uploads all, "
+      "default 0)\n"
+      "  --gpu-layers help   size the model for --gpu-layers "
+      "without loading it\n"
+      "  --gpus <a,b>      one GPU index or a comma-separated list "
+      "(default 0)\n"
+      "  --pipeline        run the model split across --gpus devices "
+      "(layer pipeline)\n"
+      "  --pipeline-split <a,b>  trunk layers per stage, in order "
+      "(default even)\n"
+      "  --calibration <file> calibrated settings to apply (env "
+      "TESSERA_CALIBRATION)\n"
+      "  --draft-block <n> draft block tokens (0 = checkpoint "
+      "default, %zu)\n"
+      "  --prefill-chunk <n> prefill tokens per forward (0 = auto, "
+      "%zu)\n"
+      "  --split-target <n> fp8 MXFP4 split-K workgroup target (0 = "
+      "built-in, ROCm only)\n"
+      "  --split-cap <n>    fp8 MXFP4 split-K factor cap (0 = built-in, "
+      "ROCm only)\n"
+      "  --attention-split <n> single-token flash-decoding chunks (0 = "
+      "built-in, %zu)\n"
+      "  --draft-context <n> DFlash2 draft context window in rows (0 = "
+      "checkpoint)\n"
+      "  --wmma | --no-wmma   fp8 tensor-core MXFP4 GEMM (default on; "
+      "diagnostic)\n"
+      "  --w4a8             MXFP4 W4A8 activation quant (diagnostic)\n"
+      "  --target-bf16      round projection outputs to bf16 "
+      "(diagnostic)\n"
+      "  --tiled-min-rows <n> | --tiled-min-cols <n>  tiled-GEMM "
+      "dispatch thresholds (diagnostic)\n"
+      "  --prefill-attn-pairs <n>  prefill attention work budget "
+      "(diagnostic)\n"
+      "  --prompt-text <s> text prompt, repeatable for parallel\n"
+      "                sessions (tokenized; needs a tokenizer)\n"
+      "  --max-completion-tokens <n> completion tokens (0 fills the "
+      "remaining context, default %zu)\n"
+      "  --max-thinking-tokens <n> think-block budget per turn (0 "
+      "leaves thinking unlimited, default 0)\n"
+      "  --enable-thinking | --no-thinking  render the chat "
+      "template with thinking (default on)\n"
+      "  --reasoning-effort <level> thinking difficulty for the "
+      "chat template (default xhigh; ignored with --no-chat)\n"
+      "  --speculate       draft with the MTP head (run and serve)\n"
+      "  --mmproj <path>   vision projector (mmproj) GGUF\n"
+      "  --image <path>    image (binary PPM) to prepend as tokens\n"
+      "  --quiet           suppress progress and info logs\n"
+      "  --verbose         enable debug logs (weight transfers, "
+      "cache probes)\n"
+      "  --no-chat         do not apply the chat template\n"
+      "  --sample          sample instead of greedy decode\n"
+      "  --temperature <f> sampling temperature (default %.1f)\n"
+      "  --top-p <f>       nucleus probability (default %.2f)\n"
+      "  --top-k <n>       keep the top n tokens (default %d)\n"
+      "  --min-p <f>       minimum probability (default %.1f)\n"
+      "  --presence-penalty <f>   presence penalty (default %.1f)\n"
+      "  --repetition-penalty <f> repetition penalty (default %.1f)\n"
+      "  --seed <n>        sampling RNG seed (default 0)\n"
+      "  --kv-f16          store the KV cache in fp16 (default fp32)\n"
+      "  --kv-q8           store the KV cache in int8\n"
+      "  --kv-q4           store the KV cache in 4-bit\n"
+      "  --kv-fp8          store the KV cache in FP8 E4M3\n"
+      "  --host <ip>       serve bind address (default %s)\n"
+      "  --port <n>        serve port (default %u)\n"
+      "  --stats-interval <s> live tok/s cadence on streams and "
+      "console (default %zu, 0 off)\n"
+      "  --no-auto-title   keep the first user line as the chat title "
+      "instead of asking the model\n"
+      "  --api-key <k>     accepted API key (repeatable; env "
+      "TESSERA_API_KEY)\n"
+      "  --allow-origin <o> CORS origin (repeatable; * allows all)\n",
+      kDefaultContext, kDefaultDraftBlock, kDefaultPrefillChunk,
+      kDefaultAttentionSplitChunks, kDefaultMaxCompletionTokens,
+      kDefaultTemperature, kDefaultTopP, kDefaultTopK, kDefaultMinP,
+      kDefaultPresencePenalty, kDefaultRepetitionPenalty, kDefaultServeHost,
+      static_cast<unsigned>(kDefaultServePort), kDefaultStatsIntervalSeconds);
+}
+
+void WarnIgnoredFlag(std::string_view flag, std::string_view reason) {
+  std::fprintf(stderr, "cli: %.*s ignored: %.*s\n",
+               static_cast<int>(flag.size()), flag.data(),
+               static_cast<int>(reason.size()), reason.data());
+}
+
+std::uint64_t PathSizeBytes(const std::string& path) {
+  std::error_code ec;
+  const std::filesystem::path p(path);
+  if (std::filesystem::is_regular_file(p, ec)) {
+    return std::filesystem::file_size(p, ec);
+  }
+  std::uint64_t total = 0;
+  if (std::filesystem::is_directory(p, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(p, ec)) {
+      if (entry.is_regular_file(ec)) {
+        total += entry.file_size(ec);
+      }
+    }
+  }
+  return total;
+}
+
+std::expected<std::vector<std::uint32_t>, StatusCode> EncodePromptText(
+    std::string_view source, bool no_chat, const Tokenizer& tokenizer,
+    const std::function<std::expected<std::string, StatusCode>()>& render) {
+  std::string text(source);
+  if (!no_chat) {
+    auto chat = render();
+    if (chat) {
+      text = *chat;
+    } else if (chat.error() != StatusCode::UnsupportedFeature) {
+      return std::unexpected(chat.error());
+    }
+  }
+  return tokenizer.Encode(text);
 }
 
 CalibrationConfig ResolveCalibration(Engine& engine, Model& model,
@@ -252,8 +291,9 @@ CalibrationConfig ResolveCalibration(Engine& engine, Model& model,
   }
   const CalibrationEntry* entry = file->Find(key);
   if (entry == nullptr) {
-    log.Info("cli", "no calibration entry for this machine and model; "
-                    "using the explicit values");
+    log.Info("cli",
+             "no calibration entry for this machine and model; "
+             "using the explicit values");
     return explicit_config;
   }
   const CalibrationConfig merged =
@@ -266,13 +306,10 @@ CalibrationConfig ResolveCalibration(Engine& engine, Model& model,
   return merged;
 }
 
-std::size_t ResolveCalibrationGpuLayers(Engine& engine,
-                                        const std::string& model_path,
-                                        std::size_t context,
-                                        KvCacheType kv_type,
-                                        std::string_view strategy,
-                                        const std::string& path,
-                                        std::size_t explicit_layers) {
+std::size_t ResolveCalibrationGpuLayers(
+    Engine& engine, const std::string& model_path, std::size_t context,
+    KvCacheType kv_type, std::string_view strategy, const std::string& path,
+    std::size_t explicit_layers) {
   if (path.empty()) {
     return explicit_layers;
   }
@@ -300,7 +337,9 @@ std::size_t ResolveCalibrationGpuLayers(Engine& engine,
 namespace {
 
 // Whole MiB, the unit the serve pre-check reports free memory in.
-std::uint64_t ToMiB(std::uint64_t bytes) { return bytes / (1024 * 1024); }
+std::uint64_t ToMiB(std::uint64_t bytes) {
+  return bytes / (1024 * 1024);
+}
 
 }  // namespace
 
@@ -329,12 +368,12 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
                       " trunk blocks plus the output head (" +
                       std::to_string(advice->total_layers) +
                       " offloadable layers, 0 keeps every layer)");
-  log.Info("cli",
-           "context " + std::to_string(context) + ", kv " +
-               std::string(ToString(kv_type)) + ": cache about " +
-               std::to_string(ToMiB(advice->kv_bytes)) + " MiB (" +
-               std::to_string(advice->full_layers) + " full, " +
-               std::to_string(advice->linear_layers) + " linear layers)");
+  log.Info("cli", "context " + std::to_string(context) + ", kv " +
+                      std::string(ToString(kv_type)) + ": cache about " +
+                      std::to_string(ToMiB(advice->kv_bytes)) + " MiB (" +
+                      std::to_string(advice->full_layers) + " full, " +
+                      std::to_string(advice->linear_layers) +
+                      " linear layers)");
   log.Info("cli", "weights: full upload " +
                       std::to_string(ToMiB(advice->full_bytes)) + " MiB");
   const std::string budget_label =
@@ -344,8 +383,9 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
                                : " MiB free");
   if (!advice->has_best) {
     if (advice->free_bytes == 0) {
-      log.Info("cli", "the backend reports no memory size; size "
-                      "--gpu-layers by hand");
+      log.Info("cli",
+               "the backend reports no memory size; size "
+               "--gpu-layers by hand");
     } else {
       log.Info("cli", "no layer count fits " + budget_label +
                           "; lower --context, quantize the KV "
@@ -357,12 +397,11 @@ int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
     log.Info("cli", "best --gpu-layers 0: the full upload fits " +
                         budget_label + "; no paging needed");
   } else {
-    log.Info("cli", "best --gpu-layers " + std::to_string(advice->best) +
-                        ": resident " +
-                        std::to_string(ToMiB(advice->best_bytes)) +
-                        " MiB plus " +
-                        std::to_string(ToMiB(advice->staging_bytes)) +
-                        " MiB staging of " + budget_label);
+    log.Info("cli",
+             "best --gpu-layers " + std::to_string(advice->best) +
+                 ": resident " + std::to_string(ToMiB(advice->best_bytes)) +
+                 " MiB plus " + std::to_string(ToMiB(advice->staging_bytes)) +
+                 " MiB staging of " + budget_label);
   }
   return 0;
 }
@@ -384,9 +423,8 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
   auto fit = core::FitGpuLayers(model_path, context, kv_type, budget,
                                 std::string(strategy), gpu_layers);
   if (!fit) {
-    log.Warn("cli", std::string("cannot size --gpu-layers for '") +
-                        model_path + "' (" +
-                        std::string(ToString(fit.error())) +
+    log.Warn("cli", std::string("cannot size --gpu-layers for '") + model_path +
+                        "' (" + std::string(ToString(fit.error())) +
                         "); check the path and file format");
     return false;
   }
@@ -401,10 +439,11 @@ bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
            "gpu " + std::to_string(device) + " cannot hold --gpu-layers " +
                std::to_string(gpu_layers) + ": resident about " +
                std::to_string(ToMiB(fit->resident_bytes)) + " MiB plus " +
-               std::to_string(ToMiB(fit->staging_bytes)) + " MiB staging plus " +
-               std::to_string(ToMiB(fit->kv_bytes)) + " MiB KV cache exceeds " +
-               budget_label + "; lower --gpu-layers (try --gpu-layers help), "
-                              "lower --context, or quantize the KV cache");
+               std::to_string(ToMiB(fit->staging_bytes)) +
+               " MiB staging plus " + std::to_string(ToMiB(fit->kv_bytes)) +
+               " MiB KV cache exceeds " + budget_label +
+               "; lower --gpu-layers (try --gpu-layers help), "
+               "lower --context, or quantize the KV cache");
   return false;
 }
 
@@ -456,8 +495,8 @@ std::vector<ConcurrentSessionResult> RunConcurrentSessions(
   workers.reserve(requests.size());
   for (std::size_t i = 0; i < requests.size(); ++i) {
     workers.emplace_back([&, i] {
-      auto outcome = pool.SubmitLeastLoaded(
-          requests[i], [&](std::uint32_t token) {
+      auto outcome =
+          pool.SubmitLeastLoaded(requests[i], [&](std::uint32_t token) {
             results[i].tokens.push_back(token);
             if (on_token) {
               on_token(i, token);

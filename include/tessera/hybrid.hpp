@@ -34,6 +34,26 @@ struct HybridOptions {
   KvCacheType kv_type = KvCacheType::F32;
 };
 
+// One data-parallel group of a hybrid layout: its index and its devices
+// in rank order, computed from the same mesh validation Hybrid::Create
+// applies. A caller that runs each group separately (for example a serve
+// pool of one runner per group) uses HybridGroups instead of building the
+// whole Hybrid, so the group math lives in one place.
+struct HybridGroupDevices {
+  std::size_t index = 0;
+  std::vector<int> devices;
+};
+
+// The groups of a hybrid layout. InvalidArgument for an empty layout or a
+// device count that is not dp_groups * mp_ranks; the device rules are the
+// mesh validator's.
+//
+// Usage:
+//   auto groups = HybridGroups(options);
+//   for (const HybridGroupDevices& group : *groups) { ... }
+[[nodiscard]] std::expected<std::vector<HybridGroupDevices>, StatusCode>
+HybridGroups(const HybridOptions& options);
+
 // Data-parallel groups of model-parallel teams behind one canonical
 // device mesh. One thread per group runs its team's forward; groups are
 // independent, so two prompts decode at once. Each group's output equals

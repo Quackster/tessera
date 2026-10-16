@@ -84,11 +84,9 @@ jinja::Value ToJinja(const core::Json& json) {
     case core::Json::Type::Bool:
       return jinja::Value::Bool(json.AsBool());
     case core::Json::Type::Number:
-      return (json.AsNumber() == static_cast<double>(
-                                      static_cast<std::int64_t>(
-                                          json.AsNumber())))
-                 ? jinja::Value::Int(
-                       static_cast<std::int64_t>(json.AsNumber()))
+      return (json.AsNumber() ==
+              static_cast<double>(static_cast<std::int64_t>(json.AsNumber())))
+                 ? jinja::Value::Int(static_cast<std::int64_t>(json.AsNumber()))
                  : jinja::Value::Double(json.AsNumber());
     case core::Json::Type::String:
       return jinja::Value::Str(json.AsString());
@@ -110,8 +108,17 @@ jinja::Value ToJinja(const core::Json& json) {
   return jinja::Value::None();
 }
 
+bool RequestEnableThinking(const core::Json& body,
+                           const TemplateDefaults& defaults) {
+  const core::Json* thinking = body.Find("enable_thinking");
+  if (thinking == nullptr || thinking->type() != core::Json::Type::Bool) {
+    return defaults.enable_thinking;
+  }
+  return thinking->AsBool();
+}
+
 std::string RenderPrompt(const Model& model, const core::Json& body,
-                         std::string* error) {
+                         std::string* error, const TemplateDefaults& defaults) {
   const std::string tmpl(model.ChatTemplate());
   if (tmpl.empty()) {
     *error = "model has no chat template";
@@ -139,22 +146,23 @@ std::string RenderPrompt(const Model& model, const core::Json& body,
   context.emplace_back("messages",
                        jinja::Value::List(std::move(message_items)));
   context.emplace_back("add_generation_prompt", jinja::Value::Bool(true));
-  context.emplace_back("tools", tools == nullptr ? jinja::Value::None()
-                                                 : ToJinja(*tools));
-  // Thinking is on unless the request turns it off. The reasoning effort
-  // defaults to the highest level the template accepts. A request overrides
-  // either one, so a template that gates on `enable_thinking` also sees the
-  // explicit default.
+  context.emplace_back(
+      "tools", tools == nullptr ? jinja::Value::None() : ToJinja(*tools));
+  // Thinking defaults to on and the reasoning effort to the highest level
+  // the template accepts; the serve options and then the request override
+  // them. The template that gates on `enable_thinking` thus always sees an
+  // explicit value.
   if (!HasKwarg(context, "enable_thinking")) {
-    const core::Json* thinking = body.Find("enable_thinking");
-    const bool thinking_on =
-        thinking == nullptr || thinking->type() != core::Json::Type::Bool ||
-        thinking->AsBool();
-    context.emplace_back("enable_thinking", jinja::Value::Bool(thinking_on));
+    context.emplace_back(
+        "enable_thinking",
+        jinja::Value::Bool(RequestEnableThinking(body, defaults)));
   }
   if (!HasKwarg(context, "reasoning_effort")) {
     const std::vector<std::string> levels = ReasoningEffortsFromTemplate(tmpl);
-    if (!levels.empty()) {
+    if (!defaults.reasoning_effort.empty()) {
+      context.emplace_back("reasoning_effort",
+                           jinja::Value::Str(defaults.reasoning_effort));
+    } else if (!levels.empty()) {
       // The template lists its levels highest first.
       context.emplace_back("reasoning_effort",
                            jinja::Value::Str(levels.front()));

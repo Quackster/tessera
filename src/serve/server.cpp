@@ -1,5 +1,3 @@
-#include "tessera/serve.hpp"
-
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -8,6 +6,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/json.hpp"
 #include "serve/http.hpp"
 #include "serve/openai.hpp"
 #include "serve/readiness.hpp"
@@ -15,25 +14,33 @@
 #include "serve/respond.hpp"
 #include "serve/session.hpp"
 #include "serve/session_chat.hpp"
-#include "core/json.hpp"
+#include "tessera/serve.hpp"
 #include "web_assets.hpp"
 
 namespace tessera {
 
 namespace {
 
-using serve::HttpRequest;
 using core::Json;
+using serve::HttpRequest;
 using serve::ReasoningEffortsFromTemplate;
-using serve::ResponseWriter;
 using serve::RenderPrompt;
+using serve::ResponseWriter;
 using serve::SendError;
 using serve::SendJson;
+using serve::TemplateDefaults;
 
 std::atomic<unsigned long long> g_requests{0};
 
 bool Bridge(const HttpRequest& request, const std::string& path) {
   return request.path == path || request.path == path + "/";
+}
+
+// The template defaults the serve options select for requests that omit
+// the thinking fields.
+TemplateDefaults DefaultsFrom(const ServeOptions& options) {
+  return TemplateDefaults{options.default_enable_thinking,
+                          options.default_reasoning_effort};
 }
 
 // The 503 body a not-ready server returns: status "loading" while the
@@ -61,9 +68,8 @@ std::expected<void, StatusCode> ServeInternal(
   // Diagnostics sink for the deferred case before the pool exists; the
   // ready case logs through the first runner's engine.
   log::Diagnostics local_log;
-  const auto handler = [&pool, &options, &sessions,
-                        &readiness](const HttpRequest& request,
-                                    ResponseWriter& writer) {
+  const auto handler = [&pool, &options, &sessions, &readiness](
+                           const HttpRequest& request, ResponseWriter& writer) {
     ++g_requests;
     // CORS.
     const std::string origin = request.Header("origin");
@@ -130,10 +136,11 @@ std::expected<void, StatusCode> ServeInternal(
     }
     if (request.method == "GET" && Bridge(request, "/metrics")) {
       (void)writer.SendHeaders(200, "text/plain; version=0.0.4");
-      (void)writer.Write("# HELP tessera_requests_total Requests served.\n"
-                         "# TYPE tessera_requests_total counter\n"
-                         "tessera_requests_total " +
-                         std::to_string(g_requests.load()) + "\n");
+      (void)writer.Write(
+          "# HELP tessera_requests_total Requests served.\n"
+          "# TYPE tessera_requests_total counter\n"
+          "tessera_requests_total " +
+          std::to_string(g_requests.load()) + "\n");
       return;
     }
     // Web UI (no build step: single files embedded at configure time).
@@ -149,8 +156,8 @@ std::expected<void, StatusCode> ServeInternal(
     }
     if (request.method == "GET" && (path == "/" || path == "/index.html")) {
       (void)writer.SendHeaders(200, "text/html");
-      (void)writer.Write(
-          serve::InjectWebDefaults(std::string_view(serve::web::kWebIndexHtml)));
+      (void)writer.Write(serve::InjectWebDefaults(
+          std::string_view(serve::web::kWebIndexHtml)));
       return;
     }
     // Every endpoint below needs the model. Wait until it is loaded and
@@ -180,10 +187,9 @@ std::expected<void, StatusCode> ServeInternal(
     if (request.method == "GET" && Bridge(request, "/props")) {
       Json props = Json::Object();
       props.Set("model_path", Json::String(std::string(model.Name())));
-      props.Set("n_ctx", Json::Number(
-                             static_cast<double>(model.MaxContextLength())));
-      props.Set("total_slots", Json::Number(
-                                   static_cast<double>(pool->size())));
+      props.Set("n_ctx",
+                Json::Number(static_cast<double>(model.MaxContextLength())));
+      props.Set("total_slots", Json::Number(static_cast<double>(pool->size())));
       // The reasoning levels the chat template offers, in template order;
       // absent when the template never reads reasoning_effort. The web UI
       // builds its difficulty selector from this list.
@@ -210,10 +216,10 @@ std::expected<void, StatusCode> ServeInternal(
     // Generations route to an idle device; when every device is busy a
     // request waits instead of failing, so parallel windows and parallel
     // API clients each get their turn.
-    serve::SessionHandler session_handler(*pool, *tokenizer, sessions,
-                                           options.default_max_completion_tokens,
-                                           options.auto_title,
-                                           options.stats_interval_seconds);
+    serve::SessionHandler session_handler(
+        *pool, *tokenizer, sessions, options.default_max_completion_tokens,
+        options.auto_title, options.stats_interval_seconds,
+        DefaultsFrom(options));
     if (path == "/api/sessions") {
       if (request.method == "GET") {
         session_handler.HandleList(writer);
@@ -358,8 +364,7 @@ std::expected<void, StatusCode> ServeInternal(
       return;
     }
     if (request.method == "POST" &&
-        (Bridge(request, "/v1/completions") ||
-         Bridge(request, "/completion") ||
+        (Bridge(request, "/v1/completions") || Bridge(request, "/completion") ||
          Bridge(request, "/completions"))) {
       auto body = Json::Parse(request.body);
       if (body == nullptr) {
@@ -368,11 +373,11 @@ std::expected<void, StatusCode> ServeInternal(
       }
       serve::OpenAiComplete(*pool, *tokenizer, sessions, writer, *body,
                             options.default_max_completion_tokens,
-                            options.stats_interval_seconds);
+                            options.stats_interval_seconds,
+                            DefaultsFrom(options));
       return;
     }
-    if (request.method == "POST" &&
-        Bridge(request, "/v1/chat/completions")) {
+    if (request.method == "POST" && Bridge(request, "/v1/chat/completions")) {
       auto body = Json::Parse(request.body);
       if (body == nullptr) {
         SendError(writer, 400, "invalid JSON body");
@@ -380,7 +385,7 @@ std::expected<void, StatusCode> ServeInternal(
       }
       serve::OpenAiChat(*pool, *tokenizer, sessions, writer, *body,
                         options.default_max_completion_tokens, false,
-                        options.stats_interval_seconds);
+                        options.stats_interval_seconds, DefaultsFrom(options));
       return;
     }
     if (request.method == "POST" &&
@@ -391,7 +396,8 @@ std::expected<void, StatusCode> ServeInternal(
         return;
       }
       std::string error;
-      const std::string prompt = RenderPrompt(model, *body, &error);
+      const std::string prompt =
+          RenderPrompt(model, *body, &error, DefaultsFrom(options));
       if (!error.empty()) {
         SendError(writer, 422, error);
         return;
@@ -412,7 +418,7 @@ std::expected<void, StatusCode> ServeInternal(
       }
       serve::OpenAiChat(*pool, *tokenizer, sessions, writer, *body,
                         options.default_max_completion_tokens, true,
-                        options.stats_interval_seconds);
+                        options.stats_interval_seconds, DefaultsFrom(options));
       return;
     }
     // Live session states: one entry per chat with its id, title,
@@ -442,24 +448,25 @@ std::expected<void, StatusCode> ServeInternal(
   if (loader) {
     // Bind and serve first, then load: a client reaches /health during
     // a slow load instead of finding the port closed.
-    loader_thread = std::thread([&pool, &readiness, &local_log,
-                                 loader = std::move(loader)] {
-      const ServeProgress report = [&readiness](std::string_view detail) {
-        readiness.Loading(std::string(detail));
-      };
-      auto loaded = loader(report);
-      if (!loaded) {
-        const std::string detail = std::string(ToString(loaded.error()));
-        readiness.Failed(detail);
-        local_log.Error(
-            "serve", "model load failed (" + detail +
-                         "); /health reports the failure and no request is served");
-        return;
-      }
-      pool = std::move(*loaded);
-      readiness.Ready(&pool->At(0).model(), pool->At(0).tokenizer());
-      local_log.Info("serve", "model ready");
-    });
+    loader_thread = std::thread(
+        [&pool, &readiness, &local_log, loader = std::move(loader)] {
+          const ServeProgress report = [&readiness](std::string_view detail) {
+            readiness.Loading(std::string(detail));
+          };
+          auto loaded = loader(report);
+          if (!loaded) {
+            const std::string detail = std::string(ToString(loaded.error()));
+            readiness.Failed(detail);
+            local_log.Error(
+                "serve",
+                "model load failed (" + detail +
+                    "); /health reports the failure and no request is served");
+            return;
+          }
+          pool = std::move(*loaded);
+          readiness.Ready(&pool->At(0).model(), pool->At(0).tokenizer());
+          local_log.Info("serve", "model ready");
+        });
   }
   auto served =
       serve::RunHttpServerOn(std::move(*bound), handler, &stop, serve_log);

@@ -38,13 +38,12 @@ Hybrid::~Hybrid() = default;
 Hybrid::Hybrid(Hybrid&& other) noexcept = default;
 Hybrid& Hybrid::operator=(Hybrid&& other) noexcept = default;
 
-std::expected<std::unique_ptr<Hybrid>, StatusCode> Hybrid::Create(
+std::expected<std::vector<HybridGroupDevices>, StatusCode> HybridGroups(
     const HybridOptions& options) {
   core::DeviceMesh mesh;
   mesh.dp_groups = options.dp_groups;
-  mesh.mp_ranks = options.devices.size() / (options.dp_groups == 0
-                                                ? 1
-                                                : options.dp_groups);
+  mesh.mp_ranks =
+      options.devices.size() / (options.dp_groups == 0 ? 1 : options.dp_groups);
   mesh.devices = options.devices;
   if (options.dp_groups == 0 ||
       options.devices.size() != options.dp_groups * mesh.mp_ranks) {
@@ -53,21 +52,36 @@ std::expected<std::unique_ptr<Hybrid>, StatusCode> Hybrid::Create(
   if (auto valid = core::ValidateMesh(mesh); !valid) {
     return std::unexpected(valid.error());
   }
+  std::vector<HybridGroupDevices> groups;
+  groups.reserve(mesh.dp_groups);
+  for (std::size_t g = 0; g < mesh.dp_groups; ++g) {
+    HybridGroupDevices group;
+    group.index = g;
+    group.devices.reserve(mesh.mp_ranks);
+    for (std::size_t r = 0; r < mesh.mp_ranks; ++r) {
+      group.devices.push_back(core::MeshDevice(mesh, g, r));
+    }
+    groups.push_back(std::move(group));
+  }
+  return groups;
+}
+
+std::expected<std::unique_ptr<Hybrid>, StatusCode> Hybrid::Create(
+    const HybridOptions& options) {
+  auto groups = HybridGroups(options);
+  if (!groups) {
+    return std::unexpected(groups.error());
+  }
   auto impl = std::make_unique<Impl>();
   impl->mp_kind = options.mp_kind;
   impl->context = options.context;
   impl->kv_type = options.kv_type;
-  impl->groups.reserve(mesh.dp_groups);
-  for (std::size_t g = 0; g < mesh.dp_groups; ++g) {
-    std::vector<int> ranks;
-    ranks.reserve(mesh.mp_ranks);
-    for (std::size_t r = 0; r < mesh.mp_ranks; ++r) {
-      ranks.push_back(core::MeshDevice(mesh, g, r));
-    }
+  impl->groups.reserve(groups->size());
+  for (const HybridGroupDevices& group_devices : *groups) {
     Impl::Group group;
-    if (mesh.mp_ranks == 1) {
+    if (group_devices.devices.size() == 1) {
       EngineOptions engine_options;
-      engine_options.device_index = ranks[0];
+      engine_options.device_index = group_devices.devices[0];
       auto engine = Engine::Create(engine_options);
       if (!engine) {
         return std::unexpected(engine.error());
@@ -84,7 +98,7 @@ std::expected<std::unique_ptr<Hybrid>, StatusCode> Hybrid::Create(
     } else if (options.mp_kind == HybridMpKind::Tensor) {
       TensorParallelOptions tp_options;
       tp_options.model_path = options.model_path;
-      tp_options.devices = ranks;
+      tp_options.devices = group_devices.devices;
       tp_options.context = options.context;
       tp_options.kv_type = options.kv_type;
       auto tp = TensorParallel::Create(tp_options);
@@ -95,7 +109,7 @@ std::expected<std::unique_ptr<Hybrid>, StatusCode> Hybrid::Create(
     } else {
       ContextParallelOptions cp_options;
       cp_options.model_path = options.model_path;
-      cp_options.devices = ranks;
+      cp_options.devices = group_devices.devices;
       cp_options.context = options.context;
       cp_options.kv_type = options.kv_type;
       auto cp = ContextParallel::Create(cp_options);
@@ -150,7 +164,9 @@ Hybrid::GenerateMany(std::span<const std::vector<std::uint32_t>> prompts,
   return result;
 }
 
-std::size_t Hybrid::GroupCount() const { return impl_->groups.size(); }
+std::size_t Hybrid::GroupCount() const {
+  return impl_->groups.size();
+}
 
 const Tokenizer* Hybrid::GetTokenizer() const {
   if (impl_->groups.empty()) {

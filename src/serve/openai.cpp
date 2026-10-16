@@ -65,9 +65,14 @@ SessionMessage AssistantTurn(std::string_view text, bool stopped,
   std::string before;
   std::string reasoning;
   (void)ParseToolCalls(text, &before, &reasoning);
-  return SessionMessage{"assistant", before, reasoning,
-                        /*tool_calls_json=*/{}, /*tool_call_id=*/{}, stopped,
-                        stats, /*created_ms=*/0};
+  return SessionMessage{"assistant",
+                        before,
+                        reasoning,
+                        /*tool_calls_json=*/{},
+                        /*tool_call_id=*/{},
+                        stopped,
+                        stats,
+                        /*created_ms=*/0};
 }
 
 // Reconcile an incoming OpenAI history with the session: 422 on a
@@ -99,10 +104,9 @@ bool BeginChatTurn(const std::shared_ptr<Session>& session,
 Json SessionPromptBody(const Json& body, const SessionView& view) {
   Json prompt_body = Json::Object();
   prompt_body.Set("messages", SessionHistoryJson(view));
-  for (const char* key : {"system", "tools", "tool_choice",
-                          "enable_thinking", "reasoning_effort", "stream",
-                          "max_completion_tokens", "max_thinking_tokens",
-                          "chat_template_kwargs"}) {
+  for (const char* key : {"system", "tools", "tool_choice", "enable_thinking",
+                          "reasoning_effort", "stream", "max_completion_tokens",
+                          "max_thinking_tokens", "chat_template_kwargs"}) {
     if (const Json* value = body.Find(key)) {
       prompt_body.Set(key, *value);
     }
@@ -131,7 +135,8 @@ bool BeginSession(SessionStore& sessions, const std::string& session_id,
 void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
                     SessionStore& sessions, ResponseWriter& writer,
                     const Json& body, std::size_t default_max,
-                    std::size_t stats_interval_seconds) {
+                    std::size_t stats_interval_seconds,
+                    const TemplateDefaults& defaults) {
   const std::string session_id = SessionIdFrom(body);
   const Json* prompt = body.Find("prompt");
   if (prompt == nullptr || !prompt->isString()) {
@@ -155,8 +160,9 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   const std::size_t max_thinking_tokens = MaxThinkingTokensFrom(body);
   RunnerLease lease;
   RunnerLease* slot = nullptr;
-  if (!RouteDevice(pool, max_thinking_tokens, /*wants_tools=*/false,
-                   [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
+  if (!RouteDevice(
+          pool, max_thinking_tokens, /*wants_tools=*/false,
+          [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
     return;
   }
   const bool shared = slot == nullptr;
@@ -166,11 +172,12 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
     const SessionView before = session->View();
     session->Append(SessionMessage{"user", prompt_text, /*reasoning=*/{},
                                    /*tool_calls_json=*/{}, /*tool_call_id=*/{},
-                                   false, /*stats=*/{}, /*created_ms=*/0});
+                                   false,
+                                   /*stats=*/{}, /*created_ms=*/0});
     MaybeNameSession(session, before);
     std::string error;
     prompt_text = RenderPrompt(model, SessionPromptBody(body, session->View()),
-                               &error);
+                               &error, defaults);
     if (!error.empty()) {
       SendError(writer, 422, error);
       return;
@@ -191,8 +198,7 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   // The pool carries the launcher's KV storage type (--kv-q8 and
   // friends); without it every serve turn would decode F32 and an
   // unlimited turn would never fit the device.
-  options.kv_type = shared ? pool.At(0).kv_type()
-                           : lease.runner().kv_type();
+  options.kv_type = shared ? pool.At(0).kv_type() : lease.runner().kv_type();
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
   }
@@ -204,8 +210,8 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   // device while yielding every few tokens (see MaybeYieldExclusive).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (shared) {
-      return pool.SubmitLeastLoaded(
-          options, next, [&writer] { return writer.IsPeerGone(); });
+      return pool.SubmitLeastLoaded(options, next,
+                                    [&writer] { return writer.IsPeerGone(); });
     }
     return lease.engine().GenerateStreaming(lease.model(), options, next);
   };
@@ -241,8 +247,8 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
       (void)speedometer.NoteToken();
       return true;
     });
-    stats.elapsed_ms = MillisBetween(gen_started,
-                                     std::chrono::steady_clock::now());
+    stats.elapsed_ms =
+        MillisBetween(gen_started, std::chrono::steady_clock::now());
     if (!streamed) {
       // A gone peer fails here only on a real error (abort returns a
       // count); anything else is reported when someone listens.
@@ -263,7 +269,8 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
     Json choice = Json::Object();
     choice.Set("text", Json::String(*text));
     choice.Set("index", Json::Number(0));
-    choice.Set("finish_reason", Json::String(FinishReasonName(streamed->reason)));
+    choice.Set("finish_reason",
+               Json::String(FinishReasonName(streamed->reason)));
     Json choices = Json::Array();
     choices.Push(std::move(choice));
     Json response = Json::Object();
@@ -283,8 +290,7 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
     if (writer.IsPeerGone()) {
       return false;
     }
-    auto piece = tokenizer.Decode(
-        std::span<const std::uint32_t>(&token, 1));
+    auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
     if (piece) {
       text += *piece;
     }
@@ -306,16 +312,16 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
     (void)speedometer.NoteToken();
     return true;
   });
-  stats.elapsed_ms = MillisBetween(gen_started,
-                                   std::chrono::steady_clock::now());
+  stats.elapsed_ms =
+      MillisBetween(gen_started, std::chrono::steady_clock::now());
   stats.completion_tokens = count;
   if (session != nullptr) {
     session->Append(AssistantTurn(text, writer.IsPeerGone(), stats));
   }
   if (!streamed) {
     Json chunk = Json::Object();
-    chunk.Set("error", Json::String(
-                           streamed.error() == StatusCode::InvalidArgument
+    chunk.Set("error",
+              Json::String(streamed.error() == StatusCode::InvalidArgument
                                ? "prompt exceeds the model context window"
                                : "generation failed"));
     WriteSse(writer, "", chunk, false);
@@ -326,9 +332,9 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   Json choice = Json::Object();
   choice.Set("text", Json::String(""));
   choice.Set("index", Json::Number(0));
-  choice.Set("finish_reason",
-             Json::String(streamed ? FinishReasonName(streamed->reason)
-                                   : "length"));
+  choice.Set(
+      "finish_reason",
+      Json::String(streamed ? FinishReasonName(streamed->reason) : "length"));
   choices.Push(std::move(choice));
   done.Set("choices", std::move(choices));
   WriteSse(writer, "", done, false);
@@ -337,9 +343,8 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
 }
 
 bool RouteDevice(RunnerPool& pool, std::size_t max_thinking_tokens,
-                 bool wants_tools,
-                 const std::function<bool()>& cancelled, RunnerLease& lease,
-                 RunnerLease** slot) {
+                 bool wants_tools, const std::function<bool()>& cancelled,
+                 RunnerLease& lease, RunnerLease** slot) {
   *slot = nullptr;
   if (pool.empty()) {
     return false;
@@ -381,7 +386,9 @@ TurnSpeedometer::TurnSpeedometer(std::chrono::seconds interval,
   if (now) {
     now_ = std::move(now);
   } else {
-    now_ = [] { return std::chrono::steady_clock::now(); };
+    now_ = [] {
+      return std::chrono::steady_clock::now();
+    };
   }
 }
 
@@ -408,12 +415,11 @@ std::optional<SpeedSample> TurnSpeedometer::NoteToken() {
   char rate[32];
   std::snprintf(rate, sizeof(rate), "%.1f", tps);
   log_->Info("serve", label_ + ": " + std::to_string(total_tokens_) +
-                         " completion token(s) at " + rate + " tok/s");
+                          " completion token(s) at " + rate + " tok/s");
   const SpeedSample sample{tps, total_tokens_};
   window_started_ = now;
   window_tokens_ = 0;
   return sample;
 }
-
 
 }  // namespace tessera::serve

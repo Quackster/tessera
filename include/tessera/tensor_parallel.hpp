@@ -59,6 +59,22 @@ class TensorParallel {
   std::expected<std::vector<std::uint32_t>, StatusCode> Generate(
       std::span<const std::uint32_t> prompt, std::size_t max_tokens);
 
+  // Streaming greedy generation: call `on_token` for each produced token and
+  // stop early when it returns false. On the plain path `cancelled`, when
+  // set, is polled between decode steps and stops the turn (Aborted). With
+  // a speculative strategy attached the ranks decode in lockstep and cannot
+  // leave a collective mid-step, so `cancelled` is polled before the turn
+  // only, and a false from `on_token` stops the stream while the decode
+  // runs to its stop token or budget.
+  //
+  // Usage:
+  //   tp->GenerateStreaming(prompt, options,
+  //                         [](std::uint32_t id) { return keep_going(id); });
+  [[nodiscard]] std::expected<GenerateOutcome, StatusCode> GenerateStreaming(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled = {});
+
   // Greedy generation with per-request speed tuning, timed. Applies
   // `options.kv_type`, `options.mxfp4_split_target`, `options.mxfp4_split_cap`
   // and `options.attention_split` to every rank, caps the decode at

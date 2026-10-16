@@ -1,25 +1,148 @@
 #include "tessera/spec_split.hpp"
 
-#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "core/decode.hpp"
-#include "core/decode_internal.hpp"
-#include "core/timing.hpp"
+#include "core/spec_driver.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/engine.hpp"
+#include "tessera/log.hpp"
 #include "tessera/model.hpp"
 #include "tessera/speculative.hpp"
 
 namespace tessera {
 
-namespace detail = ::tessera::core::detail;
+namespace {
+
+// One decode request on the split layout, behind the shared decode driver.
+// The strategy runs against the draft device, every target-side op runs
+// against the target device, and two cache objects carry this request's
+// state. backend()/model()/cache() expose the drafter's route: the driver
+// passes them only to strategy calls and to model metadata that is
+// identical across the checkpoint's routes. The driver runs on one thread,
+// so the target is externally synchronized and needs no locking.
+class SpecSplitTarget final : public core::SpecTarget {
+ public:
+  SpecSplitTarget(Backend& target_backend, Model& target,
+                  core::DecodeCache& target_cache, Backend& draft_backend,
+                  Model& draft, core::DecodeCache& draft_cache,
+                  log::Diagnostics& diagnostics, std::size_t prefill_chunk)
+      : target_backend_(target_backend),
+        target_(target),
+        target_cache_(target_cache),
+        draft_backend_(draft_backend),
+        draft_(draft),
+        draft_cache_(draft_cache),
+        diagnostics_(diagnostics),
+        prefill_chunk_(prefill_chunk) {}
+
+  log::Diagnostics& diagnostics() override { return diagnostics_; }
+  Backend& backend() override { return draft_backend_; }
+  Model& model() override { return draft_; }
+  core::DecodeCache& cache() override { return draft_cache_; }
+
+  std::expected<void, StatusCode> Prepare(
+      SpeculativeStrategy* strategy, const GenerateOptions& options) override {
+    if (strategy == nullptr) {
+      return {};
+    }
+    // The strategy lives on the draft device, so every prepare call runs
+    // against the head shard there; a fresh draft cache needs its state.
+    auto prepared = strategy->Prepare(draft_backend_, draft_);
+    if (!prepared) {
+      return std::unexpected(prepared.error());
+    }
+    strategy->SetDraftContext(options.draft_context);
+    const Architecture* arch = draft_.Arch();
+    if (arch == nullptr) {
+      return std::unexpected(StatusCode::UnsupportedFeature);
+    }
+    // Allocate the head's decode state without running the trunk, which
+    // the draft device does not hold.
+    auto ready = arch->EnsureReady(draft_backend_, draft_, draft_cache_);
+    if (!ready && ready.error() != StatusCode::UnsupportedFeature) {
+      return std::unexpected(ready.error());
+    }
+    return {};
+  }
+
+  std::expected<void, StatusCode> Prefill(std::span<const std::uint32_t> prompt,
+                                          const GenerateOptions& options,
+                                          std::vector<float>* hidden,
+                                          std::vector<float>* logits,
+                                          double* compute_ms) override {
+    core::PrefillProgress progress = [&](std::size_t done, std::size_t total) {
+      if (options.prefill_progress) {
+        options.prefill_progress(done, total);
+      }
+    };
+    const core::PrefillProgress* progress_ptr =
+        options.prefill_progress ? &progress : nullptr;
+    auto prefilled = core::PrefillTokens(
+        target_backend_, target_, target_cache_, prompt, hidden, nullptr,
+        prefill_chunk_, progress_ptr, compute_ms);
+    if (!prefilled) {
+      return std::unexpected(prefilled.error());
+    }
+    *logits = std::move(*prefilled);
+    return {};
+  }
+
+  std::expected<std::uint32_t, StatusCode> GreedyStep(
+      std::uint32_t token) override {
+    return core::DecodeToken(target_backend_, target_, target_cache_, token);
+  }
+
+  std::expected<std::vector<float>, StatusCode> LogitsStep(
+      std::uint32_t token, std::vector<float>* hidden) override {
+    return core::DecodeLogits(target_backend_, target_, target_cache_, token,
+                              hidden, nullptr, nullptr);
+  }
+
+  std::expected<DraftVerification, StatusCode> Verify(
+      std::span<const std::uint32_t> draft,
+      std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
+      std::vector<float>* hidden) override {
+    return core::VerifyDraft(target_backend_, target_, target_cache_, draft,
+                             prefix_logits, anchor, hidden, nullptr, nullptr);
+  }
+
+  void ReportDiagnostics(std::size_t loop_steps) override {
+    (void)loop_steps;
+    if (target_cache_.device != nullptr) {
+      target_cache_.device->gemms.Report(diagnostics_, "spec-split",
+                                         "decode gemm");
+      target_cache_.device->embed_kernels.Report(diagnostics_, "spec-split",
+                                                 "decode embedding");
+    }
+    if (target_cache_.arch != nullptr) {
+      target_cache_.arch->ReportCaches(diagnostics_, "spec-split");
+    }
+  }
+
+ private:
+  Backend& target_backend_;
+  Model& target_;
+  core::DecodeCache& target_cache_;
+  Backend& draft_backend_;
+  Model& draft_;
+  core::DecodeCache& draft_cache_;
+  log::Diagnostics& diagnostics_;
+  std::size_t prefill_chunk_ = 0;
+};
+
+}  // namespace
 
 struct SpecSplit::Impl {
   std::unique_ptr<Engine> target_engine;
@@ -32,6 +155,7 @@ struct SpecSplit::Impl {
   std::vector<std::uint32_t> stops;
   std::size_t context = 0;
   std::size_t prefill_chunk = 0;
+  KvCacheType kv_type = KvCacheType::F32;
 };
 
 SpecSplit::SpecSplit(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -53,6 +177,7 @@ std::expected<std::unique_ptr<SpecSplit>, StatusCode> SpecSplit::Create(
   auto impl = std::make_unique<Impl>();
   impl->context = options.context;
   impl->prefill_chunk = options.prefill_chunk;
+  impl->kv_type = options.kv_type;
   // Target first, then draft: one model load at a time, so only one
   // checkpoint is in host memory at once.
   {
@@ -73,8 +198,6 @@ std::expected<std::unique_ptr<SpecSplit>, StatusCode> SpecSplit::Create(
       return std::unexpected(model.error());
     }
     impl->target = std::move(*model);
-    impl->target_cache = std::make_unique<core::DecodeCache>();
-    impl->target_cache->kv_type = options.kv_type;
   }
   {
     EngineOptions engine_options;
@@ -103,189 +226,79 @@ std::expected<std::unique_ptr<SpecSplit>, StatusCode> SpecSplit::Create(
       return std::unexpected(model.error());
     }
     impl->draft = std::move(*model);
-    impl->draft_cache = std::make_unique<core::DecodeCache>();
   }
-  impl->strategy = CreateMtpStrategy();
-  if (auto attached = impl->strategy->Attach(
-          StrategyOptions{"", options.draft_block});
-      !attached) {
-    return std::unexpected(attached.error());
-  }
-  if (auto prepared = impl->strategy->Prepare(impl->draft_engine->Owner(),
-                                              *impl->draft);
-      !prepared) {
-    return std::unexpected(prepared.error());
-  }
-  // Allocate the draft decode state without running the trunk, which the
-  // draft device does not hold.
-  const Architecture* arch = impl->draft->Arch();
-  if (arch == nullptr) {
+  if (impl->draft->Arch() == nullptr) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
-  if (auto ready = arch->EnsureReady(impl->draft_engine->Owner(), *impl->draft,
-                                    *impl->draft_cache);
-      !ready) {
-    return std::unexpected(ready.error());
+  impl->strategy = CreateMtpStrategy();
+  if (auto attached =
+          impl->strategy->Attach(StrategyOptions{"", options.draft_block});
+      !attached) {
+    return std::unexpected(attached.error());
   }
   const std::span<const std::uint32_t> stops = impl->target->StopTokens();
   impl->stops.assign(stops.begin(), stops.end());
   return std::unique_ptr<SpecSplit>(new SpecSplit(std::move(impl)));
 }
 
-std::expected<std::vector<std::uint32_t>, StatusCode> SpecSplit::Generate(
-    std::span<const std::uint32_t> prompt, std::size_t max_tokens) {
+std::expected<GenerateOutcome, StatusCode> SpecSplit::GenerateStreaming(
+    std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token,
+    const std::function<bool()>& cancelled) {
+  if (!on_token) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
   Impl& p = *impl_;
   if (prompt.empty() || prompt.size() > p.context) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
-  Backend& target_backend = p.target_engine->Owner();
-  Backend& draft_backend = p.draft_engine->Owner();
-  Model& target = *p.target;
-  Model& draft = *p.draft;
-  core::DecodeCache& target_cache = *p.target_cache;
-  core::DecodeCache& draft_cache = *p.draft_cache;
-  SpeculativeStrategy& strategy = *p.strategy;
-  // Target prefill; the last position's hidden seeds the first anchor.
-  std::vector<float> hidden;
-  const auto prefill_started = std::chrono::steady_clock::now();
-  auto prefill = core::PrefillTokens(target_backend, target, target_cache,
-                                    prompt, &hidden, nullptr,
-                                    p.prefill_chunk, nullptr);
-  if (!prefill) {
-    return std::unexpected(prefill.error());
-  }
-  const long long prefill_ms = static_cast<long long>(
-      core::ElapsedMsDouble(prefill_started, std::chrono::steady_clock::now()));
-  if (prefill_ms > 0) {
-    const long long prompt_tps =
-        static_cast<long long>(prompt.size()) * 1000 / prefill_ms;
-    p.target_engine->Diagnostics().Info(
-        "spec-split", std::string("prefill: ") + std::to_string(prompt.size()) +
-                          " prompt token(s) in " + std::to_string(prefill_ms) +
-                          " ms (" + std::to_string(prompt_tps) +
-                          " prompt tok/s)");
-  }
-  const auto decode_started = std::chrono::steady_clock::now();
-  std::uint32_t next = detail::ArgMax(*prefill);
-  std::uint64_t position = prompt.size();
-  const std::size_t block = strategy.DraftBlock();
-  if (block == 0) {
-    return std::unexpected(StatusCode::UnsupportedFeature);
-  }
-  if (auto seeded =
-          strategy.OnAnchor(draft_backend, draft, draft_cache, next, position,
-                            hidden);
-      !seeded) {
-    return std::unexpected(seeded.error());
-  }
-  std::vector<std::uint32_t> drafts(block);
+  // Fresh caches per turn: a turn starts at position zero, so one split
+  // can serve many sequential requests. The per-call Prepare allocates the
+  // head's decode state on the fresh draft cache.
+  p.target_cache = std::make_unique<core::DecodeCache>();
+  p.target_cache->kv_type = options.kv_type;
+  p.draft_cache = std::make_unique<core::DecodeCache>();
+  SpecSplitTarget target(p.target_engine->Owner(), *p.target, *p.target_cache,
+                         p.draft_engine->Owner(), *p.draft, *p.draft_cache,
+                         p.target_engine->Diagnostics(), p.prefill_chunk);
+  const GenerateOptions framed = core::WithPrompt(options, prompt);
+  // The driver runs on one thread, so a cancel between tokens is safe.
+  const auto gated = [&](std::uint32_t token) {
+    if (cancelled && cancelled()) {
+      return false;
+    }
+    return on_token(token);
+  };
+  return core::RunDecode(target, p.strategy.get(), framed, gated);
+}
+
+std::expected<std::vector<std::uint32_t>, StatusCode> SpecSplit::Generate(
+    std::span<const std::uint32_t> prompt, std::size_t max_tokens) {
+  GenerateOptions options;
+  options.max_completion_tokens = max_tokens;
+  options.kv_type = impl_->kv_type;
   std::vector<std::uint32_t> produced;
-  const std::size_t budget =
-      max_tokens == 0 ? p.context - prompt.size() : max_tokens;
-  bool stopped = false;
-  std::size_t spec_proposed = 0;
-  std::size_t spec_accepted = 0;
-  std::size_t spec_steps = 0;
-  while (!stopped && produced.size() < budget) {
-    if (detail::IsStopToken(next, p.stops)) {
-      break;
-    }
-    produced.push_back(next);
-    auto count =
-        strategy.Draft(draft_backend, draft, draft_cache, {}, next, drafts);
-    if (!count) {
-      return std::unexpected(count.error());
-    }
-    if (*count == 0) {
-      // No usable proposal: decode the anchor alone and take its greedy
-      // token on the target.
-      auto logits =
-          core::DecodeLogits(target_backend, target, target_cache, next,
-                             &hidden, nullptr, nullptr);
-      if (!logits) {
-        return std::unexpected(logits.error());
-      }
-      const std::uint32_t picked = detail::ArgMax(*logits);
-      if (auto anchored = strategy.OnAnchor(draft_backend, draft, draft_cache,
-                                            picked, position + 1, hidden);
-          !anchored) {
-        return std::unexpected(anchored.error());
-      }
-      if (auto committed =
-              strategy.Commit(draft_backend, draft, draft_cache, 0);
-          !committed) {
-        return std::unexpected(committed.error());
-      }
-      next = picked;
-      ++position;
-      continue;
-    }
-    std::span<const std::uint32_t> proposal(drafts.data(), *count);
-    // The anchor leads the batch; `hidden` receives the last committed
-    // row's residual hidden for the next anchor.
-    auto verify = core::VerifyDraft(target_backend, target, target_cache,
-                                    proposal, {}, next, &hidden, nullptr,
-                                    nullptr);
-    if (!verify) {
-      return std::unexpected(verify.error());
-    }
-    if (auto anchored = strategy.OnAnchor(
-            draft_backend, draft, draft_cache, verify->next_token,
-            position + 1 + verify->accepted, hidden);
-        !anchored) {
-      return std::unexpected(anchored.error());
-    }
-    if (auto committed = strategy.Commit(draft_backend, draft, draft_cache,
-                                         verify->accepted);
-        !committed) {
-      return std::unexpected(committed.error());
-    }
-    spec_proposed += *count;
-    spec_accepted += verify->accepted;
-    ++spec_steps;
-    for (std::size_t i = 0; i < verify->accepted; ++i) {
-      if (produced.size() >= budget) {
-        break;
-      }
-      if (detail::IsStopToken(drafts[i], p.stops)) {
-        stopped = true;
-        break;
-      }
-      produced.push_back(drafts[i]);
-    }
-    if (stopped || produced.size() >= budget) {
-      break;
-    }
-    next = verify->next_token;
-    position += 1 + verify->accepted;
-  }
-  const long long decode_ms = static_cast<long long>(
-      core::ElapsedMsDouble(decode_started, std::chrono::steady_clock::now()));
-  if (decode_ms > 0 && !produced.empty()) {
-    const long long decode_tps =
-        static_cast<long long>(produced.size()) * 1000 / decode_ms;
-    p.target_engine->Diagnostics().Info(
-        "spec-split",
-        std::string("decode: ") + std::to_string(produced.size()) +
-            " token(s) in " + std::to_string(decode_ms) + " ms (" +
-            std::to_string(decode_tps) + " tok/s, " +
-            std::to_string(decode_ms /
-                           static_cast<long long>(produced.size())) +
-            " ms/token)");
-  }
-  if (spec_steps > 0) {
-    p.target_engine->Diagnostics().Info(
-        "spec-split", std::string("accepted ") +
-                          std::to_string(spec_accepted) + " of " +
-                          std::to_string(spec_proposed) + " draft token(s) " +
-                          "over " + std::to_string(spec_steps) + " step(s)");
+  auto outcome =
+      GenerateStreaming(prompt, options, [&produced](std::uint32_t token) {
+        produced.push_back(token);
+        return true;
+      });
+  if (!outcome) {
+    return std::unexpected(outcome.error());
   }
   return produced;
 }
 
 const Tokenizer* SpecSplit::GetTokenizer() const {
-  return impl_->target == nullptr ? nullptr
-                                  : impl_->target->GetTokenizer();
+  return impl_->target == nullptr ? nullptr : impl_->target->GetTokenizer();
+}
+
+Engine& SpecSplit::TargetEngine() {
+  return *impl_->target_engine;
+}
+
+Model& SpecSplit::TargetModel() {
+  return *impl_->target;
 }
 
 std::expected<std::string, StatusCode> SpecSplit::ChatPrompt(

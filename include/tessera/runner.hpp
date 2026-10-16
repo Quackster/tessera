@@ -21,9 +21,10 @@ namespace tessera {
 
 // One generation backend for the serve pool. A runner owns its devices;
 // Submit runs one turn to completion, streaming on the caller thread.
-// Two backends implement it: SingleDeviceRunner (one engine, one model,
-// one device, shared by the scheduler) and PipelineRunner (one model
-// layer-split across several devices). The serve layer drives only this
+// SingleDeviceRunner covers one engine on one device (shared by the
+// scheduler), PipelineRunner one model layer-split across devices, and the
+// Make*Runner factories below cover the tensor-parallel, context-parallel
+// and split-speculative layouts. The serve layer drives only this
 // interface, so a split model needs no separate HTTP path.
 //
 // A runner carries the KV cache storage type every turn on it decodes
@@ -55,8 +56,8 @@ class Runner {
   //   options.kv_type = pool.At(0).kv_type();
   [[nodiscard]] virtual KvCacheType kv_type() const = 0;
   // True when one model spans several devices (the pipeline runner). The
-  // serve layer refuses tools, images and auto-title on such a runner,
-  // because those paths run a single device's engine directly.
+  // serve layer reads it to choose the tools and image route: an exclusive
+  // lease for a single-device runner, Submit for a split runner.
   [[nodiscard]] virtual bool is_split() const = 0;
   // True when Submit alone can drive this request (the shared path). The
   // single-device runner defers to CanSchedule(engine, ...); the split
@@ -114,8 +115,7 @@ class SingleDeviceRunner : public Runner {
   [[nodiscard]] const CalibrationConfig& calibration() const override;
   [[nodiscard]] KvCacheType kv_type() const override;
   [[nodiscard]] bool is_split() const override;
-  [[nodiscard]] bool CanSchedule(
-      const GenerateOptions& options) const override;
+  [[nodiscard]] bool CanSchedule(const GenerateOptions& options) const override;
   [[nodiscard]] std::expected<GenerateOutcome, StatusCode> Submit(
       const GenerateOptions& options,
       const std::function<bool(std::uint32_t)>& on_token,
@@ -155,8 +155,7 @@ class PipelineRunner : public Runner {
   [[nodiscard]] const CalibrationConfig& calibration() const override;
   [[nodiscard]] KvCacheType kv_type() const override;
   [[nodiscard]] bool is_split() const override;
-  [[nodiscard]] bool CanSchedule(
-      const GenerateOptions& options) const override;
+  [[nodiscard]] bool CanSchedule(const GenerateOptions& options) const override;
   [[nodiscard]] std::expected<GenerateOutcome, StatusCode> Submit(
       const GenerateOptions& options,
       const std::function<bool(std::uint32_t)>& on_token,
@@ -172,6 +171,30 @@ class PipelineRunner : public Runner {
   CalibrationConfig calibration_;
   KvCacheType kv_type_ = KvCacheType::F32;
 };
+
+class ContextParallel;
+class SpecSplit;
+class TensorParallel;
+
+// Runners over the parallel layouts: one Runner that serializes turns on
+// its device lock and drives the layout's GenerateStreaming, so the serve
+// pool, leases and tool turns work unchanged. is_split() is true and
+// CanSchedule() always true, so the serve layer routes every request
+// through Submit. `device_index` is the layout's first device, for
+// /metrics and diagnostics. Calibration applies to each turn like the
+// other runners.
+//
+// Usage:
+//   pool.Add(MakeTensorParallelRunner(std::move(tp), 0));
+[[nodiscard]] std::unique_ptr<Runner> MakeTensorParallelRunner(
+    std::unique_ptr<TensorParallel> layout, int device_index,
+    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32);
+[[nodiscard]] std::unique_ptr<Runner> MakeContextParallelRunner(
+    std::unique_ptr<ContextParallel> layout, int device_index,
+    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32);
+[[nodiscard]] std::unique_ptr<Runner> MakeSpecSplitRunner(
+    std::unique_ptr<SpecSplit> layout, int device_index,
+    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32);
 
 class RunnerPool;
 
@@ -253,10 +276,11 @@ class RunnerPool {
   //   if (auto fast = pool.TryAcquire()) { /* exclusive */ }
   [[nodiscard]] std::optional<RunnerLease> TryAcquire();
 
-  // Enqueue a turn on the least-loaded runner (fewest scheduler jobs;
-  // ties go to the first) and run it to completion. Extra callers wait
-  // in arrival order instead of failing, so parallel windows and
-  // parallel API clients each get their turn. Safe for concurrent use.
+  // Enqueue a turn on the least-loaded runner (fewest queued scheduler
+  // jobs and in-flight turns; ties go to the first) and run it to
+  // completion. Extra callers wait in arrival order instead of failing,
+  // so parallel windows and parallel API clients each get their turn.
+  // Safe for concurrent use.
   //
   // Usage:
   //   auto outcome = pool.SubmitLeastLoaded(options, on_token);

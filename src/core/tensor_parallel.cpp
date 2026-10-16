@@ -1,5 +1,6 @@
 #include "tessera/tensor_parallel.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -10,8 +11,10 @@
 #include <vector>
 
 #include "core/decode.hpp"
+#include "core/generate_helpers.hpp"
 #include "core/single_device_target.hpp"
 #include "core/spec_driver.hpp"
+#include "core/think_budget.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
 #include "tessera/engine.hpp"
@@ -76,11 +79,16 @@ struct TensorParallel::Impl {
     }
   }
 
-  // Greedy generation with `options` tuning, filling `produced`; the outcome
-  // carries the produced count and the prefill/decode wall times.
+  // Greedy generation across the ranks: one Step per prefill token, then
+  // one Step per decoded token. `on_token` streams every produced token
+  // (the rank-0 sequence, which equals every rank's) and returns false to
+  // stop; `cancelled` is polled between decode steps. The outcome carries
+  // the produced count, the finish reason and the prefill/decode wall
+  // times.
   std::expected<GenerateOutcome, StatusCode> Run(
       std::span<const std::uint32_t> prompt, const GenerateOptions& options,
-      std::vector<std::uint32_t>* produced);
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled);
 
   // True when a speculative strategy is attached on the ranks.
   bool HasStrategy() const {
@@ -95,10 +103,14 @@ struct TensorParallel::Impl {
   // One speculative generation across the ranks: every rank runs the decode
   // driver on its own target and its own strategy instance, so a
   // tensor-parallel (sharded) draft head works. The collective forwards keep
-  // the ranks in lockstep; rank 0's tokens and outcome are the result.
+  // the ranks in lockstep; rank 0's tokens and outcome are the result. A
+  // rank cannot leave a collective mid-step, so a false from `on_token`
+  // only stops the stream and the decode runs to its stop token or budget;
+  // `cancelled` is polled before the turn only.
   std::expected<GenerateOutcome, StatusCode> RunSpeculative(
       std::span<const std::uint32_t> prompt, const GenerateOptions& options,
-      std::vector<std::uint32_t>* produced);
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled);
 
   // Run one token through every rank on its own thread; the ranks rendezvous
   // at each FFN and attention all-reduce. When `want_token` rank 0 also runs
@@ -147,12 +159,13 @@ struct TensorParallel::Impl {
 
 std::expected<GenerateOutcome, StatusCode> TensorParallel::Impl::Run(
     std::span<const std::uint32_t> prompt, const GenerateOptions& options,
-    std::vector<std::uint32_t>* produced) {
+    const std::function<bool(std::uint32_t)>& on_token,
+    const std::function<bool()>& cancelled) {
   if (prompt.empty() || prompt.size() > context) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
-  produced->clear();
   ResetCaches(options);
+  log::Diagnostics& log = ranks[0].engine->Diagnostics();
   GenerateOutcome outcome;
   outcome.prompt_tokens = prompt.size();
   std::uint32_t next = 0;
@@ -170,17 +183,81 @@ std::expected<GenerateOutcome, StatusCode> TensorParallel::Impl::Run(
   outcome.prefill_ms = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - prefill_started)
                            .count();
-  const std::size_t budget =
-      options.max_completion_tokens == 0 ? context - prompt.size()
-                                         : options.max_completion_tokens;
+  const std::size_t budget = options.max_completion_tokens == 0
+                                 ? context - prompt.size()
+                                 : options.max_completion_tokens;
+  // Thinking budget, the same host-side state machine as the single-device
+  // driver. Rank 0 owns the tokenizer tags; every rank sees the same ids
+  // through the lockstep Step calls.
+  auto [think, think_close] =
+      ResolveThinkBudget(*ranks[0].model, options.max_thinking_tokens);
+  if (options.max_thinking_tokens > 0 && !think.engaged()) {
+    log.Warn("tp",
+             "thinking budget ignored: the think tags do not resolve on "
+             "this model; thinking stays unlimited");
+  }
+  for (std::uint32_t id : prompt) {
+    think.noteEmitted(id);
+  }
+  std::size_t produced = 0;
   bool stopped = false;
+  bool aborted = false;
+  const auto emit = [&](std::uint32_t token) {
+    think.noteEmitted(token);
+    ++produced;
+    return on_token(token);
+  };
+  // Forward and emit the think-close ids; the last step's argmax is the
+  // next anchor. Mirrors the single-device driver's force-close.
+  auto force_close = [&]() -> std::expected<std::uint32_t, StatusCode> {
+    std::uint32_t after = 0;
+    for (std::uint32_t id : think_close) {
+      auto token = Step(id, true);
+      if (!token) {
+        return std::unexpected(token.error());
+      }
+      after = *token;
+      if (!emit(id)) {
+        aborted = true;
+        return after;
+      }
+      if (produced >= budget) {
+        return after;
+      }
+    }
+    return after;
+  };
   const auto decode_started = std::chrono::steady_clock::now();
-  for (std::size_t count = 0; count < budget; ++count) {
+  while (produced < budget) {
+    if (cancelled && cancelled()) {
+      aborted = true;
+      break;
+    }
+    if (think.closeOwed()) {
+      log.Info("tp", "thinking budget (" +
+                         std::to_string(options.max_thinking_tokens) +
+                         " token(s)) exceeded: think block force-closed, "
+                         "decoding continues");
+      auto forced = force_close();
+      if (!forced) {
+        return std::unexpected(forced.error());
+      }
+      if (aborted || produced >= budget) {
+        break;
+      }
+      next = *forced;
+    }
     if (IsStop(next, stops)) {
       stopped = true;
       break;
     }
-    produced->push_back(next);
+    if (!emit(next)) {
+      aborted = true;
+      break;
+    }
+    if (produced >= budget) {
+      break;
+    }
     auto token = Step(next, true);
     if (!token) {
       return std::unexpected(token.error());
@@ -190,19 +267,26 @@ std::expected<GenerateOutcome, StatusCode> TensorParallel::Impl::Run(
   outcome.decode_ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - decode_started)
                           .count();
-  outcome.produced = produced->size();
-  outcome.reason = stopped ? FinishReason::Stop : FinishReason::Length;
+  outcome.produced = produced;
+  outcome.reason = stopped   ? FinishReason::Stop
+                   : aborted ? FinishReason::Aborted
+                             : FinishReason::Length;
   return outcome;
 }
 
-std::expected<GenerateOutcome, StatusCode>
-TensorParallel::Impl::RunSpeculative(std::span<const std::uint32_t> prompt,
-                                     const GenerateOptions& options,
-                                     std::vector<std::uint32_t>* produced) {
+std::expected<GenerateOutcome, StatusCode> TensorParallel::Impl::RunSpeculative(
+    std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token,
+    const std::function<bool()>& cancelled) {
   if (prompt.empty() || prompt.size() > context) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
-  produced->clear();
+  if (cancelled && cancelled()) {
+    GenerateOutcome outcome;
+    outcome.prompt_tokens = prompt.size();
+    outcome.reason = FinishReason::Aborted;
+    return outcome;
+  }
   ResetCaches(options);
   // Every rank prepares its own strategy on its own backend and model, so a
   // sharded (tensor-parallel) draft head stays on its own rank.
@@ -223,8 +307,15 @@ TensorParallel::Impl::RunSpeculative(std::span<const std::uint32_t> prompt,
   // The prompt arrives separately from the options; fold it in once so every
   // rank's driver prefills it instead of the single first_token.
   const GenerateOptions framed = core::WithPrompt(options, prompt);
+  // The ranks stay in lockstep through the collective forwards, so rank 0
+  // streams every rank's token. A false from `on_token` cannot break the
+  // rank out of the driver without stranding the others in a collective:
+  // it only stops the stream, and the decode runs to its stop token or
+  // budget.
+  std::atomic<bool> stream_stopped{false};
   for (std::size_t r = 0; r < ranks.size(); ++r) {
-    threads.emplace_back([this, r, &framed, produced, &outcomes] {
+    threads.emplace_back([this, r, &framed, &on_token, &stream_stopped,
+                          &outcomes] {
       Rank& rank = ranks[r];
       core::SingleDeviceTarget target(
           rank.engine->Owner(), *rank.model, *rank.cache,
@@ -233,17 +324,16 @@ TensorParallel::Impl::RunSpeculative(std::span<const std::uint32_t> prompt,
           // ranks: it captures the target hidden for a DFlash2 drafter and
           // drives the strategy's context append. MTP captures nothing.
           /*single_token_prefill=*/false);
-      // Rank 0 owns the produced token list; the ranks stay in lockstep
-      // through the collective forwards, so every rank sees the same tokens.
       const bool emit = (r == 0);
-      auto on_token = [emit, produced](std::uint32_t token) {
-        if (emit && produced != nullptr) {
-          produced->push_back(token);
+      auto streamed = [emit, &on_token, &stream_stopped](std::uint32_t token) {
+        if (emit && !stream_stopped.load(std::memory_order_relaxed) &&
+            !on_token(token)) {
+          stream_stopped.store(true, std::memory_order_relaxed);
         }
         return true;
       };
       outcomes[r] =
-          core::RunDecode(target, rank.strategy.get(), framed, on_token);
+          core::RunDecode(target, rank.strategy.get(), framed, streamed);
     });
   }
   for (std::thread& thread : threads) {
@@ -359,15 +449,29 @@ std::expected<void, StatusCode> TensorParallel::AttachSpeculative(
   return {};
 }
 
+std::expected<GenerateOutcome, StatusCode> TensorParallel::GenerateStreaming(
+    std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+    const std::function<bool(std::uint32_t)>& on_token,
+    const std::function<bool()>& cancelled) {
+  if (!on_token) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  return impl_->HasStrategy()
+             ? impl_->RunSpeculative(prompt, options, on_token, cancelled)
+             : impl_->Run(prompt, options, on_token, cancelled);
+}
+
 std::expected<std::vector<std::uint32_t>, StatusCode> TensorParallel::Generate(
     std::span<const std::uint32_t> prompt, std::size_t max_tokens) {
   GenerateOptions options;
   options.max_completion_tokens = max_tokens;
   options.kv_type = impl_->kv_type;
   std::vector<std::uint32_t> produced;
-  auto outcome = impl_->HasStrategy()
-                     ? impl_->RunSpeculative(prompt, options, &produced)
-                     : impl_->Run(prompt, options, &produced);
+  auto outcome =
+      GenerateStreaming(prompt, options, [&produced](std::uint32_t token) {
+        produced.push_back(token);
+        return true;
+      });
   if (!outcome) {
     return std::unexpected(outcome.error());
   }
@@ -376,8 +480,9 @@ std::expected<std::vector<std::uint32_t>, StatusCode> TensorParallel::Generate(
         static_cast<double>(produced.size()) * 1000.0 / outcome->decode_ms);
     impl_->ranks[0].engine->Diagnostics().Info(
         "tp", std::string("decode: ") + std::to_string(produced.size()) +
-                  " token(s) in " + std::to_string(static_cast<long long>(
-                      outcome->decode_ms)) + " ms (" + std::to_string(tps) +
+                  " token(s) in " +
+                  std::to_string(static_cast<long long>(outcome->decode_ms)) +
+                  " ms (" + std::to_string(tps) +
                   " tok/s, ranks=" + std::to_string(impl_->ranks.size()) + ")");
   }
   return produced;
@@ -385,17 +490,12 @@ std::expected<std::vector<std::uint32_t>, StatusCode> TensorParallel::Generate(
 
 std::expected<GenerateOutcome, StatusCode> TensorParallel::GenerateTimed(
     std::span<const std::uint32_t> prompt, const GenerateOptions& options) {
-  std::vector<std::uint32_t> produced;
-  auto outcome = impl_->HasStrategy()
-                     ? impl_->RunSpeculative(prompt, options, &produced)
-                     : impl_->Run(prompt, options, &produced);
-  if (!outcome) {
-    return std::unexpected(outcome.error());
-  }
-  return *outcome;
+  return GenerateStreaming(prompt, options, [](std::uint32_t) { return true; });
 }
 
-std::size_t TensorParallel::RankCount() const { return impl_->ranks.size(); }
+std::size_t TensorParallel::RankCount() const {
+  return impl_->ranks.size();
+}
 
 Engine& TensorParallel::RankEngine(std::size_t i) {
   return *impl_->ranks.at(i).engine;

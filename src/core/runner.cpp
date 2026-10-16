@@ -1,8 +1,15 @@
 #include "tessera/runner.hpp"
 
 #include <chrono>
+#include <functional>
+#include <memory>
+#include <span>
 #include <thread>
 #include <utility>
+
+#include "tessera/context_parallel.hpp"
+#include "tessera/spec_split.hpp"
+#include "tessera/tensor_parallel.hpp"
 
 namespace tessera {
 
@@ -25,27 +32,37 @@ SingleDeviceRunner::SingleDeviceRunner(std::unique_ptr<Engine> engine,
       device_index_(device_index),
       calibration_(std::move(calibration)),
       kv_type_(kv_type) {
-  scheduler_ =
-      std::make_unique<Scheduler>(*engine_, *model_, mutex_, SchedulerOptions{});
+  scheduler_ = std::make_unique<Scheduler>(*engine_, *model_, mutex_,
+                                           SchedulerOptions{});
 }
 
-Engine& SingleDeviceRunner::engine() const { return *engine_; }
+Engine& SingleDeviceRunner::engine() const {
+  return *engine_;
+}
 
-Model& SingleDeviceRunner::model() const { return *model_; }
+Model& SingleDeviceRunner::model() const {
+  return *model_;
+}
 
 const Tokenizer* SingleDeviceRunner::tokenizer() const {
   return model_->GetTokenizer();
 }
 
-int SingleDeviceRunner::device_index() const { return device_index_; }
+int SingleDeviceRunner::device_index() const {
+  return device_index_;
+}
 
 const CalibrationConfig& SingleDeviceRunner::calibration() const {
   return calibration_;
 }
 
-KvCacheType SingleDeviceRunner::kv_type() const { return kv_type_; }
+KvCacheType SingleDeviceRunner::kv_type() const {
+  return kv_type_;
+}
 
-bool SingleDeviceRunner::is_split() const { return false; }
+bool SingleDeviceRunner::is_split() const {
+  return false;
+}
 
 bool SingleDeviceRunner::CanSchedule(const GenerateOptions& options) const {
   return tessera::CanSchedule(*engine_, options);
@@ -81,23 +98,33 @@ PipelineRunner::PipelineRunner(std::unique_ptr<Pipeline> pipeline,
   }
 }
 
-Engine& PipelineRunner::engine() const { return *facade_engine_; }
+Engine& PipelineRunner::engine() const {
+  return *facade_engine_;
+}
 
-Model& PipelineRunner::model() const { return *facade_model_; }
+Model& PipelineRunner::model() const {
+  return *facade_model_;
+}
 
 const Tokenizer* PipelineRunner::tokenizer() const {
   return facade_model_ != nullptr ? facade_model_->GetTokenizer() : nullptr;
 }
 
-int PipelineRunner::device_index() const { return device_index_; }
+int PipelineRunner::device_index() const {
+  return device_index_;
+}
 
 const CalibrationConfig& PipelineRunner::calibration() const {
   return calibration_;
 }
 
-KvCacheType PipelineRunner::kv_type() const { return kv_type_; }
+KvCacheType PipelineRunner::kv_type() const {
+  return kv_type_;
+}
 
-bool PipelineRunner::is_split() const { return true; }
+bool PipelineRunner::is_split() const {
+  return true;
+}
 
 bool PipelineRunner::CanSchedule(const GenerateOptions& options) const {
   (void)options;
@@ -127,9 +154,178 @@ std::expected<GenerateOutcome, StatusCode> PipelineRunner::Submit(
   return outcome;
 }
 
-std::size_t PipelineRunner::SchedulerActive() const { return 0; }
+std::size_t PipelineRunner::SchedulerActive() const {
+  return 0;
+}
 
-std::size_t PipelineRunner::SchedulerPending() const { return 0; }
+std::size_t PipelineRunner::SchedulerPending() const {
+  return 0;
+}
+
+namespace {
+
+// The generation face of one split layout, so one ParallelRunner drives
+// the tensor-parallel, context-parallel and split-speculative layouts
+// (AGENTS.md rule 2: no duplicate logic).
+class SplitDriver {
+ public:
+  virtual ~SplitDriver() = default;
+  virtual Engine& engine() = 0;
+  virtual Model& model() = 0;
+  virtual const Tokenizer* tokenizer() const = 0;
+  virtual std::expected<GenerateOutcome, StatusCode> GenerateStreaming(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled) = 0;
+};
+
+class TensorParallelDriver final : public SplitDriver {
+ public:
+  explicit TensorParallelDriver(std::unique_ptr<TensorParallel> layout)
+      : layout_(std::move(layout)) {}
+
+  Engine& engine() override { return layout_->RankEngine(0); }
+  Model& model() override { return layout_->RankModel(0); }
+  const Tokenizer* tokenizer() const override {
+    return layout_->GetTokenizer();
+  }
+  std::expected<GenerateOutcome, StatusCode> GenerateStreaming(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled) override {
+    return layout_->GenerateStreaming(prompt, options, on_token, cancelled);
+  }
+
+ private:
+  std::unique_ptr<TensorParallel> layout_;
+};
+
+class ContextParallelDriver final : public SplitDriver {
+ public:
+  explicit ContextParallelDriver(std::unique_ptr<ContextParallel> layout)
+      : layout_(std::move(layout)) {}
+
+  Engine& engine() override { return layout_->RankEngine(0); }
+  Model& model() override { return layout_->RankModel(0); }
+  const Tokenizer* tokenizer() const override {
+    return layout_->GetTokenizer();
+  }
+  std::expected<GenerateOutcome, StatusCode> GenerateStreaming(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled) override {
+    return layout_->GenerateStreaming(prompt, options, on_token, cancelled);
+  }
+
+ private:
+  std::unique_ptr<ContextParallel> layout_;
+};
+
+class SpecSplitDriver final : public SplitDriver {
+ public:
+  explicit SpecSplitDriver(std::unique_ptr<SpecSplit> layout)
+      : layout_(std::move(layout)) {}
+
+  Engine& engine() override { return layout_->TargetEngine(); }
+  Model& model() override { return layout_->TargetModel(); }
+  const Tokenizer* tokenizer() const override {
+    return layout_->GetTokenizer();
+  }
+  std::expected<GenerateOutcome, StatusCode> GenerateStreaming(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled) override {
+    return layout_->GenerateStreaming(prompt, options, on_token, cancelled);
+  }
+
+ private:
+  std::unique_ptr<SpecSplit> layout_;
+};
+
+// One Runner over a split layout. Submit holds the runner's device lock for
+// the whole turn, because every layout carries one generation's state in
+// its ranks and caches; concurrent callers queue on the lock in arrival
+// order. The front device backs engine()/model() for serve metadata.
+class ParallelRunner final : public Runner {
+ public:
+  ParallelRunner(std::unique_ptr<SplitDriver> driver, int device_index,
+                 CalibrationConfig calibration, KvCacheType kv_type)
+      : driver_(std::move(driver)),
+        device_index_(device_index),
+        calibration_(std::move(calibration)),
+        kv_type_(kv_type) {}
+
+  Engine& engine() const override { return driver_->engine(); }
+  Model& model() const override { return driver_->model(); }
+  const Tokenizer* tokenizer() const override { return driver_->tokenizer(); }
+  int device_index() const override { return device_index_; }
+  const CalibrationConfig& calibration() const override { return calibration_; }
+  KvCacheType kv_type() const override { return kv_type_; }
+  bool is_split() const override { return true; }
+  bool CanSchedule(const GenerateOptions& options) const override {
+    (void)options;
+    return true;
+  }
+  std::expected<GenerateOutcome, StatusCode> Submit(
+      const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled) const override {
+    GenerateOptions tuned = options;
+    ApplyToGenerateOptions(calibration_, tuned);
+    std::span<const std::uint32_t> prompt = tuned.prompt_tokens;
+    if (prompt.empty()) {
+      prompt = std::span<const std::uint32_t>(&tuned.first_token, 1);
+    }
+    // The serve on_token already watches for a dropped peer; also honor
+    // the explicit cancel between tokens.
+    const auto gated = [&](std::uint32_t token) {
+      if (cancelled && cancelled()) {
+        return false;
+      }
+      return on_token(token);
+    };
+    std::lock_guard<std::mutex> lock(mutex_);
+    active_.fetch_add(1, std::memory_order_relaxed);
+    auto outcome = driver_->GenerateStreaming(prompt, tuned, gated, cancelled);
+    active_.fetch_sub(1, std::memory_order_relaxed);
+    return outcome;
+  }
+  std::size_t SchedulerActive() const override { return 0; }
+  std::size_t SchedulerPending() const override { return 0; }
+
+ private:
+  std::unique_ptr<SplitDriver> driver_;
+  int device_index_ = 0;
+  CalibrationConfig calibration_;
+  KvCacheType kv_type_ = KvCacheType::F32;
+};
+
+}  // namespace
+
+std::unique_ptr<Runner> MakeTensorParallelRunner(
+    std::unique_ptr<TensorParallel> layout, int device_index,
+    CalibrationConfig calibration, KvCacheType kv_type) {
+  return std::make_unique<ParallelRunner>(
+      std::make_unique<TensorParallelDriver>(std::move(layout)), device_index,
+      std::move(calibration), kv_type);
+}
+
+std::unique_ptr<Runner> MakeContextParallelRunner(
+    std::unique_ptr<ContextParallel> layout, int device_index,
+    CalibrationConfig calibration, KvCacheType kv_type) {
+  return std::make_unique<ParallelRunner>(
+      std::make_unique<ContextParallelDriver>(std::move(layout)), device_index,
+      std::move(calibration), kv_type);
+}
+
+std::unique_ptr<Runner> MakeSpecSplitRunner(std::unique_ptr<SpecSplit> layout,
+                                            int device_index,
+                                            CalibrationConfig calibration,
+                                            KvCacheType kv_type) {
+  return std::make_unique<ParallelRunner>(
+      std::make_unique<SpecSplitDriver>(std::move(layout)), device_index,
+      std::move(calibration), kv_type);
+}
 
 RunnerLease::RunnerLease(Runner& runner, std::unique_lock<std::mutex> lock)
     : runner_(&runner), lock_(std::move(lock)) {
@@ -151,7 +347,9 @@ RunnerLease& RunnerLease::operator=(RunnerLease&& other) noexcept {
   return *this;
 }
 
-RunnerLease::~RunnerLease() { Release(); }
+RunnerLease::~RunnerLease() {
+  Release();
+}
 
 void RunnerLease::Release() {
   if (runner_ != nullptr) {
@@ -172,24 +370,38 @@ void RunnerLease::YieldFor(std::chrono::milliseconds quantum) {
   lock_.lock();
 }
 
-Runner& RunnerLease::runner() const { return *runner_; }
+Runner& RunnerLease::runner() const {
+  return *runner_;
+}
 
-Engine& RunnerLease::engine() const { return runner_->engine(); }
+Engine& RunnerLease::engine() const {
+  return runner_->engine();
+}
 
-Model& RunnerLease::model() const { return runner_->model(); }
+Model& RunnerLease::model() const {
+  return runner_->model();
+}
 
-const Tokenizer* RunnerLease::tokenizer() const { return runner_->tokenizer(); }
+const Tokenizer* RunnerLease::tokenizer() const {
+  return runner_->tokenizer();
+}
 
 void RunnerPool::Add(std::unique_ptr<Runner> runner) {
   std::lock_guard<std::mutex> lock(mutex_);
   runners_.push_back(std::move(runner));
 }
 
-std::size_t RunnerPool::size() const { return runners_.size(); }
+std::size_t RunnerPool::size() const {
+  return runners_.size();
+}
 
-bool RunnerPool::empty() const { return runners_.empty(); }
+bool RunnerPool::empty() const {
+  return runners_.empty();
+}
 
-Runner& RunnerPool::At(std::size_t index) const { return *runners_[index]; }
+Runner& RunnerPool::At(std::size_t index) const {
+  return *runners_[index];
+}
 
 std::optional<RunnerLease> RunnerPool::Acquire(
     const std::function<bool()>& cancelled) {
@@ -229,12 +441,17 @@ std::expected<GenerateOutcome, StatusCode> RunnerPool::SubmitLeastLoaded(
   if (runners_.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
+  // Load counts queued scheduler jobs and in-flight turns, so a pool of
+  // split runners (zero scheduler jobs each) still spreads turns instead
+  // of always choosing the first.
   Runner* chosen = runners_.front().get();
-  std::size_t head_load =
-      chosen->SchedulerActive() + chosen->SchedulerPending();
+  std::size_t head_load = chosen->SchedulerActive() +
+                          chosen->SchedulerPending() +
+                          chosen->active_.load(std::memory_order_relaxed);
   for (const auto& runner : runners_) {
-    const std::size_t load =
-        runner->SchedulerActive() + runner->SchedulerPending();
+    const std::size_t load = runner->SchedulerActive() +
+                             runner->SchedulerPending() +
+                             runner->active_.load(std::memory_order_relaxed);
     if (load < head_load) {
       head_load = load;
       chosen = runner.get();

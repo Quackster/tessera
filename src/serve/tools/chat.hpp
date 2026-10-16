@@ -5,6 +5,7 @@
 #include <functional>
 
 #include "core/json.hpp"
+#include "serve/render.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/types.hpp"
 
@@ -25,6 +26,9 @@ struct SessionMessage;
 // supplies its engine's GenerateStreaming, a split runner supplies the
 // pool's least-loaded Submit. Both stream tokens and honor the callback's
 // false return.
+//
+// The template defaults come from the serve options (see TemplateDefaults
+// in serve/render.hpp).
 using ToolGenerate = std::function<std::expected<GenerateOutcome, StatusCode>(
     const GenerateOptions&, const std::function<bool(std::uint32_t)>&)>;
 
@@ -44,11 +48,10 @@ using ToolGenerate = std::function<std::expected<GenerateOutcome, StatusCode>(
 // otherwise.
 [[nodiscard]] bool ChatWithTools(const ToolGenerate& generate, Model& model,
                                  const Tokenizer& tokenizer,
-                                 ResponseWriter& writer,
-                                 const core::Json& body,
+                                 ResponseWriter& writer, const core::Json& body,
                                  std::size_t default_max,
-                                 SessionMessage* out_turn,
-                                 KvCacheType kv_type);
+                                 SessionMessage* out_turn, KvCacheType kv_type,
+                                 const TemplateDefaults& defaults = {});
 
 }  // namespace serve
 

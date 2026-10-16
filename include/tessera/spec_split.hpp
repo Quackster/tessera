@@ -3,16 +3,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "tessera/defaults.hpp"
+#include "tessera/engine.hpp"
 #include "tessera/types.hpp"
 
 namespace tessera {
 
+class Engine;
+class Model;
 class Tokenizer;
 
 // Options for speculative-split generation: the target runs on
@@ -65,7 +69,25 @@ class SpecSplit {
   std::expected<std::vector<std::uint32_t>, StatusCode> Generate(
       std::span<const std::uint32_t> prompt, std::size_t max_tokens);
 
+  // Streaming variant: call `on_token` for each produced token; stop early
+  // when it returns false. `cancelled`, when set, is polled between tokens
+  // and stops the turn (Aborted). Each call starts from a fresh cache, so
+  // the same split serves sequential requests.
+  //
+  // Usage:
+  //   split->GenerateStreaming(prompt, options,
+  //                            [](std::uint32_t id) { return keep(id); });
+  [[nodiscard]] std::expected<GenerateOutcome, StatusCode> GenerateStreaming(
+      std::span<const std::uint32_t> prompt, const GenerateOptions& options,
+      const std::function<bool(std::uint32_t)>& on_token,
+      const std::function<bool()>& cancelled = {});
+
   [[nodiscard]] const Tokenizer* GetTokenizer() const;
+  // The target engine and model, for measurement and serve metadata (the
+  // tokenizer, chat rendering and the context length). The draft engine
+  // is internal.
+  [[nodiscard]] Engine& TargetEngine();
+  [[nodiscard]] Model& TargetModel();
   [[nodiscard]] std::expected<std::string, StatusCode> ChatPrompt(
       std::string_view user_text, bool enable_thinking = false,
       std::string_view reasoning_effort = "") const;

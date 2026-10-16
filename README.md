@@ -30,7 +30,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Parallelism | Done | One engine and model per GPU behind a pool with least loaded routing. Tensor, pipeline, context, expert, speculative split and hybrid modes match single device output. |
 | Kernel launch | Done | Vulkan records a whole decode step into one command buffer. ROCm runs one blocking stream with pinned staging. |
 | DFlash2 | Done | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. |
-| CLI | Done | Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit and concurrent benchmark. |
+| CLI | Done | One flag set for `run`, `serve` and `calibrate`. Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit and concurrent benchmark. `serve` honors every layout: replicas, `--pipeline`, `--tp`, `--cp`, `--spec-split` and `--hybrid`. |
 | Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
 | KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. |
 | Sampling | Done | Seeded sampling with Qwen 27B defaults. |
@@ -302,7 +302,7 @@ With `--api-key` set, requests need `Authorization: Bearer <key>`. `GET /health`
 
 ## Command-line arguments
 
-The first argument selects the mode: `run` decodes a prompt, `serve` starts the HTTP server, and `--list-gpus` lists the devices and exits. The table gives every flag, its scope, and its default.
+The first argument selects the mode: `run` decodes a prompt, `serve` starts the HTTP server, `calibrate` sweeps the machine, `fetch-mtp` fetches an MTP head, and `--list-gpus` lists the devices and exits. Every mode accepts the same flag set, so one parser covers every command. A flag a command cannot honor is reported as ignored and the run continues; a conflicting combination of layout flags is an error. The table gives every flag, the modes that honor it, and its default.
 
 | Argument | Scope | Default | Meaning |
 | --- | --- | --- | --- |
@@ -323,9 +323,9 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--no-chat` | run | off | Do not apply the chat template. |
 | `--max-completion-tokens <n>` | run | 0 | Completion tokens. 0 fills the remaining context. |
 | `--max-thinking-tokens <n>` | run | 0 | Think-block budget per turn. 0 leaves thinking unlimited. |
-| `--enable-thinking` | run | on | Render the chat template with thinking enabled. Thinking is on by default. |
-| `--no-thinking` | run | off | Render the chat template with thinking disabled. |
-| `--reasoning-effort <level>` | run | xhigh | Thinking difficulty for the chat template. Ignored with `--no-chat`. |
+| `--enable-thinking` | run, serve | on | Render the chat template with thinking enabled. Thinking is on by default. `serve` uses it as the default for requests that do not set one. |
+| `--no-thinking` | run, serve | off | Render the chat template with thinking disabled. `serve` uses it as the request default. |
+| `--reasoning-effort <level>` | run, serve | xhigh | Thinking difficulty for the chat template. Ignored with `--no-chat`. `serve` uses it as the request default. |
 | `--speculate` | both | off | MTP speculative decode from the target head. Needs no checkpoint. |
 | `--mtp <dir>` | both | unset | Directory of a separately fetched MTP head (from `tessera-cli fetch-mtp`) for a model whose GGUF ships none, such as the Flash-Next target. |
 | `--sample` | run | off | Sample instead of greedy decode. |
@@ -350,13 +350,13 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--prompts <file>` | calibrate | three fixed prompts | Fixed prompts, one per non-empty line, for the calibration sweep. |
 | `--calibrate-limit <n>` | calibrate | none | Measure at most n sweep points in total. |
 | **Parallelism** | | | The flags below spread work across the `--gpus` devices. |
-| `--gpus <a,b>` | run, serve, calibrate | 0 | One GPU index or a comma-separated list (for example `--gpus 0` or `--gpus 0,1`). `serve` runs one model replica per listed GPU; the split flags below are run-only and `serve` refuses them instead of silently loading replicas. Before each replica loads, `serve` refuses it when its paged weights cannot fit host RAM with the replicas already loaded. `run` uses only the first device unless a split flag is set; `calibrate` runs the single-device sweep for one index and the parallel sweep for two or more. |
-| `--pipeline` | run | off | Split layers across the `--gpus` devices. |
-| `--tp` | run | off | Split attention, FFN and MoE experts across the `--gpus` devices. |
-| `--cp` | run | off | Split the key range across the `--gpus` devices. |
-| `--spec-split` | run | off | Run the MTP draft head on the second `--gpus` device. Needs `--speculate`. |
-| `--hybrid` | run | off | Data parallel groups of model parallel teams. |
-| `--dp <n>` | run | 1 | Group count for `--hybrid`. |
+| `--gpus <a,b>` | run, serve, calibrate | 0 | One GPU index or a comma-separated list (for example `--gpus 0` or `--gpus 0,1`). `serve` runs one model replica per listed GPU, or one layout pool per group when a split flag is set. Before each replica loads, `serve` refuses it when its paged weights cannot fit host RAM with the replicas already loaded. `run` uses only the first device unless a split flag is set; `calibrate` runs the single-device sweep for one index and the parallel sweep for two or more. |
+| `--pipeline` | run, serve | off | Split layers across the `--gpus` devices. |
+| `--tp` | run, serve | off | Split attention, FFN and MoE experts across the `--gpus` devices. |
+| `--cp` | run, serve | off | Split the key range across the `--gpus` devices. |
+| `--spec-split` | run, serve | off | Run the MTP draft head on the second `--gpus` device. Needs `--speculate`. |
+| `--hybrid` | run, serve | off | Data parallel groups of model parallel teams. |
+| `--dp <n>` | run, serve | 1 | Group count for `--hybrid`. |
 
 The KV cache is fp32 when no `--kv-*` flag is set. The sampling defaults match the Qwen 3.8 27B defaults.
 

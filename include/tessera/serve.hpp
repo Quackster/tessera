@@ -34,6 +34,13 @@ struct ServeOptions {
   // Ask the model for a chat title after the first prompt of a new
   // session; off keeps the first user line as the title.
   bool auto_title = true;
+  // Thinking template default for requests that omit `enable_thinking`.
+  // A request's own flag always wins, so a client can turn thinking off
+  // on a thinking-by-default server and the other way round.
+  bool default_enable_thinking = true;
+  // Reasoning-effort template default for requests that omit
+  // `reasoning_effort`. Empty selects the template's highest level.
+  std::string default_reasoning_effort;
   // Seconds between live tok/s reports on streamed turns, to the
   // session SSE stream and the server log (0 disables both).
   std::size_t stats_interval_seconds = kDefaultStatsIntervalSeconds;
@@ -53,8 +60,9 @@ using ServeProgress = std::function<void(std::string_view)>;
 //     report("loading weights");
 //     return BuildPool(devices);
 //   };
-using PoolLoader = std::function<std::expected<std::unique_ptr<RunnerPool>,
-                                               StatusCode>(const ServeProgress&)>;
+using PoolLoader =
+    std::function<std::expected<std::unique_ptr<RunnerPool>, StatusCode>(
+        const ServeProgress&)>;
 
 // Serve a data-parallel pool of runners (one per device). Takes
 // ownership of the pool. Generations route to an idle device and queue

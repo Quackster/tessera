@@ -12,6 +12,7 @@
 #include "tessera/calibrate.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/runner.hpp"
+#include "tessera/tokenizer.hpp"
 #include "tessera/types.hpp"
 
 // Shared front-end helpers used by the run, serve and calibrate commands:
@@ -31,6 +32,27 @@ void LogModelSummary(Engine& engine, Model& model);
 
 // The run/serve usage text (also points at the calibrate command).
 void PrintUsage();
+
+// One stderr line for a flag a command accepts but cannot honor on the
+// selected route: "cli: <flag> ignored: <reason>". One formatter, so every
+// command reports an inert flag the same way.
+void WarnIgnoredFlag(std::string_view flag, std::string_view reason);
+
+// On-disk bytes of a model path: the file size for a GGUF, the sum of
+// the regular files for an MXFP4 directory. Used to refuse a device or a
+// host that cannot hold the weights before the load starts.
+[[nodiscard]] std::uint64_t PathSizeBytes(const std::string& path);
+
+// Render one source prompt through a chat template and encode it. A model
+// without a chat template (UnsupportedFeature) encodes the raw text, so a
+// --no-chat or template-less run still works; a template that exists but
+// fails to render is an error, so a thinking request never silently runs
+// as raw text. `render` runs the model's or layout's template with the
+// thinking flags already applied.
+[[nodiscard]] std::expected<std::vector<std::uint32_t>, StatusCode>
+EncodePromptText(
+    std::string_view source, bool no_chat, const Tokenizer& tokenizer,
+    const std::function<std::expected<std::string, StatusCode>()>& render);
 
 // Fill `*sampling` with the per-architecture recommended sampler for the
 // loaded model and report whether the caller should enable sampling. A

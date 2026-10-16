@@ -34,15 +34,12 @@ Json MessageJson(const SessionMessage& message) {
     item.Set("tool_call_id", Json::String(message.tool_call_id));
   }
   item.Set("stopped", Json::Bool(message.stopped));
-  item.Set("created_ms",
-           Json::Number(static_cast<double>(message.created_ms)));
+  item.Set("created_ms", Json::Number(static_cast<double>(message.created_ms)));
   item.Set("prompt_tokens",
            Json::Number(static_cast<double>(message.stats.prompt_tokens)));
   item.Set("completion_tokens",
-           Json::Number(
-               static_cast<double>(message.stats.completion_tokens)));
-  item.Set("tokens_per_second",
-           Json::Number(message.stats.TokensPerSecond()));
+           Json::Number(static_cast<double>(message.stats.completion_tokens)));
+  item.Set("tokens_per_second", Json::Number(message.stats.TokensPerSecond()));
   return item;
 }
 
@@ -176,27 +173,21 @@ bool WantsSessionStream(const Json& body) {
   return true;
 }
 
-bool BodyFlag(const Json& body, std::string_view key, bool fallback) {
-  const Json* value = body.Find(std::string(key));
-  if (value != nullptr && value->type() == Json::Type::Bool) {
-    return value->AsBool();
-  }
-  return fallback;
-}
-
 }  // namespace
 
 SessionHandler::SessionHandler(RunnerPool& pool, const Tokenizer& tokenizer,
                                SessionStore& sessions,
                                std::size_t default_max_completion_tokens,
                                bool auto_title,
-                               std::size_t stats_interval_seconds)
+                               std::size_t stats_interval_seconds,
+                               TemplateDefaults defaults)
     : pool_(pool),
       tokenizer_(tokenizer),
       sessions_(sessions),
       default_max_completion_tokens_(default_max_completion_tokens),
       auto_title_(auto_title),
-      stats_interval_seconds_(stats_interval_seconds) {}
+      stats_interval_seconds_(stats_interval_seconds),
+      template_defaults_(std::move(defaults)) {}
 
 void SessionHandler::HandleList(ResponseWriter& writer) const {
   Json items = Json::Array();
@@ -279,7 +270,8 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     }
   }
   std::string error;
-  const std::string prompt = RenderPrompt(model, prompt_body, &error);
+  const std::string prompt =
+      RenderPrompt(model, prompt_body, &error, template_defaults_);
   if (!error.empty()) {
     SendError(writer, 422, error);
     return;
@@ -289,8 +281,7 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     SendError(writer, 500, "tokenization failed");
     return;
   }
-  if (RejectOversizePrompt(writer, ids->size(),
-                           model.MaxContextLength())) {
+  if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;
   }
   GenerateOptions options;
@@ -320,9 +311,8 @@ void SessionHandler::RunTurn(RunnerLease* lease,
   log::Diagnostics& speed_log = lease != nullptr
                                     ? lease->engine().Diagnostics()
                                     : pool_.At(0).engine().Diagnostics();
-  TurnSpeedometer speedometer(
-      std::chrono::seconds(stats_interval_seconds_),
-      "session " + session->Id(), speed_log);
+  TurnSpeedometer speedometer(std::chrono::seconds(stats_interval_seconds_),
+                              "session " + session->Id(), speed_log);
   speedometer.Begin();
   // One decode step: stop aborts, pause blocks, deltas stream live
   // (buffered mode only accumulates into the totals below).
@@ -338,8 +328,7 @@ void SessionHandler::RunTurn(RunnerLease* lease,
       saw_stop = true;
       return false;
     }
-    auto piece =
-        tokenizer_.Decode(std::span<const std::uint32_t>(&token, 1));
+    auto piece = tokenizer_.Decode(std::span<const std::uint32_t>(&token, 1));
     const ThinkStreamer::Deltas part =
         streamer.Push(piece ? *piece : std::string());
     reasoning_text += part.reasoning;
@@ -362,8 +351,7 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     if (auto sample = speedometer.NoteToken()) {
       if (live) {
         Json delta = Json::Object();
-        delta.Set("tokens_per_second",
-                  Json::Number(sample->tokens_per_second));
+        delta.Set("tokens_per_second", Json::Number(sample->tokens_per_second));
         delta.Set("completion_tokens",
                   Json::Number(static_cast<double>(sample->completion_tokens)));
         WriteSse(writer, "", SseDelta(std::move(delta), ""), false);
@@ -376,8 +364,8 @@ void SessionHandler::RunTurn(RunnerLease* lease,
   // while yielding every few tokens (see on_token above).
   const auto drive = [&](const std::function<bool(std::uint32_t)>& next) {
     if (lease == nullptr) {
-      return pool_.SubmitLeastLoaded(
-          options, next, [&writer] { return writer.IsPeerGone(); });
+      return pool_.SubmitLeastLoaded(options, next,
+                                     [&writer] { return writer.IsPeerGone(); });
     }
     return lease->engine().GenerateStreaming(lease->model(), options, next);
   };
@@ -406,8 +394,8 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     const auto gen_started = std::chrono::steady_clock::now();
     auto streamed =
         drive([&](std::uint32_t token) { return on_token(token, true); });
-    stats.elapsed_ms = MillisBetween(gen_started,
-                                     std::chrono::steady_clock::now());
+    stats.elapsed_ms =
+        MillisBetween(gen_started, std::chrono::steady_clock::now());
     if (!streamed) {
       Json chunk = Json::Object();
       chunk.Set("error", Json::String("generation failed"));
@@ -437,8 +425,8 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     const auto gen_started = std::chrono::steady_clock::now();
     auto streamed =
         drive([&](std::uint32_t token) { return on_token(token, false); });
-    stats.elapsed_ms = MillisBetween(gen_started,
-                                     std::chrono::steady_clock::now());
+    stats.elapsed_ms =
+        MillisBetween(gen_started, std::chrono::steady_clock::now());
     if (!streamed) {
       SendGenerationError(writer, streamed.error());
       return;
@@ -448,9 +436,14 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     const ThinkStreamer::Deltas tail = streamer.Finish();
     reasoning_text += tail.reasoning;
     content_text += tail.content;
-    const SessionMessage turn{"assistant", content_text, reasoning_text,
-                              /*tool_calls_json=*/{}, /*tool_call_id=*/{},
-                              saw_stop, stats, /*created_ms=*/0};
+    const SessionMessage turn{"assistant",
+                              content_text,
+                              reasoning_text,
+                              /*tool_calls_json=*/{},
+                              /*tool_call_id=*/{},
+                              saw_stop,
+                              stats,
+                              /*created_ms=*/0};
     session->Append(turn);
     Json message = MessageJson(turn);
     Json response = Json::Object();
@@ -460,8 +453,9 @@ void SessionHandler::RunTurn(RunnerLease* lease,
     return;
   }
   session->Append(SessionMessage{"assistant", content_text, reasoning_text,
-                                   /*tool_calls_json=*/{}, /*tool_call_id=*/{},
-                                   saw_stop, stats, /*created_ms=*/0});
+                                 /*tool_calls_json=*/{}, /*tool_call_id=*/{},
+                                 saw_stop, stats,
+                                 /*created_ms=*/0});
 }
 
 // Take the session turn for the shared scheduler: 409 when the
@@ -492,7 +486,8 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   }
   session->Append(SessionMessage{"user", message->AsString(), /*reasoning=*/{},
                                  /*tool_calls_json=*/{}, /*tool_call_id=*/{},
-                                 false, /*stats=*/{}, /*created_ms=*/0});
+                                 false, /*stats=*/{},
+                                 /*created_ms=*/0});
   // The session turn is held first; the device routes shared or
   // queued exclusive (see RouteDevice). Plain turns share the
   // scheduler as plain greedy, so a long answer never blocks other
@@ -504,8 +499,9 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   }
   const std::size_t max_thinking = MaxThinkingTokensFrom(body);
   RunnerLease* slot = nullptr;
-  if (!RouteDevice(pool_, max_thinking, /*wants_tools=*/false,
-                   [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
+  if (!RouteDevice(
+          pool_, max_thinking, /*wants_tools=*/false,
+          [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
     return;
   }
   const bool shared = slot == nullptr;
@@ -520,7 +516,7 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
   const std::string title = session->View().title;
   RunTurn(slot, session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
-          max_thinking, BodyFlag(body, "enable_thinking", true),
+          max_thinking, RequestEnableThinking(body, template_defaults_),
           WantsSessionStream(body), title);
 }
 
@@ -543,14 +539,15 @@ void SessionHandler::HandleRetry(ResponseWriter& writer, std::string_view id,
   }
   const std::size_t max_thinking = MaxThinkingTokensFrom(body);
   RunnerLease* slot = nullptr;
-  if (!RouteDevice(pool_, max_thinking, /*wants_tools=*/false,
-                   [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
+  if (!RouteDevice(
+          pool_, max_thinking, /*wants_tools=*/false,
+          [&writer] { return writer.IsPeerGone(); }, lease, &slot)) {
     return;
   }
   const std::string title = session->View().title;
   RunTurn(slot, session, writer, body,
           MaxCompletionTokensFrom(body, default_max_completion_tokens_),
-          max_thinking, BodyFlag(body, "enable_thinking", true),
+          max_thinking, RequestEnableThinking(body, template_defaults_),
           WantsSessionStream(body), title);
 }
 

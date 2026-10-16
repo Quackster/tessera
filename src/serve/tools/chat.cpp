@@ -67,25 +67,23 @@ bool ChatBuffered(const ToolGenerate& generate, const Tokenizer& tokenizer,
                   SessionMessage* out_turn) {
   std::string text;
   const auto gen_started = std::chrono::steady_clock::now();
-  auto streamed = generate(
-      options, [&](std::uint32_t token) {
-        if (writer.IsPeerGone()) {
-          return false;
-        }
-        auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
-        text += piece ? *piece : std::string();
-        return true;
-      });
-  const long long elapsed_ms = MillisBetween(gen_started,
-                                             std::chrono::steady_clock::now());
+  auto streamed = generate(options, [&](std::uint32_t token) {
+    if (writer.IsPeerGone()) {
+      return false;
+    }
+    auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
+    text += piece ? *piece : std::string();
+    return true;
+  });
+  const long long elapsed_ms =
+      MillisBetween(gen_started, std::chrono::steady_clock::now());
   if (!streamed) {
     SendGenerationError(writer, streamed.error());
     return false;
   }
   std::string before;
   std::string reasoning;
-  const std::vector<ToolCall> calls =
-      ParseToolCalls(text, &before, &reasoning);
+  const std::vector<ToolCall> calls = ParseToolCalls(text, &before, &reasoning);
   const bool has_calls = !calls.empty();
   if (out_turn != nullptr) {
     out_turn->role = "assistant";
@@ -111,9 +109,10 @@ bool ChatBuffered(const ToolGenerate& generate, const Tokenizer& tokenizer,
   core::Json choice = core::Json::Object();
   choice.Set("index", core::Json::Number(0));
   choice.Set("message", std::move(message));
-  choice.Set("finish_reason",
-             core::Json::String(has_calls ? "tool_calls"
-                                          : FinishReasonName(streamed->reason)));
+  choice.Set(
+      "finish_reason",
+      core::Json::String(has_calls ? "tool_calls"
+                                   : FinishReasonName(streamed->reason)));
   core::Json choices = core::Json::Array();
   choices.Push(std::move(choice));
   core::Json response = core::Json::Object();
@@ -133,34 +132,33 @@ bool ChatStreamed(const ToolGenerate& generate, const Tokenizer& tokenizer,
                   const GenerateOptions& options, SessionMessage* out_turn) {
   std::string text;
   const auto gen_started = std::chrono::steady_clock::now();
-  auto streamed = generate(
-      options, [&](std::uint32_t token) {
-        if (writer.IsPeerGone()) {
-          return false;
-        }
-        auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
-        text += piece ? *piece : std::string();
-        return true;
-      });
-  const long long elapsed_ms = MillisBetween(gen_started,
-                                             std::chrono::steady_clock::now());
+  auto streamed = generate(options, [&](std::uint32_t token) {
+    if (writer.IsPeerGone()) {
+      return false;
+    }
+    auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
+    text += piece ? *piece : std::string();
+    return true;
+  });
+  const long long elapsed_ms =
+      MillisBetween(gen_started, std::chrono::steady_clock::now());
   if (!streamed) {
     core::Json chunk = core::Json::Object();
-    chunk.Set("error", core::Json::String(
-                           streamed.error() == StatusCode::InvalidArgument
-                               ? "prompt exceeds the model context window"
-                               : "generation failed"));
+    chunk.Set("error",
+              core::Json::String(streamed.error() == StatusCode::InvalidArgument
+                                     ? "prompt exceeds the model context window"
+                                     : "generation failed"));
     WriteSse(writer, "", chunk, false);
     return false;
   }
   (void)writer.SendHeaders(200, "text/event-stream", true);
   core::Json role_delta = core::Json::Object();
   role_delta.Set("role", core::Json::String("assistant"));
-  WriteSse(writer, "", StreamChunk(model_name, std::move(role_delta), ""), false);
+  WriteSse(writer, "", StreamChunk(model_name, std::move(role_delta), ""),
+           false);
   std::string before;
   std::string reasoning;
-  const std::vector<ToolCall> calls =
-      ParseToolCalls(text, &before, &reasoning);
+  const std::vector<ToolCall> calls = ParseToolCalls(text, &before, &reasoning);
   if (out_turn != nullptr) {
     out_turn->role = "assistant";
     out_turn->content = before;
@@ -217,9 +215,10 @@ bool WantsTools(const Json& body) {
 bool ChatWithTools(const ToolGenerate& generate, Model& model,
                    const Tokenizer& tokenizer, ResponseWriter& writer,
                    const Json& body, std::size_t default_max,
-                   SessionMessage* out_turn, KvCacheType kv_type) {
+                   SessionMessage* out_turn, KvCacheType kv_type,
+                   const TemplateDefaults& defaults) {
   std::string error;
-  const std::string prompt = RenderPrompt(model, body, &error);
+  const std::string prompt = RenderPrompt(model, body, &error, defaults);
   if (!error.empty()) {
     SendError(writer, 422, error);
     return false;
@@ -234,8 +233,7 @@ bool ChatWithTools(const ToolGenerate& generate, Model& model,
   options.max_thinking_tokens = MaxThinkingTokensFrom(body);
   options.prompt_tokens = *ids;
   options.kv_type = kv_type;
-  if (RejectOversizePrompt(writer, ids->size(),
-                           model.MaxContextLength())) {
+  if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return false;
   }
   const std::string model_name(model.Name());
