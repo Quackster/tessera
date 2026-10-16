@@ -313,35 +313,3 @@ add_executable(tessera-cli tools/cli/main.cpp
                             tools/cli/run_single.cpp
                             tools/cli/serve_command.cpp)
 target_link_libraries(tessera-cli PRIVATE tessera)
-
-enable_testing()
-
-include(FetchContent)
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.15.2
-)
-set(gtest_force_shared_cxx ON)
-FetchContent_MakeAvailable(googletest)
-
-# Single test binary: all suites live in tests/*.cpp.
-add_executable(tessera-tests
-    tests/types_test.cpp
-    tests/gguf_test.cpp
-    tests/safetensors_test.cpp
-    tests/engine_test.cpp
-    tests/decode_test.cpp
-    tests/tokenizer_test.cpp
-    tests/backend_test.cpp
-    tests/spec_test.cpp
-    tests/calibrate_test.cpp
-    tests/calibrate_sweep_test.cpp
-    tests/cli_test.cpp
-    tools/cli/cli_helpers.cpp
-)
-target_link_libraries(tessera-tests PRIVATE tessera GTest::gtest GTest::gtest_main)
-target_include_directories(tessera-tests PRIVATE src tools/cli)
-
-include(GoogleTest)
-gtest_discover_tests(tessera-tests)

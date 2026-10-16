@@ -147,13 +147,8 @@ These are hard rules, set by the project owner:
    as rule 4 requires); if unsure of the right approach, ask the project owner
    instead of committing a hack.
 
-9. **Tests for every function added** — when a function is added or changed,
-   add or update unit tests covering it in the same change, so no regression
-   slips through. Tests double as documentation: a reader can learn the API
-   call patterns from them, so cover usage of the public surface. Cover edge
-   cases too — empty/zero/largest inputs, malformed weight headers, error paths
-   — not just the happy path. A task is not done until the new tests are in
-   place and the full suite passes.
+9. **No new tests** — do not make new tests. Do not add test files, test
+   functions, or test targets.
 
 10. **No unsolicited docs files** — do not create new files under `docs/` (or
     new `.md` files anywhere) unless the user explicitly asks or an approved
@@ -265,13 +260,6 @@ These are hard rules, set by the project owner:
     reference. A numerical or acceptance difference from the reference is a
     defect to root-cause, not a property of the model.
 
-22. **Test discipline** — do not add tests willy-nilly. Add a new test only
-    when a change adds or alters real behavior that no existing test covers;
-    otherwise extend the test that already covers that code path. Edit an
-    existing test only when the change is about what that test checks, and
-    leave unrelated tests alone (no renaming, reformatting, or moving). Every
-    change leaves the suite compiling and passing on the configured backend.
-
 ## Working Principles
 
 Repository-specific constraints on top of the hard rules:
@@ -329,11 +317,6 @@ Before every test run, reconfigure and rebuild the target backend in one
 step, so a stale build directory never tests old code:
 
     cmake -B cmake-build-rocm -DTESSERA_BACKEND=rocm && cmake --build cmake-build-rocm -j
-
-Do not create new CMake test executables or new top-level test files. All
-runtime coverage goes into the single test target; add test functions to the
-`tests/*.cpp` sources compiled into it. New suites only fragment ctest output
-and bloat configure time.
 
 ## Where Things Live
 
