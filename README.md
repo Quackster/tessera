@@ -21,6 +21,18 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 
 ## Features
 
+| Path | Contents | Use | Hugging Face |
+| --- | --- | --- | --- |
+| `~/models/Qwen3.8-27B-GGUF/` | `Qwen3.8-27B-UD-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, `config.json` | Main GGUF target. | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
+| `~/models/Qwen3.8-27B-MXFP4-MTPFP8/` | MXFP4 weights with FP8 MTP, converted output, see below | Main MXFP4 target. | [amd/Qwen3.8-27B-Quark-AWQ-MXFP4](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4) |
+| `~/models/Qwen3.8-27B-DFlash2-FP8/` | DFlash2 draft checkpoint | Draft layout tests. | [tcclaviger/Qwen3.8-27B-DFlash2-FP8](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8) |
+| `~/models/Ornith-1.5-35B-A3B-GGUF/` | `Ornith-1.5-35B-Q4_K_M.gguf`, `mmproj-Ornith-1.5-35B-BF16.gguf` | MoE GGUF target. | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) |
+| `~/models/Ornith-1.5-35B-A3B-MXFP4-GGUF/` | MoE MXFP4 GGUF weights | Not yet supported. | [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) |
+| `~/models/Ornith-1.5-35B-A3B-BF16/` | bf16 safetensors | Not yet supported. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
+ | `~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S/*-00001-of-00002.gguf` (compute shard plus n-gram shard), `mmproj-Qwen3.8-Flash-Next-BF16.gguf` | Flash-Next decode target. The expert cache is sized to the free device memory and the batched staging is pipelined (the staging ring); the 48 tok/s target and the intermittent non-finite fault are open. | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
+
+
+<details>
 | Area | State | Detail |
 | --- | --- | --- |
 | Public API | Done | `Engine`, `Backend`, `SpeculativeStrategy`. |
@@ -50,8 +62,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Architecture modules | Done | One module per model family. |
 | MoE, MLP, norms | Done | Norms and MLP kernels done. Ornith-1.5 MoE decodes on both backends (84 tok/s ROCm, 88 Vulkan). |
 | Calibration | Done | Measures speed settings per machine and keeps the fastest. Covers split target and cap (ROCm), prefill chunk, attention split, and the draft block with a strategy attached. A parallel layout (`--tp`, `--cp`, `--pipeline`) runs both MTP (`--speculate`) and DFlash2 (`--draft`), sweeps the knobs it honors, and stores the chosen settings with the measured decode and prefill rates. `--concurrent` benchmarks 2, 3, and 4 sessions and the largest count that fits the context. Sizes and stores the layer count from free device memory, so an MoE model larger than VRAM loads paged, and `run` and `serve` apply it. `--calibrate-limit N` caps a run at N measurements. Writes JSON keyed by backend, device, model, context, KV type, strategy, and layout. |
-
-See <a href="https://github.com/Quackster/tessera/blob/main/docs/PROGRESS.md">PROGRESS.md</a> for full status.
+</details>
 
 ## Chat UI
 
@@ -140,16 +151,6 @@ See `AGENTS.md` for architecture rules and for hard rules.
 | DFlash2 FP8 draft | Done | The draft loads and runs the block. Speculation accepts 4.4 tokens per step on the 27B MXFP4 target. |
 
 Model weights live outside the repo. Each variant uses one flat directory. Model paths are runtime configuration. Code and tests never hard code model paths.
-
-| Path | Contents | Use | Hugging Face |
-| --- | --- | --- | --- |
-| `~/models/Qwen3.8-27B-GGUF/` | `Qwen3.8-27B-UD-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, `config.json` | Main GGUF target. | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
-| `~/models/Qwen3.8-27B-MXFP4-MTPFP8/` | MXFP4 weights with FP8 MTP, converted output, see below | Main MXFP4 target. | [amd/Qwen3.8-27B-Quark-AWQ-MXFP4](https://huggingface.co/amd/Qwen3.8-27B-Quark-AWQ-MXFP4) |
-| `~/models/Qwen3.8-27B-DFlash2-FP8/` | DFlash2 draft checkpoint | Draft layout tests. | [tcclaviger/Qwen3.8-27B-DFlash2-FP8](https://huggingface.co/tcclaviger/Qwen3.8-27B-DFlash2-FP8) |
-| `~/models/Ornith-1.5-35B-A3B-GGUF/` | `Ornith-1.5-35B-Q4_K_M.gguf`, `mmproj-Ornith-1.5-35B-BF16.gguf` | MoE GGUF target. | [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) |
-| `~/models/Ornith-1.5-35B-A3B-MXFP4-GGUF/` | MoE MXFP4 GGUF weights | Not yet supported. | [tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF](https://huggingface.co/tsaipifong/Ornith-1.5-35B-A3B-MXFP4-GGUF) |
-| `~/models/Ornith-1.5-35B-A3B-BF16/` | bf16 safetensors | Not yet supported. | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
- | `~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/` | `IQ3_S/*-00001-of-00002.gguf` (compute shard plus n-gram shard), `mmproj-Qwen3.8-Flash-Next-BF16.gguf` | Flash-Next decode target. The expert cache is sized to the free device memory and the batched staging is pipelined (the staging ring); the 48 tok/s target and the intermittent non-finite fault are open. | [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) |
 
 ### MXFP4 Qwen checkpoint preparation
 
@@ -330,6 +331,8 @@ curl http://127.0.0.1:8080/health
 With `--api-key` set, requests need `Authorization: Bearer <key>`. `GET /health` and `GET /metrics` stay public.
 
 ## Docker
+
+Build Tessera from source or pull a prebuilt image, then run it in Docker with your model weights mounted read-only and the required GPU devices passed through
 
 <details>
 <summary>Build from source and run</summary>
