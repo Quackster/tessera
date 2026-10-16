@@ -79,6 +79,30 @@ Example launch command:
 
 The serve command starts the HTTP server, and every served turn uses MTP speculation. On this machine decode runs about 13 tokens per second. The MTP head needs no draft checkpoint. `--speculate` drafts from the head in `--mtp`.
 
+## One R9700 with Qwen3.8-27B MTP and DFlash2
+
+One AMD Radeon AI PRO R9700 runs the Qwen3.8-27B target at the full 262144 token context with an int8 KV cache. The GGUF target uses MTP speculation from its own head. The MXFP4 target uses the DFlash2 draft checkpoint.
+
+Example launch command with MTP speculation on the GGUF target:
+
+```sh
+./cmake-build-rocm/tessera-cli serve \
+  --model ~/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --draft-block 2 \
+  --speculate --context 262144 --kv-q8 \
+  --host 0.0.0.0 --port 8080
+```
+
+Example launch command with the DFlash2 draft on the MXFP4 target:
+
+```sh
+./cmake-build-rocm/tessera-cli serve \
+  --model ~/models/Qwen3.8-27B-MXFP4-MTPFP8 \
+  --draft ~/models/Qwen3.8-27B-DFlash2-FP8 \
+  --draft-block 2 \
+  --context 262144 --kv-q8 --host 0.0.0.0 --port 8080
+```
+
 ## Architecture
 
 Core code is backend agnostic. All device work goes through the `Backend` interface. Only `src/backends/vulkan/` includes Vulkan headers. Only `src/backends/rocm/` includes HIP and ROCm headers. No vendor type crosses the backend boundary.
