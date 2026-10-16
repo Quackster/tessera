@@ -331,6 +331,9 @@ With `--api-key` set, requests need `Authorization: Bearer <key>`. `GET /health`
 
 ## Docker
 
+<details>
+<summary>Build from source and run</summary>
+
 The repository ships a `Dockerfile` and `docker/entrypoint.sh`. One image uses one backend. The entrypoint runs `serve` and reads every flag from the environment, so a container needs no command line. Model weights stay outside the image and are mounted read only.
 
 Build the ROCm image:
@@ -408,6 +411,22 @@ The launch examples above map to the environment as follows.
 -e TESSERA_DRAFT=/models/Qwen3.8-27B-DFlash2-FP8 \
 -e TESSERA_GPUS=0 -e TESSERA_DRAFT_BLOCK=2 -e TESSERA_CONTEXT=262144 -e TESSERA_KV=q8
 ```
+
+</details>
+
+<details>
+<summary>Pull a prebuilt image</summary>
+
+Prebuilt images are published to the GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/quackster/tessera:rocm    # AMD ROCm, also tagged latest
+docker pull ghcr.io/quackster/tessera:vulkan  # Vulkan
+```
+
+Use the pulled name in place of `tessera:rocm` in the run command above.
+
+</details>
 
 ## Command-line arguments
 
