@@ -30,8 +30,7 @@
 *.exe
 *.out
 *.app
-/cmake-build-vulkan
-/cmake-build-rocm
+/cmake-build-*
 
 # Python
 __pycache__/
