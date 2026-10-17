@@ -1980,9 +1980,10 @@ __global__ void SsmGateKernel(const float* a_log, const float* dt,
 // the column in registers for the whole row loop, so the state element is
 // loaded once and stored once per call instead of being walked twice per row
 // through global memory. The four lane partials of the read and of the
-// output fold through warp shuffles. The dispatch keeps the documented
-// heads * dv threads: a grid-stride loop gives each thread four column
-// slices, and the workgroup size keeps every lane quad inside one warp.
+// output fold through warp shuffles. The dispatch counts lanes (see the
+// built-in contract), so each thread takes one column slice; the grid-stride
+// loop below keeps the kernel correct for a narrower dispatch too, and the
+// workgroup size keeps every lane quad inside one warp.
 constexpr unsigned long long kDeltaStepLanes = 4;
 // State rows per lane the register slice holds: dk up to lanes * this.
 constexpr unsigned long long kDeltaStepJptMax = 64;

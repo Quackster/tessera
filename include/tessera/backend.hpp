@@ -243,7 +243,9 @@ class Kernel {
 // zero stride updates in place and a non-zero one appends every step to the
 // next history slot. dk is at most 256 (the built-in splits a state column
 // across four lanes that hold dk/4 rows each). The dispatch is
-// ceil(heads * dv / 256) workgroups of 256.
+// ceil(heads * dv * 4 / 256) workgroups of 256: a workgroup covers 64 state
+// columns with four lanes per column, and a backend that maps one thread per
+// column leaves the surplus threads idle.
 // "repeat_heads": buffer 0 is IN (fp32, rows x num_k_heads x head_k_dim),
 // buffer 1 the output OUT (fp32, rows x num_v_heads x head_k_dim);
 // scalars are num_v_heads, head_k_dim, factor and rows (num_v_heads is

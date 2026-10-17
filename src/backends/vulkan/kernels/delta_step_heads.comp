@@ -1,6 +1,9 @@
 #version 450
 
-// One thread per (head, state column); dispatch ceil(heads * dv / 256).
+// One thread per (head, state column); the dispatch counts four lanes per
+// column (ceil(heads * dv * 4 / 256) workgroups), so the surplus threads
+// return at once. The ROCm built-in splits the column across the four lanes
+// instead; this kernel keeps the whole column in one thread.
 layout(local_size_x = 256) in;
 
 // "delta_step_heads" contract: buffer 0 is S (heads x dk x dv); buffers 1..4

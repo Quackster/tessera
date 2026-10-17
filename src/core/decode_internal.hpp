@@ -1151,6 +1151,12 @@ inline std::expected<void, StatusCode> DeltaStepDevice(
 // hold dk/4 rows each in registers.
 constexpr std::size_t kDeltaStepMaxDk = 256;
 
+// Lanes one "delta_step_heads" state column is split across. The dispatch
+// counts lanes, not columns, so every lane gets its own thread and the device
+// stays busy on a long prefill; a backend that maps one thread per column
+// leaves the surplus threads idle.
+constexpr std::size_t kDeltaStepLanes = 4;
+
 // One gated-delta step for all value heads with the device state updated in
 // place (`k`/`q` are heads x dk, `v`/`o` heads x dv, `alpha`/`beta` one value
 // per head). dk above kDeltaStepMaxDk is UnsupportedFeature.
@@ -1166,7 +1172,8 @@ inline std::expected<void, StatusCode> DeltaStepHeadsDevice(
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>((heads * dv + 255) / 256);
+  launch.grid_x = static_cast<std::uint32_t>(
+      (heads * dv * kDeltaStepLanes + 255) / 256);
   launch.block_x = 256;
   launch.buffers = {&state, &k, &v, &q, &o, &alpha, &beta};
   launch.scalars = {heads, dk, dv, rows, sbase, sstride, abase};
