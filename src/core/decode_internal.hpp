@@ -1420,10 +1420,11 @@ inline std::expected<Kernel*, StatusCode> GemmTiledFor(Backend& backend,
 // the tile rows, so a shallower batch is faster on the tiled or GEMV kernel.
 constexpr std::size_t kGemmWmmaMinRows = 64;
 
-// Columns needed before the tensor-core tile pays off: the tile is this many
-// columns wide, so a narrower projection leaves the device with too few
-// workgroups to hide the weight reads and the GEMV path wins.
-constexpr std::size_t kGemmWmmaMinCols = 64;
+// Columns needed before the tensor-core tile pays off: the tile is 64 columns
+// wide and pads n, so a narrower projection wastes part of every tile. Below
+// this width the pad waste outweighs the GEMV path's per-row cost: the narrow
+// 48-column gate projections measure about three times the tensor-core tile.
+constexpr std::size_t kGemmWmmaMinCols = 32;
 
 // fp16 tensor-core tiled GEMM kernel id for a dtype ("gemm_<fmt>_wmma"), or
 // empty when the dtype has no tensor-core tile. The tile is square with

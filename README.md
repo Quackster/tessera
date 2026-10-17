@@ -48,7 +48,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | Sampling | Done | Seeded sampling with Qwen 27B defaults. `serve` starts from the launcher flags, prints the effective values at boot, and each request overrides temperature, top_p, top_k, min_p, the penalties and the seed in the body; a value outside the accepted range is rejected with 422. |
 | GEMM | Done | Q4_K to IQ, FP8/MXFP4, bf16, fp32. Tensor core paths for decode and verify. ROCm prefill runs fp16 WMMA tiles for the block formats (Q4_K to Q8_0); other backends fall through to the tiled kernel. |
 | Activation quant | Done | Per-token FP8 E4M3 quant-dequant. W4A8 opt-in. |
-| Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. Quantized prefill decodes eight key codes per load. |
+| Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. Quantized prefill decodes eight key codes per load and serves four query rows per workgroup. |
 | Weight upload | Done | Manifest to device buffers. One batched upload per load. |
 | Decode loop | Done | Single-token vanilla and hybrid GGUF loops. |
 | Hybrid SSM | Done | Load, kernels, both decode paths, MTP head done. The delta scan keeps each state column in registers across a prefill chunk. |

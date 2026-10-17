@@ -2411,9 +2411,17 @@ __device__ __forceinline__ void QuantKvCodes8(const unsigned char* data,
   }
 }
 
-// Tiled online-softmax for the quantized KV caches: one workgroup per
-// (query row, head), the query staged in shared memory, so the dot product
-// is computed once per key and the cost is O(n * head_dim) per query/head.
+// Query rows one tiled attention workgroup serves. A key row load and its
+// code decode feed every row of the block, and the tile's reduction rounds
+// cover all of them, so the per-key cost divides by this factor. The dispatch
+// stays m * heads workgroups: the ones past ceil(m / kRows) * heads return at
+// once, and a backend that maps one workgroup per row stays correct.
+constexpr unsigned long long kAttentionRows = 4;
+
+// Tiled online-softmax for the quantized KV caches: one workgroup serves up
+// to kAttentionRows consecutive query rows of one head, the queries staged in
+// shared memory, so the dot product is computed once per key and the cost is
+// O(n * head_dim) per query/head.
 template <int Kind>
 __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
                                     const unsigned char* v, const float* ks,
@@ -2426,136 +2434,264 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
                                     unsigned long long row_base,
                                     unsigned long long window) {
   constexpr unsigned long long kTile = 256;
-  __shared__ float q_s[256];
-  __shared__ float sc[256];
-  __shared__ float wt[256];
-  // Tile reduction scratch plus the broadcast {m_new, corr, l}.
-  __shared__ float red[256];
-  __shared__ float tile_bc[3];
+  constexpr unsigned long long kRows = kAttentionRows;
+  __shared__ float q_s[kRows * 256];
+  __shared__ float sc[kRows * 256];
+  __shared__ float wt[kRows * 256];
+  // Reduction scratch: 16 partials per row, plus {m_new, corr} per row.
+  __shared__ float red[kRows * 16];
+  __shared__ float tile_bc[2 * kRows];
+  const unsigned long long e = threadIdx.x;
   const unsigned long long g = blockIdx.x;
-  if (g >= m * heads) {
+  const unsigned long long blocks = (m + kRows - 1) / kRows;
+  if (g >= blocks * heads) {
     return;
   }
-  const unsigned long long e = threadIdx.x;
-  const unsigned long long i = g / heads;
+  const unsigned long long ib = g / heads;
   const unsigned long long h = g % heads;
   const unsigned long long kv = h / (heads / kv_heads);
-  const unsigned long long pos = q_base + i;
-  const unsigned long long last = pos >= n ? n - 1 : pos;
-  unsigned long long start =
-      (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
-  if (start > last) {
-    start = last;
-  }
+  const unsigned long long first = ib * kRows;
+  const unsigned long long here = m - first < kRows ? m - first : kRows;
   const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
-  const unsigned long long qb = ((row_base + i) * heads + h) * head_dim;
   if (e < head_dim) {
-    q_s[e] = q[qb + e];
+#pragma unroll
+    for (unsigned long long r = 0; r < kRows; ++r) {
+      if (r < here) {
+        const unsigned long long qb =
+            ((row_base + first + r) * heads + h) * head_dim;
+        q_s[r * 256 + e] = q[qb + e];
+      }
+    }
   }
   LdsBarrier();
-  float run_max = -1e30f;
-  float run_sum = 0.0f;
-  float acc = 0.0f;
-  unsigned long long tile = start;
+  float run_max[kRows];
+  float run_sum[kRows];
+  float acc[kRows];
+#pragma unroll
+  for (unsigned long long r = 0; r < kRows; ++r) {
+    run_max[r] = -1e30f;
+    run_sum[r] = 0.0f;
+    acc[r] = 0.0f;
+  }
+  // Row ranges: rows in a block sit at consecutive positions, so only the
+  // causal edge and a partial last block need the per-row bounds.
+  const unsigned long long stop =
+      q_base + first + (here - 1) < n ? q_base + first + (here - 1) : n - 1;
+  const unsigned long long base =
+      (window != 0 && q_base + first + 1 > window) ? q_base + first + 1 - window
+                                                   : 0;
+  unsigned long long tile = base;
   while (true) {
     const unsigned long long tile_last =
-        (tile + kTile - 1 < last) ? tile + kTile - 1 : last;
-    float s = -1e30f;
-    if (tile + e <= last) {
+        (tile + kTile - 1 < stop) ? tile + kTile - 1 : stop;
+    // Per-row key bounds for this tile's masking.
+    unsigned long long last[kRows];
+    unsigned long long start[kRows];
+#pragma unroll
+    for (unsigned long long r = 0; r < kRows; ++r) {
+      const unsigned long long pos = q_base + first + r;
+      last[r] = (r < here && pos < n) ? pos : (r < here ? n - 1 : 0);
+      start[r] = (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+      if (r >= here) {
+        // An invalid row takes no keys; its weights stay zero.
+        last[r] = 0;
+        start[r] = 1;
+      } else if (start[r] > last[r]) {
+        start[r] = last[r];
+      }
+    }
+    // QK: one code decode per key feeds every row's dot.
+    float d0[kRows];
+    float d1[kRows];
+    float d2[kRows];
+    float d3[kRows];
+#pragma unroll
+    for (unsigned long long r = 0; r < kRows; ++r) {
+      d0[r] = 0.0f;
+      d1[r] = 0.0f;
+      d2[r] = 0.0f;
+      d3[r] = 0.0f;
+    }
+    if (tile + e <= stop) {
       const unsigned long long j = tile + e;
       const unsigned long long kb = (j * kv_heads + kv) * head_dim;
-      // Four independent partial sums keep the FMA pipeline full;
-      // one chain stalls on its own latency (see the tiled GEMMs).
-      float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
       unsigned long long d = 0;
       if (head_dim % 8 == 0) {
         // Eight codes per wide load (see QuantKvCodes8).
         float c[8];
         for (; d + 8 <= head_dim; d += 8) {
           QuantKvCodes8<Kind>(k, kb + d, c);
-          dot0 = fmaf(q_s[d + 0], c[0], dot0);
-          dot1 = fmaf(q_s[d + 1], c[1], dot1);
-          dot2 = fmaf(q_s[d + 2], c[2], dot2);
-          dot3 = fmaf(q_s[d + 3], c[3], dot3);
-          dot0 = fmaf(q_s[d + 4], c[4], dot0);
-          dot1 = fmaf(q_s[d + 5], c[5], dot1);
-          dot2 = fmaf(q_s[d + 6], c[6], dot2);
-          dot3 = fmaf(q_s[d + 7], c[7], dot3);
+#pragma unroll
+          for (unsigned long long r = 0; r < kRows; ++r) {
+            const float* qs = &q_s[r * 256 + d];
+            d0[r] = fmaf(qs[0], c[0], d0[r]);
+            d1[r] = fmaf(qs[1], c[1], d1[r]);
+            d2[r] = fmaf(qs[2], c[2], d2[r]);
+            d3[r] = fmaf(qs[3], c[3], d3[r]);
+            d0[r] = fmaf(qs[4], c[4], d0[r]);
+            d1[r] = fmaf(qs[5], c[5], d1[r]);
+            d2[r] = fmaf(qs[6], c[6], d2[r]);
+            d3[r] = fmaf(qs[7], c[7], d3[r]);
+          }
         }
-        float dot = (dot0 + dot1) + (dot2 + dot3);
-        dot *= ks[j];
-        s = dot * scale;
+        const float ksj = ks[j] * scale;
+#pragma unroll
+        for (unsigned long long r = 0; r < kRows; ++r) {
+          sc[r * 256 + e] = (j >= start[r] && j <= last[r])
+                                ? ((d0[r] + d1[r]) + (d2[r] + d3[r])) * ksj
+                                : -1e30f;
+        }
       } else {
         for (; d + 3 < head_dim; d += 4) {
-          dot0 = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot0);
-          dot1 = fmaf(q_s[d + 1], QuantKvAt<Kind>(k, kb + d + 1, ks[j]), dot1);
-          dot2 = fmaf(q_s[d + 2], QuantKvAt<Kind>(k, kb + d + 2, ks[j]), dot2);
-          dot3 = fmaf(q_s[d + 3], QuantKvAt<Kind>(k, kb + d + 3, ks[j]), dot3);
+          const float ksj = ks[j];
+#pragma unroll
+          for (unsigned long long r = 0; r < kRows; ++r) {
+            const float* qs = &q_s[r * 256 + d];
+            d0[r] = fmaf(qs[0], QuantKvAt<Kind>(k, kb + d + 0, ksj), d0[r]);
+            d1[r] = fmaf(qs[1], QuantKvAt<Kind>(k, kb + d + 1, ksj), d1[r]);
+            d2[r] = fmaf(qs[2], QuantKvAt<Kind>(k, kb + d + 2, ksj), d2[r]);
+            d3[r] = fmaf(qs[3], QuantKvAt<Kind>(k, kb + d + 3, ksj), d3[r]);
+          }
         }
-        float dot = (dot0 + dot1) + (dot2 + dot3);
-        for (; d < head_dim; ++d) {
-          dot = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot);
+#pragma unroll
+        for (unsigned long long r = 0; r < kRows; ++r) {
+          sc[r * 256 + e] = (j >= start[r] && j <= last[r])
+                                ? ((d0[r] + d1[r]) + (d2[r] + d3[r])) * scale
+                                : -1e30f;
         }
-        s = dot * scale;
+      }
+    } else {
+#pragma unroll
+      for (unsigned long long r = 0; r < kRows; ++r) {
+        sc[r * 256 + e] = -1e30f;
       }
     }
-    sc[e] = s;
     LdsBarrier();
-    AttentionTileMaxExp(e, sc, wt, red, tile_bc, run_max);
+    // Tile max fold for every row in the same barrier rounds.
+    if (e < 16) {
+#pragma unroll
+      for (unsigned long long r = 0; r < kRows; ++r) {
+        float tmax = sc[r * 256 + e * 16];
+#pragma unroll
+        for (unsigned long long t = 1; t < 16; ++t) {
+          tmax = fmaxf(tmax, sc[r * 256 + e * 16 + t]);
+        }
+        red[r * 16 + e] = tmax;
+      }
+    }
+    LdsBarrier();
+    for (unsigned int s = 8; s > 0; s >>= 1) {
+      if (e < s) {
+#pragma unroll
+        for (unsigned long long r = 0; r < kRows; ++r) {
+          red[r * 16 + e] = fmaxf(red[r * 16 + e], red[r * 16 + e + s]);
+        }
+      }
+      LdsBarrier();
+    }
     if (e == 0) {
-      // Four ordered chains keep the sequential partial sums.
-      float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
-      for (unsigned long long t = 0; t < kTile; t += 4) {
-        l0 += wt[t];
-        l1 += wt[t + 1];
-        l2 += wt[t + 2];
-        l3 += wt[t + 3];
+#pragma unroll
+      for (unsigned long long r = 0; r < kRows; ++r) {
+        const float m_new =
+            fmaxf(run_max[r], fmaxf(red[r * 16], red[r * 16 + 1]));
+        tile_bc[2 * r + 0] = m_new;
+        tile_bc[2 * r + 1] = expf(run_max[r] - m_new);
       }
-      tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
     LdsBarrier();
-    const float m_new = tile_bc[0];
-    const float corr = tile_bc[1];
-    const float l = tile_bc[2];
-    // Four independent accumulators, as in the score dot above.
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    float a = 0.0f;
+#pragma unroll
+    for (unsigned long long r = 0; r < kRows; ++r) {
+      wt[r * 256 + e] = expf(sc[r * 256 + e] - tile_bc[2 * r + 0]);
+    }
+    LdsBarrier();
+    // The tile weight sums run in the same parallel fold, four rounds.
+    if (e < 16) {
+#pragma unroll
+      for (unsigned long long r = 0; r < kRows; ++r) {
+        float tsum = wt[r * 256 + e * 16];
+#pragma unroll
+        for (unsigned long long t = 1; t < 16; ++t) {
+          tsum += wt[r * 256 + e * 16 + t];
+        }
+        red[r * 16 + e] = tsum;
+      }
+    }
+    LdsBarrier();
+    for (unsigned int s = 8; s > 0; s >>= 1) {
+      if (e < s) {
+#pragma unroll
+        for (unsigned long long r = 0; r < kRows; ++r) {
+          red[r * 16 + e] += red[r * 16 + e + s];
+        }
+      }
+      LdsBarrier();
+    }
+    // The value load feeds every row: a row's weights are zero past its own
+    // last key, so one shared key loop covers the block.
+    float a0[kRows];
+    float a1[kRows];
+    float a2[kRows];
+    float a3[kRows];
+#pragma unroll
+    for (unsigned long long r = 0; r < kRows; ++r) {
+      a0[r] = 0.0f;
+      a1[r] = 0.0f;
+      a2[r] = 0.0f;
+      a3[r] = 0.0f;
+    }
     if (e < head_dim) {
       const unsigned long long count =
-          (tile + kTile - 1 <= last) ? kTile : (last - tile + 1);
+          (tile + kTile - 1 <= stop) ? kTile : (stop + 1 - tile);
       unsigned long long t = 0;
       for (; t + 3 < count; t += 4) {
         const unsigned long long b0 = (tile + t) * kv_heads + kv;
         const unsigned long long b1 = (tile + t + 1) * kv_heads + kv;
         const unsigned long long b2 = (tile + t + 2) * kv_heads + kv;
         const unsigned long long b3 = (tile + t + 3) * kv_heads + kv;
-        a0 = fmaf(wt[t], QuantKvAt<Kind>(v, b0 * head_dim + e, vs[tile + t]),
-                  a0);
-        a1 = fmaf(wt[t + 1],
-                  QuantKvAt<Kind>(v, b1 * head_dim + e, vs[tile + t + 1]), a1);
-        a2 = fmaf(wt[t + 2],
-                  QuantKvAt<Kind>(v, b2 * head_dim + e, vs[tile + t + 2]), a2);
-        a3 = fmaf(wt[t + 3],
-                  QuantKvAt<Kind>(v, b3 * head_dim + e, vs[tile + t + 3]), a3);
+        const float v0 = QuantKvAt<Kind>(v, b0 * head_dim + e, vs[tile + t]);
+        const float v1 =
+            QuantKvAt<Kind>(v, b1 * head_dim + e, vs[tile + t + 1]);
+        const float v2 =
+            QuantKvAt<Kind>(v, b2 * head_dim + e, vs[tile + t + 2]);
+        const float v3 =
+            QuantKvAt<Kind>(v, b3 * head_dim + e, vs[tile + t + 3]);
+#pragma unroll
+        for (unsigned long long r = 0; r < kRows; ++r) {
+          const float* wrow = &wt[r * 256];
+          a0[r] = fmaf(wrow[t + 0], v0, a0[r]);
+          a1[r] = fmaf(wrow[t + 1], v1, a1[r]);
+          a2[r] = fmaf(wrow[t + 2], v2, a2[r]);
+          a3[r] = fmaf(wrow[t + 3], v3, a3[r]);
+        }
       }
-      a = (a0 + a1) + (a2 + a3);
-      for (; t < count; ++t) {
-        const unsigned long long vb = (tile + t) * kv_heads + kv;
-        a = fmaf(wt[t], QuantKvAt<Kind>(v, vb * head_dim + e, vs[tile + t]),
-                 a);
+#pragma unroll
+      for (unsigned long long r = 0; r < kRows; ++r) {
+        float a = (a0[r] + a1[r]) + (a2[r] + a3[r]);
+        for (unsigned long long u = t; u < count; ++u) {
+          const unsigned long long vb = (tile + u) * kv_heads + kv;
+          a = fmaf(wt[r * 256 + u],
+                   QuantKvAt<Kind>(v, vb * head_dim + e, vs[tile + u]), a);
+        }
+        acc[r] = fmaf(tile_bc[2 * r + 1], acc[r], a);
+        run_sum[r] = fmaf(tile_bc[2 * r + 1], run_sum[r], red[r * 16]);
+        run_max[r] = tile_bc[2 * r + 0];
       }
     }
-    acc = fmaf(corr, acc, a);
-    run_sum = fmaf(corr, run_sum, l);
-    run_max = m_new;
     LdsBarrier();
-    if (tile_last >= last) {
+    if (tile_last >= stop) {
       break;
     }
     tile += kTile;
   }
   if (e < head_dim) {
-    out[qb + e] = acc / run_sum;
+#pragma unroll
+    for (unsigned long long r = 0; r < kRows; ++r) {
+      if (r < here) {
+        const unsigned long long qb =
+            ((row_base + first + r) * heads + h) * head_dim;
+        out[qb + e] = acc[r] / run_sum[r];
+      }
+    }
   }
 }
 
