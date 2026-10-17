@@ -44,14 +44,14 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | DFlash2 | Done | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. |
 | CLI | Done | One flag set for `run`, `serve` and `calibrate`. Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit and concurrent benchmark. `serve` honors every layout: replicas, `--pipeline`, `--tp`, `--cp`, `--spec-split` and `--hybrid`. |
 | Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
-| KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. |
+| KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. Prefill appends a whole row range with one cast or quantize pass per buffer. |
 | Sampling | Done | Seeded sampling with Qwen 27B defaults. `serve` starts from the launcher flags, prints the effective values at boot, and each request overrides temperature, top_p, top_k, min_p, the penalties and the seed in the body; a value outside the accepted range is rejected with 422. |
-| GEMM | Done | Q4_K to IQ, FP8/MXFP4, bf16, fp32. Tensor core paths for decode and verify. |
+| GEMM | Done | Q4_K to IQ, FP8/MXFP4, bf16, fp32. Tensor core paths for decode and verify. ROCm prefill runs fp16 WMMA tiles for the block formats (Q4_K to Q8_0); other backends fall through to the tiled kernel. |
 | Activation quant | Done | Per-token FP8 E4M3 quant-dequant. W4A8 opt-in. |
-| Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. |
+| Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. Quantized prefill decodes eight key codes per load. |
 | Weight upload | Done | Manifest to device buffers. One batched upload per load. |
 | Decode loop | Done | Single-token vanilla and hybrid GGUF loops. |
-| Hybrid SSM | Done | Load, kernels, both decode paths, MTP head done. |
+| Hybrid SSM | Done | Load, kernels, both decode paths, MTP head done. The delta scan keeps each state column in registers across a prefill chunk. |
 | Speculative decode | Done | MTP and DFlash2 end to end. Output equals greedy. GGUF MTP reaches 31-37 tok/s on the 27B target (ROCm). DFlash2 about 60 vs 23 tok/s. |
 | MXFP4 path | Done | Parse, kernels, HF config, tokenizer. Matches GGUF greedy output. |
 | DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |

@@ -2017,9 +2017,13 @@ __device__ __forceinline__ void DeltaStepHeadsSlice(
   const unsigned long long k_base = h * dk;
   const unsigned long long v_base = h * dv;
   float st[kJpt];
+  // The row's k, then its q: staging the loads keeps them independent of the
+  // FMA chain, so a row pays two memory round trips instead of one per element.
+  float rq[kJpt];
 #pragma unroll
   for (unsigned long long jj = 0; jj < kJpt; ++jj) {
-    st[jj] = jj < jn ? s[s_base_in + (j0 + jj) * dv + d] : 0.0f;
+    const unsigned long long j = j0 + jj < dk ? j0 + jj : dk - 1;
+    st[jj] = s[s_base_in + j * dv + d];
   }
   // Rows share the recurrent state and advance it in turn, so a whole
   // sequence costs one launch (rows = 1 is the single-token step).
@@ -2029,6 +2033,11 @@ __device__ __forceinline__ void DeltaStepHeadsSlice(
     const float a = alpha[abase + t * heads + h];
     const float b = beta[abase + t * heads + h];
     const float vb = v[vo + v_base + d];
+#pragma unroll
+    for (unsigned long long jj = 0; jj < kJpt; ++jj) {
+      const unsigned long long j = j0 + jj < dk ? j0 + jj : dk - 1;
+      rq[jj] = k[ko + k_base + j];
+    }
     // Four partial sums keep the dk/4-deep read and output chains short.
     float r0 = 0.0f;
     float r1 = 0.0f;
@@ -2037,21 +2046,45 @@ __device__ __forceinline__ void DeltaStepHeadsSlice(
 #pragma unroll
     for (unsigned long long jj = 0; jj < kJpt; jj += 4) {
       if (jj + 0 < jn) {
-        r0 = fmaf(st[jj + 0], k[ko + k_base + j0 + jj + 0], r0);
+        r0 = fmaf(st[jj + 0], rq[jj + 0], r0);
       }
       if (jj + 1 < jn) {
-        r1 = fmaf(st[jj + 1], k[ko + k_base + j0 + jj + 1], r1);
+        r1 = fmaf(st[jj + 1], rq[jj + 1], r1);
       }
       if (jj + 2 < jn) {
-        r2 = fmaf(st[jj + 2], k[ko + k_base + j0 + jj + 2], r2);
+        r2 = fmaf(st[jj + 2], rq[jj + 2], r2);
       }
       if (jj + 3 < jn) {
-        r3 = fmaf(st[jj + 3], k[ko + k_base + j0 + jj + 3], r3);
+        r3 = fmaf(st[jj + 3], rq[jj + 3], r3);
       }
     }
     float read = (r0 + r1) + (r2 + r3);
     read += __shfl_xor_sync(~0ull, read, 1, 32);
     read += __shfl_xor_sync(~0ull, read, 2, 32);
+#pragma unroll
+    for (unsigned long long jj = 0; jj < kJpt; jj += 4) {
+      if (jj + 0 < jn) {
+        const float kk = rq[jj + 0];
+        st[jj + 0] = a * (st[jj + 0] - b * kk * read) + b * vb * kk;
+      }
+      if (jj + 1 < jn) {
+        const float kk = rq[jj + 1];
+        st[jj + 1] = a * (st[jj + 1] - b * kk * read) + b * vb * kk;
+      }
+      if (jj + 2 < jn) {
+        const float kk = rq[jj + 2];
+        st[jj + 2] = a * (st[jj + 2] - b * kk * read) + b * vb * kk;
+      }
+      if (jj + 3 < jn) {
+        const float kk = rq[jj + 3];
+        st[jj + 3] = a * (st[jj + 3] - b * kk * read) + b * vb * kk;
+      }
+    }
+#pragma unroll
+    for (unsigned long long jj = 0; jj < kJpt; ++jj) {
+      const unsigned long long j = j0 + jj < dk ? j0 + jj : dk - 1;
+      rq[jj] = q[ko + k_base + j];
+    }
     float o0 = 0.0f;
     float o1 = 0.0f;
     float o2 = 0.0f;
@@ -2059,32 +2092,16 @@ __device__ __forceinline__ void DeltaStepHeadsSlice(
 #pragma unroll
     for (unsigned long long jj = 0; jj < kJpt; jj += 4) {
       if (jj + 0 < jn) {
-        const unsigned long long j = j0 + jj + 0;
-        const float kk = k[ko + k_base + j];
-        const float u = a * (st[jj + 0] - b * kk * read) + b * vb * kk;
-        st[jj + 0] = u;
-        o0 = fmaf(u, q[ko + k_base + j], o0);
+        o0 = fmaf(st[jj + 0], rq[jj + 0], o0);
       }
       if (jj + 1 < jn) {
-        const unsigned long long j = j0 + jj + 1;
-        const float kk = k[ko + k_base + j];
-        const float u = a * (st[jj + 1] - b * kk * read) + b * vb * kk;
-        st[jj + 1] = u;
-        o1 = fmaf(u, q[ko + k_base + j], o1);
+        o1 = fmaf(st[jj + 1], rq[jj + 1], o1);
       }
       if (jj + 2 < jn) {
-        const unsigned long long j = j0 + jj + 2;
-        const float kk = k[ko + k_base + j];
-        const float u = a * (st[jj + 2] - b * kk * read) + b * vb * kk;
-        st[jj + 2] = u;
-        o2 = fmaf(u, q[ko + k_base + j], o2);
+        o2 = fmaf(st[jj + 2], rq[jj + 2], o2);
       }
       if (jj + 3 < jn) {
-        const unsigned long long j = j0 + jj + 3;
-        const float kk = k[ko + k_base + j];
-        const float u = a * (st[jj + 3] - b * kk * read) + b * vb * kk;
-        st[jj + 3] = u;
-        o3 = fmaf(u, q[ko + k_base + j], o3);
+        o3 = fmaf(st[jj + 3], rq[jj + 3], o3);
       }
     }
     float out = (o0 + o1) + (o2 + o3);
@@ -2355,6 +2372,45 @@ __device__ __forceinline__ float QuantKvAt(const unsigned char* data,
   return Fp8E4M3ToFloatDev(data[idx]) * s;
 }
 
+// Eight consecutive codes of a quantized KV row, without the row scale: the
+// caller folds the scale into the score once per key. One wide load covers
+// eight codes, because the per-key byte gather (one 32-byte sector per lane
+// per element) is what makes the tiled attention memory bound. head_dim must
+// be a multiple of 8 so every key row stays naturally aligned; the caller
+// keeps the scalar path otherwise.
+template <int Kind>
+__device__ __forceinline__ void QuantKvCodes8(const unsigned char* data,
+                                              unsigned long long d,
+                                              float* out) {
+  if (Kind == kQuantKvQ8) {
+    const unsigned long long w =
+        *reinterpret_cast<const unsigned long long*>(data + d);
+#pragma unroll
+    for (unsigned long long i = 0; i < 8; ++i) {
+      out[i] = static_cast<float>(static_cast<signed char>(w >> (8 * i)));
+    }
+    return;
+  }
+  if (Kind == kQuantKvQ4) {
+    const unsigned int word =
+        reinterpret_cast<const unsigned int*>(data)[d >> 3];
+#pragma unroll
+    for (unsigned long long i = 0; i < 8; ++i) {
+      int value = static_cast<int>((word >> (4 * i)) & 0xFu);
+      value = (value & 0x8) != 0 ? value - 16 : value;
+      out[i] = static_cast<float>(value);
+    }
+    return;
+  }
+  const unsigned long long w =
+      *reinterpret_cast<const unsigned long long*>(data + d);
+#pragma unroll
+  for (unsigned long long i = 0; i < 8; ++i) {
+    out[i] = Fp8E4M3ToFloatDev(
+        static_cast<unsigned char>(w >> (8 * i)));
+  }
+}
+
 // Tiled online-softmax for the quantized KV caches: one workgroup per
 // (query row, head), the query staged in shared memory, so the dot product
 // is computed once per key and the cost is O(n * head_dim) per query/head.
@@ -2412,17 +2468,36 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
       // one chain stalls on its own latency (see the tiled GEMMs).
       float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
       unsigned long long d = 0;
-      for (; d + 3 < head_dim; d += 4) {
-        dot0 = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot0);
-        dot1 = fmaf(q_s[d + 1], QuantKvAt<Kind>(k, kb + d + 1, ks[j]), dot1);
-        dot2 = fmaf(q_s[d + 2], QuantKvAt<Kind>(k, kb + d + 2, ks[j]), dot2);
-        dot3 = fmaf(q_s[d + 3], QuantKvAt<Kind>(k, kb + d + 3, ks[j]), dot3);
+      if (head_dim % 8 == 0) {
+        // Eight codes per wide load (see QuantKvCodes8).
+        float c[8];
+        for (; d + 8 <= head_dim; d += 8) {
+          QuantKvCodes8<Kind>(k, kb + d, c);
+          dot0 = fmaf(q_s[d + 0], c[0], dot0);
+          dot1 = fmaf(q_s[d + 1], c[1], dot1);
+          dot2 = fmaf(q_s[d + 2], c[2], dot2);
+          dot3 = fmaf(q_s[d + 3], c[3], dot3);
+          dot0 = fmaf(q_s[d + 4], c[4], dot0);
+          dot1 = fmaf(q_s[d + 5], c[5], dot1);
+          dot2 = fmaf(q_s[d + 6], c[6], dot2);
+          dot3 = fmaf(q_s[d + 7], c[7], dot3);
+        }
+        float dot = (dot0 + dot1) + (dot2 + dot3);
+        dot *= ks[j];
+        s = dot * scale;
+      } else {
+        for (; d + 3 < head_dim; d += 4) {
+          dot0 = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot0);
+          dot1 = fmaf(q_s[d + 1], QuantKvAt<Kind>(k, kb + d + 1, ks[j]), dot1);
+          dot2 = fmaf(q_s[d + 2], QuantKvAt<Kind>(k, kb + d + 2, ks[j]), dot2);
+          dot3 = fmaf(q_s[d + 3], QuantKvAt<Kind>(k, kb + d + 3, ks[j]), dot3);
+        }
+        float dot = (dot0 + dot1) + (dot2 + dot3);
+        for (; d < head_dim; ++d) {
+          dot = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot);
+        }
+        s = dot * scale;
       }
-      float dot = (dot0 + dot1) + (dot2 + dot3);
-      for (; d < head_dim; ++d) {
-        dot = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot);
-      }
-      s = dot * scale;
     }
     sc[e] = s;
     LdsBarrier();
@@ -2574,17 +2649,36 @@ __device__ void AttentionQuantSplit(const float* q, const unsigned char* k,
       const unsigned long long kb = (j * kv_heads + kv) * head_dim;
       float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
       unsigned long long d = 0;
-      for (; d + 3 < head_dim; d += 4) {
-        dot0 = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot0);
-        dot1 = fmaf(q_s[d + 1], QuantKvAt<Kind>(k, kb + d + 1, ks[j]), dot1);
-        dot2 = fmaf(q_s[d + 2], QuantKvAt<Kind>(k, kb + d + 2, ks[j]), dot2);
-        dot3 = fmaf(q_s[d + 3], QuantKvAt<Kind>(k, kb + d + 3, ks[j]), dot3);
+      if (head_dim % 8 == 0) {
+        // Eight codes per wide load (see QuantKvCodes8).
+        float c[8];
+        for (; d + 8 <= head_dim; d += 8) {
+          QuantKvCodes8<Kind>(k, kb + d, c);
+          dot0 = fmaf(q_s[d + 0], c[0], dot0);
+          dot1 = fmaf(q_s[d + 1], c[1], dot1);
+          dot2 = fmaf(q_s[d + 2], c[2], dot2);
+          dot3 = fmaf(q_s[d + 3], c[3], dot3);
+          dot0 = fmaf(q_s[d + 4], c[4], dot0);
+          dot1 = fmaf(q_s[d + 5], c[5], dot1);
+          dot2 = fmaf(q_s[d + 6], c[6], dot2);
+          dot3 = fmaf(q_s[d + 7], c[7], dot3);
+        }
+        float dot = (dot0 + dot1) + (dot2 + dot3);
+        dot *= ks[j];
+        s = dot * scale;
+      } else {
+        for (; d + 3 < head_dim; d += 4) {
+          dot0 = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot0);
+          dot1 = fmaf(q_s[d + 1], QuantKvAt<Kind>(k, kb + d + 1, ks[j]), dot1);
+          dot2 = fmaf(q_s[d + 2], QuantKvAt<Kind>(k, kb + d + 2, ks[j]), dot2);
+          dot3 = fmaf(q_s[d + 3], QuantKvAt<Kind>(k, kb + d + 3, ks[j]), dot3);
+        }
+        float dot = (dot0 + dot1) + (dot2 + dot3);
+        for (; d < head_dim; ++d) {
+          dot = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot);
+        }
+        s = dot * scale;
       }
-      float dot = (dot0 + dot1) + (dot2 + dot3);
-      for (; d < head_dim; ++d) {
-        dot = fmaf(q_s[d], QuantKvAt<Kind>(k, kb + d, ks[j]), dot);
-      }
-      s = dot * scale;
     }
     sc[e] = s;
     LdsBarrier();
