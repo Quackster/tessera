@@ -23,7 +23,7 @@ namespace detail = ::tessera::core::detail;
 using core::Conv1dStepRef;
 using core::DecodeCache;
 using detail::AddDevice;
-using detail::AppendKv;
+using detail::AppendKvRows;
 using detail::AttentionDevice;
 using detail::Conv1dStateDevice;
 using detail::DeltaStepHeadsDevice;
@@ -196,6 +196,24 @@ std::expected<void, StatusCode> EnsureSplitReady(Backend& backend,
     }
     h.attention_split_kernel = std::move(*kernel);
   }
+  if (h.attention_split_gqa_kernel == nullptr &&
+      type != KvCacheType::Q8 && type != KvCacheType::Q4 &&
+      type != KvCacheType::FP8) {
+    // The GQA split kernel needs one load per K row and V element to
+    // serve every head of a kv head; only the plain KV types have it. A
+    // backend without the kernel reports UnsupportedFeature and the
+    // single-token path keeps the per-head split kernel.
+    const std::size_t kv_heads = cfg.attention.kv_heads;
+    const std::size_t ratio = kv_heads == 0 ? 0 : heads / kv_heads;
+    if (ratio >= 1 && ratio <= kMaxGqaHeads) {
+      auto kernel = backend.LoadKernel("attention_split_gqa", {});
+      if (kernel) {
+        h.attention_split_gqa_kernel = std::move(*kernel);
+      } else if (kernel.error() != StatusCode::UnsupportedFeature) {
+        return std::unexpected(kernel.error());
+      }
+    }
+  }
   return {};
 }
 
@@ -364,9 +382,9 @@ std::expected<void, StatusCode> RunFullBlock(
   }
   if (!cp || (pos >= h.cp->k0 && pos < h.cp->k1)) {
     if (auto appended =
-            AppendKv(backend, h.cast_kernel.get(), h.quant_kernel.get(),
-                     h.kv_scratch.get(), h.kv_scratch.get(),
-                     h.scale_scratch.get(), kv, *h.kf, *h.vf, kv_dim);
+            AppendKvRows(backend, h.cast_kernel.get(), h.quant_kernel.get(),
+                         h.kv_scratch.get(), h.kv_scratch.get(),
+                         h.scale_scratch.get(), kv, *h.kf, *h.vf, kv_dim, 0, 1);
         !appended) {
       return std::unexpected(appended.error());
     }
@@ -409,7 +427,9 @@ std::expected<void, StatusCode> RunFullBlock(
                   split)
                   .has_value()
             : detail::AttentionSplitDevice(
-                  backend, *h.attention_split_kernel,
+                  backend, h.attention_split_gqa_kernel
+                               ? *h.attention_split_gqa_kernel
+                               : *h.attention_split_kernel,
                   *h.attention_combine_kernel, *h.q, *kv.k, *kv.v, *h.attn,
                   *h.split_acc, *h.split_max, *h.split_sum, kv.rows, heads,
                   kv_heads, head_dim, pos, 0, 1, split,

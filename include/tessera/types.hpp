@@ -136,6 +136,13 @@ enum class DType : int {
 // contract and the weight loaders.
 constexpr std::size_t kQ4KBlockElements = 256;
 
+// Query heads one "attention_split_gqa" workgroup serves: the split
+// (flash-decoding) kernel keeps every query head of one kv head in one
+// workgroup so each K row and each V element is read once, and this is
+// the largest group the kernel's shared memory holds. A model with a
+// larger group falls back to "attention_split".
+constexpr std::size_t kMaxGqaHeads = 6;
+
 // Byte size of a dense tensor with `numel` elements. Block types use
 // their block layout (ggml 2026 numbering, F4E2M1 packs two elements
 // per byte); plain types use ElementBytes. UnsupportedFeature for

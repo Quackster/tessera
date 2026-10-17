@@ -200,7 +200,7 @@ std::uint64_t FullKvLayerBytes(const TransformerConfig& config,
   if (kv_dim == 0 || context == 0) {
     return 0;
   }
-  // Row bytes mirror AppendKv; quantized types add one fp32 scale row
+  // Row bytes mirror AppendKvRows; quantized types add one fp32 scale row
   // each for the keys and the values.
   const std::size_t row =
       type == KvCacheType::F32   ? kv_dim * 4

@@ -10,7 +10,7 @@ namespace tessera::core {
 
 namespace {
 
-using detail::AppendKv;
+using detail::AppendKvRows;
 using detail::AttentionQuantDevice;
 using detail::CachedKernel;
 using detail::DownloadF32;
@@ -329,9 +329,9 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
       return std::unexpected(StatusCode::DeviceError);
     }
     if (auto appended =
-            AppendKv(backend, st.cast_kernel.get(), st.quant_kernel.get(),
-                     st.kv_scratch.get(), st.kv_scratch.get(),
-                     st.scale_scratch.get(), kv, *st.k, *st.v, kv_dim);
+            AppendKvRows(backend, st.cast_kernel.get(), st.quant_kernel.get(),
+                         st.kv_scratch.get(), st.kv_scratch.get(),
+                         st.scale_scratch.get(), kv, *st.k, *st.v, kv_dim, 0, 1);
         !appended) {
       return std::unexpected(appended.error());
     }

@@ -241,7 +241,9 @@ class Kernel {
 // run in turn, advancing the shared state: each step reads the state at
 // sbase + head offset and writes it at sbase + sstride + head offset, so a
 // zero stride updates in place and a non-zero one appends every step to the
-// next history slot. The dispatch is ceil(heads * dv / 256) workgroups of 256.
+// next history slot. dk is at most 256 (the built-in splits a state column
+// across four lanes that hold dk/4 rows each). The dispatch is
+// ceil(heads * dv / 256) workgroups of 256.
 // "repeat_heads": buffer 0 is IN (fp32, rows x num_k_heads x head_k_dim),
 // buffer 1 the output OUT (fp32, rows x num_v_heads x head_k_dim);
 // scalars are num_v_heads, head_k_dim, factor and rows (num_v_heads is
@@ -312,6 +314,12 @@ class Kernel {
 // (m*heads*split fp32 each); scalars are m, n, heads, kv_heads,
 // head_dim, q_base, window, kv_f16, causal and split. The dispatch is
 // m*heads*split workgroups of 256.
+// "attention_split_gqa": flash-decoding variant of attention_split where
+// one workgroup serves every query head of one kv head, so a K row load
+// and a V element load feed heads/kv_heads heads instead of one. Same
+// buffers, scalars, chunks and partial layout as attention_split, so
+// "attention_combine" is unchanged. m must be 1 and heads/kv_heads at
+// most kMaxGqaHeads; the dispatch is kv_heads*split workgroups of 256.
 // "attention_q8_split", "attention_q4_split", "attention_fp8_split":
 // split-N variants of the quantized attentions (same kind rule as
 // attention_q8). Buffers are q, k, v, ks, vs (as in attention_q8) plus
@@ -437,6 +445,20 @@ class Kernel {
     if (launch.scalars[0] == 0 || launch.scalars[1] == 0 || heads == 0 ||
         kv_heads == 0 || launch.scalars[4] == 0 ||
         (heads % kv_heads) != 0 || launch.scalars[9] == 0) {
+      return StatusCode::InvalidArgument;
+    }
+  }
+  if (kernel.Id() == "attention_split_gqa") {
+    if (launch.buffers.size() != 6 || launch.scalars.size() != 10) {
+      return StatusCode::InvalidArgument;
+    }
+    const std::uint64_t m = launch.scalars[0];
+    const std::uint64_t heads = launch.scalars[2];
+    const std::uint64_t kv_heads = launch.scalars[3];
+    if (m != 1 || heads == 0 || kv_heads == 0 || launch.scalars[1] == 0 ||
+        launch.scalars[4] == 0 || launch.scalars[4] > 256 ||
+        (heads % kv_heads) != 0 || heads / kv_heads > kMaxGqaHeads ||
+        launch.scalars[9] == 0) {
       return StatusCode::InvalidArgument;
     }
   }

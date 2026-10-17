@@ -266,6 +266,7 @@ elseif(TESSERA_BACKEND STREQUAL "rocm")
     target_sources(tessera PRIVATE src/backends/rocm/rocm_backend.cpp
                                    src/backends/rocm/rocm_kernels_basic.cpp
                                    src/backends/rocm/rocm_kernels_block.cpp
+                                   src/backends/rocm/rocm_kernels_wmma.cpp
                                    src/backends/rocm/rocm_kernels_iq.cpp
                                    src/backends/rocm/rocm_kernels_gemv.cpp
                                    src/backends/rocm/rocm_kernels_moe.cpp
@@ -278,6 +279,7 @@ elseif(TESSERA_BACKEND STREQUAL "rocm")
         src/backends/rocm/rocm_backend.cpp
         src/backends/rocm/rocm_kernels_basic.cpp
         src/backends/rocm/rocm_kernels_block.cpp
+        src/backends/rocm/rocm_kernels_wmma.cpp
         src/backends/rocm/rocm_kernels_iq.cpp
         src/backends/rocm/rocm_kernels_gemv.cpp
         src/backends/rocm/rocm_kernels_moe.cpp

@@ -304,6 +304,22 @@ std::expected<void, StatusCode> ProjectBatch(
       return std::unexpected(rows.error());
     }
   }
+  if (!projected_done && m >= detail::kGemmWmmaMinRows &&
+      n >= detail::kGemmWmmaMinCols && k % 256 == 0 &&
+      !detail::GemmWmmaKernelName(dtype).empty()) {
+    // fp16 tensor-core tile: about nine times the scalar tiled kernel on
+    // the block-quantized formats, so it takes every batch of at least one
+    // tile of rows. A backend without the tile reports UnsupportedFeature
+    // and the batch falls through to the tiled kernel below.
+    auto wmma = detail::GemmWmmaFor(backend, h.gemm_tiled, dtype);
+    if (wmma) {
+      projected = detail::ProjectTiledDevice(backend, **wmma, a, w, out, m, n,
+                                             k);
+      projected_done = true;
+    } else if (wmma.error() != StatusCode::UnsupportedFeature) {
+      return std::unexpected(wmma.error());
+    }
+  }
   if (!projected_done &&
       (m >= TiledMinRows() || (m >= 2 && n >= TiledMinCols())) &&
       !detail::GemmTiledKernelName(dtype).empty()) {

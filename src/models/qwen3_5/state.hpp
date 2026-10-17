@@ -62,6 +62,11 @@ struct Qwen35State final : core::ArchState {
   // with the partial scratch below.
   std::unique_ptr<Kernel> attention_split_kernel;
   std::unique_ptr<Kernel> attention_combine_kernel;
+  // GQA variant of the split kernel, loaded when one workgroup can serve
+  // every query head of one kv head (heads/kv_heads <= kMaxGqaHeads); it
+  // drops the KV traffic of long-context decode by that factor. Null =>
+  // use attention_split_kernel.
+  std::unique_ptr<Kernel> attention_split_gqa_kernel;
   // Split-N partial scratch (pacc/pmax/psum), grown on demand to cover
   // split_heads * split chunks of split_dim floats.
   std::unique_ptr<Buffer> split_acc, split_max, split_sum;

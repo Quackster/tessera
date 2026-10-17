@@ -95,6 +95,43 @@ __global__ void RopeKernel(float* data, unsigned long long rows,
   base[j + pairs] = x1 * s + x2 * c;
 }
 
+// Tile softmax front end shared by the tiled attention kernels (base and
+// split, plain and quantized). Thread e owns score sc[e] of the tile; the
+// run max takes an order-free fmaxf fold and every thread then exps its
+// own score, so the one-thread scan that serialized 256 expf calls
+// disappears. Each caller keeps its own summation order.
+__device__ void AttentionTileMaxExp(const unsigned long long e,
+                                    const float* sc, float* wt, float* red,
+                                    float* tile_bc, const float run_max) {
+  if (e < 16) {
+    float tmax = sc[e * 16];
+    for (unsigned long long t = 1; t < 16; ++t) {
+      tmax = fmaxf(tmax, sc[e * 16 + t]);
+    }
+    red[e] = tmax;
+  }
+  LdsBarrier();
+  if (e < 8) {
+    red[e] = fmaxf(red[e], red[e + 8]);
+  }
+  LdsBarrier();
+  if (e < 4) {
+    red[e] = fmaxf(red[e], red[e + 4]);
+  }
+  LdsBarrier();
+  if (e < 2) {
+    red[e] = fmaxf(red[e], red[e + 2]);
+  }
+  LdsBarrier();
+  if (e == 0) {
+    tile_bc[0] = fmaxf(run_max, fmaxf(red[0], red[1]));
+    tile_bc[1] = expf(run_max - tile_bc[0]);
+  }
+  LdsBarrier();
+  wt[e] = expf(sc[e] - tile_bc[0]);
+  LdsBarrier();
+}
+
 // Built-in "attention": causal grouped-query attention, scale
 // 1/sqrt(head_dim), fp32 sequential accumulation. Buffers are q, k, v
 // and out; scalars are m, n, heads, kv_heads, head_dim, q_base. One
@@ -116,7 +153,8 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
   __shared__ float q_s[256];
   __shared__ float sc[256];
   __shared__ float wt[256];
-  // Tile reduction broadcast: thread 0 computes the max/weights once.
+  // Tile reduction scratch plus the broadcast {m_new, corr, l}.
+  __shared__ float red[256];
   __shared__ float tile_bc[3];
   const std::uint16_t* kh = reinterpret_cast<const std::uint16_t*>(k);
   const std::uint16_t* vh = reinterpret_cast<const std::uint16_t*>(v);
@@ -179,32 +217,16 @@ __global__ void AttentionKernel(const float* q, const float* k, const float* v,
     }
     sc[e] = s;
     LdsBarrier();
-    // One thread reduces the tile so a long context pays one scan,
-    // not one scan per thread. Same order as before, same numerics.
+    AttentionTileMaxExp(e, sc, wt, red, tile_bc, run_max);
     if (e == 0) {
-      float tmax = -1e30f;
-      for (unsigned long long t = 0; t < kTile; ++t) {
-        tmax = fmaxf(tmax, sc[t]);
-      }
-      const float m_new = fmaxf(run_max, tmax);
-      const float corr = expf(run_max - m_new);
+      // Four ordered chains keep the sequential partial sums.
       float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
       for (unsigned long long t = 0; t < kTile; t += 4) {
-        const float w0 = expf(sc[t] - m_new);
-        const float w1 = expf(sc[t + 1] - m_new);
-        const float w2 = expf(sc[t + 2] - m_new);
-        const float w3 = expf(sc[t + 3] - m_new);
-        wt[t] = w0;
-        wt[t + 1] = w1;
-        wt[t + 2] = w2;
-        wt[t + 3] = w3;
-        l0 += w0;
-        l1 += w1;
-        l2 += w2;
-        l3 += w3;
+        l0 += wt[t];
+        l1 += wt[t + 1];
+        l2 += wt[t + 2];
+        l3 += wt[t + 3];
       }
-      tile_bc[0] = m_new;
-      tile_bc[1] = corr;
       tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
     LdsBarrier();
@@ -264,6 +286,7 @@ __global__ void AttentionSplitKernel(
   __shared__ float q_s[256];
   __shared__ float sc[256];
   __shared__ float wt[256];
+  // Tile reduction broadcast: thread 0 computes the max/weights once.
   __shared__ float tile_bc[3];
   const std::uint16_t* kh = reinterpret_cast<const std::uint16_t*>(k);
   const std::uint16_t* vh = reinterpret_cast<const std::uint16_t*>(v);
@@ -404,6 +427,235 @@ __global__ void AttentionSplitKernel(
   if (e == 0) {
     pmax[base] = run_max;
     psum[base] = run_sum;
+  }
+}
+
+// Built-in "attention_split_gqa": flash-decoding variant of
+// "attention_split" for one query row where one workgroup serves every
+// query head of one kv head. One K row load and one V element load then
+// feed heads/kv_heads heads instead of one, which is what makes long
+// context decode fast: the KV traffic drops by that factor. Workgroup
+// (kv, chunk) writes the same per (query row, head, chunk) partials as
+// "attention_split", so "attention_combine" is unchanged. Buffers and
+// scalars are those of "attention_split"; m must be 1, head_dim at most
+// 256 and heads/kv_heads at most kMaxGqaHeads. The dispatch is
+// kv_heads * split workgroups of 256.
+__global__ void AttentionSplitGqaKernel(
+    const float* q, const float* k, const float* v, float* pacc, float* pmax,
+    float* psum, unsigned long long m, unsigned long long n,
+    unsigned long long heads, unsigned long long kv_heads,
+    unsigned long long head_dim, unsigned long long q_base,
+    unsigned long long window, unsigned long long kv_f16,
+    unsigned long long causal, unsigned long long split) {
+  constexpr unsigned long long kTile = 256;
+  constexpr unsigned long long kHeads = kMaxGqaHeads;
+  __shared__ float q_s[kHeads * kTile];
+  __shared__ float sc[kHeads * kTile];
+  __shared__ float red[kHeads * 32];
+  // Per-head tile broadcast: {m_new, corr, sum}.
+  __shared__ float tile_bc[3 * kHeads];
+  const std::uint16_t* kh = reinterpret_cast<const std::uint16_t*>(k);
+  const std::uint16_t* vh = reinterpret_cast<const std::uint16_t*>(v);
+  const auto kat = [&](unsigned long long idx) {
+    return kv_f16 ? Fp16ToFloatDev(kh[idx]) : k[idx];
+  };
+  const auto vat = [&](unsigned long long idx) {
+    return kv_f16 ? Fp16ToFloatDev(vh[idx]) : v[idx];
+  };
+  const unsigned long long e = threadIdx.x;
+  const unsigned long long ratio = kv_heads == 0 ? 0 : heads / kv_heads;
+  const unsigned long long kv = blockIdx.x / split;
+  const unsigned long long s_idx = blockIdx.x % split;
+  if (m != 1 || ratio == 0 || ratio > kHeads || kv >= kv_heads) {
+    return;
+  }
+  const unsigned long long pos = q_base;
+  const unsigned long long last =
+      causal != 0 ? (pos >= n ? n - 1 : pos) : n - 1;
+  unsigned long long start = 0;
+  if (causal != 0) {
+    start = (window != 0 && pos + 1 > window) ? pos + 1 - window : 0;
+    if (start > last) {
+      start = last;
+    }
+  }
+  const unsigned long long span = last + 1 - start;
+  const unsigned long long chunk = (span + split - 1) / split;
+  const unsigned long long cstart = start + s_idx * chunk;
+  unsigned long long cend = cstart + chunk - 1;
+  if (cend > last) {
+    cend = last;
+  }
+  if (cstart > last) {
+#pragma unroll
+    for (unsigned long long r = 0; r < kHeads; ++r) {
+      if (r < ratio) {
+        const unsigned long long base = (kv * ratio + r) * split + s_idx;
+        if (e == 0) {
+          pmax[base] = -1e30f;
+          psum[base] = 0.0f;
+        }
+        if (e < head_dim) {
+          pacc[base * head_dim + e] = 0.0f;
+        }
+      }
+    }
+    return;
+  }
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  float run_max[kHeads];
+  float run_sum[kHeads];
+  float acc[kHeads];
+#pragma unroll
+  for (unsigned long long r = 0; r < kHeads; ++r) {
+    if (r < ratio) {
+      if (e < head_dim) {
+        q_s[r * kTile + e] = q[(kv * ratio + r) * head_dim + e];
+      }
+      run_max[r] = -1e30f;
+      run_sum[r] = 0.0f;
+      acc[r] = 0.0f;
+    }
+  }
+  LdsBarrier();
+  unsigned long long tile = cstart;
+  while (true) {
+    const unsigned long long tile_last =
+        (tile + kTile - 1 < cend) ? tile + kTile - 1 : cend;
+    // Score pass: thread e owns key tile+e of the chunk and reuses its K
+    // row for every head of the group.
+    float s[kHeads];
+#pragma unroll
+    for (unsigned long long r = 0; r < kHeads; ++r) {
+      if (r < ratio) {
+        s[r] = -1e30f;
+      }
+    }
+    if (tile + e <= cend) {
+      const unsigned long long kb = ((tile + e) * kv_heads + kv) * head_dim;
+      float dot[kHeads];
+#pragma unroll
+      for (unsigned long long r = 0; r < kHeads; ++r) {
+        if (r < ratio) {
+          dot[r] = 0.0f;
+        }
+      }
+      for (unsigned long long d = 0; d < head_dim; ++d) {
+        const float kd = kat(kb + d);
+#pragma unroll
+        for (unsigned long long r = 0; r < kHeads; ++r) {
+          if (r < ratio) {
+            dot[r] = fmaf(q_s[r * kTile + d], kd, dot[r]);
+          }
+        }
+      }
+#pragma unroll
+      for (unsigned long long r = 0; r < kHeads; ++r) {
+        if (r < ratio) {
+          s[r] = dot[r] * scale;
+        }
+      }
+    }
+#pragma unroll
+    for (unsigned long long r = 0; r < kHeads; ++r) {
+      if (r < ratio) {
+        sc[r * kTile + e] = s[r];
+      }
+    }
+    LdsBarrier();
+    // Exact per-head tile max (fmaxf is order free), then a parallel exp
+    // and four ordered partial-sum chains per head, as in "attention".
+    if (e < ratio * 32) {
+      const unsigned long long r = e / 32;
+      const unsigned long long c = (e % 32) * 8;
+      float tmax = sc[r * kTile + c];
+      for (unsigned long long t = 1; t < 8; ++t) {
+        tmax = fmaxf(tmax, sc[r * kTile + c + t]);
+      }
+      red[e] = tmax;
+    }
+    LdsBarrier();
+    if (e < ratio) {
+      float tmax = red[e * 32];
+      for (unsigned long long t = 1; t < 32; ++t) {
+        tmax = fmaxf(tmax, red[e * 32 + t]);
+      }
+      const float m_new = fmaxf(run_max[e], tmax);
+      tile_bc[e] = m_new;
+      tile_bc[kHeads + e] = expf(run_max[e] - m_new);
+    }
+    LdsBarrier();
+#pragma unroll
+    for (unsigned long long r = 0; r < kHeads; ++r) {
+      if (r < ratio) {
+        sc[r * kTile + e] = expf(sc[r * kTile + e] - tile_bc[r]);
+      }
+    }
+    LdsBarrier();
+    if (e < ratio * 4) {
+      const unsigned long long r = e / 4;
+      const unsigned long long c = e % 4;
+      float chain = 0.0f;
+      for (unsigned long long t = c; t < kTile; t += 4) {
+        chain += sc[r * kTile + t];
+      }
+      red[e] = chain;
+    }
+    LdsBarrier();
+    if (e < ratio) {
+      tile_bc[2 * kHeads + e] =
+          (red[e * 4] + red[e * 4 + 1]) + (red[e * 4 + 2] + red[e * 4 + 3]);
+    }
+    LdsBarrier();
+    // Value pass: thread e owns output element e and reuses each V
+    // element for every head of the group.
+    float a[kHeads];
+#pragma unroll
+    for (unsigned long long r = 0; r < kHeads; ++r) {
+      if (r < ratio) {
+        a[r] = 0.0f;
+      }
+    }
+    if (e < head_dim) {
+      const unsigned long long count =
+          (tile + kTile - 1 <= cend) ? kTile : (cend - tile + 1);
+      for (unsigned long long t = 0; t < count; ++t) {
+        const float vv = vat(((tile + t) * kv_heads + kv) * head_dim + e);
+#pragma unroll
+        for (unsigned long long r = 0; r < kHeads; ++r) {
+          if (r < ratio) {
+            a[r] = fmaf(sc[r * kTile + t], vv, a[r]);
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (unsigned long long r = 0; r < kHeads; ++r) {
+      if (r < ratio) {
+        const float corr = tile_bc[kHeads + r];
+        acc[r] = fmaf(corr, acc[r], a[r]);
+        run_sum[r] = fmaf(corr, run_sum[r], tile_bc[2 * kHeads + r]);
+        run_max[r] = tile_bc[r];
+      }
+    }
+    LdsBarrier();
+    if (tile_last >= cend) {
+      break;
+    }
+    tile += kTile;
+  }
+#pragma unroll
+  for (unsigned long long r = 0; r < kHeads; ++r) {
+    if (r < ratio) {
+      const unsigned long long base = (kv * ratio + r) * split + s_idx;
+      if (e < head_dim) {
+        pacc[base * head_dim + e] = acc[r];
+      }
+      if (e == 0) {
+        pmax[base] = run_max[r];
+        psum[base] = run_sum[r];
+      }
+    }
   }
 }
 
@@ -1723,21 +1975,38 @@ __global__ void SsmGateKernel(const float* a_log, const float* dt,
   beta[t] = 1.0f / (1.0f + expf(-beta_raw[t]));
 }
 
-// Built-in "delta_step_heads": one gated-delta step for all value
-// heads. One thread per (head, state column).
-__global__ void DeltaStepHeadsKernel(
+// Built-in "delta_step_heads": one gated-delta step for all value heads.
+// Four lanes of one warp own one state column: a lane keeps its dk/4 slice of
+// the column in registers for the whole row loop, so the state element is
+// loaded once and stored once per call instead of being walked twice per row
+// through global memory. The four lane partials of the read and of the
+// output fold through warp shuffles. The dispatch keeps the documented
+// heads * dv threads: a grid-stride loop gives each thread four column
+// slices, and the workgroup size keeps every lane quad inside one warp.
+constexpr unsigned long long kDeltaStepLanes = 4;
+// State rows per lane the register slice holds: dk up to lanes * this.
+constexpr unsigned long long kDeltaStepJptMax = 64;
+
+// One (head, column, lane) item over all rows. `item` indexes lane quads, so
+// four consecutive items share a column and their lanes reduce together.
+template <unsigned long long kJpt>
+__device__ __forceinline__ void DeltaStepHeadsSlice(
     float* s, const float* k, const float* v, const float* q, float* o,
     const float* alpha, const float* beta, unsigned long long heads,
     unsigned long long dk, unsigned long long dv, unsigned long long rows,
     unsigned long long sbase, unsigned long long sstride,
-    unsigned long long abase) {
-  const unsigned long long idx =
-      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= heads * dv) {
-    return;
-  }
-  const unsigned long long h = idx / dv;
-  const unsigned long long d = idx % dv;
+    unsigned long long abase, unsigned long long item) {
+  const unsigned long long total = heads * dv * kDeltaStepLanes;
+  const bool valid = item < total;
+  // An item past the end repeats column 0 so its quad still reduces; its
+  // stores are gated by `valid` and its reads stay in bounds.
+  const unsigned long long c = valid ? item / kDeltaStepLanes : 0;
+  const unsigned long long lane = valid ? item % kDeltaStepLanes : 0;
+  const unsigned long long h = c / dv;
+  const unsigned long long d = c % dv;
+  const unsigned long long jpt = (dk + kDeltaStepLanes - 1) / kDeltaStepLanes;
+  const unsigned long long j0 = lane * jpt;
+  const unsigned long long jn = (j0 + jpt < dk ? j0 + jpt : dk) - j0;
   const unsigned long long s_base = h * dk * dv;
   // The input state is at sbase and the updated state at sbase + sstride; a
   // zero stride advances in place, a non-zero one appends each row's
@@ -1747,69 +2016,136 @@ __global__ void DeltaStepHeadsKernel(
   const unsigned long long s_base_in = sbase + s_base;
   const unsigned long long k_base = h * dk;
   const unsigned long long v_base = h * dv;
+  float st[kJpt];
+#pragma unroll
+  for (unsigned long long jj = 0; jj < kJpt; ++jj) {
+    st[jj] = jj < jn ? s[s_base_in + (j0 + jj) * dv + d] : 0.0f;
+  }
   // Rows share the recurrent state and advance it in turn, so a whole
   // sequence costs one launch (rows = 1 is the single-token step).
   for (unsigned long long t = 0; t < rows; ++t) {
-    const unsigned long long s_rd = s_base_in + t * sstride;
-    const unsigned long long s_wr = s_base_in + (t + 1) * sstride;
-    const float* kt = k + t * heads * dk;
-    const float* vt = v + t * heads * dv;
-    const float* qt = q + t * heads * dk;
+    const unsigned long long ko = t * heads * dk;
+    const unsigned long long vo = t * heads * dv;
     const float a = alpha[abase + t * heads + h];
     const float b = beta[abase + t * heads + h];
-    // Four partial sums keep the dk-deep read and output chains short.
+    const float vb = v[vo + v_base + d];
+    // Four partial sums keep the dk/4-deep read and output chains short.
     float r0 = 0.0f;
     float r1 = 0.0f;
     float r2 = 0.0f;
     float r3 = 0.0f;
-    unsigned long long j = 0;
-    for (; j + 4 <= dk; j += 4) {
-      r0 = fmaf(s[s_rd + (j + 0) * dv + d], kt[k_base + j + 0], r0);
-      r1 = fmaf(s[s_rd + (j + 1) * dv + d], kt[k_base + j + 1], r1);
-      r2 = fmaf(s[s_rd + (j + 2) * dv + d], kt[k_base + j + 2], r2);
-      r3 = fmaf(s[s_rd + (j + 3) * dv + d], kt[k_base + j + 3], r3);
+#pragma unroll
+    for (unsigned long long jj = 0; jj < kJpt; jj += 4) {
+      if (jj + 0 < jn) {
+        r0 = fmaf(st[jj + 0], k[ko + k_base + j0 + jj + 0], r0);
+      }
+      if (jj + 1 < jn) {
+        r1 = fmaf(st[jj + 1], k[ko + k_base + j0 + jj + 1], r1);
+      }
+      if (jj + 2 < jn) {
+        r2 = fmaf(st[jj + 2], k[ko + k_base + j0 + jj + 2], r2);
+      }
+      if (jj + 3 < jn) {
+        r3 = fmaf(st[jj + 3], k[ko + k_base + j0 + jj + 3], r3);
+      }
     }
-    for (; j < dk; ++j) {
-      r0 = fmaf(s[s_rd + j * dv + d], kt[k_base + j], r0);
-    }
-    const float read = (r0 + r1) + (r2 + r3);
+    float read = (r0 + r1) + (r2 + r3);
+    read += __shfl_xor_sync(~0ull, read, 1, 32);
+    read += __shfl_xor_sync(~0ull, read, 2, 32);
     float o0 = 0.0f;
     float o1 = 0.0f;
     float o2 = 0.0f;
     float o3 = 0.0f;
-    j = 0;
-    for (; j + 4 <= dk; j += 4) {
-      const float u0 =
-          a * (s[s_rd + (j + 0) * dv + d] - b * kt[k_base + j + 0] * read) +
-          b * vt[v_base + d] * kt[k_base + j + 0];
-      const float u1 =
-          a * (s[s_rd + (j + 1) * dv + d] - b * kt[k_base + j + 1] * read) +
-          b * vt[v_base + d] * kt[k_base + j + 1];
-      const float u2 =
-          a * (s[s_rd + (j + 2) * dv + d] - b * kt[k_base + j + 2] * read) +
-          b * vt[v_base + d] * kt[k_base + j + 2];
-      const float u3 =
-          a * (s[s_rd + (j + 3) * dv + d] - b * kt[k_base + j + 3] * read) +
-          b * vt[v_base + d] * kt[k_base + j + 3];
-      s[s_wr + (j + 0) * dv + d] = u0;
-      s[s_wr + (j + 1) * dv + d] = u1;
-      s[s_wr + (j + 2) * dv + d] = u2;
-      s[s_wr + (j + 3) * dv + d] = u3;
-      o0 = fmaf(u0, qt[k_base + j + 0], o0);
-      o1 = fmaf(u1, qt[k_base + j + 1], o1);
-      o2 = fmaf(u2, qt[k_base + j + 2], o2);
-      o3 = fmaf(u3, qt[k_base + j + 3], o3);
+#pragma unroll
+    for (unsigned long long jj = 0; jj < kJpt; jj += 4) {
+      if (jj + 0 < jn) {
+        const unsigned long long j = j0 + jj + 0;
+        const float kk = k[ko + k_base + j];
+        const float u = a * (st[jj + 0] - b * kk * read) + b * vb * kk;
+        st[jj + 0] = u;
+        o0 = fmaf(u, q[ko + k_base + j], o0);
+      }
+      if (jj + 1 < jn) {
+        const unsigned long long j = j0 + jj + 1;
+        const float kk = k[ko + k_base + j];
+        const float u = a * (st[jj + 1] - b * kk * read) + b * vb * kk;
+        st[jj + 1] = u;
+        o1 = fmaf(u, q[ko + k_base + j], o1);
+      }
+      if (jj + 2 < jn) {
+        const unsigned long long j = j0 + jj + 2;
+        const float kk = k[ko + k_base + j];
+        const float u = a * (st[jj + 2] - b * kk * read) + b * vb * kk;
+        st[jj + 2] = u;
+        o2 = fmaf(u, q[ko + k_base + j], o2);
+      }
+      if (jj + 3 < jn) {
+        const unsigned long long j = j0 + jj + 3;
+        const float kk = k[ko + k_base + j];
+        const float u = a * (st[jj + 3] - b * kk * read) + b * vb * kk;
+        st[jj + 3] = u;
+        o3 = fmaf(u, q[ko + k_base + j], o3);
+      }
     }
     float out = (o0 + o1) + (o2 + o3);
-    for (; j < dk; ++j) {
-      const float updated =
-          a * (s[s_rd + j * dv + d] - b * kt[k_base + j] * read) +
-          b * vt[v_base + d] * kt[k_base + j];
-      s[s_wr + j * dv + d] = updated;
-      out = fmaf(updated, qt[k_base + j], out);
+    out += __shfl_xor_sync(~0ull, out, 1, 32);
+    out += __shfl_xor_sync(~0ull, out, 2, 32);
+    if (valid && lane == 0) {
+      o[t * heads * dv + c] = out;
     }
-    o[t * heads * dv + idx] = out;
-    // The next row reads what this one just wrote.
+    if (sstride != 0) {
+      // Row t's post-state goes to slot t+1 for a rollback.
+#pragma unroll
+      for (unsigned long long jj = 0; jj < kJpt; ++jj) {
+        if (valid && jj < jn) {
+          s[s_base_in + (t + 1) * sstride + (j0 + jj) * dv + d] = st[jj];
+        }
+      }
+    }
+  }
+  if (sstride == 0) {
+    // In-place mode keeps the final state in registers until the last row.
+#pragma unroll
+    for (unsigned long long jj = 0; jj < kJpt; ++jj) {
+      if (valid && jj < jn) {
+        s[s_base_in + (j0 + jj) * dv + d] = st[jj];
+      }
+    }
+  }
+}
+
+__global__ void DeltaStepHeadsKernel(
+    float* s, const float* k, const float* v, const float* q, float* o,
+    const float* alpha, const float* beta, unsigned long long heads,
+    unsigned long long dk, unsigned long long dv, unsigned long long rows,
+    unsigned long long sbase, unsigned long long sstride,
+    unsigned long long abase) {
+  if (heads == 0 || dk == 0 || dv == 0 || rows == 0) {
+    return;
+  }
+  const unsigned long long jpt = (dk + kDeltaStepLanes - 1) / kDeltaStepLanes;
+  if (jpt > kDeltaStepJptMax) {
+    // The launcher rejects dk above kDeltaStepLanes * kDeltaStepJptMax; this
+    // guard keeps a stale launcher from writing a partial state.
+    return;
+  }
+  const unsigned long long idx =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const unsigned long long threads =
+      static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+  const unsigned long long items = heads * dv * kDeltaStepLanes;
+  const unsigned long long rounds = (items + threads - 1) / threads;
+  if (jpt <= 32) {
+    for (unsigned long long round = 0; round < rounds; ++round) {
+      DeltaStepHeadsSlice<32>(s, k, v, q, o, alpha, beta, heads, dk, dv, rows,
+                              sbase, sstride, abase, idx + round * threads);
+    }
+    return;
+  }
+  for (unsigned long long round = 0; round < rounds; ++round) {
+    DeltaStepHeadsSlice<kDeltaStepJptMax>(s, k, v, q, o, alpha, beta, heads, dk,
+                                          dv, rows, sbase, sstride, abase,
+                                          idx + round * threads);
   }
 }
 
@@ -2037,7 +2373,8 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
   __shared__ float q_s[256];
   __shared__ float sc[256];
   __shared__ float wt[256];
-  // Tile reduction broadcast: thread 0 computes the max/weights once.
+  // Tile reduction scratch plus the broadcast {m_new, corr, l}.
+  __shared__ float red[256];
   __shared__ float tile_bc[3];
   const unsigned long long g = blockIdx.x;
   if (g >= m * heads) {
@@ -2089,32 +2426,16 @@ __device__ void AttentionQuantTiled(const float* q, const unsigned char* k,
     }
     sc[e] = s;
     LdsBarrier();
-    // One thread reduces the tile so a long context pays one scan,
-    // not one scan per thread. Same order as before, same numerics.
+    AttentionTileMaxExp(e, sc, wt, red, tile_bc, run_max);
     if (e == 0) {
-      float tmax = -1e30f;
-      for (unsigned long long t = 0; t < kTile; ++t) {
-        tmax = fmaxf(tmax, sc[t]);
-      }
-      const float m_new = fmaxf(run_max, tmax);
-      const float corr = expf(run_max - m_new);
+      // Four ordered chains keep the sequential partial sums.
       float l0 = 0.0f, l1 = 0.0f, l2 = 0.0f, l3 = 0.0f;
       for (unsigned long long t = 0; t < kTile; t += 4) {
-        const float w0 = expf(sc[t] - m_new);
-        const float w1 = expf(sc[t + 1] - m_new);
-        const float w2 = expf(sc[t + 2] - m_new);
-        const float w3 = expf(sc[t + 3] - m_new);
-        wt[t] = w0;
-        wt[t + 1] = w1;
-        wt[t + 2] = w2;
-        wt[t + 3] = w3;
-        l0 += w0;
-        l1 += w1;
-        l2 += w2;
-        l3 += w3;
+        l0 += wt[t];
+        l1 += wt[t + 1];
+        l2 += wt[t + 2];
+        l3 += wt[t + 3];
       }
-      tile_bc[0] = m_new;
-      tile_bc[1] = corr;
       tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
     LdsBarrier();
@@ -2197,6 +2518,7 @@ __device__ void AttentionQuantSplit(const float* q, const unsigned char* k,
   __shared__ float q_s[256];
   __shared__ float sc[256];
   __shared__ float wt[256];
+  // Tile reduction broadcast: thread 0 computes the max/weights once.
   __shared__ float tile_bc[3];
   const unsigned long long g = blockIdx.x;
   if (g >= m * heads * split) {

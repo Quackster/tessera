@@ -45,7 +45,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | CLI | Done | One flag set for `run`, `serve` and `calibrate`. Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit and concurrent benchmark. `serve` honors every layout: replicas, `--pipeline`, `--tp`, `--cp`, `--spec-split` and `--hybrid`. |
 | Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
 | KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. |
-| Sampling | Done | Seeded sampling with Qwen 27B defaults. |
+| Sampling | Done | Seeded sampling with Qwen 27B defaults. `serve` starts from the launcher flags, prints the effective values at boot, and each request overrides temperature, top_p, top_k, min_p, the penalties and the seed in the body; a value outside the accepted range is rejected with 422. |
 | GEMM | Done | Q4_K to IQ, FP8/MXFP4, bf16, fp32. Tensor core paths for decode and verify. |
 | Activation quant | Done | Per-token FP8 E4M3 quant-dequant. W4A8 opt-in. |
 | Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. |
@@ -57,7 +57,7 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |
 | Baseline pinning | Done | Fixed-seed fixtures identical on Vulkan and ROCm. |
 | Tokenizer and chat | Done | Byte-level BPE, Jinja2-subset templates, stop tokens. |
-| Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. Capability harness (`tools/harness/probe_harness.py`) drives task steering, long-horizon context and session memory over the API on both backends. |
+| Serving | Partial | HTTP/1.1 server, sessions, web UI, streamed reasoning, tool calls. Sampling defaults come from the launcher flags; a turn without a body override uses them, `temperature 0` decodes greedy, and a request without a seed draws a fresh one. Plain turns run without a drafter; a turn that uses one drops a greedy-only strategy when it samples and says so in the log. Capability harness (`tools/harness/probe_harness.py`) drives task steering, long-horizon context and session memory over the API on both backends. |
 | Vision | Partial | CLIP encoder, merger, image injection. Prefill speed work remains. |
 | Architecture modules | Done | One module per model family. |
 | MoE, MLP, norms | Done | Norms and MLP kernels done. Ornith-1.5 MoE decodes on both backends (84 tok/s ROCm, 88 Vulkan). |

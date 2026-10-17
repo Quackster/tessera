@@ -19,6 +19,12 @@ __device__ __forceinline__ std::uint16_t LoadU16(const unsigned char* p) {
   return v;
 }
 
+__device__ __forceinline__ std::uint32_t LoadU32(const unsigned char* p) {
+  std::uint32_t v = 0;
+  std::memcpy(&v, p, 4);
+  return v;
+}
+
 // The warp-per-output GEMV family ("gemm_<fmt>_vec"): one 32-lane group per
 // output element and eight groups per 256-thread workgroup, so the grid is
 // ceil(m n / 8). Every lane owns eight elements of each quant block and

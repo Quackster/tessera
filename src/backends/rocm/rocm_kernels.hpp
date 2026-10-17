@@ -14,6 +14,8 @@
 #include <cstring>
 #include <limits>
 
+#include <tessera/types.hpp>
+
 #include "backends/rocm/rocm_device.hpp"
 
 namespace tessera::backends::rocm {
@@ -144,6 +146,19 @@ __global__ void AttentionSplitKernel(const float* q, const float* k,
                                      unsigned long long kv_f16,
                                      unsigned long long causal,
                                      unsigned long long split);
+__global__ void AttentionSplitGqaKernel(const float* q, const float* k,
+                                        const float* v, float* pacc,
+                                        float* pmax, float* psum,
+                                        unsigned long long m,
+                                        unsigned long long n,
+                                        unsigned long long heads,
+                                        unsigned long long kv_heads,
+                                        unsigned long long head_dim,
+                                        unsigned long long q_base,
+                                        unsigned long long window,
+                                        unsigned long long kv_f16,
+                                        unsigned long long causal,
+                                        unsigned long long split);
 __global__ void AttentionCombineKernel(const float* pacc, const float* pmax,
                                        const float* psum, float* out,
                                        unsigned long long m,
@@ -202,6 +217,35 @@ __global__ void GemmMxFp4WmmaReduceKernel(const float* part, float* c,
 __global__ void GemmBf16WmmaKernel(const float* a, const unsigned short* w,
                                    float* c, unsigned long long m,
                                    unsigned long long n, unsigned long long k);
+// fp16 tensor-core batched GEMM for the block-quantized formats (see
+// rocm_kernels_wmma.cpp). Grid ceil(n / 64) x ceil(m / 64), block 256.
+__global__ void GemmQ4KWmmaKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k);
+__global__ void GemmQ5KWmmaKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k);
+__global__ void GemmQ6KWmmaKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k);
+__global__ void GemmQ3KWmmaKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k);
+__global__ void GemmIq4XsWmmaKernel(const float* a, const unsigned char* w,
+                                    float* c, unsigned long long m,
+                                    unsigned long long n,
+                                    unsigned long long k);
+__global__ void GemmIq4NlWmmaKernel(const float* a, const unsigned char* w,
+                                    float* c, unsigned long long m,
+                                    unsigned long long n,
+                                    unsigned long long k);
+__global__ void GemmIq3SWmmaKernel(const float* a, const unsigned char* w,
+                                   float* c, unsigned long long m,
+                                   unsigned long long n,
+                                   unsigned long long k);
+__global__ void GemmQ80WmmaKernel(const float* a, const unsigned char* w,
+                                  float* c, unsigned long long m,
+                                  unsigned long long n, unsigned long long k);
 __global__ void MxFp4RowRefKernel(const unsigned char* w, unsigned char* wref,
                                   unsigned long long n, unsigned long long k);
 __global__ void GemmQ4KKernel(const float* a, const unsigned char* w,

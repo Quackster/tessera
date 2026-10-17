@@ -28,6 +28,7 @@ layout(set = 0, binding = 5) buffer Out { float out_values[]; };
 shared float q_s[256];
 shared float sc[256];
 shared float wt[256];
+shared float red[256];
 shared float tile_bc[3];
 
 // OCP FP8 E4M3 byte -> fp32 (port of the core Fp8E4M3ToFloat).
@@ -147,31 +148,44 @@ void main() {
     }
     sc[e] = s;
     barrier();
-    // One thread reduces the tile so a long context pays one scan.
-    if (e == 0u) {
-      float tmax = -1e30;
-      for (uint t = 0u; t < 256u; ++t) {
-        tmax = max(tmax, sc[t]);
+    // Parallel tile softmax: the run max takes an order-free fold, every
+    // thread exps its own score, and thread 0 keeps the ordered sum.
+    if (e < 16u) {
+      float tmax = sc[e * 16u];
+      for (uint t = 1u; t < 16u; ++t) {
+        tmax = max(tmax, sc[e * 16u + t]);
       }
-      float m_new = max(run_max, tmax);
-      float corr = exp(run_max - m_new);
+      red[e] = tmax;
+    }
+    barrier();
+    if (e < 8u) {
+      red[e] = max(red[e], red[e + 8u]);
+    }
+    barrier();
+    if (e < 4u) {
+      red[e] = max(red[e], red[e + 4u]);
+    }
+    barrier();
+    if (e < 2u) {
+      red[e] = max(red[e], red[e + 2u]);
+    }
+    barrier();
+    if (e == 0u) {
+      tile_bc[0] = max(run_max, max(red[0], red[1u]));
+      tile_bc[1] = exp(run_max - tile_bc[0]);
+    }
+    barrier();
+    wt[e] = exp(sc[e] - tile_bc[0]);
+    barrier();
+    if (e == 0u) {
+      // Four ordered chains keep the sequential partial sums.
       float l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
       for (uint t = 0u; t < 256u; t += 4u) {
-        float w0 = exp(sc[t] - m_new);
-        float w1 = exp(sc[t + 1u] - m_new);
-        float w2 = exp(sc[t + 2u] - m_new);
-        float w3 = exp(sc[t + 3u] - m_new);
-        wt[t] = w0;
-        wt[t + 1u] = w1;
-        wt[t + 2u] = w2;
-        wt[t + 3u] = w3;
-        l0 += w0;
-        l1 += w1;
-        l2 += w2;
-        l3 += w3;
+        l0 += wt[t];
+        l1 += wt[t + 1u];
+        l2 += wt[t + 2u];
+        l3 += wt[t + 3u];
       }
-      tile_bc[0] = m_new;
-      tile_bc[1] = corr;
       tile_bc[2] = (l0 + l1) + (l2 + l3);
     }
     barrier();

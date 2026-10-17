@@ -21,7 +21,7 @@ namespace detail = ::tessera::core::detail;
 using core::Conv1dStepRef;
 using core::DecodeCache;
 using detail::AddDevice;
-using detail::AppendKv;
+using detail::AppendKvRows;
 using detail::AttentionDevice;
 using detail::AttentionQuantDevice;
 using detail::Conv1dStateDevice;
@@ -274,32 +274,26 @@ std::expected<void, StatusCode> RunFullBlockBatch(
                    cfg.attention.rope_theta)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  // F32 caches append straight from the batch K/V at row t (no scratch
-  // round-trip); the cast/quant paths still copy the row first.
-  const bool kv_f32 = kv.type == KvCacheType::F32;
-  for (std::size_t t = 0; t < rows; ++t) {
-    // A rank under context parallelism keeps only the rows in its key chunk.
-    if (cp && (pos + t < h.cp->k0 || pos + t >= h.cp->k1)) {
-      continue;
-    }
-    const Buffer* ksrc = b.kf.get();
-    const Buffer* vsrc = b.vf.get();
-    std::size_t row_offset = 0;
-    if (kv_f32) {
-      row_offset = t * kv_dim * 4;
-    } else {
-      if (!backend.CopyD2D(*b.kf, t * kv_dim * 4, *h.kf, 0, kv_dim * 4) ||
-          !backend.CopyD2D(*b.vf, t * kv_dim * 4, *h.vf, 0, kv_dim * 4)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-      ksrc = h.kf.get();
-      vsrc = h.vf.get();
-    }
+  // Append the chunk's key/value rows to the cache. A rank under context
+  // parallelism keeps only its key range, which is contiguous in t, so one
+  // range append covers the kept rows; the row kernels cast or quantize the
+  // whole block in one pass, so a chunk costs a few launches instead of one
+  // per row.
+  std::size_t first = 0;
+  std::size_t count = rows;
+  if (cp) {
+    const std::uint64_t end = pos + rows;
+    const std::uint64_t lo = pos > h.cp->k0 ? pos : h.cp->k0;
+    const std::uint64_t hi = end < h.cp->k1 ? end : h.cp->k1;
+    first = hi > lo ? static_cast<std::size_t>(lo - pos) : 0;
+    count = hi > lo ? static_cast<std::size_t>(hi - lo) : 0;
+  }
+  if (count != 0) {
     if (auto appended =
-            AppendKv(backend, h.cast_kernel.get(), h.quant_kernel.get(),
-                     h.kv_scratch.get(), h.kv_scratch.get(),
-                     h.scale_scratch.get(), kv, *ksrc, *vsrc, kv_dim,
-                     row_offset);
+            AppendKvRows(backend, h.cast_kernel.get(), h.quant_kernel.get(),
+                         h.kv_scratch.get(), h.kv_scratch.get(),
+                         h.scale_scratch.get(), kv, *b.kf, *b.vf, kv_dim,
+                         first, count);
         !appended) {
       return std::unexpected(appended.error());
     }
@@ -631,28 +625,17 @@ std::expected<void, StatusCode> RunFullBlockBatchMulti(
                            cfg.attention.rope_theta)) {
     return std::unexpected(StatusCode::DeviceError);
   }
-  // Append each sequence's key/value row to its own cache.
+  // Append each sequence's key/value row to its own cache. The row kernels
+  // read from row 0, so the transform covers the rows before the appended
+  // one and the copy takes the appended slice.
   for (std::size_t t = 0; t < rows; ++t) {
     Qwen35State& s = *seqs[t];
     Qwen35State::FullKv& kv = s.full[layer];
-    const Buffer* ksrc = b.kf.get();
-    const Buffer* vsrc = b.vf.get();
-    std::size_t row_offset = 0;
-    if (kv.type == KvCacheType::F32) {
-      row_offset = t * kv_dim * 4;
-    } else {
-      if (!backend.CopyD2D(*b.kf, t * kv_dim * 4, *s.kf, 0, kv_dim * 4) ||
-          !backend.CopyD2D(*b.vf, t * kv_dim * 4, *s.vf, 0, kv_dim * 4)) {
-        return std::unexpected(StatusCode::DeviceError);
-      }
-      ksrc = s.kf.get();
-      vsrc = s.vf.get();
-    }
     if (auto appended =
-            detail::AppendKv(backend, s.cast_kernel.get(), s.quant_kernel.get(),
-                             s.kv_scratch.get(), s.kv_scratch.get(),
-                             s.scale_scratch.get(), kv, *ksrc, *vsrc, kv_dim,
-                             row_offset);
+            AppendKvRows(backend, s.cast_kernel.get(), s.quant_kernel.get(),
+                         s.kv_scratch.get(), s.kv_scratch.get(),
+                         s.scale_scratch.get(), kv, *b.kf, *b.vf, kv_dim, t,
+                         1);
         !appended) {
       return std::unexpected(appended.error());
     }

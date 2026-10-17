@@ -217,22 +217,22 @@ inline std::expected<void, StatusCode> CastF16Device(
   return backend.LaunchKernel(kernel, launch);
 }
 
-// Quantize one fp32 row (n elements, n a multiple of 4) to packed int8, 4-bit
-// or FP8 with an absmax scale. The kernel is the row-parallel variant (one
-// workgroup per row), so the whole workgroup reduces the absmax and writes
-// the codes; a one-thread launch made a single lane walk the row and
-// dominated fp8 KV decode.
+// Quantize `rows` fp32 rows (`cols` elements each, cols a multiple of 4) to
+// packed int8, 4-bit or FP8 with one absmax scale per row. The kernel is the
+// row-parallel variant (one workgroup per row), so the whole workgroup
+// reduces a row's absmax and writes its codes; a one-thread launch made a
+// single lane walk the row and dominated fp8 KV decode.
 inline std::expected<void, StatusCode> QuantizeRowDevice(
     Backend& backend, const Kernel& kernel, const Buffer& in, Buffer& out,
-    Buffer& scale, std::size_t n) {
-  if (n == 0 || n % 4 != 0) {
+    Buffer& scale, std::size_t rows, std::size_t cols) {
+  if (rows == 0 || cols == 0 || cols % 4 != 0) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
   KernelLaunch launch;
-  launch.grid_x = 1;
+  launch.grid_x = static_cast<std::uint32_t>(rows);
   launch.block_x = 256;
   launch.buffers = {&in, &out, &scale};
-  launch.scalars = {1, n};
+  launch.scalars = {rows, cols};
   return backend.LaunchKernel(kernel, launch);
 }
 
@@ -310,7 +310,10 @@ inline std::expected<void, StatusCode> AttentionCombineDevice(
 
 // Split-N attention over `n` keys: the split kernel writes one
 // unnormalized partial per (query row, head, chunk) into pacc/pmax/psum,
-// then the combine kernel merges them into `out`.
+// then the combine kernel merges them into `out`. The GQA variant serves
+// every head of one kv head per workgroup, so its dispatch is keyed on
+// the kv heads rather than the query heads; both variants write the same
+// partials.
 inline std::expected<void, StatusCode> AttentionSplitDevice(
     Backend& backend, const Kernel& split_kernel, const Kernel& combine_kernel,
     const Buffer& q, const Buffer& k, const Buffer& v, Buffer& out,
@@ -321,8 +324,14 @@ inline std::expected<void, StatusCode> AttentionSplitDevice(
   if (head_dim == 0 || head_dim > 256 || split == 0) {
     return std::unexpected(StatusCode::UnsupportedFeature);
   }
+  const bool gqa = split_kernel.Id() == "attention_split_gqa";
+  if (gqa && (rows != 1 || kv_heads == 0 || heads % kv_heads != 0 ||
+              heads / kv_heads > kMaxGqaHeads)) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
   KernelLaunch launch;
-  launch.grid_x = static_cast<std::uint32_t>(rows * heads * split);
+  launch.grid_x = static_cast<std::uint32_t>(gqa ? kv_heads * split
+                                                 : rows * heads * split);
   launch.block_x = 256;
   launch.buffers = {&q, &k, &v, &pacc, &pmax, &psum};
   launch.scalars = {rows, n, heads, kv_heads, head_dim,
@@ -506,14 +515,27 @@ inline std::expected<void, StatusCode> CpAttentionDevice(
   return {};
 }
 
-// Append one key/value row. `kv.type` selects fp32, fp16 (via `cast` into
-// `f16_scratch`) or int8 (via `quant` into `q8_scratch`/`scale_scratch`).
+// Append `count` consecutive key/value rows of a batch to the cache, the
+// first one at source row `first_row`, landing on cache rows kv.rows onward.
+// `kv.type` selects fp32 (copied straight from the batch), fp16 (via `cast`
+// into `f16_scratch`) or int8 (via `quant` into `q8_scratch`/`scale_scratch`).
+// The cast/quantize kernels read their source from row 0, so the transform
+// covers rows [0, first_row + count) and only the appended slice is copied;
+// the cache layout and the numerics match a row-at-a-time append. Long
+// prefills pass a whole chunk, so one launch per source buffer replaces one
+// launch per row.
 template <typename Kv>
-inline std::expected<void, StatusCode> AppendKv(
+inline std::expected<void, StatusCode> AppendKvRows(
     Backend& backend, const Kernel* cast, const Kernel* quant,
     Buffer* f16_scratch, Buffer* q8_scratch, Buffer* scale_scratch, Kv& kv,
-    const Buffer& k_row, const Buffer& v_row, std::size_t kv_dim,
-    std::size_t row_byte_offset = 0) {
+    const Buffer& k_src, const Buffer& v_src, std::size_t kv_dim,
+    std::size_t first_row, std::size_t count) {
+  if (kv_dim == 0) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (count == 0) {
+    return {};
+  }
   const std::size_t row_bytes =
       kv.type == KvCacheType::F32   ? kv_dim * 4
       : kv.type == KvCacheType::F16 ? kv_dim * 2
@@ -522,9 +544,17 @@ inline std::expected<void, StatusCode> AppendKv(
   const bool quantized = kv.type == KvCacheType::Q8 ||
                          kv.type == KvCacheType::Q4 ||
                          kv.type == KvCacheType::FP8;
-  if (kv.rows == kv.capacity) {
-    const std::size_t new_capacity =
+  const std::size_t src_rows = first_row + count;
+  if (k_src.Size() < src_rows * kv_dim * 4 ||
+      v_src.Size() < src_rows * kv_dim * 4) {
+    return std::unexpected(StatusCode::InvalidArgument);
+  }
+  if (kv.rows + count > kv.capacity) {
+    std::size_t new_capacity =
         kv.capacity == 0 ? kInitialKvRows : kv.capacity * 2;
+    if (new_capacity < kv.rows + count) {
+      new_capacity = kv.rows + count;
+    }
     auto grown_k = backend.AllocateBuffer(new_capacity * row_bytes,
                                           MemoryKind::Device);
     auto grown_v = backend.AllocateBuffer(new_capacity * row_bytes,
@@ -559,42 +589,98 @@ inline std::expected<void, StatusCode> AppendKv(
     }
     kv.capacity = new_capacity;
   }
-  const auto store = [&](const Buffer& row, Buffer& dst,
-                         Buffer* scale_dst) -> bool {
+  const auto grow = [&backend](Buffer* slot,
+                               std::size_t bytes) -> std::expected<void, StatusCode> {
+    if (slot == nullptr) {
+      return std::unexpected(StatusCode::InvalidArgument);
+    }
+    if (slot->Size() >= bytes) {
+      return {};
+    }
+    auto grown = backend.AllocateBuffer(bytes, MemoryKind::Device);
+    if (!grown) {
+      return std::unexpected(StatusCode::OutOfMemory);
+    }
+    *slot = std::move(**grown);
+    return {};
+  };
+  // Transform rows [0, src_rows) of `src` into the shared scratch and report
+  // the buffer holding the codes plus (for a quantized type) the scales.
+  const auto transform =
+      [&](const Buffer& src,
+          const Buffer** codes,
+          const Buffer** scales) -> std::expected<void, StatusCode> {
     if (kv.type == KvCacheType::F32) {
-      return backend
-          .CopyD2D(row, row_byte_offset, dst, kv.rows * row_bytes, row_bytes)
-          .has_value();
+      *codes = &src;
+      *scales = nullptr;
+      return {};
     }
     if (kv.type == KvCacheType::F16) {
-      if (cast == nullptr || f16_scratch == nullptr) {
-        return false;
+      if (cast == nullptr) {
+        return std::unexpected(StatusCode::InvalidArgument);
       }
-      if (!CastF16Device(backend, *cast, row, *f16_scratch, kv_dim)) {
-        return false;
+      if (auto grown = grow(f16_scratch, src_rows * kv_dim * 2); !grown) {
+        return grown;
       }
-      return backend.CopyD2D(*f16_scratch, 0, dst, kv.rows * row_bytes,
-                             row_bytes)
-          .has_value();
+      *codes = f16_scratch;
+      *scales = nullptr;
+      if (!CastF16Device(backend, *cast, src, *f16_scratch, src_rows * kv_dim)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+      return {};
     }
-    if (quant == nullptr || q8_scratch == nullptr || scale_scratch == nullptr ||
-        scale_dst == nullptr) {
-      return false;
+    if (quant == nullptr) {
+      return std::unexpected(StatusCode::InvalidArgument);
     }
-    if (!QuantizeRowDevice(backend, *quant, row, *q8_scratch, *scale_scratch,
-                           kv_dim)) {
-      return false;
+    if (auto grown = grow(q8_scratch, src_rows * row_bytes); !grown) {
+      return grown;
     }
-    return backend.CopyD2D(*q8_scratch, 0, dst, kv.rows * row_bytes, row_bytes)
-               .has_value() &&
-           backend.CopyD2D(*scale_scratch, 0, *scale_dst, kv.rows * 4, 4)
-               .has_value();
+    if (auto grown = grow(scale_scratch, src_rows * 4); !grown) {
+      return grown;
+    }
+    *codes = q8_scratch;
+    *scales = scale_scratch;
+    if (!QuantizeRowDevice(backend, *quant, src, *q8_scratch, *scale_scratch,
+                           src_rows, kv_dim)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    return {};
   };
-  if (!store(k_row, *kv.k, kv.k_scale.get()) ||
-      !store(v_row, *kv.v, kv.v_scale.get())) {
-    return std::unexpected(StatusCode::DeviceError);
+  const auto store = [&](const Buffer& codes, const Buffer* scales,
+                         Buffer& dst,
+                         Buffer* scale_dst) -> std::expected<void, StatusCode> {
+    if (!backend.CopyD2D(codes, first_row * row_bytes, dst,
+                         kv.rows * row_bytes, count * row_bytes)) {
+      return std::unexpected(StatusCode::DeviceError);
+    }
+    if (scales != nullptr) {
+      if (scale_dst == nullptr) {
+        return std::unexpected(StatusCode::InvalidArgument);
+      }
+      if (!backend.CopyD2D(*scales, first_row * 4, *scale_dst, kv.rows * 4,
+                           count * 4)) {
+        return std::unexpected(StatusCode::DeviceError);
+      }
+    }
+    return {};
+  };
+  const Buffer* k_codes = nullptr;
+  const Buffer* k_scales = nullptr;
+  const Buffer* v_codes = nullptr;
+  const Buffer* v_scales = nullptr;
+  if (auto k = transform(k_src, &k_codes, &k_scales); !k) {
+    return k;
   }
-  ++kv.rows;
+  if (auto k = store(*k_codes, k_scales, *kv.k, kv.k_scale.get()); !k) {
+    return k;
+  }
+  if (auto v = transform(v_src, &v_codes, &v_scales); !v) {
+    return v;
+  }
+  if (auto v = store(*v_codes, v_scales, *kv.v, kv.v_scale.get()); !v) {
+    return v;
+  }
+  kv.rows += count;
   return {};
 }
 
@@ -1061,14 +1147,24 @@ inline std::expected<void, StatusCode> DeltaStepDevice(
   return backend.LaunchKernel(kernel, launch);
 }
 
-// One gated-delta step for all value heads with the device state updated// in place (`k`/`q` are heads x dk, `v`/`o` heads x dv, `alpha`/`beta`
-// one value per head).
+// Deepest state column the "delta_step_heads" built-in covers: four lanes
+// hold dk/4 rows each in registers.
+constexpr std::size_t kDeltaStepMaxDk = 256;
+
+// One gated-delta step for all value heads with the device state updated in
+// place (`k`/`q` are heads x dk, `v`/`o` heads x dv, `alpha`/`beta` one value
+// per head). dk above kDeltaStepMaxDk is UnsupportedFeature.
 inline std::expected<void, StatusCode> DeltaStepHeadsDevice(
     Backend& backend, const Kernel& kernel, Buffer& state, const Buffer& k,
     const Buffer& v, const Buffer& q, Buffer& o, const Buffer& alpha,
     const Buffer& beta, std::size_t heads, std::size_t dk, std::size_t dv,
     std::size_t rows = 1, std::size_t sbase = 0, std::size_t sstride = 0,
     std::size_t abase = 0) {
+  // A state column is split across four lanes that hold dk/4 rows each in
+  // registers: 256 is the deepest column the built-in covers.
+  if (dk > kDeltaStepMaxDk) {
+    return std::unexpected(StatusCode::UnsupportedFeature);
+  }
   KernelLaunch launch;
   launch.grid_x = static_cast<std::uint32_t>((heads * dv + 255) / 256);
   launch.block_x = 256;
@@ -1319,19 +1415,68 @@ inline std::expected<Kernel*, StatusCode> GemmTiledFor(Backend& backend,
                       GemmTiledKernelName(dtype));
 }
 
+// Rows needed before the fp16 tensor-core tile pays off: the tile is this
+// many rows deep and the dequant ALU of a weight element is amortized over
+// the tile rows, so a shallower batch is faster on the tiled or GEMV kernel.
+constexpr std::size_t kGemmWmmaMinRows = 64;
+
+// Columns needed before the tensor-core tile pays off: the tile is this many
+// columns wide, so a narrower projection leaves the device with too few
+// workgroups to hide the weight reads and the GEMV path wins.
+constexpr std::size_t kGemmWmmaMinCols = 64;
+
+// fp16 tensor-core tiled GEMM kernel id for a dtype ("gemm_<fmt>_wmma"), or
+// empty when the dtype has no tensor-core tile. The tile is square with
+// kGemmWmmaMinRows a side. ROCm provides these for the block-quantized
+// formats; a backend without them reports UnsupportedFeature at load time
+// and the caller falls back to the tiled or GEMV kernel.
+inline std::string_view GemmWmmaKernelName(DType dtype) {
+  switch (dtype) {
+    case DType::Q4K: return "gemm_q4k_wmma";
+    case DType::Q5K: return "gemm_q5k_wmma";
+    case DType::Q6K: return "gemm_q6k_wmma";
+    case DType::Q3K: return "gemm_q3k_wmma";
+    case DType::IQ4_XS: return "gemm_iq4xs_wmma";
+    case DType::IQ4_NL: return "gemm_iq4nl_wmma";
+    case DType::IQ3_S: return "gemm_iq3s_wmma";
+    case DType::Q80: return "gemm_q80_wmma";
+    default: return {};
+  }
+}
+
+// Load (once, into `cache`) and return the tensor-core GEMM kernel for a
+// dtype, or UnsupportedFeature when the dtype or backend has none.
+inline std::expected<Kernel*, StatusCode> GemmWmmaFor(Backend& backend,
+                                                      KernelCache& cache,
+                                                      DType dtype) {
+  return CachedKernel(backend, cache, static_cast<int>(dtype) + 0x8000,
+                      GemmWmmaKernelName(dtype));
+}
+
 // C = A x dequant(W)^T with the tiled batched kernel: each weight block
 // is dequantized once per tile and reused across the tile's rows. The
 // converted kernels (Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS, IQ4_NL, IQ3_S, MXFP4)
 // tile a 32-row x 32-column block over 1024 threads, so activation reads
 // over 32 columns; the F32/BF16 kernels tile 32 rows x 8 columns over
-// 256 threads with the same shared staging. Same buffers and scalars as
+// 256 threads with the same shared staging; the "_wmma" tensor-core tiles
+// are kGemmWmmaMinRows square over 256 threads. Same buffers and scalars as
 // ProjectDevice (m, n, k); m must be positive and k a multiple of the
 // block elements.
 inline std::expected<void, StatusCode> ProjectTiledDevice(
     Backend& backend, const Kernel& kernel, const Buffer& a, const Buffer& w,
     Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
   KernelLaunch launch;
-  if (kernel.Id() == "gemm_q4k_batched" ||
+  if (kernel.Id().ends_with("_wmma")) {
+    // The fp16 tensor-core tile: kGemmWmmaMinRows square, one workgroup per
+    // tile (see GemmWmmaKernelName).
+    launch.grid_x =
+        static_cast<std::uint32_t>((n + kGemmWmmaMinRows - 1) /
+                                   kGemmWmmaMinRows);
+    launch.grid_y =
+        static_cast<std::uint32_t>((m + kGemmWmmaMinRows - 1) /
+                                   kGemmWmmaMinRows);
+    launch.block_x = 256;
+  } else if (kernel.Id() == "gemm_q4k_batched" ||
       kernel.Id() == "gemm_q5k_batched" ||
              kernel.Id() == "gemm_q6k_batched" ||
              kernel.Id() == "gemm_iq4xs_batched" ||
