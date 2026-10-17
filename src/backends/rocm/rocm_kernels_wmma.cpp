@@ -27,7 +27,7 @@ namespace tessera::backends::rocm {
 
 // Tile geometry in fp16 elements. The 8-element pad on each staged row keeps
 // the fragment rows off each other's banks.
-constexpr int kTileRows = 64;
+constexpr int kTileRows = 128;
 constexpr int kTileCols = 64;
 constexpr int kTileK = 64;
 constexpr int kTileStride = kTileK + 8;
@@ -347,14 +347,16 @@ __device__ __forceinline__ void WmmaGemmBody(const float* a,
       static_cast<unsigned long long>(blockIdx.y) * kTileRows;
   const unsigned long long col0 =
       static_cast<unsigned long long>(blockIdx.x) * kTileCols;
-  const int wr = (warp >> 1) * 16;
-  const int wc = (warp & 1) * 32;
+  const int wr = warp * 16;
+  const int wc = 0;
   const int acol8 = (lane >> 4) * 8;
   const unsigned long long blocks = k / Codec::kBlockElements;
   Codec::FillLut(sLut, tid);
   LdsBarrier();
   F32x8 acc0 = F32x8(0.0f);
   F32x8 acc1 = F32x8(0.0f);
+  F32x8 acc2 = F32x8(0.0f);
+  F32x8 acc3 = F32x8(0.0f);
   for (unsigned long long k0 = 0; k0 < k; k0 += kTileK) {
     for (int u = tid; u < kTileRows * kStageGroups; u += kTileThreads) {
       const int r = u / kStageGroups;
@@ -385,6 +387,8 @@ __device__ __forceinline__ void WmmaGemmBody(const float* a,
       F16x8 af;
       F16x8 wf0;
       F16x8 wf1;
+      F16x8 wf2;
+      F16x8 wf3;
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         af[j] = *reinterpret_cast<const short*>(
@@ -393,9 +397,15 @@ __device__ __forceinline__ void WmmaGemmBody(const float* a,
             &sW[(wc + (lane & 15)) * kTileStride + ks * 16 + acol8 + j]);
         wf1[j] = *reinterpret_cast<const short*>(
             &sW[(wc + 16 + (lane & 15)) * kTileStride + ks * 16 + acol8 + j]);
+        wf2[j] = *reinterpret_cast<const short*>(
+            &sW[(wc + 32 + (lane & 15)) * kTileStride + ks * 16 + acol8 + j]);
+        wf3[j] = *reinterpret_cast<const short*>(
+            &sW[(wc + 48 + (lane & 15)) * kTileStride + ks * 16 + acol8 + j]);
       }
       acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, wf0, acc0);
       acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, wf1, acc1);
+      acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, wf2, acc2);
+      acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af, wf3, acc3);
     }
     LdsBarrier();
   }
@@ -410,6 +420,12 @@ __device__ __forceinline__ void WmmaGemmBody(const float* a,
     }
     if (r + j < m && n0 + 16 < n) {
       c[(r + j) * n + n0 + 16] = acc1[j];
+    }
+    if (r + j < m && n0 + 32 < n) {
+      c[(r + j) * n + n0 + 32] = acc2[j];
+    }
+    if (r + j < m && n0 + 48 < n) {
+      c[(r + j) * n + n0 + 48] = acc3[j];
     }
   }
 }

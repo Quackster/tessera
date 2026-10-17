@@ -1427,6 +1427,13 @@ inline std::expected<Kernel*, StatusCode> GemmTiledFor(Backend& backend,
 // the tile rows, so a shallower batch is faster on the tiled or GEMV kernel.
 constexpr std::size_t kGemmWmmaMinRows = 64;
 
+// fp16 tensor-core tile geometry: the tile is this many rows by this many
+// columns, one workgroup per tile, so the launcher's grid must match. The
+// tall shape amortizes one weight decode over twice the rows of a square
+// tile, which is where the kernel's instruction time goes.
+constexpr std::size_t kGemmWmmaTileRows = 128;
+constexpr std::size_t kGemmWmmaTileCols = 64;
+
 // Columns needed before the tensor-core tile pays off: the tile is 64 columns
 // wide and pads n, so a narrower projection wastes part of every tile. Below
 // this width the pad waste outweighs the GEMV path's per-row cost: the narrow
@@ -1475,14 +1482,14 @@ inline std::expected<void, StatusCode> ProjectTiledDevice(
     Buffer& c, std::size_t m, std::size_t n, std::size_t k) {
   KernelLaunch launch;
   if (kernel.Id().ends_with("_wmma")) {
-    // The fp16 tensor-core tile: kGemmWmmaMinRows square, one workgroup per
-    // tile (see GemmWmmaKernelName).
+    // The fp16 tensor-core tile: kGemmWmmaTileRows x kGemmWmmaTileCols, one
+    // workgroup per tile (see GemmWmmaKernelName).
     launch.grid_x =
-        static_cast<std::uint32_t>((n + kGemmWmmaMinRows - 1) /
-                                   kGemmWmmaMinRows);
+        static_cast<std::uint32_t>((n + kGemmWmmaTileCols - 1) /
+                                   kGemmWmmaTileCols);
     launch.grid_y =
-        static_cast<std::uint32_t>((m + kGemmWmmaMinRows - 1) /
-                                   kGemmWmmaMinRows);
+        static_cast<std::uint32_t>((m + kGemmWmmaTileRows - 1) /
+                                   kGemmWmmaTileRows);
     launch.block_x = 256;
   } else if (kernel.Id() == "gemm_q4k_batched" ||
       kernel.Id() == "gemm_q5k_batched" ||
