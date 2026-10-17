@@ -1628,13 +1628,14 @@ __global__ void SigmoidGateKernel(const float* a, const float* g, float* o,
 }
 
 // Built-in "l2norm": row-wise L2 normalization over rows x cols fp32. One
-// workgroup per row (shared-memory sum reduction), dispatch `rows`
-// workgroups of 256.
+// workgroup per row; one warp sums the row through shuffles (the block-wide
+// tree cost ten barrier rounds per row) and the block writes the result.
+// Dispatch `rows` workgroups of 256 or more.
 __global__ void L2NormKernel(const float* x, float* y,
                              unsigned long long rows, unsigned long long cols,
                              unsigned long long eps_bits,
                              unsigned long long scale_bits) {
-  __shared__ float red[1024];
+  __shared__ float red[32];
   const unsigned long long r = static_cast<unsigned long long>(blockIdx.x);
   if (r >= rows) {
     return;
@@ -1648,15 +1649,17 @@ __global__ void L2NormKernel(const float* x, float* y,
   std::memcpy(&eps, &eps_bits32, 4);
   std::uint32_t scale_bits32 = static_cast<std::uint32_t>(scale_bits);
   std::memcpy(&scale, &scale_bits32, 4);
-  float sum = 0.0f;
-  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
-    sum = fmaf(x[base + c], x[base + c], sum);
-  }
-  red[tid] = sum;
-  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    LdsBarrier();
-    if (tid < s) {
-      red[tid] += red[tid + s];
+  if ((tid >> 5) == 0) {
+    const unsigned long long lane = tid & 31;
+    float sum = 0.0f;
+    for (unsigned long long c = lane; c < cols; c += 32) {
+      sum = fmaf(x[base + c], x[base + c], sum);
+    }
+    for (unsigned int s = 16; s > 0; s >>= 1) {
+      sum += __shfl_xor_sync(~0ull, sum, s, 32);
+    }
+    if (lane == 0) {
+      red[0] = sum;
     }
   }
   LdsBarrier();
@@ -1667,8 +1670,9 @@ __global__ void L2NormKernel(const float* x, float* y,
 }
 
 // Built-in "rmsnorm_gated": row-wise RMS norm scaled by a SiLU gate
-// over rows x cols fp32. One thread per row with sequential
-// accumulation.
+// over rows x cols fp32. One workgroup per row; one warp sums the row
+// through shuffles (the block-wide tree cost eight barrier rounds per row)
+// and the block writes the result.
 __global__ void RmsnormGatedKernel(const float* x, const float* w,
                                    const float* gate, float* y,
                                    unsigned long long rows,
@@ -1676,7 +1680,7 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
                                    unsigned long long eps_bits,
                                    unsigned long long gbase,
                                    unsigned long long ybase) {
-  __shared__ float red[256];
+  __shared__ float red[32];
   const unsigned long long r = static_cast<unsigned long long>(blockIdx.x);
   if (r >= rows) {
     return;
@@ -1687,15 +1691,17 @@ __global__ void RmsnormGatedKernel(const float* x, const float* w,
   static_assert(sizeof(eps) == 4);
   std::uint32_t bits = static_cast<std::uint32_t>(eps_bits);
   std::memcpy(&eps, &bits, 4);
-  float sum = 0.0f;
-  for (unsigned long long c = tid; c < cols; c += blockDim.x) {
-    sum = fmaf(x[base + c], x[base + c], sum);
-  }
-  red[tid] = sum;
-  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-    LdsBarrier();
-    if (tid < s) {
-      red[tid] += red[tid + s];
+  if ((tid >> 5) == 0) {
+    const unsigned long long lane = tid & 31;
+    float sum = 0.0f;
+    for (unsigned long long c = lane; c < cols; c += 32) {
+      sum = fmaf(x[base + c], x[base + c], sum);
+    }
+    for (unsigned int s = 16; s > 0; s >>= 1) {
+      sum += __shfl_xor_sync(~0ull, sum, s, 32);
+    }
+    if (lane == 0) {
+      red[0] = sum;
     }
   }
   LdsBarrier();
