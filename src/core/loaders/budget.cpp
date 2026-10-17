@@ -299,20 +299,13 @@ std::uint64_t StagingWeightBytes(const WeightBudget& budget,
   return total;
 }
 
-// Cache bytes at context, split by where they live: the full-attention KV
-// cache (offloadable to system RAM) and the context-independent linear
-// state (always on the device). One geometrically grown full-attention
-// layer each, plus one MTP KV layer for the "mtp" strategy. Shared with
-// RecommendGpuLayers so the help text and the fit check judge the same
-// cost.
-struct CacheCost {
-  std::uint64_t full_kv_bytes = 0;
-  std::uint64_t linear_bytes = 0;
-};
-
-CacheCost CacheBytes(const TransformerConfig& config, std::size_t trunk_layers,
-                     std::size_t context, KvCacheType kv_type,
-                     const std::string& strategy) {
+// Cache bytes at context: one geometrically grown full-attention layer
+// each, the context-independent linear state each, plus one MTP layer
+// for the "mtp" strategy. Shared with RecommendGpuLayers so the help
+// text and the fit check judge the same cost.
+std::uint64_t CacheBytes(const TransformerConfig& config,
+                         std::size_t trunk_layers, std::size_t context,
+                         KvCacheType kv_type, const std::string& strategy) {
   std::size_t full_layers = 0;
   for (std::size_t l = 0; l < trunk_layers; ++l) {
     if (config.IsFullAttentionLayer(l)) {
@@ -321,21 +314,14 @@ CacheCost CacheBytes(const TransformerConfig& config, std::size_t trunk_layers,
   }
   const std::size_t linear_layers =
       config.hybrid ? trunk_layers - full_layers : 0;
-  CacheCost cost;
-  cost.full_kv_bytes = static_cast<std::uint64_t>(full_layers) *
-                       FullKvLayerBytes(config, kv_type, context);
-  cost.linear_bytes = static_cast<std::uint64_t>(linear_layers) *
-                      LinearStateLayerBytes(config);
+  std::uint64_t kv_bytes = static_cast<std::uint64_t>(full_layers) *
+                           FullKvLayerBytes(config, kv_type, context);
+  kv_bytes += static_cast<std::uint64_t>(linear_layers) *
+              LinearStateLayerBytes(config);
   if (strategy == "mtp") {
-    cost.full_kv_bytes += FullKvLayerBytes(config, kv_type, context);
+    kv_bytes += FullKvLayerBytes(config, kv_type, context);
   }
-  return cost;
-}
-
-// Device bytes of the cache: the linear state always, the full-attention
-// KV only when it is not offloaded to system RAM.
-std::uint64_t DeviceCacheBytes(const CacheCost& cost, bool kv_offload) {
-  return (kv_offload ? 0 : cost.full_kv_bytes) + cost.linear_bytes;
+  return kv_bytes;
 }
 
 // Overflow-safe fit: resident weights plus the paging staging buffers plus
@@ -357,7 +343,7 @@ bool FitsBudget(std::uint64_t resident, std::uint64_t staging,
 
 std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
     const std::string& path, std::size_t context, KvCacheType kv_type,
-    std::uint64_t free_bytes, const std::string& strategy, bool kv_offload) {
+    std::uint64_t free_bytes, const std::string& strategy) {
   auto config = Model::ProbeConfig(path);
   if (!config) {
     return std::unexpected(config.error());
@@ -376,22 +362,20 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
   const std::size_t linear_layers = config->hybrid
                                         ? budget->trunk_layers - full_layers
                                         : 0;
-  const CacheCost cost =
+  const std::uint64_t kv_bytes =
       CacheBytes(*config, budget->trunk_layers, context, kv_type, strategy);
-  const std::uint64_t device_cache = DeviceCacheBytes(cost, kv_offload);
   GpuLayersAdvice advice;
   advice.trunk_layers = budget->trunk_layers;
   advice.total_layers = budget->trunk_layers + 1;
   advice.full_layers = full_layers;
   advice.linear_layers = linear_layers;
   advice.full_bytes = ResidentWeightBytes(*budget, 0);
-  advice.kv_bytes = cost.full_kv_bytes + cost.linear_bytes;
-  advice.kv_offload = kv_offload;
+  advice.kv_bytes = kv_bytes;
   advice.free_bytes = free_bytes;
   if (free_bytes == 0) {
     return advice;
   }
-  if (FitsBudget(advice.full_bytes, /*staging=*/0, device_cache, free_bytes)) {
+  if (FitsBudget(advice.full_bytes, /*staging=*/0, kv_bytes, free_bytes)) {
     advice.has_best = true;
     advice.best = 0;
     advice.best_bytes = advice.full_bytes;
@@ -400,7 +384,7 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
   for (std::size_t layers = budget->trunk_layers; layers > 0; --layers) {
     const std::uint64_t resident = ResidentWeightBytes(*budget, layers);
     const std::uint64_t staging = StagingWeightBytes(*budget, layers);
-    if (FitsBudget(resident, staging, device_cache, free_bytes)) {
+    if (FitsBudget(resident, staging, kv_bytes, free_bytes)) {
       advice.has_best = true;
       advice.best = layers;
       advice.best_bytes = resident;
@@ -414,7 +398,7 @@ std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
 std::expected<GpuLayersFit, StatusCode> FitGpuLayers(
     const std::string& path, std::size_t context, KvCacheType kv_type,
     std::uint64_t budget_bytes, const std::string& strategy,
-    std::size_t gpu_layers, bool kv_offload) {
+    std::size_t gpu_layers) {
   auto config = Model::ProbeConfig(path);
   if (!config) {
     return std::unexpected(config.error());
@@ -424,17 +408,15 @@ std::expected<GpuLayersFit, StatusCode> FitGpuLayers(
   if (!budget) {
     return std::unexpected(budget.error());
   }
-  const CacheCost cost =
-      CacheBytes(*config, budget->trunk_layers, context, kv_type, strategy);
   GpuLayersFit fit;
   fit.total_layers = budget->trunk_layers + 1;
   fit.resident_bytes = ResidentWeightBytes(*budget, gpu_layers);
   fit.staging_bytes = StagingWeightBytes(*budget, gpu_layers);
-  fit.kv_bytes = cost.full_kv_bytes + cost.linear_bytes;
-  fit.kv_offload = kv_offload;
+  fit.kv_bytes =
+      CacheBytes(*config, budget->trunk_layers, context, kv_type, strategy);
   fit.budget_bytes = budget_bytes;
-  fit.fits = FitsBudget(fit.resident_bytes, fit.staging_bytes,
-                        DeviceCacheBytes(cost, kv_offload), budget_bytes);
+  fit.fits = FitsBudget(fit.resident_bytes, fit.staging_bytes, fit.kv_bytes,
+                        budget_bytes);
   return fit;
 }
 

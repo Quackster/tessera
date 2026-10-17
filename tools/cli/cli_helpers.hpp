@@ -89,23 +89,20 @@ EncodePromptText(
 // Print the `--gpu-layers help` sizing advice for a model path without
 // loading it: the offloadable layer count, the KV cache cost at
 // `context`, and the largest fitting layer count on this engine's
-// device. `kv_offload` keeps the full-attention KV cache in system RAM,
-// so the advice does not reserve device space for it. Returns the
-// process exit code (0 on advice, 1 on error).
+// device. Returns the process exit code (0 on advice, 1 on error).
 int LogGpuLayersAdvice(Engine& engine, const std::string& model_path,
                        std::size_t context, KvCacheType kv_type,
-                       std::string_view strategy, bool kv_offload = false);
+                       std::string_view strategy);
 
 // Refuse a paged load whose resident set plus KV cache cannot fit the
 // engine's device before the load starts, logging what is needed and
-// what fits. `kv_offload` keeps the full-attention KV cache in system
-// RAM, so it is not counted against the device. True when the load may
-// proceed (or when the backend reports no memory size, so nothing can
-// be judged). `device` names the GPU in the refusal message.
+// what fits. True when the load may proceed (or when the backend
+// reports no memory size, so nothing can be judged). `device` names
+// the GPU in the refusal message.
 bool CheckGpuLayersFit(Engine& engine, const std::string& model_path,
                        std::size_t context, KvCacheType kv_type,
                        std::string_view strategy, std::size_t gpu_layers,
-                       int device, bool kv_offload = false);
+                       int device);
 
 // Refuse a replica load whose paged weights cannot fit system RAM, before
 // the load starts. `held_bytes` is the paged host bytes of the replicas

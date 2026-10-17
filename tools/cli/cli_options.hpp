@@ -71,13 +71,11 @@ struct CliOptions {
 
   // Decode shape.
   tessera::SamplingOptions sampling;
-  bool sample = true;  // --sample (sampling is on by default)
+  bool sample = false;  // --sample
   bool sampling_explicit = false;
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   bool kv_type_set = false;
-  bool kv_offload = false;  // --kv-offload
   std::uint64_t seed = 0;
-  bool seed_set = false;  // --seed
   std::size_t max_completion_tokens = 0;
   std::size_t max_thinking_tokens = 0;
   std::size_t context = kDefaultContext;
@@ -392,8 +390,6 @@ namespace detail {
       options->sample = true;
     } else if (MatchKvType(arg, options->kv_type)) {
       options->kv_type_set = true;
-    } else if (arg == "--kv-offload") {
-      options->kv_offload = true;
     } else if (arg == "--temperature") {
       auto value = RealValue(args, i, arg);
       if (!value) {
@@ -442,7 +438,6 @@ namespace detail {
         return std::unexpected(value.error());
       }
       options->seed = *value;
-      options->seed_set = true;
     } else if (arg == "--max-completion-tokens") {
       auto value = SizeValue(args, i, arg);
       if (!value) {

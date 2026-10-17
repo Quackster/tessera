@@ -106,9 +106,7 @@ Json SessionPromptBody(const Json& body, const SessionView& view) {
   prompt_body.Set("messages", SessionHistoryJson(view));
   for (const char* key : {"system", "tools", "tool_choice", "enable_thinking",
                           "reasoning_effort", "stream", "max_completion_tokens",
-                          "max_thinking_tokens", "chat_template_kwargs",
-                          "temperature", "top_p", "top_k", "min_p",
-                          "presence_penalty", "repetition_penalty", "seed"}) {
+                          "max_thinking_tokens", "chat_template_kwargs"}) {
     if (const Json* value = body.Find(key)) {
       prompt_body.Set(key, *value);
     }
@@ -201,12 +199,9 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   // friends); without it every serve turn would decode F32 and an
   // unlimited turn would never fit the device.
   options.kv_type = shared ? pool.At(0).kv_type() : lease.runner().kv_type();
-  options.kv_offload =
-      shared ? pool.At(0).kv_offload() : lease.runner().kv_offload();
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
   }
-  ApplyRequestSampling(body, &options);
   if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;
   }

@@ -49,11 +49,6 @@ struct SamplingOptions {
   float repetition_penalty = kDefaultRepetitionPenalty;
 };
 
-// A fresh seed for sampling, drawn from the system entropy source. Use
-// it when a caller leaves GenerateOptions::seed unset, so sampled runs
-// differ each time instead of repeating one fixed sequence.
-[[nodiscard]] std::uint64_t RandomSeed();
-
 // Options for Engine::Generate.
 struct GenerateOptions {
   // Completion tokens to produce; 0 (the default) fills the remaining
@@ -83,15 +78,11 @@ struct GenerateOptions {
   // Prompt tokens fed before generation; when non-empty they take the
   // place of first_token and the last one seeds generation.
   std::vector<std::uint32_t> prompt_tokens;
-  // When true (the default) tokens are drawn from `sampling` with `seed`;
-  // set false for the greedy reference path. The SamplingOptions defaults
-  // are the model-card defaults, so a caller that sets nothing samples
-  // with those values.
-  bool sample = true;
+  // When false (the default) the reference greedy path runs. When true,
+  // tokens are drawn from `sampling` with the fixed `seed`.
+  bool sample = false;
   SamplingOptions sampling;
   // RNG seed for sampling; a fixed value keeps sampling reproducible.
-  // Callers that do not specify a seed pass RandomSeed() so a sampled
-  // run differs each time.
   std::uint64_t seed = 0;
   // Draft tokens per speculative step for the DFlash2 draft; 0 uses the
   // draft checkpoint's configured block size.
@@ -107,10 +98,6 @@ struct GenerateOptions {
   std::size_t progress_every = 64;
   // Storage type of the full-attention KV cache (default fp32).
   KvCacheType kv_type = KvCacheType::F32;
-  // Keep the full-attention KV cache in pinned system RAM instead of
-  // device memory. The attention kernels read the cache over the host
-  // mapping, so a long context fits on a small device. Off by default.
-  bool kv_offload = false;
   // Extra stop token ids for this request, added to the model's declared
   // stop tokens (Model::StopTokens). Generation ends when it samples one
   // of them, and the stop token is not emitted. Use this for a chat

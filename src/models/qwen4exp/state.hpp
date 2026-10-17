@@ -94,10 +94,6 @@ struct Qwen4ExpState final : core::ArchState {
   std::vector<GdnLayer> gdn;
   std::vector<QsaLayer> qsa;
   std::size_t position = 0;
-  // Where the paged K/V pools live: Device, or HostVisible when the cache
-  // is offloaded to system RAM. The trunk picks the kind once; the MTP
-  // draft's pools use the same kind.
-  MemoryKind kv_memory = MemoryKind::Device;
   bool ready = false;
 
   // Batched-forward scratch (prefill and the multi-row verify). The residual

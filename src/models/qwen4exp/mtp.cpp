@@ -56,8 +56,8 @@ std::uint32_t Grid(std::size_t elements) {
 
 std::expected<void, StatusCode> Alloc(Backend& backend,
                                       std::unique_ptr<Buffer>& slot,
-                                      std::size_t bytes, MemoryKind memory) {
-  auto buffer = backend.AllocateBuffer(bytes, memory);
+                                      std::size_t bytes) {
+  auto buffer = backend.AllocateBuffer(bytes, MemoryKind::Device);
   if (!buffer) {
     return std::unexpected(buffer.error());
   }
@@ -106,17 +106,16 @@ std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
       kMtpPages * g.kv_heads * kMtpPageSize * g.head_dim * 2;
   const std::size_t attend_bytes =
       kMtpMaxAttend * g.kv_heads * g.head_dim * 2;
-  if (!Alloc(backend, h.mtp_k_pool, pool_bytes, h.kv_memory) ||
-      !Alloc(backend, h.mtp_v_pool, pool_bytes, h.kv_memory) ||
-      !Alloc(backend, h.mtp_page_table, kMtpPages * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.mtp_ids, kMtpMaxAttend * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.mtp_k_scratch, attend_bytes, MemoryKind::Device) ||
-      !Alloc(backend, h.mtp_v_scratch, attend_bytes, MemoryKind::Device) ||
+  if (!Alloc(backend, h.mtp_k_pool, pool_bytes) ||
+      !Alloc(backend, h.mtp_v_pool, pool_bytes) ||
+      !Alloc(backend, h.mtp_page_table, kMtpPages * 4) ||
+      !Alloc(backend, h.mtp_ids, kMtpMaxAttend * 4) ||
+      !Alloc(backend, h.mtp_k_scratch, attend_bytes) ||
+      !Alloc(backend, h.mtp_v_scratch, attend_bytes) ||
       !Alloc(backend, h.mtp_expert_scratch,
-             2 * h.mtp_weights->inter * h.mtp_weights->hidden * 2,
-             MemoryKind::Device) ||
-      !Alloc(backend, h.mtp_hidden_branch, g.hc_dim * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.mtp_streams, g.hc_dim * 4, MemoryKind::Device)) {
+             2 * h.mtp_weights->inter * h.mtp_weights->hidden * 2) ||
+      !Alloc(backend, h.mtp_hidden_branch, g.hc_dim * 4) ||
+      !Alloc(backend, h.mtp_streams, g.hc_dim * 4)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   // The draft's paged K/V pools start empty, so an unwritten cell reads as
@@ -133,17 +132,16 @@ std::expected<void, StatusCode> EnsureMtpReady(Backend& backend,
   const std::size_t inter = h.mtp_weights->inter;
   const std::size_t hidden = h.mtp_weights->hidden;
   const std::size_t top_k = cfg.experts_per_tok;
-  if (!Alloc(backend, h.moe_logits, ne * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_ids, top_k * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_vals, top_k * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_wts, top_k * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_sig, 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_acc, hidden * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_shared, hidden * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_gate_out, inter * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_up_out, inter * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_inter, inter * 4, MemoryKind::Device) ||
-      !Alloc(backend, h.moe_phi, top_k * inter * 4, MemoryKind::Device)) {
+  if (!Alloc(backend, h.moe_logits, ne * 4) ||
+      !Alloc(backend, h.moe_ids, top_k * 4) ||
+      !Alloc(backend, h.moe_vals, top_k * 4) ||
+      !Alloc(backend, h.moe_wts, top_k * 4) || !Alloc(backend, h.moe_sig, 4) ||
+      !Alloc(backend, h.moe_acc, hidden * 4) ||
+      !Alloc(backend, h.moe_shared, hidden * 4) ||
+      !Alloc(backend, h.moe_gate_out, inter * 4) ||
+      !Alloc(backend, h.moe_up_out, inter * 4) ||
+      !Alloc(backend, h.moe_inter, inter * 4) ||
+      !Alloc(backend, h.moe_phi, top_k * inter * 4)) {
     return std::unexpected(StatusCode::OutOfMemory);
   }
   std::vector<std::int32_t> table(kMtpPages);
@@ -375,8 +373,7 @@ std::expected<void, StatusCode> RunMtpMoe(Backend& backend,
 std::expected<std::uint32_t, StatusCode> RunMtpDraft(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::span<const float> hidden,
-    std::uint32_t token, std::uint64_t pos, std::vector<float>* mtp_hidden_out,
-    std::vector<float>* logits_out) {
+    std::uint32_t token, std::uint64_t pos, std::vector<float>* mtp_hidden_out) {
   if (auto ready = EnsureMtpReady(backend, model, cfg, g, h); !ready) {
     return std::unexpected(ready.error());
   }
@@ -513,9 +510,6 @@ std::expected<std::uint32_t, StatusCode> RunMtpDraft(
     if ((*logits)[i] > (*logits)[best]) {
       best = i;
     }
-  }
-  if (logits_out != nullptr) {
-    *logits_out = std::move(*logits);
   }
   h.mtp_rows = pos + 1;
   return best;

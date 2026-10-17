@@ -39,9 +39,6 @@ struct PipelineOptions {
   std::size_t context = kDefaultContext;
   // Storage type of the full-attention KV cache.
   KvCacheType kv_type = KvCacheType::F32;
-  // Keep the full-attention KV cache in pinned system RAM instead of
-  // device memory. See GenerateOptions::kv_offload.
-  bool kv_offload = false;
   // Directory of a separately fetched MTP head, loaded on the last stage,
   // which owns the head for the attached drafter. Empty when the model's
   // own GGUF carries the nextn block.

@@ -1,7 +1,6 @@
 #include "tessera/speculative.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -11,7 +10,6 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/loaders/safetensors.hpp"
-#include "core/sampling.hpp"
 #include "spec/dflash2_candidates.hpp"
 #include "spec/dflash2_config.hpp"
 #include "spec/dflash2_context.hpp"
@@ -283,8 +281,7 @@ class DFlash2Strategy final : public SpeculativeStrategy {
   std::expected<std::size_t, StatusCode> Draft(
       Backend& backend, Model& target, core::DecodeCache& cache,
       std::span<const float> current_logits, std::uint32_t anchor,
-      std::span<std::uint32_t> drafts, const DraftSampling* sampling,
-      DraftDistribution* distribution) override {
+      std::span<std::uint32_t> drafts) override {
     (void)target;
     (void)cache;
     (void)current_logits;
@@ -374,7 +371,19 @@ class DFlash2Strategy final : public SpeculativeStrategy {
                            cand_ids.size() * 4)) {
         return std::unexpected(StatusCode::DeviceError);
       }
-      return PickPath(scores, cand_ids, drafts, sampling, distribution);
+      std::size_t predecessor = 0;
+      for (std::size_t r = 0; r < block_ && r < drafts.size(); ++r) {
+        const float* row = scores.data() + (r * topk_ + predecessor) * topk_;
+        std::size_t best = 0;
+        for (std::size_t c = 1; c < topk_; ++c) {
+          if (row[c] > row[best]) {
+            best = c;
+          }
+        }
+        drafts[r] = cand_ids[r * topk_ + best];
+        predecessor = best;
+      }
+      return block_;
     }
     backend.Synchronize();
     std::vector<float> draft_logits(query_rows_ * vocab_);
@@ -435,11 +444,23 @@ class DFlash2Strategy final : public SpeculativeStrategy {
                            scores.size() * 4)) {
         return std::unexpected(StatusCode::DeviceError);
       }
-      return PickPath(scores, cand_ids, drafts, sampling, distribution);
+      std::size_t predecessor = 0;
+      for (std::size_t r = 0; r < block_ && r < drafts.size(); ++r) {
+        const float* row = scores.data() + (r * topk_ + predecessor) * topk_;
+        std::size_t best = 0;
+        for (std::size_t c = 1; c < topk_; ++c) {
+          if (row[c] > row[best]) {
+            best = c;
+          }
+        }
+        drafts[r] = cand_ids[r * topk_ + best];
+        predecessor = best;
+      }
+      return block_;
     }
     for (std::size_t r = 0; r < block_ && r < drafts.size(); ++r) {
       std::span<const float> row(mask_logits.data() + r * vocab_, vocab_);
-      drafts[r] = SampleMaskRow(row, sampling, distribution);
+      drafts[r] = core::detail::ArgMax(row);
     }
     return block_;
   }
@@ -456,95 +477,7 @@ class DFlash2Strategy final : public SpeculativeStrategy {
                                   1 + accepted);
   }
 
-  private:
-  // Walk the selector lattice, one row per draft position. Greedy picks the
-  // best successor; a sampled walk draws the successor from softmax(row/T)
-  // and records q over the block's K candidates (zero elsewhere).
-  std::size_t PickPath(const std::vector<float>& scores,
-                       const std::vector<std::uint32_t>& cand_ids,
-                       std::span<std::uint32_t> drafts,
-                       const DraftSampling* sampling,
-                       DraftDistribution* distribution) {
-    const bool sample = DraftSamples(sampling);
-    std::size_t predecessor = 0;
-    for (std::size_t r = 0; r < block_ && r < drafts.size(); ++r) {
-      const float* row = scores.data() + (r * topk_ + predecessor) * topk_;
-      std::size_t chosen = 0;
-      if (sample) {
-        const double temp = sampling->sampling->temperature;
-        std::vector<double> probs(topk_, 0.0);
-        double maxv = row[0];
-        for (std::size_t c = 1; c < topk_; ++c) {
-          maxv = std::max(maxv, static_cast<double>(row[c]));
-        }
-        double denom = 0.0;
-        for (std::size_t c = 0; c < topk_; ++c) {
-          probs[c] = std::exp((static_cast<double>(row[c]) - maxv) / temp);
-          denom += probs[c];
-        }
-        if (denom > 0.0) {
-          for (double& p : probs) {
-            p /= denom;
-          }
-        } else {
-          probs.assign(topk_, 0.0);
-          probs[0] = 1.0;
-        }
-        std::uniform_real_distribution<double> uniform(0.0, 1.0);
-        const double drawn = uniform(*sampling->rng);
-        double cumulative = 0.0;
-        chosen = topk_ - 1;
-        for (std::size_t c = 0; c < topk_; ++c) {
-          cumulative += probs[c];
-          if (drawn < cumulative) {
-            chosen = c;
-            break;
-          }
-        }
-        const std::size_t base = distribution->probs.size();
-        distribution->probs.resize(base + vocab_, 0.0);
-        for (std::size_t c = 0; c < topk_; ++c) {
-          distribution->probs[base + cand_ids[r * topk_ + c]] = probs[c];
-        }
-        distribution->rows = r + 1;
-        distribution->vocab = vocab_;
-      } else {
-        for (std::size_t c = 1; c < topk_; ++c) {
-          if (row[c] > row[chosen]) {
-            chosen = c;
-          }
-        }
-      }
-      drafts[r] = cand_ids[r * topk_ + chosen];
-      predecessor = chosen;
-    }
-    return block_;
-  }
-
-  // The no-selector fallback: sample the draft token from a mask row's full
-  // distribution (temperature only) and record q; greedy argmax otherwise.
-  std::uint32_t SampleMaskRow(std::span<const float> row,
-                              const DraftSampling* sampling,
-                              DraftDistribution* distribution) {
-    if (!DraftSamples(sampling)) {
-      return core::detail::ArgMax(row);
-    }
-    std::vector<double> q = core::BuildDenseDistribution(
-        row, *sampling->sampling, std::span<const std::uint32_t>{});
-    const std::uint32_t token = core::SampleFromDense(q, *sampling->rng);
-    distribution->probs.insert(distribution->probs.end(), q.begin(), q.end());
-    distribution->rows += 1;
-    distribution->vocab = q.size();
-    return token;
-  }
-
-  // Whether the draft samples: a sampling context with a positive
-  // temperature. Zero temperature is greedy and records no distribution.
-  static bool DraftSamples(const DraftSampling* sampling) {
-    return sampling != nullptr && sampling->sampling != nullptr &&
-           sampling->rng != nullptr && sampling->sampling->temperature > 0.0f;
-  }
-
+ private:
   std::string draft_path_;
   std::size_t draft_block_size_ = 0;
   bool attached_ = false;

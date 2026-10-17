@@ -55,9 +55,6 @@ class Runner {
   //   GenerateOptions options;
   //   options.kv_type = pool.At(0).kv_type();
   [[nodiscard]] virtual KvCacheType kv_type() const = 0;
-  // True when turns on this runner keep the full-attention KV cache in
-  // pinned system RAM (the launcher passed --kv-offload).
-  [[nodiscard]] virtual bool kv_offload() const = 0;
   // True when one model spans several devices (the pipeline runner). The
   // serve layer reads it to choose the tools and image route: an exclusive
   // lease for a single-device runner, Submit for a split runner.
@@ -109,8 +106,7 @@ class SingleDeviceRunner : public Runner {
   SingleDeviceRunner(std::unique_ptr<Engine> engine,
                      std::unique_ptr<Model> model, int device_index,
                      CalibrationConfig calibration = {},
-                     KvCacheType kv_type = KvCacheType::F32,
-                     bool kv_offload = false);
+                     KvCacheType kv_type = KvCacheType::F32);
 
   [[nodiscard]] Engine& engine() const override;
   [[nodiscard]] Model& model() const override;
@@ -118,7 +114,6 @@ class SingleDeviceRunner : public Runner {
   [[nodiscard]] int device_index() const override;
   [[nodiscard]] const CalibrationConfig& calibration() const override;
   [[nodiscard]] KvCacheType kv_type() const override;
-  [[nodiscard]] bool kv_offload() const override;
   [[nodiscard]] bool is_split() const override;
   [[nodiscard]] bool CanSchedule(const GenerateOptions& options) const override;
   [[nodiscard]] std::expected<GenerateOutcome, StatusCode> Submit(
@@ -134,7 +129,6 @@ class SingleDeviceRunner : public Runner {
   int device_index_ = 0;
   CalibrationConfig calibration_;
   KvCacheType kv_type_ = KvCacheType::F32;
-  bool kv_offload_ = false;
   // Destroyed before the engine, the model and the device lock, so its
   // dispatcher joins while everything it borrows is still alive.
   std::unique_ptr<Scheduler> scheduler_;
@@ -152,8 +146,7 @@ class PipelineRunner : public Runner {
  public:
   PipelineRunner(std::unique_ptr<Pipeline> pipeline, int device_index,
                  CalibrationConfig calibration = {},
-                 KvCacheType kv_type = KvCacheType::F32,
-                 bool kv_offload = false);
+                 KvCacheType kv_type = KvCacheType::F32);
 
   [[nodiscard]] Engine& engine() const override;
   [[nodiscard]] Model& model() const override;
@@ -161,7 +154,6 @@ class PipelineRunner : public Runner {
   [[nodiscard]] int device_index() const override;
   [[nodiscard]] const CalibrationConfig& calibration() const override;
   [[nodiscard]] KvCacheType kv_type() const override;
-  [[nodiscard]] bool kv_offload() const override;
   [[nodiscard]] bool is_split() const override;
   [[nodiscard]] bool CanSchedule(const GenerateOptions& options) const override;
   [[nodiscard]] std::expected<GenerateOutcome, StatusCode> Submit(
@@ -178,7 +170,6 @@ class PipelineRunner : public Runner {
   int device_index_ = 0;
   CalibrationConfig calibration_;
   KvCacheType kv_type_ = KvCacheType::F32;
-  bool kv_offload_ = false;
 };
 
 class ContextParallel;
@@ -197,16 +188,13 @@ class TensorParallel;
 //   pool.Add(MakeTensorParallelRunner(std::move(tp), 0));
 [[nodiscard]] std::unique_ptr<Runner> MakeTensorParallelRunner(
     std::unique_ptr<TensorParallel> layout, int device_index,
-    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32,
-    bool kv_offload = false);
+    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32);
 [[nodiscard]] std::unique_ptr<Runner> MakeContextParallelRunner(
     std::unique_ptr<ContextParallel> layout, int device_index,
-    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32,
-    bool kv_offload = false);
+    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32);
 [[nodiscard]] std::unique_ptr<Runner> MakeSpecSplitRunner(
     std::unique_ptr<SpecSplit> layout, int device_index,
-    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32,
-    bool kv_offload = false);
+    CalibrationConfig calibration = {}, KvCacheType kv_type = KvCacheType::F32);
 
 class RunnerPool;
 

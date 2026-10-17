@@ -5,7 +5,6 @@
 #include <expected>
 #include <memory>
 #include <optional>
-#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -34,52 +33,11 @@ namespace core {
 struct DecodeCache;
 }  // namespace core
 
-struct SamplingOptions;
-
-// The sampling state a sampled verification needs. Null in a greedy
-// verification. A verifier that receives it draws the target's token at
-// each scored row from `sampling` with `rng` (history plus the rows
-// already accepted supply the penalty history) and accepts the draft
-// while the drawn token matches it, so the emitted sequence equals plain
-// sampling for the same seed. The verifier advances `rng` once per scored
-// row up to and including the first mismatch, then once more for the
-// bonus row when every draft matched.
-struct SampledVerify {
-  const SamplingOptions* sampling = nullptr;
-  std::mt19937_64* rng = nullptr;
-  std::span<const std::uint32_t> history;
-  // The draft's sampling distribution, one dense row per proposed token
-  // (rows x vocab), when the drafter sampled. Null for a greedy draft; the
-  // verifier then matches the drawn target token instead of using rejection.
-  const std::vector<double>* draft_probs = nullptr;
-  std::size_t draft_vocab = 0;
-};
-
-// Sampling state for a sampled draft. When null the drafter proposes
-// greedily and records no distribution. `history` is the penalty history
-// before the draft window; the drafter extends it with the drafts it draws,
-// so each draft distribution matches the target's scale.
-struct DraftSampling {
-  const SamplingOptions* sampling = nullptr;
-  std::mt19937_64* rng = nullptr;
-  std::span<const std::uint32_t> history;
-};
-
-// The draft's sampling distribution, one dense row per proposed token
-// (rows x vocab), row-major. The drafter fills it when it sampled the
-// drafts; a greedy draft leaves it empty.
-struct DraftDistribution {
-  std::vector<double> probs;
-  std::size_t rows = 0;
-  std::size_t vocab = 0;
-};
-
-// The outcome of verifying a draft against the target model. In the greedy
-// mode `accepted` leading draft tokens match the target's argmax and are
-// already in the cache; `next_token` is the target's argmax token after
-// them. In the sampled mode (see SampledVerify) `accepted` tokens match
-// the target's drawn token and `next_token` is the drawn token at the
-// first mismatch (or the bonus draw when all matched).
+// The outcome of verifying a greedy draft against the target model.
+// `accepted` leading draft tokens match the target's greedy distribution
+// and are already in the cache; `next_token` is the target's greedy token
+// after them (the bonus token); `logits` is the distribution after the
+// accepted prefix, ready to verify the next draft.
 struct DraftVerification {
   std::size_t accepted = 0;
   std::uint32_t next_token = 0;
@@ -208,9 +166,7 @@ class Architecture {
   // When `anchor` is set the anchor token is processed as the batch's first
   // row (so its logits score `draft[0]` and its captured features are row 0
   // of `capture`); the caller then commits the anchor plus the accepted
-  // drafts. `prefix_logits` is ignored in that case. When `sampled` is
-  // non-null the accept rule draws the target's token per row and matches
-  // it (see SampledVerify); the rollback keeps exactly the matched prefix.
+  // drafts. `prefix_logits` is ignored in that case.
   [[nodiscard]] virtual std::expected<DraftVerification, StatusCode> Verify(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const std::uint32_t> draft,
@@ -218,20 +174,16 @@ class Architecture {
       std::optional<std::uint32_t> anchor,
       std::vector<float>* hidden_out,
       const std::vector<std::size_t>* capture_layers = nullptr,
-      std::vector<Buffer*>* capture = nullptr,
-      const SampledVerify* sampled = nullptr) const = 0;
+      std::vector<Buffer*>* capture = nullptr) const = 0;
 
   // One multi-token-prediction draft step: fuse the token embedding and
   // the backbone hidden, run the draft block and return the drafted
   // token. `mtp_hidden_out`, when non-null, receives the draft hidden to
-  // chain the next draft step. `logits_out`, when non-null, receives the
-  // draft's vocab-wide logits so a caller can sample the draft and keep its
-  // distribution.
+  // chain the next draft step.
   [[nodiscard]] virtual std::expected<std::uint32_t, StatusCode> Draft(
       Backend& backend, const Model& model, core::DecodeCache& cache,
       std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-      std::vector<float>* mtp_hidden_out,
-      std::vector<float>* logits_out = nullptr) const = 0;
+      std::vector<float>* mtp_hidden_out) const = 0;
 
   // Rows currently committed in the draft key/value cache (0 when there is
   // none). Draft chaining appends a row per draft; after a partial accept

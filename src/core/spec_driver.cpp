@@ -65,14 +65,13 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
                                      "prefill so the device stays alive");
     return std::unexpected(StatusCode::InvalidArgument);
   }
-  // A sampled request must not run through a greedy-only verifier: the
-  // greedy accept rule would decode the sampled request as greedy. Drop the
-  // strategy for this generation and sample normally when the target cannot
-  // verify a sampled draft.
-  if (strategy != nullptr && options.sample &&
-      !target.SupportsSampledVerify()) {
-    diagnostics.Info("engine", "request samples: the target verifies greedily "
-                               "only; decoding without the drafter");
+  // A sampled request must not run through a greedy-only drafter: the greedy
+  // accept rule would decode the sampled request as greedy. Drop the
+  // strategy for this generation and sample normally.
+  if (strategy != nullptr && options.sample && !strategy->SupportsSampling()) {
+    diagnostics.Info("engine", "request samples: strategy '" +
+                                   std::string(strategy->Name()) +
+                                   "' is greedy only; decoding without it");
     strategy = nullptr;
   }
   if (auto prepared = target.Prepare(strategy, options); !prepared) {
@@ -121,41 +120,6 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
   const std::vector<std::uint32_t> stops = StopSet(model, options);
   const auto pick = [&](std::span<const float> logits) {
     return PickToken(logits, options.sample, options.sampling, history, rng);
-  };
-  // The sampled draft's distribution, filled by Draft and read by the
-  // verifier for rejection sampling. Empty for a greedy draft.
-  DraftDistribution draft_dist;
-  // Sampling state for a sampled draft; null when the request is greedy.
-  const auto draft_sampling = [&]() {
-    DraftSampling sampling;
-    if (strategy != nullptr && options.sample) {
-      sampling.sampling = &options.sampling;
-      sampling.rng = &rng;
-      sampling.history = history;
-    }
-    return sampling;
-  };
-  // Verify one draft. A sampled request passes the sampling state so the
-  // target draws its token per row and matches it; the emitted prefix then
-  // equals plain sampling for the same seed. With a draft distribution the
-  // verifier uses rejection sampling instead.
-  const auto verify_draft = [&](std::span<const std::uint32_t> proposal,
-                                std::span<const float> prefix_logits,
-                                std::optional<std::uint32_t> anchor,
-                                std::vector<float>* hidden) {
-    SampledVerify sampled;
-    if (strategy != nullptr && options.sample) {
-      sampled.sampling = &options.sampling;
-      sampled.rng = &rng;
-      sampled.history = history;
-      if (draft_dist.rows > 0 && draft_dist.vocab > 0) {
-        sampled.draft_probs = &draft_dist.probs;
-        sampled.draft_vocab = draft_dist.vocab;
-      }
-    }
-    const SampledVerify* sampled_ptr =
-        sampled.sampling != nullptr ? &sampled : nullptr;
-    return target.Verify(proposal, prefix_logits, anchor, hidden, sampled_ptr);
   };
   std::size_t block = strategy != nullptr ? strategy->DraftBlock() : 0;
   if (options.draft_tokens > 0 && options.draft_tokens < block) {
@@ -273,12 +237,8 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
     // is read once per step. The drafter context already excludes this anchor:
     // OnAnchor runs after the verify and appends the anchor it produced.
     if (strategy != nullptr && block > 0 && strategy->FoldsAnchor()) {
-      draft_dist = DraftDistribution{};
-      DraftSampling ds = draft_sampling();
       auto count = strategy->Draft(target.backend(), model, target.cache(), {},
-                                   next, drafts,
-                                   ds.sampling != nullptr ? &ds : nullptr,
-                                   &draft_dist);
+                                   next, drafts);
       if (!count) {
         return std::unexpected(count.error());
       }
@@ -306,7 +266,7 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
         continue;
       }
       std::span<const std::uint32_t> proposal(drafts.data(), *count);
-      auto verify = verify_draft(proposal, {}, next, &hidden);
+      auto verify = target.Verify(proposal, {}, next, &hidden);
       if (!verify) {
         return std::unexpected(verify.error());
       }
@@ -376,19 +336,14 @@ std::expected<GenerateOutcome, StatusCode> RunDecode(
       if (!anchored) {
         return std::unexpected(anchored.error());
       }
-      draft_dist = DraftDistribution{};
-      DraftSampling ds = draft_sampling();
       auto count = strategy->Draft(target.backend(), model, target.cache(),
-                                   *logits, next, drafts,
-                                   ds.sampling != nullptr ? &ds : nullptr,
-                                   &draft_dist);
+                                   *logits, next, drafts);
       if (!count) {
         return std::unexpected(count.error());
       }
       if (*count > 0) {
         std::span<const std::uint32_t> proposal(drafts.data(), *count);
-        auto verify =
-            verify_draft(proposal, *logits, std::nullopt, &hidden);
+        auto verify = target.Verify(proposal, *logits, std::nullopt, &hidden);
         if (!verify) {
           return std::unexpected(verify.error());
         }

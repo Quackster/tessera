@@ -29,9 +29,6 @@ struct SpecSplitOptions {
   std::vector<int> devices;  // [target, draft], in that order
   std::size_t context = kDefaultContext;
   KvCacheType kv_type = KvCacheType::F32;
-  // Keep the full-attention KV cache in pinned system RAM instead of
-  // device memory. See GenerateOptions::kv_offload.
-  bool kv_offload = false;
   // Tokens per draft block; 0 uses the strategy default.
   std::size_t draft_block = 0;
   // Prefill tokens per forward; 0 selects the automatic default.

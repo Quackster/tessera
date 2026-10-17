@@ -12,7 +12,6 @@
 #include "core/numerics/ngram.hpp"
 #include "core/numerics/qsa.hpp"
 #include "core/profile.hpp"
-#include "core/sampling.hpp"
 #include "models/qwen4exp/architecture.hpp"
 #include "models/qwen4exp/mtp.hpp"
 #include "models/qwen4exp/ple_table.hpp"
@@ -228,8 +227,8 @@ std::expected<void, StatusCode> LoadKernel(Backend& backend,
 
 std::expected<void, StatusCode> Alloc(Backend& backend,
                                       std::unique_ptr<Buffer>& slot,
-                                      std::size_t bytes, MemoryKind memory) {
-  auto buf = backend.AllocateBuffer(bytes, memory);
+                                      std::size_t bytes) {
+  auto buf = backend.AllocateBuffer(bytes, MemoryKind::Device);
   if (!buf) {
     return std::unexpected(buf.error());
   }
@@ -842,7 +841,7 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
   const std::size_t f = 4;
   auto make = [&](std::unique_ptr<Buffer>& slot,
                   std::size_t bytes) -> std::expected<void, StatusCode> {
-    return Alloc(backend, slot, bytes, MemoryKind::Device);
+    return Alloc(backend, slot, bytes);
   };
   const std::size_t hc_dim = g.hc_dim;
   const std::size_t q_dim = g.heads * g.head_dim;
@@ -889,10 +888,6 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
 
   const std::size_t pool_bytes =
       qsa_pages * g.kv_heads * kQsaPageSize * g.head_dim * 2;
-  // An offloaded cache keeps the paged K/V pools in system RAM; everything
-  // else stays in device memory. The MTP draft shares the choice.
-  h.kv_memory =
-      cache.kv_offload ? MemoryKind::HostVisible : MemoryKind::Device;
   // The paged K/V pools start empty. The indexer can select a cell in the
   // current block that the append has not written yet, so an unwritten pool
   // must read as zeros, never as whatever the allocator returned.
@@ -916,8 +911,7 @@ std::expected<Qwen4ExpState*, StatusCode> InitState(
   for (std::size_t l = range.first; l < range.last; ++l) {
     if (cfg.IsFullAttentionLayer(l)) {
       Qwen4ExpState::QsaLayer& st = h.qsa[l];
-      if (!Alloc(backend, st.k_pool, pool_bytes, h.kv_memory) ||
-          !Alloc(backend, st.v_pool, pool_bytes, h.kv_memory) ||
+      if (!make(st.k_pool, pool_bytes) || !make(st.v_pool, pool_bytes) ||
           !make(st.page_table, qsa_pages * 4) ||
           !make(st.idx_tail, (kQsaIdxBlock - 1) * g.idx_dim * f) ||
           !make(st.idx_dead, g.idx_dim * f) ||
@@ -1272,15 +1266,9 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
     std::span<const std::uint32_t> draft, std::span<const float> prefix_logits,
     std::optional<std::uint32_t> anchor, std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture, const SampledVerify* sampled) const {
+    std::vector<Buffer*>* capture) const {
   if (!anchor.has_value() && prefix_logits.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
-  }
-  const bool sample = sampled != nullptr && sampled->sampling != nullptr &&
-                      sampled->rng != nullptr;
-  std::vector<std::uint32_t> hist;
-  if (sample) {
-    hist.assign(sampled->history.begin(), sampled->history.end());
   }
   DraftVerification result;
   if (anchor.has_value()) {
@@ -1293,39 +1281,11 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
   } else {
     result.logits.assign(prefix_logits.begin(), prefix_logits.end());
   }
-  const bool rejection =
-      sample && sampled->draft_probs != nullptr &&
-      sampled->draft_vocab == result.logits.size() &&
-      sampled->draft_probs->size() >= draft.size() * sampled->draft_vocab;
-  bool all = true;
-  for (std::size_t i = 0; i < draft.size(); ++i) {
-    const std::uint32_t token = draft[i];
-    if (rejection) {
-      const std::vector<double> target = core::BuildDenseDistribution(
-          result.logits, *sampled->sampling, hist);
-      const std::span<const double> q(sampled->draft_probs->data() +
-                                          i * sampled->draft_vocab,
-                                      sampled->draft_vocab);
-      const core::RejectionResult step =
-          core::RejectionStep(target, q, token, *sampled->rng);
-      if (!step.accepted) {
-        result.next_token = step.token;
-        all = false;
-        break;
-      }
-    } else {
-      const std::uint32_t y =
-          sample ? core::SampleToken(result.logits, *sampled->sampling, hist,
-                                     *sampled->rng)
-                 : static_cast<std::uint32_t>(ArgMaxToken(result.logits));
-      if (y != token) {
-        result.next_token = y;
-        all = false;
-        break;
-      }
+  for (const std::uint32_t token : draft) {
+    if (static_cast<std::uint32_t>(ArgMaxToken(result.logits)) != token) {
+      break;
     }
     ++result.accepted;
-    hist.push_back(token);
     auto logits = Logits(backend, model, cache, token, hidden_out,
                          capture_layers, capture, nullptr);
     if (!logits) {
@@ -1333,25 +1293,14 @@ std::expected<DraftVerification, StatusCode> Qwen4ExpArchitecture::Verify(
     }
     result.logits = std::move(*logits);
   }
-  if (all) {
-    if (rejection) {
-      result.next_token = core::SampleFromDense(
-          core::BuildDenseDistribution(result.logits, *sampled->sampling, hist),
-          *sampled->rng);
-    } else {
-      result.next_token =
-          sample ? core::SampleToken(result.logits, *sampled->sampling, hist,
-                                     *sampled->rng)
-                 : static_cast<std::uint32_t>(ArgMaxToken(result.logits));
-    }
-  }
+  result.next_token = static_cast<std::uint32_t>(ArgMaxToken(result.logits));
   return result;
 }
 
 std::expected<std::uint32_t, StatusCode> Qwen4ExpArchitecture::Draft(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-    std::vector<float>* mtp_hidden_out, std::vector<float>* logits_out) const {
+    std::vector<float>* mtp_hidden_out) const {
   auto config = model.Config();
   if (!config) {
     return std::unexpected(config.error());
@@ -1366,7 +1315,7 @@ std::expected<std::uint32_t, StatusCode> Qwen4ExpArchitecture::Draft(
   }
   Qwen4ExpState& h = State(cache);
   return RunMtpDraft(backend, model, *config, *geom, h, hidden, token, pos,
-                     mtp_hidden_out, logits_out);
+                     mtp_hidden_out);
 }
 
 std::size_t Qwen4ExpArchitecture::DraftRows(

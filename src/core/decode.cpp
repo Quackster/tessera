@@ -5,7 +5,6 @@
 #include <optional>
 
 #include "core/decode_internal.hpp"
-#include "core/sampling.hpp"
 #include "core/timing.hpp"
 
 namespace tessera::core {
@@ -265,7 +264,7 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
     std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
     std::vector<float>* hidden_out,
     const std::vector<std::size_t>* capture_layers,
-    std::vector<Buffer*>* capture, const SampledVerify* sampled) {
+    std::vector<Buffer*>* capture) {
   if (!anchor.has_value() && prefix_logits.empty()) {
     return std::unexpected(StatusCode::InvalidArgument);
   }
@@ -281,13 +280,7 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   const Architecture* arch = model.Arch();
   if (arch != nullptr && (draft.size() > 1 || anchor.has_value())) {
     return arch->Verify(backend, model, cache, draft, prefix_logits, anchor,
-                        hidden_out, capture_layers, capture, sampled);
-  }
-  const bool sample = sampled != nullptr && sampled->sampling != nullptr &&
-                      sampled->rng != nullptr;
-  std::vector<std::uint32_t> hist;
-  if (sample) {
-    hist.assign(sampled->history.begin(), sampled->history.end());
+                        hidden_out, capture_layers, capture);
   }
   DraftVerification result;
   if (anchor.has_value()) {
@@ -304,55 +297,18 @@ std::expected<DraftVerification, StatusCode> VerifyDraft(
   } else {
     result.logits.assign(prefix_logits.begin(), prefix_logits.end());
   }
-  const bool rejection =
-      sample && sampled->draft_probs != nullptr &&
-      sampled->draft_vocab == result.logits.size() &&
-      sampled->draft_probs->size() >= draft.size() * sampled->draft_vocab;
-  bool all = true;
-  for (std::size_t i = 0; i < draft.size(); ++i) {
-    const std::uint32_t token = draft[i];
-    if (rejection) {
-      const std::vector<double> target =
-          BuildDenseDistribution(result.logits, *sampled->sampling, hist);
-      const std::span<const double> q(
-          sampled->draft_probs->data() + i * sampled->draft_vocab,
-          sampled->draft_vocab);
-      const RejectionResult step =
-          RejectionStep(target, q, token, *sampled->rng);
-      if (!step.accepted) {
-        result.next_token = step.token;
-        all = false;
-        break;
-      }
-    } else {
-      const std::uint32_t y =
-          sample ? SampleToken(result.logits, *sampled->sampling, hist,
-                               *sampled->rng)
-                 : detail::ArgMax(result.logits);
-      if (y != token) {
-        result.next_token = y;
-        all = false;
-        break;
-      }
+  for (const std::uint32_t token : draft) {
+    if (detail::ArgMax(result.logits) != token) {
+      break;
     }
-    ++result.accepted;
-    hist.push_back(token);
     auto logits = DecodeLogits(backend, model, cache, token, hidden_out);
     if (!logits) {
       return std::unexpected(logits.error());
     }
     result.logits = std::move(*logits);
+    ++result.accepted;
   }
-  if (all) {
-    result.next_token =
-        rejection ? SampleFromDense(BuildDenseDistribution(result.logits,
-                                                           *sampled->sampling,
-                                                           hist),
-                                    *sampled->rng)
-        : sample  ? SampleToken(result.logits, *sampled->sampling, hist,
-                                *sampled->rng)
-                  : detail::ArgMax(result.logits);
-  }
+  result.next_token = detail::ArgMax(result.logits);
   return result;
 }
 

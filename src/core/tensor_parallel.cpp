@@ -61,7 +61,6 @@ struct TensorParallel::Impl {
   std::size_t hidden_dim = 0;
   std::size_t context = 0;
   KvCacheType kv_type = KvCacheType::F32;
-  bool kv_offload = false;
   std::vector<std::uint32_t> stops;
 
   // Fresh decode caches for every rank, so one generation starts at position
@@ -72,7 +71,6 @@ struct TensorParallel::Impl {
     for (std::size_t r = 0; r < ranks.size(); ++r) {
       auto cache = std::make_unique<core::DecodeCache>();
       cache->kv_type = options.kv_type;
-      cache->kv_offload = options.kv_offload;
       cache->tuning.mxfp4_split_target = options.mxfp4_split_target;
       cache->tuning.mxfp4_split_cap = options.mxfp4_split_cap;
       cache->tuning.attention_split = options.attention_split;
@@ -325,10 +323,7 @@ std::expected<GenerateOutcome, StatusCode> TensorParallel::Impl::RunSpeculative(
           // The batched prefill, now that ForwardBatch all-reduces across the
           // ranks: it captures the target hidden for a DFlash2 drafter and
           // drives the strategy's context append. MTP captures nothing.
-          /*single_token_prefill=*/false,
-          // The head is replicated, so every rank's logits are the full
-          // target distribution; a sampled verify stays in lockstep.
-          /*supports_sampled_verify=*/true);
+          /*single_token_prefill=*/false);
       const bool emit = (r == 0);
       auto streamed = [emit, &on_token, &stream_stopped](std::uint32_t token) {
         if (emit && !stream_stopped.load(std::memory_order_relaxed) &&
@@ -373,7 +368,6 @@ TensorParallel::Create(const TensorParallelOptions& options) {
   impl->hidden_dim = config->hidden_dim;
   impl->context = options.context;
   impl->kv_type = options.kv_type;
-  impl->kv_offload = options.kv_offload;
   impl->barrier.world = static_cast<int>(options.devices.size());
   const int world = static_cast<int>(options.devices.size());
   impl->ranks.reserve(options.devices.size());
@@ -472,7 +466,6 @@ std::expected<std::vector<std::uint32_t>, StatusCode> TensorParallel::Generate(
   GenerateOptions options;
   options.max_completion_tokens = max_tokens;
   options.kv_type = impl_->kv_type;
-  options.kv_offload = impl_->kv_offload;
   std::vector<std::uint32_t> produced;
   auto outcome =
       GenerateStreaming(prompt, options, [&produced](std::uint32_t token) {

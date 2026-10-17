@@ -249,8 +249,6 @@ std::expected<void, StatusCode> DecodeStepDeviceForward(
     state->kv.resize(cfg.layers);
     for (auto& kv : state->kv) {
       kv.type = cache.kv_type;
-      kv.memory =
-          cache.kv_offload ? MemoryKind::HostVisible : MemoryKind::Device;
     }
     cache.device = std::move(state);
   }

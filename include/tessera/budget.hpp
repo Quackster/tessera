@@ -99,11 +99,7 @@ struct GpuLayersAdvice {
   // Staging bytes at `best` (0 for the full upload).
   std::uint64_t staging_bytes = 0;
   // Cache bytes at context, with one MTP layer when strategy is "mtp".
-  // The total: the offloaded full-attention part still costs host RAM.
   std::uint64_t kv_bytes = 0;
-  // True when the full-attention KV cache is offloaded to system RAM, so
-  // only the linear state counts against the device budget.
-  bool kv_offload = false;
   // Device budget in bytes: free memory when the backend reports it, else
   // the device total (an upper bound; other processes may hold memory).
   std::uint64_t free_bytes = 0;
@@ -120,15 +116,12 @@ struct GpuLayersAdvice {
 // Recommend a `--gpu-layers` value for `path` at `context` with `kv_type`
 // against `free_bytes` of device memory. `strategy` is "mtp", "dflash2"
 // or "none" (the calibration label): it decides the MTP head and its KV
-// row. `kv_offload` keeps the full-attention KV cache in system RAM, so
-// only the linear state counts against the device. An estimate: weights
-// are exact, the cache follows the loader's growth, and a headroom
-// reserve covers the driver, the scratch and the draft.
-// FileNotFound/MalformedFile/UnsupportedFeature as MeasureWeights.
+// row. An estimate: weights are exact, the cache follows the loader's
+// growth, and a headroom reserve covers the driver, the scratch and the
+// draft. FileNotFound/MalformedFile/UnsupportedFeature as MeasureWeights.
 [[nodiscard]] std::expected<GpuLayersAdvice, StatusCode> RecommendGpuLayers(
     const std::string& path, std::size_t context, KvCacheType kv_type,
-    std::uint64_t free_bytes, const std::string& strategy,
-    bool kv_offload = false);
+    std::uint64_t free_bytes, const std::string& strategy);
 
 // Fit of one requested `--gpu-layers` value against device memory.
 struct GpuLayersFit {
@@ -139,11 +132,7 @@ struct GpuLayersFit {
   // Staging buffer bytes at the requested value (0 for the full upload).
   std::uint64_t staging_bytes = 0;
   // Cache bytes at context, with one MTP layer when strategy is "mtp".
-  // The total: the offloaded full-attention part still costs host RAM.
   std::uint64_t kv_bytes = 0;
-  // True when the full-attention KV cache is offloaded to system RAM, so
-  // only the linear state counts against the device budget.
-  bool kv_offload = false;
   // Device budget in bytes (free memory or the device total).
   std::uint64_t budget_bytes = 0;
   // True when budget_bytes is the device total, not current free memory.
@@ -156,9 +145,7 @@ struct GpuLayersFit {
 // `kv_type` against `budget_bytes` of device memory. `budget_bytes`
 // must be nonzero: pass free memory when the backend reports it, else
 // the device total (then budget_is_total is set). `strategy` is "mtp",
-// "dflash2" or "none". `kv_offload` keeps the full-attention KV cache in
-// system RAM, so only the linear state counts against the device. Same
-// errors as MeasureWeights.
+// "dflash2" or "none". Same errors as MeasureWeights.
 //
 // Usage:
 //   auto fit = FitGpuLayers(path, 4096, kv, free, "none", 20);
@@ -166,6 +153,6 @@ struct GpuLayersFit {
 [[nodiscard]] std::expected<GpuLayersFit, StatusCode> FitGpuLayers(
     const std::string& path, std::size_t context, KvCacheType kv_type,
     std::uint64_t budget_bytes, const std::string& strategy,
-    std::size_t gpu_layers, bool kv_offload = false);
+    std::size_t gpu_layers);
 
 }  // namespace tessera::core

@@ -44,15 +44,15 @@ The project author tests with a 7900 XTX and two R9700 cards. There is no recent
 | DFlash2 | Done | Draft forward built and running. 4.4 tokens/step on 27B MXFP4. |
 | CLI | Done | One flag set for `run`, `serve` and `calibrate`. Load, summary, streaming, sampling, serve, KV-cache flags, speculate, images, thinking flags, calibrate with an optional point limit and concurrent benchmark. `serve` honors every layout: replicas, `--pipeline`, `--tp`, `--cp`, `--spec-split` and `--hybrid`. |
 | Generation | Done | Greedy decode, chunked prefill, thinking budget, stop tokens, configurable KV cache. |
-| KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. `--kv-offload` keeps the full-attention cache in pinned system RAM so a long context fits on a small device. |
-| Sampling | Done | On by default with the model-card defaults (temperature, top_p, top_k, min_p, presence and repetition penalties). The HTTP API reads `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `repetition_penalty` and `seed` from each request; `temperature` 0 is greedy. The seed defaults to a fresh random value per request, and to random per run on the CLI. |
+| KV cache | Done | fp32/fp16/int8/4-bit/FP8 E4M3 on both backends. Row-parallel quant kernel. |
+| Sampling | Done | Seeded sampling with Qwen 27B defaults. |
 | GEMM | Done | Q4_K to IQ, FP8/MXFP4, bf16, fp32. Tensor core paths for decode and verify. |
 | Activation quant | Done | Per-token FP8 E4M3 quant-dequant. W4A8 opt-in. |
 | Attention and RoPE | Done | GQA, tiled attention, all KV variants. Split key range for single token. |
 | Weight upload | Done | Manifest to device buffers. One batched upload per load. |
 | Decode loop | Done | Single-token vanilla and hybrid GGUF loops. |
 | Hybrid SSM | Done | Load, kernels, both decode paths, MTP head done. |
-| Speculative decode | Done | MTP and DFlash2 end to end. Greedy output equals greedy without speculation; a sampled request keeps the drafter and uses rejection sampling (the drafter samples from its own distribution and the verifier accepts with min(1, p/q), resampling from the residual on rejection), so the output stays lossless for the target distribution. GGUF MTP reaches 31-37 tok/s on the 27B target (ROCm); rejection lifts acceptance to about 0.9. DFlash2 about 60 vs 23 tok/s. |
+| Speculative decode | Done | MTP and DFlash2 end to end. Output equals greedy. GGUF MTP reaches 31-37 tok/s on the 27B target (ROCm). DFlash2 about 60 vs 23 tok/s. |
 | MXFP4 path | Done | Parse, kernels, HF config, tokenizer. Matches GGUF greedy output. |
 | DFlash2 decode | Partial | Real draft end to end. 3.5 to 4.4 tokens/step. Two defects fixed. |
 | Baseline pinning | Done | Fixed-seed fixtures identical on Vulkan and ROCm. |
@@ -74,21 +74,19 @@ Here's an example of an SVG generation:
 
 ## Two R9700s with Qwen3.8-Flash-Next MTP
 
-Two AMD Radeon AI PRO R9700 cards and 64 GB of DDR4 system RAM run the Qwen3.8-Flash-Next IQ3_S target with MTP speculation on a layer split. This configuration works without Resizable BAR. Expect about 13 tokens per second.
+Two AMD Radeon AI PRO R9700 cards run the Qwen3.8-Flash-Next IQ3_S target with MTP speculation on a layer split. This configuration works without Resizable BAR.
 
 Without Resizable BAR the BAR window is small. Tessera keeps part of each stage in system RAM and pages the rest on demand. `--gpu-layers 24` sizes the resident part so the last stage also fits the output head, the token embedding, and the MTP head. `--pipeline-split 24,24` puts 24 trunk blocks on each card.
 
-Example launch command:
-
 ```sh
-./tessera-cli serve \
+./cmake-build-rocm/tessera-cli run \
   --model ~/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf \
   --mtp ~/models/Qwen3.8-Flash-Next-MTP \
   --speculate --pipeline --pipeline-split 24,24 --gpus 0,1 \
   --context 262144 --kv-q8 --gpu-layers 24
 ```
 
-The serve command starts the HTTP server, and every served turn uses MTP speculation. On this machine decode runs about 13 tokens per second. The MTP head needs no draft checkpoint. `--speculate` drafts from the head in `--mtp`.
+The run prefills the whole prompt, streams each output token, and stops at the declared stop token. On this machine MTP decode runs about 12 tokens per second. The MTP head needs no draft checkpoint. `--speculate` drafts from the head in `--mtp`.
 
 ## One R9700 with Qwen3.8-27B MTP and DFlash2
 
@@ -236,8 +234,6 @@ The `calibrate` flags:
   single-device sweep.
 * `--kv-f16`, `--kv-q8`, `--kv-q4`, `--kv-fp8` KV cache type. Default int8
   (kv8).
-* `--kv-offload` is not honored. Calibration sizes the device-resident
-  cache. `calibrate` warns and ignores the flag.
 * `--prompts <file>` fixed prompts, one per non-empty line. Default three
   fixed prompts.
 * `--calibrate-limit <n>` measure at most n sweep points in total, in
@@ -476,19 +472,18 @@ The first argument selects the mode: `run` decodes a prompt, `serve` starts the 
 | `--reasoning-effort <level>` | run, serve | xhigh | Thinking difficulty for the chat template. Ignored with `--no-chat`. `serve` uses it as the request default. |
 | `--speculate` | both | off | MTP speculative decode from the target head. Needs no checkpoint. |
 | `--mtp <dir>` | both | unset | Directory of a separately fetched MTP head (from `tessera-cli fetch-mtp`) for a model whose GGUF ships none, such as the Flash-Next target. |
-| `--sample` | run | on | Sampling is on by default; this flag is a no-op. Set `--temperature 0` for greedy decode. |
-| `--temperature <f>` | run | 0.6 | Sampling temperature. 0 decodes greedily. |
+| `--sample` | run | off | Sample instead of greedy decode. |
+| `--temperature <f>` | run | 0.6 | Sampling temperature. |
 | `--top-p <f>` | run | 0.95 | Nucleus probability. |
 | `--top-k <n>` | run | 20 | Keep the top n tokens. |
 | `--min-p <f>` | run | 0.0 | Minimum probability. |
 | `--presence-penalty <f>` | run | 0.0 | Presence penalty. |
 | `--repetition-penalty <f>` | run | 1.0 | Repetition penalty. |
-| `--seed <n>` | run | random | Sampling RNG seed. A run without it draws a fresh random seed. |
+| `--seed <n>` | run | 0 | Sampling RNG seed. |
 | `--kv-f16` | run | off | Store the KV cache in fp16. |
 | `--kv-q8` | run | off | Store the KV cache in int8. |
 | `--kv-q4` | run | off | Store the KV cache in 4-bit. |
 | `--kv-fp8` | run | off | Store the KV cache in FP8 E4M3. |
-| `--kv-offload` | both | off | Keep the full-attention KV cache in pinned system RAM instead of device memory. The attention kernels read the cache over the host mapping, so a long context fits on a small device. `calibrate` warns and ignores the flag. |
 | `--host <ip>` | serve | 127.0.0.1 | Bind address. |
 | `--port <n>` | serve | 8080 | Bind port. |
 | `--stats-interval <s>` | serve | 5 | Live tok/s cadence on streams and console. 0 disables. |

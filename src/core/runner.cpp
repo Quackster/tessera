@@ -26,13 +26,12 @@ SingleDeviceRunner::SingleDeviceRunner(std::unique_ptr<Engine> engine,
                                        std::unique_ptr<Model> model,
                                        int device_index,
                                        CalibrationConfig calibration,
-                                       KvCacheType kv_type, bool kv_offload)
+                                       KvCacheType kv_type)
     : engine_(std::move(engine)),
       model_(std::move(model)),
       device_index_(device_index),
       calibration_(std::move(calibration)),
-      kv_type_(kv_type),
-      kv_offload_(kv_offload) {
+      kv_type_(kv_type) {
   scheduler_ = std::make_unique<Scheduler>(*engine_, *model_, mutex_,
                                            SchedulerOptions{});
 }
@@ -59,10 +58,6 @@ const CalibrationConfig& SingleDeviceRunner::calibration() const {
 
 KvCacheType SingleDeviceRunner::kv_type() const {
   return kv_type_;
-}
-
-bool SingleDeviceRunner::kv_offload() const {
-  return kv_offload_;
 }
 
 bool SingleDeviceRunner::is_split() const {
@@ -92,12 +87,11 @@ std::size_t SingleDeviceRunner::SchedulerPending() const {
 
 PipelineRunner::PipelineRunner(std::unique_ptr<Pipeline> pipeline,
                                int device_index, CalibrationConfig calibration,
-                               KvCacheType kv_type, bool kv_offload)
+                               KvCacheType kv_type)
     : pipeline_(std::move(pipeline)),
       device_index_(device_index),
       calibration_(std::move(calibration)),
-      kv_type_(kv_type),
-      kv_offload_(kv_offload) {
+      kv_type_(kv_type) {
   if (pipeline_ != nullptr && pipeline_->StageCount() > 0) {
     facade_engine_ = &pipeline_->StageEngine(0);
     facade_model_ = &pipeline_->StageModel(0);
@@ -126,10 +120,6 @@ const CalibrationConfig& PipelineRunner::calibration() const {
 
 KvCacheType PipelineRunner::kv_type() const {
   return kv_type_;
-}
-
-bool PipelineRunner::kv_offload() const {
-  return kv_offload_;
 }
 
 bool PipelineRunner::is_split() const {
@@ -259,13 +249,11 @@ class SpecSplitDriver final : public SplitDriver {
 class ParallelRunner final : public Runner {
  public:
   ParallelRunner(std::unique_ptr<SplitDriver> driver, int device_index,
-                 CalibrationConfig calibration, KvCacheType kv_type,
-                 bool kv_offload)
+                 CalibrationConfig calibration, KvCacheType kv_type)
       : driver_(std::move(driver)),
         device_index_(device_index),
         calibration_(std::move(calibration)),
-        kv_type_(kv_type),
-        kv_offload_(kv_offload) {}
+        kv_type_(kv_type) {}
 
   Engine& engine() const override { return driver_->engine(); }
   Model& model() const override { return driver_->model(); }
@@ -273,7 +261,6 @@ class ParallelRunner final : public Runner {
   int device_index() const override { return device_index_; }
   const CalibrationConfig& calibration() const override { return calibration_; }
   KvCacheType kv_type() const override { return kv_type_; }
-  bool kv_offload() const override { return kv_offload_; }
   bool is_split() const override { return true; }
   bool CanSchedule(const GenerateOptions& options) const override {
     (void)options;
@@ -311,35 +298,33 @@ class ParallelRunner final : public Runner {
   int device_index_ = 0;
   CalibrationConfig calibration_;
   KvCacheType kv_type_ = KvCacheType::F32;
-  bool kv_offload_ = false;
 };
 
 }  // namespace
 
 std::unique_ptr<Runner> MakeTensorParallelRunner(
     std::unique_ptr<TensorParallel> layout, int device_index,
-    CalibrationConfig calibration, KvCacheType kv_type, bool kv_offload) {
+    CalibrationConfig calibration, KvCacheType kv_type) {
   return std::make_unique<ParallelRunner>(
       std::make_unique<TensorParallelDriver>(std::move(layout)), device_index,
-      std::move(calibration), kv_type, kv_offload);
+      std::move(calibration), kv_type);
 }
 
 std::unique_ptr<Runner> MakeContextParallelRunner(
     std::unique_ptr<ContextParallel> layout, int device_index,
-    CalibrationConfig calibration, KvCacheType kv_type, bool kv_offload) {
+    CalibrationConfig calibration, KvCacheType kv_type) {
   return std::make_unique<ParallelRunner>(
       std::make_unique<ContextParallelDriver>(std::move(layout)), device_index,
-      std::move(calibration), kv_type, kv_offload);
+      std::move(calibration), kv_type);
 }
 
 std::unique_ptr<Runner> MakeSpecSplitRunner(std::unique_ptr<SpecSplit> layout,
                                             int device_index,
                                             CalibrationConfig calibration,
-                                            KvCacheType kv_type,
-                                            bool kv_offload) {
+                                            KvCacheType kv_type) {
   return std::make_unique<ParallelRunner>(
       std::make_unique<SpecSplitDriver>(std::move(layout)), device_index,
-      std::move(calibration), kv_type, kv_offload);
+      std::move(calibration), kv_type);
 }
 
 RunnerLease::RunnerLease(Runner& runner, std::unique_lock<std::mutex> lock)

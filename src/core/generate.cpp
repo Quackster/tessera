@@ -74,7 +74,6 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
     const std::function<bool(std::uint32_t)>& on_token) {
   core::DecodeCache cache;
   cache.kv_type = options.kv_type;
-  cache.kv_offload = options.kv_offload;
   cache.tuning.mxfp4_split_target = options.mxfp4_split_target;
   cache.tuning.mxfp4_split_cap = options.mxfp4_split_cap;
   cache.tuning.attention_split = options.attention_split;
@@ -85,9 +84,7 @@ std::expected<GenerateOutcome, StatusCode> Engine::GenerateStreaming(
   cache.profile = profiling ? &profile : nullptr;
   core::SingleDeviceTarget target(*backend_, model, cache, diagnostics_,
                                   prefill_chunk_tokens_,
-                                  profiling ? &profile : nullptr,
-                                  /*single_token_prefill=*/false,
-                                  /*supports_sampled_verify=*/true);
+                                  profiling ? &profile : nullptr);
   return core::RunDecode(target, speculative_.get(), options, on_token);
 }
 

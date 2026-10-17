@@ -55,7 +55,6 @@ Engine::GenerateBatch(Model& model, std::span<const GenerateOptions> requests) {
     const GenerateOptions& options = requests[i];
     BatchSequence& sequence = sequences[i];
     sequence.cache.kv_type = options.kv_type;
-    sequence.cache.kv_offload = options.kv_offload;
     sequence.cache.tuning.mxfp4_split_target = options.mxfp4_split_target;
     sequence.cache.tuning.mxfp4_split_cap = options.mxfp4_split_cap;
     sequence.cache.tuning.attention_split = options.attention_split;

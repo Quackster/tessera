@@ -30,7 +30,6 @@ struct Hybrid::Impl {
   HybridMpKind mp_kind = HybridMpKind::Tensor;
   std::size_t context = 0;
   KvCacheType kv_type = KvCacheType::F32;
-  bool kv_offload = false;
 };
 
 Hybrid::Hybrid(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -77,7 +76,6 @@ std::expected<std::unique_ptr<Hybrid>, StatusCode> Hybrid::Create(
   impl->mp_kind = options.mp_kind;
   impl->context = options.context;
   impl->kv_type = options.kv_type;
-  impl->kv_offload = options.kv_offload;
   impl->groups.reserve(groups->size());
   for (const HybridGroupDevices& group_devices : *groups) {
     Impl::Group group;
@@ -103,7 +101,6 @@ std::expected<std::unique_ptr<Hybrid>, StatusCode> Hybrid::Create(
       tp_options.devices = group_devices.devices;
       tp_options.context = options.context;
       tp_options.kv_type = options.kv_type;
-      tp_options.kv_offload = options.kv_offload;
       auto tp = TensorParallel::Create(tp_options);
       if (!tp) {
         return std::unexpected(tp.error());
@@ -115,7 +112,6 @@ std::expected<std::unique_ptr<Hybrid>, StatusCode> Hybrid::Create(
       cp_options.devices = group_devices.devices;
       cp_options.context = options.context;
       cp_options.kv_type = options.kv_type;
-      cp_options.kv_offload = options.kv_offload;
       auto cp = ContextParallel::Create(cp_options);
       if (!cp) {
         return std::unexpected(cp.error());
@@ -150,7 +146,6 @@ Hybrid::GenerateMany(std::span<const std::vector<std::uint32_t>> prompts,
         options.prompt_tokens = prompts[g];
         options.max_completion_tokens = max_tokens;
         options.kv_type = impl_->kv_type;
-        options.kv_offload = impl_->kv_offload;
         outputs[g] = group.engine->Generate(*group.model, options);
       }
     });

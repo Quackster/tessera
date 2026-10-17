@@ -293,12 +293,9 @@ void SessionHandler::RunTurn(RunnerLease* lease,
   // unlimited turn would never fit the device.
   options.kv_type =
       lease != nullptr ? lease->runner().kv_type() : pool_.At(0).kv_type();
-  options.kv_offload = lease != nullptr ? lease->runner().kv_offload()
-                                        : pool_.At(0).kv_offload();
   if (lease != nullptr) {
     ApplyToGenerateOptions(lease->runner().calibration(), options);
   }
-  ApplyRequestSampling(request, &options);
   ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
   std::string reasoning_text;
   std::string content_text;
@@ -514,8 +511,7 @@ void SessionHandler::HandleChat(ResponseWriter& writer, std::string_view id,
     MaybeAutoTitle(pool_, session, auto_title_);
   } else {
     MaybeAutoTitle(slot->engine(), slot->model(), tokenizer_, session,
-                   auto_title_, slot->runner().kv_type(),
-                   slot->runner().kv_offload());
+                   auto_title_, slot->runner().kv_type());
   }
   const std::string title = session->View().title;
   RunTurn(slot, session, writer, body,

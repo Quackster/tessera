@@ -28,13 +28,11 @@ namespace serve {
 // model for a short title when enabled (call with the session turn and
 // the device slot held), else fall back to the first user line. No-op
 // unless the title is still the default; never touches a renamed
-// session or the history. `kv_type` is the runner's KV storage type and
-// `kv_offload` its KV cache location, read onto the title request like
-// every other serve turn.
+// session or the history. `kv_type` is the runner's KV storage type,
+// read onto the title request like every other serve turn.
 void MaybeAutoTitle(Engine& engine, Model& model, const Tokenizer& tokenizer,
                     const std::shared_ptr<Session>& session, bool enabled,
-                    KvCacheType kv_type = KvCacheType::F32,
-                    bool kv_offload = false);
+                    KvCacheType kv_type = KvCacheType::F32);
 
 // Pool form of the above: titles through the shared scheduler when
 // the engine allows it, else a brief exclusive lease. Same result.

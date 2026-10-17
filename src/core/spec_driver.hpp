@@ -63,20 +63,10 @@ class SpecTarget {
 
   // Verify a draft against the target: the anchor (when set) leads the
   // batch; `hidden`, when non-null, receives the last accepted row's hidden.
-  // When `sampled` is non-null the target draws its token per row and
-  // matches it (see SampledVerify), so the accepted prefix equals plain
-  // sampling for the same seed.
   virtual std::expected<DraftVerification, StatusCode> Verify(
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits,
-      std::optional<std::uint32_t> anchor, std::vector<float>* hidden,
-      const SampledVerify* sampled) = 0;
-
-  // True when Verify honors a non-null `sampled` (a sampled request can
-  // still run the drafter). False (the default) means the target only
-  // verifies greedily, so the driver drops the strategy for a sampled
-  // request and samples without it.
-  [[nodiscard]] virtual bool SupportsSampledVerify() const { return false; }
+      std::optional<std::uint32_t> anchor, std::vector<float>* hidden) = 0;
 
   // Report the target's per-cache and profiler diagnostics after the loop.
   // `loop_steps` is the decode loop's step count for the profiler.

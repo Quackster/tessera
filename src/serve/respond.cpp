@@ -1,7 +1,6 @@
 #include "serve/respond.hpp"
 
 #include <chrono>
-#include <cstdint>
 #include <string>
 
 #include "tessera/serve.hpp"
@@ -66,56 +65,6 @@ std::size_t MaxCompletionTokensFrom(const core::Json& body,
 
 std::size_t MaxThinkingTokensFrom(const core::Json& body) {
   return PositiveTokenBudget(body, "max_thinking_tokens");
-}
-
-namespace {
-
-// The number under `name`, else nullptr. A missing field or a
-// non-number reads as absent.
-const core::Json* NumberField(const core::Json& body, std::string_view name) {
-  const core::Json* value = body.Find(name);
-  if (value != nullptr && value->type() == core::Json::Type::Number) {
-    return value;
-  }
-  return nullptr;
-}
-
-}  // namespace
-
-void ApplyRequestSampling(const core::Json& body, GenerateOptions* options) {
-  const core::Json* temperature = NumberField(body, "temperature");
-  const core::Json* top_p = NumberField(body, "top_p");
-  const core::Json* top_k = NumberField(body, "top_k");
-  const core::Json* min_p = NumberField(body, "min_p");
-  const core::Json* presence = NumberField(body, "presence_penalty");
-  const core::Json* repetition = NumberField(body, "repetition_penalty");
-  const core::Json* seed = NumberField(body, "seed");
-  // Sampling is the default; the request fields override the struct's
-  // model-card defaults. temperature 0 keeps the greedy argmax.
-  options->sample = true;
-  if (temperature != nullptr) {
-    options->sampling.temperature = static_cast<float>(temperature->AsNumber());
-  }
-  if (top_p != nullptr) {
-    options->sampling.top_p = static_cast<float>(top_p->AsNumber());
-  }
-  if (top_k != nullptr && top_k->AsNumber() >= 0.0) {
-    options->sampling.top_k = static_cast<int>(top_k->AsNumber());
-  }
-  if (min_p != nullptr) {
-    options->sampling.min_p = static_cast<float>(min_p->AsNumber());
-  }
-  if (presence != nullptr) {
-    options->sampling.presence_penalty =
-        static_cast<float>(presence->AsNumber());
-  }
-  if (repetition != nullptr) {
-    options->sampling.repetition_penalty =
-        static_cast<float>(repetition->AsNumber());
-  }
-  options->seed = seed != nullptr && seed->AsNumber() >= 0.0
-                      ? static_cast<std::uint64_t>(seed->AsNumber())
-                      : RandomSeed();
 }
 
 std::string SessionIdFrom(const core::Json& body) {

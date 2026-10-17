@@ -21,16 +21,14 @@ SingleDeviceTarget::SingleDeviceTarget(Backend& backend, Model& model,
                                        log::Diagnostics& diagnostics,
                                        std::size_t prefill_chunk,
                                        Profile* profile,
-                                       bool single_token_prefill,
-                                       bool supports_sampled_verify)
+                                       bool single_token_prefill)
     : backend_(backend),
       model_(model),
       cache_(cache),
       diagnostics_(diagnostics),
       prefill_chunk_(prefill_chunk),
       profile_(profile),
-      single_token_prefill_(single_token_prefill),
-      supports_sampled_verify_(supports_sampled_verify) {}
+      single_token_prefill_(single_token_prefill) {}
 
 std::expected<void, StatusCode> SingleDeviceTarget::Prepare(
     SpeculativeStrategy* strategy, const GenerateOptions& options) {
@@ -160,14 +158,14 @@ std::expected<std::vector<float>, StatusCode> SingleDeviceTarget::LogitsStep(
 std::expected<DraftVerification, StatusCode> SingleDeviceTarget::Verify(
     std::span<const std::uint32_t> draft,
     std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
-    std::vector<float>* hidden, const SampledVerify* sampled) {
+    std::vector<float>* hidden) {
   core::PhaseScope scope(profile_, core::Phase::kVerify);
   const std::vector<std::size_t>* layers =
       capture_layers_.empty() ? nullptr : &capture_layers_;
   std::vector<Buffer*>* buffers =
       capture_layers_.empty() ? nullptr : &capture_buffers_;
   return core::VerifyDraft(backend_, model_, cache_, draft, prefix_logits,
-                           anchor, hidden, layers, buffers, sampled);
+                           anchor, hidden, layers, buffers);
 }
 
 void SingleDeviceTarget::ReportDiagnostics(std::size_t loop_steps) {

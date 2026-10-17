@@ -181,11 +181,6 @@ struct DecodeCache {
   // Storage type of the full-attention KV cache (default fp32). Set
   // before the first step.
   KvCacheType kv_type = KvCacheType::F32;
-  // Keep the full-attention KV cache in pinned system RAM instead of
-  // device memory (default false). The attention kernels read the cache
-  // over the host mapping, so a long context costs no VRAM. Set before
-  // the first step.
-  bool kv_offload = false;
   // Request tuning the architecture module reads from its state (copied
   // when the state is created). Set before the first step.
   RequestTuning tuning;
@@ -219,9 +214,6 @@ struct DeviceDecodeState {
     // one row instead of reallocating the whole cache.
     std::size_t capacity = 0;
     KvCacheType type = KvCacheType::F32;
-    // Where the rows live: Device, or HostVisible when the cache is
-    // offloaded to system RAM.
-    MemoryKind memory = MemoryKind::Device;
   };
   std::unique_ptr<Kernel> rmsnorm_kernel;
   std::unique_ptr<Kernel> add_kernel;
@@ -278,13 +270,11 @@ struct DeviceDecodeState {
 // architecture module, which fuses the token embedding and the backbone
 // hidden (`hidden`, hidden_dim floats), runs its draft block and returns
 // the drafted token. `pos` is the sequence position for the draft block's
-// RoPE. `logits_out`, when non-null, receives the draft's vocab-wide
-// logits. UnsupportedFeature when the architecture has no draft head.
+// RoPE. UnsupportedFeature when the architecture has no draft head.
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> MtpDraftStep(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-    std::vector<float>* mtp_hidden_out = nullptr,
-    std::vector<float>* logits_out = nullptr);
+    std::vector<float>* mtp_hidden_out = nullptr);
 
 // The full vocab logits for one device-resident vanilla step.
 [[nodiscard]] std::expected<std::vector<float>, StatusCode>
@@ -384,10 +374,7 @@ using PrefillProgress = std::function<void(std::size_t, std::size_t)>;
 // accepted drafts, `prefix_logits` is ignored, and row 0 of `capture` is
 // the anchor's hidden. When `hidden_out` is non-null it receives the final
 // hidden state of the last accepted token (unchanged when nothing is
-// accepted), so an MTP drafter can chain on it. When `sampled` is non-null
-// the target draws its token per row and matches it instead of the argmax
-// (see SampledVerify); the output then equals plain sampling for the same
-// seed.
+// accepted), so an MTP drafter can chain on it.
 [[nodiscard]] std::expected<DraftVerification, StatusCode> VerifyDraft(
     Backend& backend, const Model& model, DecodeCache& cache,
     std::span<const std::uint32_t> draft,
@@ -395,7 +382,6 @@ using PrefillProgress = std::function<void(std::size_t, std::size_t)>;
     std::optional<std::uint32_t> anchor = std::nullopt,
     std::vector<float>* hidden_out = nullptr,
     const std::vector<std::size_t>* capture_layers = nullptr,
-    std::vector<Buffer*>* capture = nullptr,
-    const SampledVerify* sampled = nullptr);
+    std::vector<Buffer*>* capture = nullptr);
 
 }  // namespace tessera::core

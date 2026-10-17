@@ -34,8 +34,7 @@ namespace tessera::models::qwen4exp {
 [[nodiscard]] std::expected<std::uint32_t, StatusCode> RunMtpDraft(
     Backend& backend, const Model& model, const TransformerConfig& cfg,
     const Qwen4ExpGeometry& g, Qwen4ExpState& h, std::span<const float> hidden,
-    std::uint32_t token, std::uint64_t pos, std::vector<float>* mtp_hidden_out,
-    std::vector<float>* logits_out = nullptr);
+    std::uint32_t token, std::uint64_t pos, std::vector<float>* mtp_hidden_out);
 
 // Committed MTP KV rows, for the strategy's truncation after a verify.
 [[nodiscard]] std::size_t MtpDraftRows(const Qwen4ExpState& h);

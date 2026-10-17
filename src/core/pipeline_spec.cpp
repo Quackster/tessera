@@ -15,7 +15,6 @@
 #include "core/decode.hpp"
 #include "core/decode_internal.hpp"
 #include "core/pipeline_impl.hpp"
-#include "core/sampling.hpp"
 #include "core/spec_driver.hpp"
 #include "tessera/architecture.hpp"
 #include "tessera/backend.hpp"
@@ -133,22 +132,20 @@ struct Pipeline::Impl::Target : public core::SpecTarget {
   std::expected<DraftVerification, StatusCode> Verify(
       std::span<const std::uint32_t> draft,
       std::span<const float> prefix_logits, std::optional<std::uint32_t> anchor,
-      std::vector<float>* hidden, const SampledVerify* sampled) override {
+      std::vector<float>* hidden) override {
     const std::size_t prefix = position_;
     const std::vector<std::size_t>* cap =
         capture_layers_.empty() ? nullptr : &capture_layers_;
     std::vector<Buffer*>* cap_out =
         capture_layers_.empty() ? nullptr : &capture_buffers_;
     auto verified = impl_.VerifyBatch(draft, prefix_logits, anchor, hidden,
-                                      prefix, cap, cap_out, sampled);
+                                      prefix, cap, cap_out);
     if (!verified) {
       return std::unexpected(verified.error());
     }
     position_ += (anchor.has_value() ? 1 : 0) + verified->accepted;
     return verified;
   }
-
-  [[nodiscard]] bool SupportsSampledVerify() const override { return true; }
 
   void ReportDiagnostics(std::size_t loop_steps) override {
     (void)loop_steps;
@@ -306,12 +303,11 @@ std::expected<void, StatusCode> Pipeline::Impl::ForwardRows(
   return {};
 }
 
-  std::expected<DraftVerification, StatusCode> Pipeline::Impl::VerifyBatch(
-      std::span<const std::uint32_t> draft, std::span<const float> prefix_logits,
-      std::optional<std::uint32_t> anchor, std::vector<float>* hidden_out,
-      std::size_t prefix_position,
-      const std::vector<std::size_t>* capture_layers,
-      const std::vector<Buffer*>* capture_out, const SampledVerify* sampled) {
+std::expected<DraftVerification, StatusCode> Pipeline::Impl::VerifyBatch(
+    std::span<const std::uint32_t> draft, std::span<const float> prefix_logits,
+    std::optional<std::uint32_t> anchor, std::vector<float>* hidden_out,
+    std::size_t prefix_position, const std::vector<std::size_t>* capture_layers,
+    const std::vector<Buffer*>* capture_out) {
   const std::size_t lead = anchor.has_value() ? 1 : 0;
   std::vector<std::uint32_t> tokens;
   tokens.reserve(draft.size() + lead);
@@ -342,50 +338,7 @@ std::expected<void, StatusCode> Pipeline::Impl::ForwardRows(
   const auto logits_row = [&](std::size_t row) {
     return std::span<const float>(flat.data() + row * vocab, vocab);
   };
-  const bool sample = sampled != nullptr && sampled->sampling != nullptr &&
-                      sampled->rng != nullptr;
-  if (sample) {
-    // Score each row against the target. A draft distribution selects
-    // rejection sampling; otherwise the target's drawn token is matched.
-    const bool rejection =
-        sampled->draft_probs != nullptr && sampled->draft_vocab == vocab &&
-        sampled->draft_probs->size() >= draft.size() * vocab;
-    const auto row_logits = [&](std::size_t i) -> std::span<const float> {
-      if (lead == 1) {
-        return logits_row(i);
-      }
-      return i == 0 ? prefix_logits : logits_row(i - 1);
-    };
-    const auto bonus_logits = [&]() -> std::span<const float> {
-      return lead == 1 ? logits_row(draft.size())
-                       : logits_row(draft.size() - 1);
-    };
-    core::SampledMatch match;
-    if (rejection) {
-      const std::vector<double>& q = *sampled->draft_probs;
-      match = core::AcceptRejectionPrefix(
-          draft, sampled->history, *sampled->rng,
-          [&](std::size_t i, std::span<const std::uint32_t> hist) {
-            return core::BuildDenseDistribution(row_logits(i),
-                                                *sampled->sampling, hist);
-          },
-          [&](std::size_t i) {
-            return std::span<const double>(q.data() + i * vocab, vocab);
-          },
-          [&](std::span<const std::uint32_t> hist) {
-            return core::BuildDenseDistribution(bonus_logits(),
-                                                *sampled->sampling, hist);
-          });
-    } else {
-      match = core::AcceptSampledPrefix(
-          draft, *sampled->sampling, sampled->history, *sampled->rng,
-          [&](std::size_t i) { return row_logits(i); },
-          [&] { return bonus_logits(); });
-    }
-    accepted = match.accepted;
-    result.accepted = accepted;
-    result.next_token = match.next_token;
-  } else if (lead == 1) {
+  if (lead == 1) {
     for (std::size_t i = 0; i < draft.size(); ++i) {
       if (core::detail::ArgMax(logits_row(i)) != draft[i]) {
         break;

@@ -28,7 +28,7 @@ using core::detail::UploadF32;
 std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
     Backend& backend, const Model& model, core::DecodeCache& cache,
     std::span<const float> hidden, std::uint32_t token, std::uint64_t pos,
-    std::vector<float>* mtp_hidden_out, std::vector<float>* logits_out) const {
+    std::vector<float>* mtp_hidden_out) const {
     auto config = model.Config();
     if (!config) {
       return std::unexpected(config.error());
@@ -133,15 +133,6 @@ std::expected<std::uint32_t, StatusCode> Qwen35Architecture::Draft(
       }
       if (profile != nullptr) {
         backend.Synchronize();
-      }
-    }
-    // The draft's full distribution, for a sampled draft that keeps q.
-    if (logits_out != nullptr) {
-      logits_out->resize(cfg.vocab_size);
-      if (!backend.CopyD2H(*h.logits,
-                           reinterpret_cast<std::byte*>(logits_out->data()),
-                           logits_out->size() * 4)) {
-        return std::unexpected(StatusCode::DeviceError);
       }
     }
     // Argmax over the shared-head logits on the device. Prefer an on-device
