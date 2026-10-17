@@ -39,14 +39,17 @@ using ToolGenerate = std::function<std::expected<GenerateOutcome, StatusCode>(
 
 // Run one tool-aware chat turn and write the OpenAI chat response
 // (buffered or SSE). Falls back to a plain text answer when the model
-// emits no tool call. `generate` runs the turn on the serving backend
-// (single device or layer split); `model` backs the chat template and the
-// context limit. `kv_type` is the runner's KV storage type, read onto the
-// request like every other serve turn. `out_turn` (null to skip) receives
-// the assistant turn for session history: text content, reasoning and the
-// OpenAI-form tool_calls dump. True when the turn generated (and
-// `out_turn`, when given, is valid); the error response is already sent
-// otherwise.
+// emits no tool call. SSE responses stream live: reasoning while the
+// thinking block is open, then the answer text, then each completed
+// tool call, as the splitter resolves them; the buffered response
+// writes the same split in one shot. `generate` runs the turn on the
+// serving backend (single device or layer split); `model` backs the chat
+// template and the context limit. `kv_type` is the runner's KV storage
+// type, read onto the request like every other serve turn. `out_turn`
+// (null to skip) receives the assistant turn for session history: text
+// content, reasoning and the OpenAI-form tool_calls dump. True when the
+// turn generated (and `out_turn`, when given, is valid); the error
+// response is already sent otherwise.
 [[nodiscard]] bool ChatWithTools(const ToolGenerate& generate, Model& model,
                                  const Tokenizer& tokenizer,
                                  ResponseWriter& writer, const core::Json& body,

@@ -68,6 +68,53 @@ class ThinkStreamer {
   std::string emitted_content_;
 };
 
+// Incremental scanner for the model's <tool_call> blocks. Feed
+// think-stripped text in order; text before the first opener streams
+// through as it arrives, each block parses once its closer is seen,
+// and text from the first opener on is dropped (a malformed or
+// unclosed block contributes nothing). A trailing fragment that may
+// still grow into an opener is withheld until it resolves, so block
+// markup never leaks into the content text. Feeding a whole turn and
+// calling Finish yields the same text and calls as ParseToolCalls.
+class ToolCallStreamer {
+ public:
+  struct Deltas {
+    std::string text;
+    std::vector<ToolCall> calls;
+  };
+  [[nodiscard]] Deltas Push(std::string_view piece);
+  [[nodiscard]] Deltas Finish();
+
+ private:
+  std::string pending_;
+  bool saw_opener_ = false;
+  std::size_t parsed_ = 0;
+};
+
+// Incremental reply splitter for the tool-aware streaming path:
+// reasoning follows ThinkStreamer (thinking streams live), content is
+// the tool-scanner text, and each tool call is reported once, in
+// order. Pushing a whole turn and calling Finish yields the same
+// reasoning, content and calls as ParseToolCalls.
+class ReplyStreamer {
+ public:
+  explicit ReplyStreamer(bool think_expected);
+  struct Deltas {
+    std::string reasoning;
+    std::string content;
+    std::vector<ToolCall> calls;
+    // Append another delta set (a Finish tail into the running total):
+    // text joins, calls move in order.
+    void Append(Deltas&& other);
+  };
+  [[nodiscard]] Deltas Push(std::string_view piece);
+  [[nodiscard]] Deltas Finish();
+
+ private:
+  ThinkStreamer think_;
+  ToolCallStreamer scan_;
+};
+
 // The tool list from the request body to render, or nullptr for none.
 // Sets `error` when `tools` is not an array or `tool_choice` is neither
 // a string nor an object.

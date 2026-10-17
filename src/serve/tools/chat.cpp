@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -25,18 +26,28 @@ namespace {
 
 constexpr char kChatId[] = "chatcmpl-0";
 
+// One OpenAI tool_calls entry; streaming entries carry the array index
+// (non-streaming message entries do not).
+core::Json ToolCallJson(const ToolCall& call, bool with_index,
+                        std::size_t index) {
+  core::Json function = core::Json::Object();
+  function.Set("name", core::Json::String(call.name));
+  function.Set("arguments", core::Json::String(call.arguments));
+  core::Json entry = core::Json::Object();
+  if (with_index) {
+    entry.Set("index", core::Json::Number(static_cast<double>(index)));
+  }
+  entry.Set("id", core::Json::String(call.id));
+  entry.Set("type", core::Json::String("function"));
+  entry.Set("function", std::move(function));
+  return entry;
+}
+
 // OpenAI tool_calls array for the parsed model calls.
 core::Json ToolCallsJson(const std::vector<ToolCall>& calls) {
   core::Json items = core::Json::Array();
   for (const ToolCall& call : calls) {
-    core::Json function = core::Json::Object();
-    function.Set("name", core::Json::String(call.name));
-    function.Set("arguments", core::Json::String(call.arguments));
-    core::Json entry = core::Json::Object();
-    entry.Set("id", core::Json::String(call.id));
-    entry.Set("type", core::Json::String("function"));
-    entry.Set("function", std::move(function));
-    items.Push(std::move(entry));
+    items.Push(ToolCallJson(call, /*with_index=*/false, 0));
   }
   return items;
 }
@@ -61,9 +72,29 @@ core::Json StreamChunk(const std::string& model_name, core::Json delta,
   return chunk;
 }
 
+// Fill the session turn from the split reply: `content` and `reasoning`
+// are the concatenated streamer deltas, `calls` the parsed tool calls.
+void FillTurn(SessionMessage* out_turn, std::string_view content,
+              std::string_view reasoning, const std::vector<ToolCall>& calls,
+              bool stopped, std::size_t prompt_tokens,
+              std::size_t completion_tokens, long long elapsed_ms) {
+  if (out_turn == nullptr) {
+    return;
+  }
+  out_turn->role = "assistant";
+  out_turn->content = std::string(content);
+  out_turn->reasoning = std::string(reasoning);
+  out_turn->tool_calls_json =
+      calls.empty() ? std::string() : ToolCallsJson(calls).Dump();
+  out_turn->stopped = stopped;
+  out_turn->stats.prompt_tokens = prompt_tokens;
+  out_turn->stats.completion_tokens = completion_tokens;
+  out_turn->stats.elapsed_ms = elapsed_ms;
+}
+
 bool ChatBuffered(const ToolGenerate& generate, const Tokenizer& tokenizer,
                   ResponseWriter& writer, const std::string& model_name,
-                  const GenerateOptions& options, std::size_t prompt_size,
+                  const GenerateOptions& options, bool think_expected,
                   SessionMessage* out_turn) {
   std::string text;
   const auto gen_started = std::chrono::steady_clock::now();
@@ -81,38 +112,31 @@ bool ChatBuffered(const ToolGenerate& generate, const Tokenizer& tokenizer,
     SendGenerationError(writer, streamed.error());
     return false;
   }
-  std::string before;
-  std::string reasoning;
-  const std::vector<ToolCall> calls = ParseToolCalls(text, &before, &reasoning);
-  const bool has_calls = !calls.empty();
-  if (out_turn != nullptr) {
-    out_turn->role = "assistant";
-    out_turn->content = before;
-    out_turn->reasoning = reasoning;
-    out_turn->tool_calls_json =
-        has_calls ? ToolCallsJson(calls).Dump() : std::string();
-    out_turn->stopped = writer.IsPeerGone();
-    out_turn->stats.prompt_tokens = prompt_size;
-    out_turn->stats.completion_tokens = streamed->produced;
-    out_turn->stats.elapsed_ms = elapsed_ms;
-  }
+  ReplyStreamer streamer(think_expected);
+  ReplyStreamer::Deltas deltas = streamer.Push(text);
+  deltas.Append(streamer.Finish());
+  FillTurn(out_turn, deltas.content, deltas.reasoning, deltas.calls,
+           writer.IsPeerGone(), options.prompt_tokens.size(),
+           streamed->produced, elapsed_ms);
   core::Json message = core::Json::Object();
   message.Set("role", core::Json::String("assistant"));
-  if (!reasoning.empty()) {
-    message.Set("reasoning_content", core::Json::String(reasoning));
+  if (!deltas.reasoning.empty()) {
+    message.Set("reasoning_content", core::Json::String(deltas.reasoning));
   }
   message.Set("content",
-              before.empty() ? core::Json() : core::Json::String(before));
-  if (has_calls) {
-    message.Set("tool_calls", ToolCallsJson(calls));
+              deltas.content.empty() ? core::Json()
+                                     : core::Json::String(deltas.content));
+  if (!deltas.calls.empty()) {
+    message.Set("tool_calls", ToolCallsJson(deltas.calls));
   }
   core::Json choice = core::Json::Object();
   choice.Set("index", core::Json::Number(0));
   choice.Set("message", std::move(message));
   choice.Set(
       "finish_reason",
-      core::Json::String(has_calls ? "tool_calls"
-                                   : FinishReasonName(streamed->reason)));
+      core::Json::String(deltas.calls.empty()
+                             ? FinishReasonName(streamed->reason)
+                             : "tool_calls"));
   core::Json choices = core::Json::Array();
   choices.Push(std::move(choice));
   core::Json response = core::Json::Object();
@@ -120,86 +144,83 @@ bool ChatBuffered(const ToolGenerate& generate, const Tokenizer& tokenizer,
   response.Set("object", core::Json::String("chat.completion"));
   response.Set("model", core::Json::String(model_name));
   response.Set("choices", std::move(choices));
-  response.Set("usage", UsageJson(prompt_size, streamed->produced));
+  response.Set("usage",
+               UsageJson(options.prompt_tokens.size(), streamed->produced));
   SendJson(writer, 200, response);
   return true;
 }
 
-// The turn is generated first, then replayed as SSE: the client cannot
-// tell content apart from a tool call until the block is complete.
+// The turn streams live: reasoning, content and each tool call go out
+// as the splitter resolves them, so the client sees the first deltas
+// as soon as decoding starts (the buffered variant replays the same
+// deltas in one shot).
 bool ChatStreamed(const ToolGenerate& generate, const Tokenizer& tokenizer,
                   ResponseWriter& writer, const std::string& model_name,
-                  const GenerateOptions& options, SessionMessage* out_turn) {
-  std::string text;
+                  const GenerateOptions& options, bool think_expected,
+                  SessionMessage* out_turn) {
+  (void)writer.SendHeaders(200, "text/event-stream", true);
+  core::Json role_delta = core::Json::Object();
+  role_delta.Set("role", core::Json::String("assistant"));
+  WriteSse(writer, "", StreamChunk(model_name, std::move(role_delta), ""),
+           false);
+  ReplyStreamer streamer(think_expected);
+  ReplyStreamer::Deltas total;
+  const auto emit = [&](const ReplyStreamer::Deltas& part) {
+    if (!part.reasoning.empty()) {
+      core::Json delta = core::Json::Object();
+      delta.Set("reasoning_content", core::Json::String(part.reasoning));
+      WriteSse(writer, "", StreamChunk(model_name, std::move(delta), ""),
+               false);
+      total.reasoning += part.reasoning;
+    }
+    if (!part.content.empty()) {
+      core::Json delta = core::Json::Object();
+      delta.Set("content", core::Json::String(part.content));
+      WriteSse(writer, "", StreamChunk(model_name, std::move(delta), ""),
+               false);
+      total.content += part.content;
+    }
+    for (const ToolCall& call : part.calls) {
+      core::Json items = core::Json::Array();
+      items.Push(ToolCallJson(call, /*with_index=*/true, total.calls.size()));
+      core::Json delta = core::Json::Object();
+      delta.Set("tool_calls", std::move(items));
+      WriteSse(writer, "", StreamChunk(model_name, std::move(delta), ""),
+               false);
+      total.calls.push_back(call);
+    }
+  };
   const auto gen_started = std::chrono::steady_clock::now();
   auto streamed = generate(options, [&](std::uint32_t token) {
     if (writer.IsPeerGone()) {
       return false;
     }
     auto piece = tokenizer.Decode(std::span<const std::uint32_t>(&token, 1));
-    text += piece ? *piece : std::string();
+    emit(streamer.Push(piece ? *piece : std::string()));
     return true;
   });
+  emit(streamer.Finish());
   const long long elapsed_ms =
       MillisBetween(gen_started, std::chrono::steady_clock::now());
   if (!streamed) {
-    core::Json chunk = core::Json::Object();
-    chunk.Set("error",
-              core::Json::String(streamed.error() == StatusCode::InvalidArgument
-                                     ? "prompt exceeds the model context window"
-                                     : "generation failed"));
-    WriteSse(writer, "", chunk, false);
+    if (!writer.IsPeerGone()) {
+      core::Json chunk = core::Json::Object();
+      chunk.Set("error",
+                core::Json::String(streamed.error() == StatusCode::InvalidArgument
+                                       ? "prompt exceeds the model context window"
+                                       : "generation failed"));
+      WriteSse(writer, "", chunk, false);
+    }
     return false;
   }
-  (void)writer.SendHeaders(200, "text/event-stream", true);
-  core::Json role_delta = core::Json::Object();
-  role_delta.Set("role", core::Json::String("assistant"));
-  WriteSse(writer, "", StreamChunk(model_name, std::move(role_delta), ""),
-           false);
-  std::string before;
-  std::string reasoning;
-  const std::vector<ToolCall> calls = ParseToolCalls(text, &before, &reasoning);
-  if (out_turn != nullptr) {
-    out_turn->role = "assistant";
-    out_turn->content = before;
-    out_turn->reasoning = reasoning;
-    out_turn->tool_calls_json =
-        calls.empty() ? std::string() : ToolCallsJson(calls).Dump();
-    out_turn->stopped = writer.IsPeerGone();
-    out_turn->stats.prompt_tokens = options.prompt_tokens.size();
-    out_turn->stats.completion_tokens = streamed->produced;
-    out_turn->stats.elapsed_ms = elapsed_ms;
-  }
-  if (!reasoning.empty()) {
-    core::Json delta = core::Json::Object();
-    delta.Set("reasoning_content", core::Json::String(reasoning));
-    WriteSse(writer, "", StreamChunk(model_name, std::move(delta), ""), false);
-  }
-  if (!before.empty()) {
-    core::Json delta = core::Json::Object();
-    delta.Set("content", core::Json::String(before));
-    WriteSse(writer, "", StreamChunk(model_name, std::move(delta), ""), false);
-  }
-  for (std::size_t i = 0; i < calls.size(); ++i) {
-    core::Json function = core::Json::Object();
-    function.Set("name", core::Json::String(calls[i].name));
-    function.Set("arguments", core::Json::String(calls[i].arguments));
-    core::Json entry = core::Json::Object();
-    entry.Set("index", core::Json::Number(static_cast<double>(i)));
-    entry.Set("id", core::Json::String(calls[i].id));
-    entry.Set("type", core::Json::String("function"));
-    entry.Set("function", std::move(function));
-    core::Json items = core::Json::Array();
-    items.Push(std::move(entry));
-    core::Json delta = core::Json::Object();
-    delta.Set("tool_calls", std::move(items));
-    WriteSse(writer, "", StreamChunk(model_name, std::move(delta), ""), false);
-  }
+  FillTurn(out_turn, total.content, total.reasoning, total.calls,
+           writer.IsPeerGone(), options.prompt_tokens.size(),
+           streamed->produced, elapsed_ms);
   core::Json end = core::Json::Object();
   WriteSse(writer, "",
            StreamChunk(model_name, std::move(end),
-                       calls.empty() ? FinishReasonName(streamed->reason)
-                                     : "tool_calls"),
+                       total.calls.empty() ? FinishReasonName(streamed->reason)
+                                           : "tool_calls"),
            false);
   (void)writer.Write("data: [DONE]\n\n");
   return true;
@@ -242,12 +263,17 @@ bool ChatWithTools(const ToolGenerate& generate, Model& model,
     return false;
   }
   const std::string model_name(model.Name());
+  // The template opens the thinking block for thinking turns, so the
+  // splitter streams the leading text as reasoning; the same check as
+  // the plain chat path (see ThinkExpected).
+  const bool think_expected =
+      ThinkExpected(prompt, RequestEnableThinking(body, defaults));
   if (WantsStream(body)) {
     return ChatStreamed(generate, tokenizer, writer, model_name, options,
-                        out_turn);
+                        think_expected, out_turn);
   }
   return ChatBuffered(generate, tokenizer, writer, model_name, options,
-                      ids->size(), out_turn);
+                      think_expected, out_turn);
 }
 
 }  // namespace tessera::serve

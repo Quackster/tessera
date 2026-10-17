@@ -1,6 +1,10 @@
 #include "serve/tools/tool_call.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <iterator>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -180,38 +184,14 @@ bool NormalizeCall(const core::Json& call, core::Json* out,
 std::vector<ToolCall> ParseToolCalls(std::string_view text,
                                       std::string* text_before,
                                       std::string* reasoning) {
-  const ThinkSplit split = SplitThink(text);
-  const std::string_view body = split.text;
+  ReplyStreamer streamer(/*think_expected=*/false);
+  ReplyStreamer::Deltas deltas = streamer.Push(text);
+  deltas.Append(streamer.Finish());
+  *text_before = Trim(deltas.content);
   if (reasoning != nullptr) {
-    *reasoning = Trim(split.reasoning);
+    *reasoning = Trim(deltas.reasoning);
   }
-  std::vector<ToolCall> calls;
-  std::size_t pos = 0;
-  bool first = true;
-  while (true) {
-    const std::size_t open = body.find(kCallOpen, pos);
-    if (open == kMissing) {
-      break;
-    }
-    if (first) {
-      *text_before = Trim(body.substr(0, open));
-      first = false;
-    }
-    const std::size_t close = body.find(kCallClose, open);
-    if (close == kMissing) {
-      break;
-    }
-    const std::size_t begin = open + sizeof(kCallOpen) - 1;
-    if (auto call = ParseBlock(body.substr(begin, close - begin),
-                               calls.size())) {
-      calls.push_back(std::move(*call));
-    }
-    pos = close + sizeof(kCallClose) - 1;
-  }
-  if (first) {
-    *text_before = Trim(split.text);
-  }
-  return calls;
+  return deltas.calls;
 }
 
 bool ThinkExpected(std::string_view prompt, bool enable_thinking) {
@@ -244,34 +224,44 @@ std::size_t CommonPrefix(std::string_view emitted, std::string_view text) {
   return n;
 }
 
-// A tail that may still grow into a think tag: a proper prefix of
-// an opener or a closer. Complete openers use the unclosed span
-// check in Push; this covers their split pieces ("<", "<t", "</" and
-// so on). Anything else (like "a < b") streams at once.
-bool IsThinkTagPrefix(std::string_view tail) {
-  constexpr std::string_view kOpen = "<think>";
-  constexpr std::string_view kClose = "</think>";
-  const auto is_prefix = [](std::string_view tag, std::string_view text) {
-    return text.size() < tag.size() &&
-           tag.substr(0, text.size()) == text;
-  };
-  return !tail.empty() &&
-         (is_prefix(kOpen, tail) || is_prefix(kClose, tail));
+// True when `text` is a non-empty proper prefix of one of `tags`
+// ("<", "<t", "</" and so on): it may still grow into a full marker.
+// Anything else (like "a < b") is decided text and streams at once.
+bool IsTagFragment(std::string_view text,
+                   std::span<const std::string_view> tags) {
+  if (text.empty()) {
+    return false;
+  }
+  for (std::string_view tag : tags) {
+    if (text.size() < tag.size() && tag.substr(0, text.size()) == text) {
+      return true;
+    }
+  }
+  return false;
 }
 
-// Length of the trailing tag fragment: only a suffix shorter than a
-// full marker can still grow into one, so the scan stays bounded and
-// decided text always streams.
-std::size_t TagPrefixTail(std::string_view text) {
-  constexpr std::size_t kTagLen = 8;  // longest think marker
-  const std::size_t cap = std::min(text.size(), kTagLen);
+// Length of the trailing fragment that may still grow into one of
+// `tags`: only a suffix shorter than a full marker can, so the scan
+// stays bounded and decided text always streams.
+std::size_t TagFragmentTail(std::string_view text,
+                            std::span<const std::string_view> tags) {
+  std::size_t cap = 0;
+  for (std::string_view tag : tags) {
+    cap = std::max(cap, tag.size() - 1);
+  }
+  cap = std::min(cap, text.size());
   for (std::size_t len = cap; len > 0; --len) {
-    if (IsThinkTagPrefix(text.substr(text.size() - len))) {
+    if (IsTagFragment(text.substr(text.size() - len), tags)) {
       return len;
     }
   }
   return 0;
 }
+
+// The markers each splitter holds back while they are partial.
+constexpr std::string_view kThinkTags[] = {core::kThinkOpenTag,
+                                           core::kThinkCloseTag};
+constexpr std::string_view kCallTags[] = {kCallOpen};
 
 }  // namespace
 
@@ -288,7 +278,7 @@ ThinkStreamer::Deltas ThinkStreamer::Push(std::string_view piece) {
       // holding it until the closer. Only a trailing tag fragment is
       // withheld (it may yet grow into a tag).
       const std::string_view visible = std::string_view(raw_).substr(
-          0, raw_.size() - TagPrefixTail(raw_));
+          0, raw_.size() - TagFragmentTail(raw_, kThinkTags));
       Deltas deltas;
       deltas.reasoning = std::string(visible).substr(
           CommonPrefix(emitted_reasoning_, visible));
@@ -314,7 +304,8 @@ ThinkStreamer::Deltas ThinkStreamer::Push(std::string_view piece) {
     } else {
       const std::size_t bracket = split.text.rfind('<');
       if (bracket != std::string::npos &&
-          IsThinkTagPrefix(std::string_view(split.text).substr(bracket))) {
+          IsTagFragment(std::string_view(split.text).substr(bracket),
+                        kThinkTags)) {
         visible = std::string_view(split.text).substr(0, bracket);
       }
     }
@@ -345,6 +336,98 @@ ThinkStreamer::Deltas ThinkStreamer::Finish() {
     return deltas;
   }
   return Push({});
+}
+
+ToolCallStreamer::Deltas ToolCallStreamer::Push(std::string_view piece) {
+  pending_.append(piece);
+  Deltas deltas;
+  while (true) {
+    const std::size_t open = pending_.find(kCallOpen);
+    if (open == std::string::npos) {
+      // Hold a possible opener fragment. Before the first block the
+      // rest streams through; later the rest is inter-block text and
+      // is dropped, like the post-hoc parse.
+      const std::size_t hold = TagFragmentTail(pending_, kCallTags);
+      const std::size_t emit = pending_.size() - hold;
+      if (!saw_opener_) {
+        deltas.text.append(pending_, 0, emit);
+      }
+      pending_.erase(0, emit);
+      return deltas;
+    }
+    if (!saw_opener_) {
+      deltas.text.append(pending_, 0, open);
+    }
+    pending_.erase(0, open);
+    saw_opener_ = true;
+    const std::size_t begin = sizeof(kCallOpen) - 1;
+    const std::size_t close = pending_.find(kCallClose, begin);
+    if (close == std::string::npos) {
+      return deltas;  // the block is still arriving
+    }
+    if (auto call = ParseBlock(
+            std::string_view(pending_).substr(begin, close - begin),
+            parsed_)) {
+      deltas.calls.push_back(std::move(*call));
+      ++parsed_;
+    }
+    pending_.erase(0, close + sizeof(kCallClose) - 1);
+  }
+}
+
+ToolCallStreamer::Deltas ToolCallStreamer::Finish() {
+  Deltas deltas;
+  if (!saw_opener_) {
+    // A held opener fragment with no complete opener is plain text.
+    deltas.text = std::move(pending_);
+  }
+  pending_.clear();
+  return deltas;
+}
+
+ReplyStreamer::ReplyStreamer(bool think_expected)
+    : think_(think_expected) {}
+
+void ReplyStreamer::Deltas::Append(Deltas&& other) {
+  reasoning += other.reasoning;
+  content += other.content;
+  calls.insert(calls.end(),
+               std::make_move_iterator(other.calls.begin()),
+               std::make_move_iterator(other.calls.end()));
+}
+
+namespace {
+
+// Fold one scanner result into the accumulated reply deltas.
+void AppendScan(ToolCallStreamer::Deltas&& scan,
+                ReplyStreamer::Deltas* out) {
+  out->content += scan.text;
+  out->calls.insert(out->calls.end(),
+                    std::make_move_iterator(scan.calls.begin()),
+                    std::make_move_iterator(scan.calls.end()));
+}
+
+}  // namespace
+
+ReplyStreamer::Deltas ReplyStreamer::Push(std::string_view piece) {
+  const ThinkStreamer::Deltas part = think_.Push(piece);
+  Deltas deltas;
+  deltas.reasoning = part.reasoning;
+  if (!part.content.empty()) {
+    AppendScan(scan_.Push(part.content), &deltas);
+  }
+  return deltas;
+}
+
+ReplyStreamer::Deltas ReplyStreamer::Finish() {
+  const ThinkStreamer::Deltas part = think_.Finish();
+  Deltas deltas;
+  deltas.reasoning = part.reasoning;
+  if (!part.content.empty()) {
+    AppendScan(scan_.Push(part.content), &deltas);
+  }
+  AppendScan(scan_.Finish(), &deltas);
+  return deltas;
 }
 
 const core::Json* EffectiveTools(const core::Json& body,

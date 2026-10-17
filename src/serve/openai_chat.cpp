@@ -67,6 +67,10 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   }
   const bool shared = slot == nullptr;
   Model& model = shared ? pool.At(0).model() : lease.model();
+  // Exclusive (thinking, tools) turns yield the device every few
+  // tokens so a queued scheduler turn streams beside them instead of
+  // behind them.
+  int yield_count = 0;
   if (wants_tools) {
     // The tool turn runs on the serving backend: a single-device lease
     // holds its engine, a split runner shares the pool's Submit.
@@ -76,11 +80,22 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
         [&](const GenerateOptions& options,
             const std::function<bool(std::uint32_t)>& next)
         -> std::expected<GenerateOutcome, StatusCode> {
+      // Stream and yield per token exactly like a plain exclusive
+      // turn (see the chat stream below).
+      const auto step = [&](std::uint32_t token) {
+        if (!next(token)) {
+          return false;
+        }
+        if (!shared) {
+          MaybeYieldExclusive(lease, yield_count);
+        }
+        return true;
+      };
       if (shared) {
         return pool.SubmitLeastLoaded(
-            options, next, [&writer] { return writer.IsPeerGone(); });
+            options, step, [&writer] { return writer.IsPeerGone(); });
       }
-      return lease.engine().GenerateStreaming(lease.model(), options, next);
+      return lease.engine().GenerateStreaming(lease.model(), options, step);
     };
     SessionMessage assistant;
     const bool ok = ChatWithTools(
@@ -147,10 +162,6 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   TurnSpeedometer speedometer(std::chrono::seconds(stats_interval_seconds),
                               speed_label, speed_log);
   speedometer.Begin();
-  // Exclusive (thinking) turns yield the device every few tokens so
-  // a queued scheduler turn streams beside them instead of behind
-  // them.
-  int yield_count = 0;
   // Thinking defaults to on (or the serve option's value). The chat
   // template then opens the <think> block in the prompt, so the model
   // streams reasoning with no opening tag in its output; ThinkExpected
