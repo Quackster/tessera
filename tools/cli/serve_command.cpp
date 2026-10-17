@@ -72,13 +72,6 @@ void WarnInertServeFlags(const CliOptions& options) {
   if (!options.image_path.empty() || !options.mmproj_path.empty()) {
     WarnIgnoredFlag("--image/--mmproj", "images arrive with each chat request");
   }
-  if (options.sample || options.sampling_explicit) {
-    WarnIgnoredFlag("--sample/--temperature/...",
-                    "sampling is per request in the HTTP API");
-  }
-  if (options.seed != 0) {
-    WarnIgnoredFlag("--seed", "the seed is per request in the HTTP API");
-  }
   if (options.max_thinking_tokens != 0) {
     WarnIgnoredFlag("--max-thinking-tokens",
                     "budgets are per request in the HTTP API");
@@ -440,6 +433,13 @@ int RunServeCommand(const CliOptions& options) {
   serve_options.default_enable_thinking = options.enable_thinking;
   serve_options.default_reasoning_effort =
       options.reasoning_effort_set ? options.reasoning_effort : std::string();
+  // The launcher's sampling values are the server defaults; a request
+  // body may override any field. Without --seed every turn draws a fresh
+  // seed, so two turns of the same prompt differ.
+  serve_options.default_sampling = options.sampling;
+  if (options.seed_set) {
+    serve_options.default_seed = options.seed;
+  }
 
   // Build the pool on the loader thread. Devices load and warm one at a
   // time, so only one model's weights are in host memory at once. The

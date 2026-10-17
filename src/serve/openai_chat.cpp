@@ -32,7 +32,8 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
                 SessionStore& sessions, ResponseWriter& writer,
                 const Json& body, std::size_t default_max, bool anthropic,
                 std::size_t stats_interval_seconds,
-                const TemplateDefaults& defaults) {
+                const TemplateDefaults& defaults,
+                const TurnSampling& sampling) {
   const std::string session_id = SessionIdFrom(body);
   std::shared_ptr<Session> session;
   SessionTurn turn;
@@ -84,7 +85,7 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
     SessionMessage assistant;
     const bool ok = ChatWithTools(
         generate, model, tokenizer, writer, prompt_body, default_max,
-        session != nullptr ? &assistant : nullptr, tool_kv, defaults);
+        session != nullptr ? &assistant : nullptr, tool_kv, defaults, sampling);
     if (session != nullptr && ok) {
       session->Append(std::move(assistant));
     }
@@ -114,6 +115,11 @@ void OpenAiChat(RunnerPool& pool, const Tokenizer& tokenizer,
   options.kv_type = shared ? pool.At(0).kv_type() : lease.runner().kv_type();
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
+  }
+  if (auto applied = ApplyTurnSampling(prompt_body, sampling, &options);
+      !applied) {
+    SendError(writer, 422, applied.error());
+    return;
   }
   if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;

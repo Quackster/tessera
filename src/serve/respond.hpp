@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <expected>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -31,6 +33,23 @@ void SendError(ResponseWriter& writer, int status, const std::string& message);
                                                  std::size_t fallback);
 // Positive `max_thinking_tokens` from the body, else 0 (unlimited).
 [[nodiscard]] std::size_t MaxThinkingTokensFrom(const core::Json& body);
+// Server-side generation defaults for served turns, resolved from the
+// serve options: the sampling parameters and the seed policy.
+struct TurnSampling {
+  SamplingOptions sampling;
+  // Unset draws a fresh random seed per turn, so two turns of the same
+  // prompt differ; a set value makes every turn reproducible.
+  std::optional<std::uint64_t> seed;
+};
+// Resolve one turn's sampling: the server defaults, then the body's
+// OpenAI-style fields (temperature, top_p, top_k, min_p,
+// presence_penalty, repetition_penalty, seed). Turns always sample;
+// temperature 0 stays greedy. The error message is for a field outside
+// the engine's range, for example a negative temperature; the caller
+// answers 422.
+[[nodiscard]] std::expected<void, std::string> ApplyTurnSampling(
+    const core::Json& body, const TurnSampling& defaults,
+    GenerateOptions* options);
 // Session id from the body (`session_id` string); empty when the
 // request is stateless. OpenAI clients ignore the unknown field, so
 // passing it is compatible with other servers.

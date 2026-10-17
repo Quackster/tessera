@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <exception>
 #include <expected>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <string>
@@ -40,6 +42,7 @@ struct CliOptions {
   std::string calibration_path;  // --calibration (env TESSERA_CALIBRATION)
   std::string prompts_path;      // --prompts (calibrate)
   std::vector<std::string> prompt_texts;  // --prompt-text, repeatable
+  std::string prompt_file_path;  // --prompt-file (one prompt, read from a file)
 
   // Logging and chat rendering.
   bool quiet = false;           // --quiet
@@ -76,6 +79,7 @@ struct CliOptions {
   tessera::KvCacheType kv_type = tessera::KvCacheType::F32;
   bool kv_type_set = false;
   std::uint64_t seed = 0;
+  bool seed_set = false;  // --seed
   std::size_t max_completion_tokens = 0;
   std::size_t max_thinking_tokens = 0;
   std::size_t context = kDefaultContext;
@@ -202,6 +206,12 @@ namespace detail {
         return std::unexpected(value.error());
       }
       options->prompt_texts.emplace_back(*value);
+    } else if (arg == "--prompt-file") {
+      auto value = StringValue(args, i, arg);
+      if (!value) {
+        return std::unexpected(value.error());
+      }
+      options->prompt_file_path = *value;
     } else if (arg == "--mmproj") {
       auto value = StringValue(args, i, arg);
       if (!value) {
@@ -438,6 +448,7 @@ namespace detail {
         return std::unexpected(value.error());
       }
       options->seed = *value;
+      options->seed_set = true;
     } else if (arg == "--max-completion-tokens") {
       auto value = SizeValue(args, i, arg);
       if (!value) {
@@ -537,6 +548,46 @@ inline void ApplyCliEnvDefaults(CliOptions* options) {
       options->calibration_path = env;
     }
   }
+}
+
+// Read --prompt-file into prompt_texts as one whitespace-normalized
+// prompt. A file that cannot be read or holds no text is an error, so a
+// typo does not turn into an empty-prompt run. The prompt sits in a file
+// because one command-line argument cannot carry a long context prompt
+// past the kernel's argument size limit.
+[[nodiscard]] inline std::expected<void, std::string> ApplyCliPromptFile(
+    CliOptions* options) {
+  if (options->prompt_file_path.empty()) {
+    return {};
+  }
+  std::ifstream stream(options->prompt_file_path, std::ios::binary);
+  if (!stream) {
+    return std::unexpected("cannot read --prompt-file '" +
+                           options->prompt_file_path + "'");
+  }
+  const std::string raw((std::istreambuf_iterator<char>(stream)),
+                        std::istreambuf_iterator<char>());
+  std::string prompt;
+  prompt.reserve(raw.size());
+  bool in_space = true;  // leading whitespace never reaches the prompt
+  for (const char c : raw) {
+    const bool space = c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    if (space) {
+      in_space = true;
+      continue;
+    }
+    if (in_space && !prompt.empty()) {
+      prompt.push_back(' ');
+    }
+    in_space = false;
+    prompt.push_back(c);
+  }
+  if (prompt.empty()) {
+    return std::unexpected("--prompt-file '" + options->prompt_file_path +
+                           "' holds no text");
+  }
+  options->prompt_texts.push_back(std::move(prompt));
+  return {};
 }
 
 }  // namespace tessera::cli

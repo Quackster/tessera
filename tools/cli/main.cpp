@@ -67,6 +67,10 @@ int main(int argc, char** argv) {
     return kExitUsage;
   }
   tessera::cli::ApplyCliEnvDefaults(&options);
+  if (auto prompt = tessera::cli::ApplyCliPromptFile(&options); !prompt) {
+    std::fprintf(stderr, "cli: %s\n", prompt.error().c_str());
+    return kExitUsage;
+  }
   if (command == "calibrate") {
     return tessera::cli::RunCalibrateCommand(options);
   }

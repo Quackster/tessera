@@ -106,7 +106,9 @@ Json SessionPromptBody(const Json& body, const SessionView& view) {
   prompt_body.Set("messages", SessionHistoryJson(view));
   for (const char* key : {"system", "tools", "tool_choice", "enable_thinking",
                           "reasoning_effort", "stream", "max_completion_tokens",
-                          "max_thinking_tokens", "chat_template_kwargs"}) {
+                          "max_thinking_tokens", "chat_template_kwargs",
+                          "temperature", "top_p", "top_k", "min_p",
+                          "presence_penalty", "repetition_penalty", "seed"}) {
     if (const Json* value = body.Find(key)) {
       prompt_body.Set(key, *value);
     }
@@ -136,7 +138,8 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
                     SessionStore& sessions, ResponseWriter& writer,
                     const Json& body, std::size_t default_max,
                     std::size_t stats_interval_seconds,
-                    const TemplateDefaults& defaults) {
+                    const TemplateDefaults& defaults,
+                    const TurnSampling& sampling) {
   const std::string session_id = SessionIdFrom(body);
   const Json* prompt = body.Find("prompt");
   if (prompt == nullptr || !prompt->isString()) {
@@ -201,6 +204,10 @@ void OpenAiComplete(RunnerPool& pool, const Tokenizer& tokenizer,
   options.kv_type = shared ? pool.At(0).kv_type() : lease.runner().kv_type();
   if (!shared) {
     ApplyToGenerateOptions(lease.runner().calibration(), options);
+  }
+  if (auto applied = ApplyTurnSampling(body, sampling, &options); !applied) {
+    SendError(writer, 422, applied.error());
+    return;
   }
   if (RejectOversizePrompt(writer, ids->size(), model.MaxContextLength())) {
     return;

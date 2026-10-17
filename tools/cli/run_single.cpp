@@ -323,16 +323,8 @@ int RunSingleDeviceGeneration(const CliOptions& options) {
                    : " (reasoning_effort=" + options.reasoning_effort + ")"));
     }
     if (options.sample) {
-      log.Info(
-          "cli",
-          "sampling: temperature=" + std::to_string(sampling.temperature) +
-              " top_p=" + std::to_string(sampling.top_p) +
-              " top_k=" + std::to_string(sampling.top_k) +
-              " min_p=" + std::to_string(sampling.min_p) +
-              " presence_penalty=" + std::to_string(sampling.presence_penalty) +
-              " repetition_penalty=" +
-              std::to_string(sampling.repetition_penalty) +
-              " seed=" + std::to_string(options.seed));
+      log.Info("cli", "sampling: " + DescribeSampling(sampling) +
+                          " seed=" + std::to_string(options.seed));
     } else {
       log.Info("cli", "sampling: greedy");
     }

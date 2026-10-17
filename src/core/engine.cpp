@@ -1,12 +1,29 @@
 #include "tessera/engine.hpp"
 
 #include <memory>
+#include <random>
 #include <string>
 #include <utility>
 
 #include "core/timing.hpp"
 
 namespace tessera {
+
+std::string DescribeSampling(const SamplingOptions& sampling) {
+  return "temperature=" + std::to_string(sampling.temperature) +
+         " top_p=" + std::to_string(sampling.top_p) +
+         " top_k=" + std::to_string(sampling.top_k) +
+         " min_p=" + std::to_string(sampling.min_p) +
+         " presence_penalty=" + std::to_string(sampling.presence_penalty) +
+         " repetition_penalty=" + std::to_string(sampling.repetition_penalty);
+}
+
+std::uint64_t RandomSeed() {
+  // Two draws cover the full 64-bit width on a 32-bit random_device.
+  std::random_device device;
+  return (static_cast<std::uint64_t>(device()) << 32) ^
+         static_cast<std::uint64_t>(device());
+}
 
 Engine::Engine(std::unique_ptr<Backend> backend, log::Diagnostics diagnostics,
                std::size_t prefill_chunk_tokens)

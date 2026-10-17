@@ -1,6 +1,7 @@
 #include "serve/respond.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <string>
 
 #include "tessera/serve.hpp"
@@ -19,6 +20,38 @@ std::size_t PositiveTokenBudget(const core::Json& body, std::string_view name) {
     return static_cast<std::size_t>(value->AsNumber());
   }
   return 0;
+}
+
+// The number under `name`, else nullptr. A missing field or a
+// non-number reads as absent.
+const core::Json* NumberField(const core::Json& body, std::string_view name) {
+  const core::Json* value = body.Find(name);
+  if (value != nullptr && value->type() == core::Json::Type::Number) {
+    return value;
+  }
+  return nullptr;
+}
+
+// The first parameter outside the range the engine accepts (see
+// ValidateSamplingOptions), or empty. Checked at the request boundary so
+// the client gets a clear 422 instead of the generation error path.
+std::string SamplingRangeError(const SamplingOptions& sampling) {
+  if (!(sampling.temperature >= 0.0f)) {
+    return "temperature must be >= 0";
+  }
+  if (!(sampling.top_p > 0.0f) || sampling.top_p > 1.0f) {
+    return "top_p must be in (0, 1]";
+  }
+  if (sampling.top_k < 0) {
+    return "top_k must be >= 0";
+  }
+  if (!(sampling.min_p >= 0.0f) || sampling.min_p >= 1.0f) {
+    return "min_p must be in [0, 1)";
+  }
+  if (!(sampling.repetition_penalty > 0.0f)) {
+    return "repetition_penalty must be > 0";
+  }
+  return {};
 }
 
 }  // namespace
@@ -65,6 +98,50 @@ std::size_t MaxCompletionTokensFrom(const core::Json& body,
 
 std::size_t MaxThinkingTokensFrom(const core::Json& body) {
   return PositiveTokenBudget(body, "max_thinking_tokens");
+}
+
+std::expected<void, std::string> ApplyTurnSampling(
+    const core::Json& body, const TurnSampling& defaults,
+    GenerateOptions* options) {
+  // Sampling is the serve contract; temperature 0 stays greedy inside
+  // the sampler without consuming the rng.
+  options->sample = true;
+  options->sampling = defaults.sampling;
+  if (const core::Json* value = NumberField(body, "temperature")) {
+    options->sampling.temperature = static_cast<float>(value->AsNumber());
+  }
+  if (const core::Json* value = NumberField(body, "top_p")) {
+    options->sampling.top_p = static_cast<float>(value->AsNumber());
+  }
+  if (const core::Json* value = NumberField(body, "top_k");
+      value != nullptr && value->AsNumber() >= 0.0) {
+    options->sampling.top_k = static_cast<int>(value->AsNumber());
+  }
+  if (const core::Json* value = NumberField(body, "min_p")) {
+    options->sampling.min_p = static_cast<float>(value->AsNumber());
+  }
+  if (const core::Json* value = NumberField(body, "presence_penalty")) {
+    options->sampling.presence_penalty = static_cast<float>(value->AsNumber());
+  }
+  if (const core::Json* value = NumberField(body, "repetition_penalty")) {
+    options->sampling.repetition_penalty =
+        static_cast<float>(value->AsNumber());
+  }
+  if (const std::string error = SamplingRangeError(options->sampling);
+      !error.empty()) {
+    return std::unexpected("invalid sampling parameters: " + error);
+  }
+  // A request seed wins, then the server's fixed seed; without either,
+  // a fresh seed per turn so two turns of the same prompt differ.
+  const core::Json* seed = NumberField(body, "seed");
+  if (seed != nullptr && seed->AsNumber() >= 0.0) {
+    options->seed = static_cast<std::uint64_t>(seed->AsNumber());
+  } else if (defaults.seed.has_value()) {
+    options->seed = *defaults.seed;
+  } else {
+    options->seed = RandomSeed();
+  }
+  return {};
 }
 
 std::string SessionIdFrom(const core::Json& body) {

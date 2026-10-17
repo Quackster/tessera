@@ -29,6 +29,7 @@ using serve::ResponseWriter;
 using serve::SendError;
 using serve::SendJson;
 using serve::TemplateDefaults;
+using serve::TurnSampling;
 
 std::atomic<unsigned long long> g_requests{0};
 
@@ -41,6 +42,12 @@ bool Bridge(const HttpRequest& request, const std::string& path) {
 TemplateDefaults DefaultsFrom(const ServeOptions& options) {
   return TemplateDefaults{options.default_enable_thinking,
                           options.default_reasoning_effort};
+}
+
+// The sampling defaults the serve options select for requests that omit
+// the OpenAI-style sampling fields.
+TurnSampling SamplingDefaultsFrom(const ServeOptions& options) {
+  return TurnSampling{options.default_sampling, options.default_seed};
 }
 
 // The 503 body a not-ready server returns: status "loading" while the
@@ -219,7 +226,7 @@ std::expected<void, StatusCode> ServeInternal(
     serve::SessionHandler session_handler(
         *pool, *tokenizer, sessions, options.default_max_completion_tokens,
         options.auto_title, options.stats_interval_seconds,
-        DefaultsFrom(options));
+        DefaultsFrom(options), SamplingDefaultsFrom(options));
     if (path == "/api/sessions") {
       if (request.method == "GET") {
         session_handler.HandleList(writer);
@@ -374,7 +381,7 @@ std::expected<void, StatusCode> ServeInternal(
       serve::OpenAiComplete(*pool, *tokenizer, sessions, writer, *body,
                             options.default_max_completion_tokens,
                             options.stats_interval_seconds,
-                            DefaultsFrom(options));
+                            DefaultsFrom(options), SamplingDefaultsFrom(options));
       return;
     }
     if (request.method == "POST" && Bridge(request, "/v1/chat/completions")) {
@@ -385,7 +392,8 @@ std::expected<void, StatusCode> ServeInternal(
       }
       serve::OpenAiChat(*pool, *tokenizer, sessions, writer, *body,
                         options.default_max_completion_tokens, false,
-                        options.stats_interval_seconds, DefaultsFrom(options));
+                        options.stats_interval_seconds, DefaultsFrom(options),
+                        SamplingDefaultsFrom(options));
       return;
     }
     if (request.method == "POST" &&
@@ -418,7 +426,8 @@ std::expected<void, StatusCode> ServeInternal(
       }
       serve::OpenAiChat(*pool, *tokenizer, sessions, writer, *body,
                         options.default_max_completion_tokens, true,
-                        options.stats_interval_seconds, DefaultsFrom(options));
+                        options.stats_interval_seconds, DefaultsFrom(options),
+                        SamplingDefaultsFrom(options));
       return;
     }
     // Live session states: one entry per chat with its id, title,
@@ -445,6 +454,15 @@ std::expected<void, StatusCode> ServeInternal(
   if (!bound) {
     return std::unexpected(bound.error());
   }
+  // The sampling every turn starts from; a request body may override any
+  // field, so this line is what a client that sends none gets.
+  const serve::TurnSampling sampling_defaults = SamplingDefaultsFrom(options);
+  const std::string seed = sampling_defaults.seed.has_value()
+                               ? std::to_string(*sampling_defaults.seed)
+                               : "random";
+  serve_log.Info("serve", "sampling defaults: " +
+                              DescribeSampling(sampling_defaults.sampling) +
+                              " seed=" + seed);
   if (loader) {
     // Bind and serve first, then load: a client reaches /health during
     // a slow load instead of finding the port closed.

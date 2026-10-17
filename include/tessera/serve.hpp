@@ -5,6 +5,7 @@
 #include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -44,6 +45,15 @@ struct ServeOptions {
   // Seconds between live tok/s reports on streamed turns, to the
   // session SSE stream and the server log (0 disables both).
   std::size_t stats_interval_seconds = kDefaultStatsIntervalSeconds;
+  // Sampling parameters served turns start from: the model-card defaults
+  // (tessera/defaults.hpp) unless the launcher overrides them. A request
+  // body may override any field (temperature, top_p, top_k, min_p,
+  // presence_penalty, repetition_penalty, seed). temperature 0 keeps the
+  // greedy path; a sampled turn runs without a greedy-only drafter.
+  SamplingOptions default_sampling;
+  // Fixed RNG seed for served turns; unset draws a fresh random seed per
+  // turn, so two turns of the same prompt differ.
+  std::optional<std::uint64_t> default_seed;
 };
 
 // Reports the loader's current step (for example "loading weights" or

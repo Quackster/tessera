@@ -100,7 +100,7 @@ void WarnInertCalibrateFlags(const CliOptions& options) {
     WarnIgnoredFlag("--image/--mmproj/--prompt-text/--no-chat",
                     "calibration uses fixed prompts or --prompts");
   }
-  if (options.sample || options.sampling_explicit || options.seed != 0) {
+  if (options.sampling_explicit || options.seed_set) {
     WarnIgnoredFlag("--sample/--temperature/.../--seed",
                     "calibration decodes greedy");
   }

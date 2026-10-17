@@ -6,6 +6,7 @@
 
 #include "core/json.hpp"
 #include "serve/render.hpp"
+#include "serve/respond.hpp"
 #include "tessera/engine.hpp"
 #include "tessera/types.hpp"
 
@@ -51,7 +52,8 @@ using ToolGenerate = std::function<std::expected<GenerateOutcome, StatusCode>(
                                  ResponseWriter& writer, const core::Json& body,
                                  std::size_t default_max,
                                  SessionMessage* out_turn, KvCacheType kv_type,
-                                 const TemplateDefaults& defaults = {});
+                                 const TemplateDefaults& defaults = {},
+                                 const TurnSampling& sampling = {});
 
 }  // namespace serve
 

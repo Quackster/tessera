@@ -180,14 +180,15 @@ SessionHandler::SessionHandler(RunnerPool& pool, const Tokenizer& tokenizer,
                                std::size_t default_max_completion_tokens,
                                bool auto_title,
                                std::size_t stats_interval_seconds,
-                               TemplateDefaults defaults)
+                               TemplateDefaults defaults, TurnSampling sampling)
     : pool_(pool),
       tokenizer_(tokenizer),
       sessions_(sessions),
       default_max_completion_tokens_(default_max_completion_tokens),
       auto_title_(auto_title),
       stats_interval_seconds_(stats_interval_seconds),
-      template_defaults_(std::move(defaults)) {}
+      template_defaults_(std::move(defaults)),
+      sampling_(sampling) {}
 
 void SessionHandler::HandleList(ResponseWriter& writer) const {
   Json items = Json::Array();
@@ -295,6 +296,11 @@ void SessionHandler::RunTurn(RunnerLease* lease,
       lease != nullptr ? lease->runner().kv_type() : pool_.At(0).kv_type();
   if (lease != nullptr) {
     ApplyToGenerateOptions(lease->runner().calibration(), options);
+  }
+  if (auto applied = ApplyTurnSampling(request, sampling_, &options);
+      !applied) {
+    SendError(writer, 422, applied.error());
+    return;
   }
   ThinkStreamer streamer(ThinkExpected(prompt, enable_thinking));
   std::string reasoning_text;

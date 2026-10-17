@@ -49,6 +49,19 @@ struct SamplingOptions {
   float repetition_penalty = kDefaultRepetitionPenalty;
 };
 
+// One-line summary of `sampling` for diagnostics: the parameter names
+// with their values. The caller adds the context (a seed, a "defaults"
+// label) around it.
+//
+// Usage:
+//   log.Info("cli", "sampling: " + DescribeSampling(gen.sampling));
+[[nodiscard]] std::string DescribeSampling(const SamplingOptions& sampling);
+
+// A fresh 64-bit seed from the system entropy source. A caller that was
+// not given a seed passes this so sampled runs differ each time; an
+// explicit seed stays reproducible.
+[[nodiscard]] std::uint64_t RandomSeed();
+
 // Options for Engine::Generate.
 struct GenerateOptions {
   // Completion tokens to produce; 0 (the default) fills the remaining
